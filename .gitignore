@@ -1,0 +1,27 @@
+# Build artifacts (regenerable)
+node_modules/
+dist/
+dist-ssr/
+core/build/
+src-tauri/target/
+src-tauri/binaries/
+release/
+
+# Logs
+*.log
+logs/
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+
+# Local env (never commit secrets — use DEEPFOLD_GOOGLE_CLIENT_SECRET env at build time)
+.env
+.env.*
+!.env.example
+
+# Claude Code session state (per-developer)
+.claude/
+CLAUDE.md

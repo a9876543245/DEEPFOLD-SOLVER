@@ -1,0 +1,29 @@
+[package]
+name = "deepsolver-app"
+version = "1.0.4"
+description = "DEEPFOLD-SOLVER - GPU-Accelerated GTO Poker Solver with Training Mode"
+authors = ["DEEPFOLD"]
+edition = "2021"
+
+[lib]
+name = "deepsolver_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-opener = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+bincode = "2"
+flate2 = "1"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+sha2 = "0.10"
+base64 = "0.22"

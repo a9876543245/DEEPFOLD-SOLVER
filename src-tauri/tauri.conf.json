@@ -1,0 +1,65 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DEEPFOLD - SOLVER",
+  "version": "1.0.4",
+  "identifier": "co.deepfold.solver",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "DEEPFOLD - SOLVER",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 700,
+        "decorations": true,
+        "transparent": false,
+        "resizable": true,
+        "devtools": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": ["msi", "nsis"],
+    "publisher": "DEEPFOLD",
+    "category": "Education",
+    "shortDescription": "GPU-Accelerated GTO Poker Solver",
+    "longDescription": "DEEPFOLD-SOLVER is a GPU-accelerated GTO poker solver with built-in training mode, pre-solved spot library, and multilingual UI (English / 中文 / 日本語). Automatically runs on CUDA GPU when available, falls back to CPU when not.",
+    "externalBin": [
+      "binaries/deepsolver_core"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDEzMkZGRjQwRjEzQjVDMDcKUldRSFhEdnhRUDh2RTF3a0ZXK1laVk4yVzVXWU00ZDIyanBtUFZYU3hSWWFYU3RsSUZucE91RDcK",
+      "endpoints": [
+        "https://github.com/a9876543245/DEEPFOLD-SOLVER/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}
