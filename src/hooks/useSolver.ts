@@ -417,6 +417,8 @@ export function useSolver() {
       // Path B: surface the runout context so the picker UI can render.
       dealt_cards: entry.dealt_cards,
       runout_options: entry.runout_options,
+      // EV per grid label for the EV/equity disclosure UI.
+      combo_evs: entry.combo_evs,
     };
     setResult(next);  // wrapped setter syncs the ref
     return true;

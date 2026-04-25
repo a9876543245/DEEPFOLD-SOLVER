@@ -494,8 +494,23 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
       {/* Hovered Combo Info (when no target selected) */}
       {hoveredCombo && !result.target_combo_analysis && !comboVariants && (
         <div className="glass-panel animate-fade-in" style={{ padding: 10 }}>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2 }}>
-            {hoveredCombo}
+          <div style={{
+            display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 2,
+          }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>{hoveredCombo}</div>
+            {/* EV from cache, if present (#3 from roadmap). Avoids forcing a
+             *  re-solve just to show the per-combo number. */}
+            {result.combo_evs && hoveredCombo in result.combo_evs && (
+              <div style={{
+                fontSize: 11,
+                color: result.combo_evs[hoveredCombo] >= 0
+                  ? 'var(--color-green)' : 'var(--color-red, #ef4444)',
+                fontWeight: 700,
+              }}>
+                EV {result.combo_evs[hoveredCombo] >= 0 ? '+' : ''}
+                {result.combo_evs[hoveredCombo].toFixed(2)}
+              </div>
+            )}
           </div>
           <div style={{ fontSize: 10, color: 'var(--color-text-secondary)' }}>
             {t('panel.clickToAnalyze')}

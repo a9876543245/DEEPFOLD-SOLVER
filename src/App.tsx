@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { BoardSelector } from './components/BoardSelector';
 import { PositionSelector } from './components/PositionSelector';
 import { SolverControls } from './components/SolverControls';
@@ -25,6 +25,7 @@ import { isRealSolverAvailable } from './lib/presolvedSpots';
 import { DrillMode } from './components/DrillMode';
 import { GtoChartBrowser } from './components/GtoChartBrowser';
 import { RunoutPicker } from './components/RunoutPicker';
+import { useGtoAutoRange } from './hooks/useGtoAutoRange';
 import { HelpCircle, BookOpen, Crosshair } from 'lucide-react';
 import { useT, useLanguage, LANGUAGES } from './lib/i18n';
 import type { AuthUser } from './lib/auth';
@@ -59,6 +60,16 @@ function App() {
   // the "#XX" suffix in the cache lookup.
   const [selectedRunout, setSelectedRunout] = useState<string | null>(null);
 
+  // Auto-load GTO preflop ranges matching the selected matchup. Returns
+  // metadata about which charts were applied so the UI can disclose
+  // (e.g. "Loaded BTN open from 6max_100bb / Cash 6max_100bb BTN_K17").
+  const { applied: appliedGtoRanges } = useGtoAutoRange(
+    selectedMatchup, setCustomIpRange, setCustomOopRange);
+
+  // Off-range combo cache state — actual sync useEffect lives below the
+  // useSolver() call so it can read `result` without TDZ issues.
+  const [offRangeCache, setOffRangeCache] = useState<Record<string, ComboAnalysis>>({});
+
   // Grid display mode
   const [gridMode, setGridMode] = useState<GridDisplayMode>('mix');
   const [heatmapAction, setHeatmapAction] = useState<string>('');
@@ -86,6 +97,24 @@ function App() {
   }, [flopBoard, turnCard, riverCard]);
 
   const { result, setResult, loading, error, elapsed, progress, solve, reset, navigate } = useSolver();
+
+  // Off-range combo cache (#2 from roadmap). After a target_combo solve
+  // completes (~10s), keep its analysis so a re-click on the same hand is
+  // instant. Cleared whenever a *fresh* spot solve runs (new strategy_tree
+  // reference + no target_combo_analysis = fresh spot).
+  const prevTreeRef = useRef<unknown>(null);
+  useEffect(() => {
+    if (!result) return;
+    const treeChanged = result.strategy_tree !== prevTreeRef.current;
+    const hasTarget   = !!result.target_combo_analysis;
+    if (treeChanged && !hasTarget) {
+      setOffRangeCache({});
+    } else if (hasTarget) {
+      const a = result.target_combo_analysis!;
+      setOffRangeCache(prev => prev[a.combo] === a ? prev : { ...prev, [a.combo]: a });
+    }
+    prevTreeRef.current = result.strategy_tree;
+  }, [result]);
 
   // Helper: convert an ActionStep[] path into the engine's history string.
   // Skips Deal steps. If `selectedRunout` is set, attaches "#<card>" to the
@@ -326,12 +355,20 @@ function App() {
       }
       setResult(prev => prev ? { ...prev, target_combo_analysis: analysis } : prev);
     } else {
-      // Off-range — real re-solve with target_combo, forcing it into the range
+      // Off-range. First check the off-range cache — re-clicks of a hand
+      // we already solved-with-target_combo are instant.
+      const cached = offRangeCache[label];
+      if (cached) {
+        setResult(prev => prev ? { ...prev, target_combo_analysis: cached } : prev);
+        return;
+      }
+      // Cache miss → real re-solve with target_combo, forcing it into the
+      // range. Result auto-saves to offRangeCache via the useEffect above.
       const request = buildRequest(fullBoard, currentNode?.path, currentNode?.pot, currentNode?.effectiveStack);
       request.target_combo = label;
       solve(request);
     }
-  }, [result, flopBoard, fullBoard, currentNode, solve, buildRequest]);
+  }, [result, flopBoard, fullBoard, currentNode, solve, buildRequest, offRangeCache, setResult]);
 
   // Breadcrumb history for ActionNavigator
   const breadcrumbHistory = useMemo(() => {
@@ -539,6 +576,33 @@ function App() {
 
       {/* Update banner (no-op in browser mode) */}
       <UpdateBanner />
+
+      {/* Auto-loaded GTO range disclosure. Shows after a matchup change
+       *  when the bundled chart library found a match for IP/OOP. Click
+       *  opens the GTO browser so user can pick a different chart. */}
+      {appliedGtoRanges.length > 0 && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          padding: '6px 12px', background: 'rgba(124, 58, 237, 0.08)',
+          borderBottom: '1px solid rgba(124, 58, 237, 0.2)',
+          fontSize: 12,
+        }}>
+          <span style={{ color: 'var(--color-text-secondary)' }}>GTO ranges loaded:</span>
+          {appliedGtoRanges.map(r => (
+            <button key={r.scenarioId} onClick={() => setGtoBrowserOpen(true)}
+              title={`Click to browse GTO library and pick a different ${r.side} chart`}
+              style={{
+                padding: '2px 8px', background: 'rgba(124, 58, 237, 0.15)',
+                border: '1px solid rgba(124, 58, 237, 0.3)', borderRadius: 4,
+                color: '#c4b5fd', cursor: 'pointer', fontFamily: 'inherit', fontSize: 11,
+              }}
+            >
+              {r.side} {r.position}: {r.scenarioId.split('/').pop()}
+            </button>
+          ))}
+        </div>
+      )}
+
 
       {/* Left Sidebar */}
       <aside className="sidebar-left">

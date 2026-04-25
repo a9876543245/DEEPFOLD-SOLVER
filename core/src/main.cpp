@@ -458,6 +458,15 @@ std::string result_to_json(
             }
             json << "}";
 
+            // Per-grid-label EV (chips, from acting player's perspective).
+            json << ",\"combo_evs\":{";
+            for (size_t i = 0; i < entry.combo_evs.size(); ++i) {
+                json << "\"" << escape_json(entry.combo_evs[i].first) << "\":"
+                     << std::setprecision(2) << entry.combo_evs[i].second;
+                if (i + 1 < entry.combo_evs.size()) json << ",";
+            }
+            json << "}";
+
             // Path B fields: dealt_cards + runout_options. dealt_cards is the
             // cumulative card string for UI disclosure ("2c,Jd"). runout_options
             // lists every canonical card the immediate prior chance had (so

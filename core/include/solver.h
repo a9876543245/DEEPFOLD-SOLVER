@@ -113,6 +113,11 @@ public:
         std::string opponent_side;                           // "OOP" | "IP"
         std::vector<std::pair<std::string, float>> opponent_range;
 
+        // Per-grid-label EV (in chips, from acting player's perspective)
+        // at THIS node. Aggregated across canonical slots weighted by reach.
+        // Empty for terminal/chance fallthrough nodes.
+        std::vector<std::pair<std::string, float>> combo_evs;
+
         // Path B (per-runout cache):
         // Cumulative cards dealt from root to this node via the path's
         // chance-skip jumps. Empty if no chance preceded this node. Lets the
@@ -191,7 +196,8 @@ private:
                                                    std::vector<float>& reach_ip);
     std::vector<float> cpu_ev_traverse(uint32_t node_idx, int perspective,
                                         std::vector<float>& reach_oop,
-                                        std::vector<float>& reach_ip) const;
+                                        std::vector<float>& reach_ip,
+                                        std::map<uint32_t, std::vector<float>>* out_node_values = nullptr) const;
     void compute_combo_evs();
 
     // ---- Helpers ----
@@ -533,8 +539,16 @@ inline void Solver::apply_node_locks() {
 
 inline std::vector<float> Solver::cpu_ev_traverse(
     uint32_t node_idx, int perspective,
-    std::vector<float>& reach_oop, std::vector<float>& reach_ip) const
+    std::vector<float>& reach_oop, std::vector<float>& reach_ip,
+    std::map<uint32_t, std::vector<float>>* out_node_values) const
 {
+    // Helper: write the per-combo values to the out-map (if requested) and
+    // then return them. Used at every return point so the map records every
+    // visited node's values during a single root traversal.
+    auto record = [&](std::vector<float>&& vals) -> std::vector<float> {
+        if (out_node_values) (*out_node_values)[node_idx] = vals;
+        return std::move(vals);
+    };
     uint16_t nc = iso_.num_canonical;
     auto nt = static_cast<NodeType>(tree_.node_types[node_idx]);
 
@@ -594,7 +608,7 @@ inline std::vector<float> Solver::cpu_ev_traverse(
                 values[c] = sign * gain * opp_total;
             }
         }
-        return values;
+        return record(std::move(values));
     }
 
     if (nt == NodeType::CHANCE) {
@@ -603,7 +617,7 @@ inline std::vector<float> Solver::cpu_ev_traverse(
         // rather than silently dropping the child, which would bias the
         // average toward survivors.
         uint8_t nch = tree_.num_children[node_idx];
-        if (nch == 0) return std::vector<float>(nc, 0.0f);
+        if (nch == 0) return record(std::vector<float>(nc, 0.0f));
         std::vector<float> avg(nc, 0.0f);
         uint32_t total_weight = 0;
         uint32_t off = tree_.children_offset[node_idx];
@@ -613,7 +627,7 @@ inline std::vector<float> Solver::cpu_ev_traverse(
                                 ? tree_.runout_weight[child] : 1;
             if (weight == 0) weight = 1;
             std::vector<float> child_vals = cpu_ev_traverse(
-                child, perspective, reach_oop, reach_ip);
+                child, perspective, reach_oop, reach_ip, out_node_values);
             for (uint16_t c = 0; c < nc; ++c) {
                 avg[c] += static_cast<float>(weight) * child_vals[c];
             }
@@ -623,13 +637,13 @@ inline std::vector<float> Solver::cpu_ev_traverse(
             float inv = 1.0f / static_cast<float>(total_weight);
             for (uint16_t c = 0; c < nc; ++c) avg[c] *= inv;
         }
-        return avg;
+        return record(std::move(avg));
     }
 
     int acting = tree_.active_player[node_idx];
     uint8_t na = tree_.num_children[node_idx];
     if (node_idx >= strategy_.size() || strategy_[node_idx].empty()) {
-        return std::vector<float>(nc, 0.0f);
+        return record(std::vector<float>(nc, 0.0f));
     }
     const auto& strat = strategy_[node_idx];
 
@@ -642,7 +656,7 @@ inline std::vector<float> Solver::cpu_ev_traverse(
             saved[c] = acting_reach[c];
             acting_reach[c] *= strat[a * nc + c];
         }
-        action_vals[a] = cpu_ev_traverse(child, perspective, reach_oop, reach_ip);
+        action_vals[a] = cpu_ev_traverse(child, perspective, reach_oop, reach_ip, out_node_values);
         for (uint16_t c = 0; c < nc; ++c) acting_reach[c] = saved[c];
     }
 
@@ -656,7 +670,7 @@ inline std::vector<float> Solver::cpu_ev_traverse(
             for (uint16_t c = 0; c < nc; ++c)
                 node_vals[c] += action_vals[a][c];
     }
-    return node_vals;
+    return record(std::move(node_vals));
 }
 
 inline void Solver::compute_combo_evs() {
@@ -1353,6 +1367,69 @@ Solver::build_strategy_tree(int max_player_depth) const {
     std::map<std::string, StrategyTreeEntry> out;
     if (!solved_) return out;
 
+    // Pre-compute per-node EVs from each player's perspective by running
+    // cpu_ev_traverse from root with capture maps. One pass per perspective
+    // gets values for ALL inner nodes — way cheaper than re-traversing per
+    // cache entry. Memory: ~nodes × nc × 4B (~few MB for typical solves).
+    std::map<uint32_t, std::vector<float>> node_vals_oop;
+    std::map<uint32_t, std::vector<float>> node_vals_ip;
+    {
+        auto roop = oop_reach_, rip = ip_reach_;
+        cpu_ev_traverse(0, 0, roop, rip, &node_vals_oop);
+        roop = oop_reach_; rip = ip_reach_;
+        cpu_ev_traverse(0, 1, roop, rip, &node_vals_ip);
+    }
+
+    // Aggregate per-canonical-combo values into per-grid-label EVs at one
+    // node. Uses the acting player's reach as weights so labels with no
+    // reach at this node contribute zero (rather than skewing the mean).
+    // Normalize raw cpu_ev_traverse values: they're scaled by total opponent
+    // reach × canonical_weight (so a wider opponent range inflates the
+    // numbers proportionally). Divide by that total to get chips per hand.
+    auto opp_total_weight = [&](bool acting_is_ip) -> float {
+        const auto& opp = acting_is_ip ? oop_reach_ : ip_reach_;
+        float total = 0.0f;
+        for (uint16_t c = 0; c < iso_.num_canonical; ++c) {
+            float w = static_cast<float>(iso_.canonical_weights[c]);
+            total += opp[c] * w;
+        }
+        return total;
+    };
+    float oop_norm = 1.0f / std::max(1e-6f, opp_total_weight(false)); // OOP acting → IP opp
+    float ip_norm  = 1.0f / std::max(1e-6f, opp_total_weight(true));  // IP acting  → OOP opp
+
+    auto evs_at = [&](uint32_t node) -> std::vector<std::pair<std::string, float>> {
+        auto nt = static_cast<NodeType>(tree_.node_types[node]);
+        if (nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) return {};
+        bool acting_is_ip = (nt == NodeType::PLAYER_IP);
+        const auto& vals_map = acting_is_ip ? node_vals_ip : node_vals_oop;
+        auto it = vals_map.find(node);
+        if (it == vals_map.end()) return {};
+        const std::vector<float>& vals = it->second;
+        float norm = acting_is_ip ? ip_norm : oop_norm;
+
+        const auto& reach = acting_is_ip ? ip_reach_ : oop_reach_;
+        const auto& combo_table = get_combo_table();
+        std::map<std::string, float> sum_w_val;
+        std::map<std::string, float> sum_w;
+        for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+            uint16_t ci = iso_.original_to_canonical[i];
+            if (ci == UINT16_MAX) continue;
+            float r = (ci < reach.size()) ? reach[ci] : 0.0f;
+            if (r <= 0.0f) continue;
+            std::string label = combo_to_grid_label(combo_table[i]);
+            float v = (ci < vals.size()) ? vals[ci] : 0.0f;
+            sum_w_val[label] += r * v * norm;
+            sum_w[label]     += r;
+        }
+        std::vector<std::pair<std::string, float>> out_pairs;
+        for (auto& [label, sw] : sum_w) {
+            if (sw <= 0.0f) continue;
+            out_pairs.push_back({label, sum_w_val[label] / sw});
+        }
+        return out_pairs;
+    };
+
     // Path token formatter: cards encode as "<rank><suit>" lowercase
     // (e.g. card 0 = "2c"). Used in the cache key for runout selection.
     // Format chosen to be human-readable in JSON output and easy to parse
@@ -1474,6 +1551,7 @@ Solver::build_strategy_tree(int max_player_depth) const {
         auto opp = extract_opponent_range_at(node);
         entry.opponent_side  = opp.opponent;
         entry.opponent_range = std::move(opp.labels);
+        entry.combo_evs      = evs_at(node);
         entry.dealt_cards    = dealt_now;
         entry.runout_options = runouts_now;
 

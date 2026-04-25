@@ -108,6 +108,10 @@ pub struct StrategyTreeEntry {
         std::collections::HashMap<String, f64>>,
     pub opponent_side: String,
     pub opponent_range: std::collections::HashMap<String, f64>,
+    /// Per-grid-label EV at this node (chips, from acting player's view).
+    /// Empty for nodes the acting player doesn't reach.
+    #[serde(default)]
+    pub combo_evs: std::collections::HashMap<String, f64>,
     /// Path B: cumulative runout cards from root to this node (empty for
     /// nodes before any chance). Format: ["2c", "Jd"]. Lets the UI disclose
     /// "this strategy is for runout: 2♣ + J♦" instead of silently showing

@@ -131,6 +131,9 @@ export interface SolverResponse {
    *  Used by the "view opponent" toggle in RangeGrid to render a heatmap
    *  of "what hands does the opponent have here". */
   opponent_range?: Record<string, number>;
+  /** Per-grid-label EV at the currently-displayed node (chips, acting view).
+   *  Mirrors the field in cache entry — `useSolver.navigate` copies it up. */
+  combo_evs?: Record<string, number>;
   /** Route A navigation cache: history-path -> per-node strategy bundle.
    *  Lets the UI navigate within an already-solved tree without re-invoking
    *  the engine. Path format matches the comma-separated player-action
@@ -157,6 +160,9 @@ export interface StrategyTreeEntry {
   combo_strategies: Record<string, ComboStrategy>;
   opponent_side: 'OOP' | 'IP';
   opponent_range: Record<string, number>;
+  /** Per-grid-label EV at this node, in chips, from the acting player's
+   *  perspective. Empty for labels the acting player has zero reach for. */
+  combo_evs?: Record<string, number>;
   /** Path B: cumulative dealt cards from root via this path's chance jumps.
    *  Empty for pre-chance nodes. Used by the UI to disclose the actual
    *  runout the cached strategies represent (e.g. "2c"). */
