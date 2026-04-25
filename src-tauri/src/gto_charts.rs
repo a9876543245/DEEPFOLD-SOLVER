@@ -69,15 +69,30 @@ struct RawAction {
     name: String,
 }
 
-/// Locate the bundled `gto_output/` directory. Tries (in order):
-///   1. `gto_output/` next to the executable (production sidecar)
-///   2. Project root (development: walk up from cwd looking for it)
+/// Locate the bundled `gto_output/` directory.
+///
+/// Search order — covers every layout we care about:
+///   1. `<exe>/resources/gto_output/`
+///      Tauri 2 production with `"resources": {"../gto_output": "gto_output"}`
+///      object-form mapping (the clean install layout).
+///   2. `<exe>/resources/_up_/gto_output/`
+///      Tauri 2 production with array-form `["../gto_output/**/*"]` glob —
+///      Tauri prefixes parent-relative paths with `_up_` for safety.
+///   3. `<exe>/gto_output/`
+///      Sidecar-style co-location, or a manual install drop.
+///   4. Walk up from cwd looking for `gto_output/` — development mode.
 fn find_gto_root() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            let p = parent.join("gto_output");
-            if p.exists() && p.is_dir() {
-                return Some(p);
+            let candidates = [
+                parent.join("resources").join("gto_output"),
+                parent.join("resources").join("_up_").join("gto_output"),
+                parent.join("gto_output"),
+            ];
+            for c in candidates.iter() {
+                if c.exists() && c.is_dir() {
+                    return Some(c.clone());
+                }
             }
         }
     }
