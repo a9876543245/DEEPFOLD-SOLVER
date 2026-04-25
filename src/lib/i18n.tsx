@@ -73,6 +73,30 @@ const dict: Dict = {
   'position.oop3bettor': { en: 'OOP · 3-Bettor', zh: 'OOP · 3-Bet 者', ja: 'OOP · 3ベッター' },
   'reset': { en: 'Reset', zh: '重置', ja: 'リセット' },
 
+  // ---- Game Context Selector (game type / scenario / stack depth) ----
+  'gctx': { en: 'Game / Stack', zh: '牌局 / 籌碼', ja: 'ゲーム / スタック' },
+  'gctx.gameType': { en: 'Game type', zh: '牌局類型', ja: 'ゲーム種別' },
+  'gctx.cash': { en: 'Cash', zh: '現金桌', ja: 'キャッシュ' },
+  'gctx.mtt': { en: 'MTT', zh: '錦標賽', ja: 'トーナメント' },
+  'gctx.format': { en: 'Format', zh: '場景', ja: 'フォーマット' },
+  'gctx.stack': { en: 'Effective stack', zh: '有效籌碼', ja: '有効スタック' },
+  'gctx.bb': { en: 'BB', zh: 'BB', ja: 'BB' },
+  'gctx.any': { en: 'Any', zh: '任意', ja: 'すべて' },
+  'gctx.noScenarios': {
+    en: 'GTO chart library not available — using built-in TexasSolver ranges',
+    zh: 'GTO 圖庫未載入 — 使用內建 TexasSolver 範圍',
+    ja: 'GTOチャートライブラリが利用できません — 内蔵TexasSolverレンジを使用中',
+  },
+  // MTT scenario tooltips (folder names from gto_output/mtt/)
+  'gctx.mtt.rfi':            { en: 'Raise First In', zh: '首位加注 (RFI)', ja: 'ファーストイン' },
+  'gctx.mtt.vs_rfi':         { en: 'Facing an open', zh: '面對首位加注', ja: 'オープンに対する' },
+  'gctx.mtt.vs_3b':          { en: 'We open, facing 3-bet', zh: '我方加注被 3-Bet', ja: '当方オープン後3ベット対応' },
+  'gctx.mtt.vs_4b':          { en: 'Facing a 4-bet', zh: '面對 4-Bet', ja: '4ベット対応' },
+  'gctx.mtt.vs_open_3b':     { en: 'Open 3-bet (3-bet vs open)', zh: '對開局加注 3-Bet', ja: 'オープンに3ベット' },
+  'gctx.mtt.vs_open_call':   { en: 'Open call (call vs open)', zh: '對開局加注跟注', ja: 'オープンにコール' },
+  'gctx.mtt.bb_defense_bvb': { en: 'BB defense (Blind vs Blind)', zh: 'BB vs SB 盲注大戰', ja: 'BB vs SB ブラインド戦' },
+  'gctx.mtt.hu':             { en: 'Heads-up', zh: '一對一', ja: 'ヘッズアップ' },
+
   // ---- Board Selector ----
   'board': { en: 'Board', zh: '公共牌', ja: 'ボード' },
   'board.selectFlop': { en: 'Select Flop', zh: '選擇翻牌', ja: 'フロップを選択' },

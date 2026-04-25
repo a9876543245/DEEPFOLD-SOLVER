@@ -19,6 +19,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { isTauri } from '../lib/tauriEnv';
 import { parseRange } from '../lib/ranges';
 import type { PositionMatchup, Position } from '../lib/ranges';
+import type { GameContext } from '../lib/poker';
 import type { GtoScenario, GtoChart } from '../components/GtoChartBrowser';
 
 export interface AppliedGtoRange {
@@ -35,39 +36,54 @@ function chartHeroFor(pos: Position): string {
   return pos === 'MP' ? 'HJ' : pos;
 }
 
-/** Pick the GTO scenario_type bucket matching a matchup. Cash 6max default. */
-function scenarioTypeFor(_matchup: PositionMatchup): string {
-  // For now: assume Cash 6max 100bb. Extend when MATCHUPS gains more types.
-  return '6max_100bb';
-}
-
-/** Find the best chart in `scenarios` matching (game, scenario, position).
- *  Tie-break: prefer charts with no `effective_bb` (= "default stack"). */
+/** Find the best chart in `scenarios` matching (game, scenario, position,
+ *  effective_bb). Effective stack is honored when set; otherwise charts
+ *  without a pinned stack are preferred (= the "generic" entry). */
 function findBestChart(
   scenarios: GtoScenario[],
   game: string,
   scenarioType: string,
   position: string,
+  effectiveBB: number | null,
 ): GtoScenario | null {
-  const matches = scenarios.filter(s =>
+  const base = scenarios.filter(s =>
     s.game_type === game &&
     s.scenario_type === scenarioType &&
     s.hero_position === position
   );
-  if (matches.length === 0) return null;
-  // Prefer charts without a pinned stack (most generic).
-  const stackless = matches.filter(s => s.effective_bb == null);
-  return (stackless[0] ?? matches[0]);
+  if (base.length === 0) return null;
+
+  // Stack filter: exact match wins; if user picked a stack but no chart
+  // pins it, fall back to the closest pinned value (smallest |Δ|).
+  if (effectiveBB != null) {
+    const exact = base.filter(s => s.effective_bb === effectiveBB);
+    if (exact.length) return exact[0];
+    const pinned = base.filter(s => s.effective_bb != null);
+    if (pinned.length) {
+      pinned.sort((a, b) =>
+        Math.abs((a.effective_bb ?? 0) - effectiveBB) -
+        Math.abs((b.effective_bb ?? 0) - effectiveBB),
+      );
+      return pinned[0];
+    }
+    // None of them pin a stack — fall through to the generic entry below.
+  }
+
+  // No stack preference (or no pinned chart matched): prefer stackless,
+  // else any.
+  const stackless = base.filter(s => s.effective_bb == null);
+  return (stackless[0] ?? base[0]);
 }
 
 export function useGtoAutoRange(
   matchup: PositionMatchup | null,
+  gameContext: GameContext,
   setCustomIpRange: (r: string | null) => void,
   setCustomOopRange: (r: string | null) => void,
 ) {
   const [scenarios, setScenarios] = useState<GtoScenario[] | null>(null);
   const [applied, setApplied] = useState<AppliedGtoRange[]>([]);
-  const lastMatchupKey = useRef<string | null>(null);
+  const lastKey = useRef<string | null>(null);
 
   // One-shot scenario list fetch on mount (Tauri only).
   useEffect(() => {
@@ -83,20 +99,28 @@ export function useGtoAutoRange(
     })();
   }, []);
 
-  // On matchup change, try to auto-apply matching GTO ranges.
+  // On matchup OR game-context change, try to auto-apply matching GTO ranges.
   useEffect(() => {
     if (!matchup || !scenarios || !isTauri()) {
       setApplied([]);
       return;
     }
-    const key = `${matchup.label}|${matchup.potType}|${matchup.ip}|${matchup.oop}`;
-    if (lastMatchupKey.current === key) return;
-    lastMatchupKey.current = key;
+    // Cache key includes BOTH matchup AND game context so flipping the
+    // game type (e.g. Cash → MTT) re-runs the lookup even if positions
+    // didn't change.
+    const key = `${matchup.label}|${matchup.potType}|${matchup.ip}|${matchup.oop}` +
+                `||${gameContext.gameType}|${gameContext.scenarioType}|${gameContext.effectiveBB ?? 'any'}`;
+    if (lastKey.current === key) return;
+    lastKey.current = key;
 
-    const game = 'Cash';
-    const scenarioType = scenarioTypeFor(matchup);
-    const ipChart  = findBestChart(scenarios, game, scenarioType, chartHeroFor(matchup.ip));
-    const oopChart = findBestChart(scenarios, game, scenarioType, chartHeroFor(matchup.oop));
+    const ipChart  = findBestChart(
+      scenarios, gameContext.gameType, gameContext.scenarioType,
+      chartHeroFor(matchup.ip), gameContext.effectiveBB,
+    );
+    const oopChart = findBestChart(
+      scenarios, gameContext.gameType, gameContext.scenarioType,
+      chartHeroFor(matchup.oop), gameContext.effectiveBB,
+    );
 
     const newApplied: AppliedGtoRange[] = [];
 
@@ -138,7 +162,7 @@ export function useGtoAutoRange(
 
       setApplied(newApplied);
     })();
-  }, [matchup, scenarios, setCustomIpRange, setCustomOopRange]);
+  }, [matchup, gameContext, scenarios, setCustomIpRange, setCustomOopRange]);
 
   // Manual override: clear the auto-applied disclosure when user edits a
   // range. Caller passes their custom range setter directly; this is just

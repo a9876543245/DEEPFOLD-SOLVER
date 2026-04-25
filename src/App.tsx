@@ -9,7 +9,7 @@ import { ActionNavigator } from './components/ActionNavigator';
 import { ActionBar } from './components/ActionBar';
 import { TurnRiverCardSelector } from './components/TurnRiverCardSelector';
 import { useSolver } from './hooks/useSolver';
-import type { SolverRequest, NodeLock, ComboAnalysis } from './lib/poker';
+import type { SolverRequest, NodeLock, ComboAnalysis, GameContext } from './lib/poker';
 import { getHandStrength, RANK_VALUES } from './lib/poker';
 import type { Position, PositionMatchup } from './lib/ranges';
 import { createRootNode, takeAction, dealCard, BET_SIZINGS } from './lib/gameTree';
@@ -24,6 +24,7 @@ import { UpdateBanner } from './components/UpdateBanner';
 import { isRealSolverAvailable } from './lib/presolvedSpots';
 import { DrillMode } from './components/DrillMode';
 import { GtoChartBrowser } from './components/GtoChartBrowser';
+import { GameContextSelector } from './components/GameContextSelector';
 import { RunoutPicker } from './components/RunoutPicker';
 import { useGtoAutoRange } from './hooks/useGtoAutoRange';
 import { HelpCircle, BookOpen, Crosshair } from 'lucide-react';
@@ -60,11 +61,32 @@ function App() {
   // the "#XX" suffix in the cache lookup.
   const [selectedRunout, setSelectedRunout] = useState<string | null>(null);
 
-  // Auto-load GTO preflop ranges matching the selected matchup. Returns
+  // Game context — drives which preflop chart bucket auto-loads as default
+  // ranges. Default = Cash 6max 100bb (matches the legacy MATCHUPS dataset).
+  const [gameContext, setGameContext] = useState<GameContext>({
+    gameType: 'Cash',
+    scenarioType: '6max_100bb',
+    effectiveBB: 100,
+  });
+
+  // Auto-load GTO preflop ranges matching (game context × matchup). Returns
   // metadata about which charts were applied so the UI can disclose
   // (e.g. "Loaded BTN open from 6max_100bb / Cash 6max_100bb BTN_K17").
   const { applied: appliedGtoRanges } = useGtoAutoRange(
-    selectedMatchup, setCustomIpRange, setCustomOopRange);
+    selectedMatchup, gameContext, setCustomIpRange, setCustomOopRange);
+
+  // When the user changes the effective stack via GameContextSelector,
+  // sync pot + chip stack so the solver tree builds at the right depth.
+  // pot defaults: SRP ≈ 2.5bb, 3BET ≈ 22bb (matches MATCHUPS defaults).
+  // 1 BB = 10 chips (matches existing convention in MATCHUPS).
+  useEffect(() => {
+    if (gameContext.effectiveBB == null) return;
+    const newStackChips = gameContext.effectiveBB * 10;
+    const isThreeBet = selectedMatchup?.potType === '3BET';
+    const newPotChips = (isThreeBet ? 22 : 5.5) * 10;
+    setStack(newStackChips);
+    setPot(Math.round(newPotChips));
+  }, [gameContext.effectiveBB, selectedMatchup?.potType]);
 
   // Off-range combo cache state — actual sync useEffect lives below the
   // useSolver() call so it can read `result` without TDZ issues.
@@ -606,9 +628,14 @@ function App() {
 
       {/* Left Sidebar */}
       <aside className="sidebar-left">
-        <PositionSelector 
-          selectedMatchup={selectedMatchup} 
-          onMatchupChange={handleMatchupChange} 
+        {/* Game / Stack context — drives which preflop chart bucket the
+         *  PositionSelector's matchup choice resolves to in the bundled
+         *  GTO library. Cash 6max 100bb default (matches MATCHUPS). */}
+        <GameContextSelector value={gameContext} onChange={setGameContext} />
+
+        <PositionSelector
+          selectedMatchup={selectedMatchup}
+          onMatchupChange={handleMatchupChange}
           onReset={() => { 
             setSelectedMatchup(null); 
             setHeroPosition(null); 

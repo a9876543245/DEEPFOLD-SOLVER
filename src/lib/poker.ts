@@ -179,6 +179,19 @@ export interface RunoutOption {
   weight: number;   // orbit size
 }
 
+/** Context that scopes which preflop chart is used as the default IP/OOP
+ *  range. User picks via GameContextSelector; useGtoAutoRange consumes it
+ *  to filter the bundled GTO library before matching the position pair. */
+export interface GameContext {
+  /** "Cash" or "MTT" — top-level game type bucket from the chart library. */
+  gameType: string;
+  /** Folder name inside the bucket: "6max_100bb", "vs_open_3b", etc. */
+  scenarioType: string;
+  /** Effective stack in BB. null = no preference (use any chart in this
+   *  scenario). When set, also drives the auto pot/stack values in chips. */
+  effectiveBB: number | null;
+}
+
 /// GPU detection info — returned by Tauri command `get_gpu_info`.
 export interface GpuInfo {
   has_cuda_gpu: boolean;
