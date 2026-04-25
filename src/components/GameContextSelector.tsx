@@ -77,6 +77,15 @@ export function GameContextSelector({ value, onChange }: Props) {
     return { sorted, hasNull, total: matches.length };
   }, [scenarios, value.gameType, value.scenarioType]);
 
+  // Cash format names encode the stack depth ("6max_100bb" → 100,
+  // "6max_200bb" → 200, "8max_straddle" → null). MTT formats
+  // ("vs_open_3b" etc.) don't, so users pick the stack manually.
+  const parseStackFromFormat = (st: string): number | null => {
+    const m = st.match(/_(\d+)bb/i);
+    return m ? parseInt(m[1], 10) : null;
+  };
+  const stackIsFromFormat = (gt: string) => gt === 'Cash';
+
   // When the user picks a new game type, snap format + stack to defaults
   // for that type so we don't leave the selector in an unreachable state.
   const handleGameType = (gt: string) => {
@@ -84,11 +93,15 @@ export function GameContextSelector({ value, onChange }: Props) {
       (scenarios ?? []).filter(s => s.game_type === gt).map(s => s.scenario_type),
     )).sort();
     const newFormat = newFormats[0] ?? value.scenarioType;
-    onChange({ gameType: gt, scenarioType: newFormat, effectiveBB: null });
+    const newStack = stackIsFromFormat(gt) ? parseStackFromFormat(newFormat) : null;
+    onChange({ gameType: gt, scenarioType: newFormat, effectiveBB: newStack });
   };
 
   const handleFormat = (fmt: string) => {
-    onChange({ gameType: value.gameType, scenarioType: fmt, effectiveBB: null });
+    const newStack = stackIsFromFormat(value.gameType)
+      ? parseStackFromFormat(fmt)
+      : null;
+    onChange({ gameType: value.gameType, scenarioType: fmt, effectiveBB: newStack });
   };
 
   const handleStack = (bb: number | null) => {
@@ -158,16 +171,20 @@ export function GameContextSelector({ value, onChange }: Props) {
             </select>
           </Row>
 
-          {/* Stack depth dropdown */}
-          <Row label={t('gctx.stack')}>
-            <select value={value.effectiveBB ?? ''} onChange={e => handleStack(e.target.value === '' ? null : Number(e.target.value))}
-              style={selectStyle}>
-              <option value="">{t('gctx.any')}</option>
-              {stacks.sorted.map(bb => (
-                <option key={bb} value={bb}>{bb} {t('gctx.bb')}</option>
-              ))}
-            </select>
-          </Row>
+          {/* Stack depth — Cash formats encode stack in the name itself
+           *  ("6max_100bb" → 100bb), so the row is omitted entirely.
+           *  MTT formats don't, so the user picks manually. */}
+          {!stackIsFromFormat(value.gameType) && (
+            <Row label={t('gctx.stack')}>
+              <select value={value.effectiveBB ?? ''} onChange={e => handleStack(e.target.value === '' ? null : Number(e.target.value))}
+                style={selectStyle}>
+                <option value="">{t('gctx.any')}</option>
+                {stacks.sorted.map(bb => (
+                  <option key={bb} value={bb}>{bb} {t('gctx.bb')}</option>
+                ))}
+              </select>
+            </Row>
+          )}
         </>
       )}
     </div>

@@ -601,9 +601,13 @@ function App() {
 
       {/* Auto-loaded GTO range disclosure. Shows after a matchup change
        *  when the bundled chart library found a match for IP/OOP. Click
-       *  opens the GTO browser so user can pick a different chart. */}
+       *  opens the GTO browser so user can pick a different chart.
+       *  gridColumn: 1 / -1 forces full-width like the header — without it
+       *  the banner eats a grid cell and pushes sidebar/main/right out of
+       *  alignment (v1.0.7 layout bug). */}
       {appliedGtoRanges.length > 0 && (
         <div style={{
+          gridColumn: '1 / -1',
           display: 'flex', alignItems: 'center', gap: 8,
           padding: '6px 12px', background: 'rgba(124, 58, 237, 0.08)',
           borderBottom: '1px solid rgba(124, 58, 237, 0.2)',
