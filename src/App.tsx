@@ -25,6 +25,22 @@ import { isRealSolverAvailable } from './lib/presolvedSpots';
 import { DrillMode } from './components/DrillMode';
 import { GtoChartBrowser } from './components/GtoChartBrowser';
 import { GameContextSelector } from './components/GameContextSelector';
+
+/**
+ * Feature flag — temporarily disables the entire GTO Chart Library surface
+ * (header button, browser modal, GameContextSelector, auto-load hook,
+ * "GTO ranges loaded" disclosure banner).
+ *
+ * Why disabled: two independent poker pros audited the bundled
+ * `gto_output/` chart data and found extraction errors in ~50-75% of
+ * sampled charts (premium hands folding, trash hands raising, missing
+ * actions, scenario/action mismatches). The OCR/extraction pipeline that
+ * generates the JSON from the source spreadsheet needs to be fixed first.
+ *
+ * Set back to `true` once the chart data passes the 5-rule sanity check
+ * documented in STATUS-AND-ROADMAP.md.
+ */
+const GTO_CHART_LIBRARY_ENABLED = false;
 import { RunoutPicker } from './components/RunoutPicker';
 import { useGtoAutoRange } from './hooks/useGtoAutoRange';
 import { HelpCircle, BookOpen, Crosshair } from 'lucide-react';
@@ -69,11 +85,13 @@ function App() {
     effectiveBB: 100,
   });
 
-  // Auto-load GTO preflop ranges matching (game context × matchup). Returns
-  // metadata about which charts were applied so the UI can disclose
-  // (e.g. "Loaded BTN open from 6max_100bb / Cash 6max_100bb BTN_K17").
+  // Auto-load GTO preflop ranges matching (game context × matchup).
+  // Disabled while GTO_CHART_LIBRARY_ENABLED is false — pass null matchup
+  // so the hook short-circuits without applying ranges or populating the
+  // disclosure banner. Hardcoded MATCHUPS defaults are used instead.
   const { applied: appliedGtoRanges } = useGtoAutoRange(
-    selectedMatchup, gameContext, setCustomIpRange, setCustomOopRange);
+    GTO_CHART_LIBRARY_ENABLED ? selectedMatchup : null,
+    gameContext, setCustomIpRange, setCustomOopRange);
 
   // When the user changes the effective stack via GameContextSelector,
   // sync pot + chip stack so the solver tree builds at the right depth.
@@ -544,19 +562,21 @@ function App() {
             <Crosshair size={13} /> {t('drill.start')}
           </button>
 
-          {/* GTO Chart Library button */}
-          <button onClick={() => setGtoBrowserOpen(true)} title="GTO Preflop Chart Library"
-            style={{
-              display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px',
-              borderRadius: 'var(--radius-full)', border: 'none', cursor: 'pointer',
-              background: 'var(--color-glass)', color: 'var(--color-text-secondary)',
-              fontSize: 11, fontWeight: 600, fontFamily: 'inherit', transition: 'all 150ms ease',
-            }}
-            onMouseOver={e => { e.currentTarget.style.background = 'var(--color-glass-hover)'; e.currentTarget.style.color = '#fff'; }}
-            onMouseOut={e => { e.currentTarget.style.background = 'var(--color-glass)'; e.currentTarget.style.color = 'var(--color-text-secondary)'; }}
-          >
-            GTO Charts
-          </button>
+          {/* GTO Chart Library button — disabled while chart data fails audit */}
+          {GTO_CHART_LIBRARY_ENABLED && (
+            <button onClick={() => setGtoBrowserOpen(true)} title="GTO Preflop Chart Library"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px',
+                borderRadius: 'var(--radius-full)', border: 'none', cursor: 'pointer',
+                background: 'var(--color-glass)', color: 'var(--color-text-secondary)',
+                fontSize: 11, fontWeight: 600, fontFamily: 'inherit', transition: 'all 150ms ease',
+              }}
+              onMouseOver={e => { e.currentTarget.style.background = 'var(--color-glass-hover)'; e.currentTarget.style.color = '#fff'; }}
+              onMouseOut={e => { e.currentTarget.style.background = 'var(--color-glass)'; e.currentTarget.style.color = 'var(--color-text-secondary)'; }}
+            >
+              GTO Charts
+            </button>
+          )}
 
           {/* Language switcher */}
           <div style={{
@@ -632,10 +652,13 @@ function App() {
 
       {/* Left Sidebar */}
       <aside className="sidebar-left">
-        {/* Game / Stack context — drives which preflop chart bucket the
-         *  PositionSelector's matchup choice resolves to in the bundled
-         *  GTO library. Cash 6max 100bb default (matches MATCHUPS). */}
-        <GameContextSelector value={gameContext} onChange={setGameContext} />
+        {/* Game / Stack context — disabled while GTO chart library is
+         *  off (GTO_CHART_LIBRARY_ENABLED flag). Without the chart lookup
+         *  the selector has no effect on default ranges, so hiding the
+         *  whole panel is cleaner than greying it out. */}
+        {GTO_CHART_LIBRARY_ENABLED && (
+          <GameContextSelector value={gameContext} onChange={setGameContext} />
+        )}
 
         <PositionSelector
           selectedMatchup={selectedMatchup}
@@ -980,15 +1003,19 @@ function App() {
 
       {showGuide && <GuideModal onClose={() => setShowGuide(false)} />}
 
-      {/* GTO chart library — preflop chart browser + range applicator */}
-      <GtoChartBrowser
-        open={gtoBrowserOpen}
-        onClose={() => setGtoBrowserOpen(false)}
-        onApply={(rangeStr, side) => {
-          if (side === 'IP') setCustomIpRange(rangeStr);
-          else setCustomOopRange(rangeStr);
-        }}
-      />
+      {/* GTO chart library — preflop chart browser + range applicator.
+       *  Disabled while the bundled chart data fails poker correctness
+       *  audit (see GTO_CHART_LIBRARY_ENABLED flag at top of file). */}
+      {GTO_CHART_LIBRARY_ENABLED && (
+        <GtoChartBrowser
+          open={gtoBrowserOpen}
+          onClose={() => setGtoBrowserOpen(false)}
+          onApply={(rangeStr, side) => {
+            if (side === 'IP') setCustomIpRange(rangeStr);
+            else setCustomOopRange(rangeStr);
+          }}
+        />
+      )}
 
       {showSpotLibrary && (
         <SpotLibrary

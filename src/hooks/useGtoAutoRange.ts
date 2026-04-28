@@ -36,43 +36,83 @@ function chartHeroFor(pos: Position): string {
   return pos === 'MP' ? 'HJ' : pos;
 }
 
-/** Find the best chart in `scenarios` matching (game, scenario, position,
- *  effective_bb). Effective stack is honored when set; otherwise charts
- *  without a pinned stack are preferred (= the "generic" entry). */
+/** Extract the bundled-folder portion of a chart id ("cash/6max_100bb" /
+ *  "mtt/vs_open_3b"). The chart library data update made `scenario_type`
+ *  semantic ("RFI", "vs_Open", "vs_3B", ...) and no longer matches the
+ *  folder name, so all bucket filtering uses the path prefix instead. */
+function chartFolder(s: GtoScenario): string {
+  const parts = s.id.split('/');
+  return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : s.id;
+}
+
+/** For a (potType, side) combination, return scenario_type names ranked
+ *  by how well they fit. The first match found in the bundled charts wins.
+ *  Multiple candidates are listed because not every (folder × position)
+ *  has every scenario type. */
+function scenarioCandidates(
+  potType: 'SRP' | '3BET',
+  side: 'IP' | 'OOP',
+): string[] {
+  // SRP context (single raise + call):
+  //   IP = the raiser → their range is the open (RFI)
+  //   OOP = the caller → their range is "vs_Open" facing IP's open
+  // 3BET context (raise + 3-bet + call):
+  //   IP = the original raiser facing 3-bet → their range is "vs_3B"
+  //   OOP = the 3-bettor → their range is "vs_Open" with a 3-bet response
+  if (potType === 'SRP') {
+    return side === 'IP'
+      ? ['RFI', 'SB_vs_BB']                           // IP raiser
+      : ['vs_Open', 'vs_RFI'];                        // OOP caller
+  }
+  // 3BET
+  return side === 'IP'
+    ? ['vs_3B', 'vs_4B', 'vs_4B_allin']               // IP facing 3-bet
+    : ['vs_Open', 'vs_RFI'];                          // OOP 3-bettor
+}
+
+/** Find the best chart in `scenarios` matching (folder, position, scenario,
+ *  effective_bb). Tries the scenario candidates in order; first folder+position
+ *  hit with the best stack match wins. */
 function findBestChart(
   scenarios: GtoScenario[],
-  game: string,
-  scenarioType: string,
-  position: string,
+  folderPath: string,                  // e.g. "cash/6max_100bb"
+  position: string,                    // hero_position to match
+  scenarioRanking: string[],
   effectiveBB: number | null,
 ): GtoScenario | null {
-  const base = scenarios.filter(s =>
-    s.game_type === game &&
-    s.scenario_type === scenarioType &&
+  const inFolder = scenarios.filter(s =>
+    chartFolder(s) === folderPath &&
     s.hero_position === position
   );
-  if (base.length === 0) return null;
+  if (inFolder.length === 0) return null;
 
-  // Stack filter: exact match wins; if user picked a stack but no chart
-  // pins it, fall back to the closest pinned value (smallest |Δ|).
-  if (effectiveBB != null) {
-    const exact = base.filter(s => s.effective_bb === effectiveBB);
-    if (exact.length) return exact[0];
-    const pinned = base.filter(s => s.effective_bb != null);
-    if (pinned.length) {
-      pinned.sort((a, b) =>
-        Math.abs((a.effective_bb ?? 0) - effectiveBB) -
-        Math.abs((b.effective_bb ?? 0) - effectiveBB),
-      );
-      return pinned[0];
+  const stackPick = (pool: GtoScenario[]): GtoScenario | null => {
+    if (pool.length === 0) return null;
+    if (effectiveBB != null) {
+      const exact = pool.filter(s => s.effective_bb === effectiveBB);
+      if (exact.length) return exact[0];
+      const pinned = pool.filter(s => s.effective_bb != null);
+      if (pinned.length) {
+        pinned.sort((a, b) =>
+          Math.abs((a.effective_bb ?? 0) - effectiveBB) -
+          Math.abs((b.effective_bb ?? 0) - effectiveBB),
+        );
+        return pinned[0];
+      }
     }
-    // None of them pin a stack — fall through to the generic entry below.
-  }
+    const stackless = pool.filter(s => s.effective_bb == null);
+    return (stackless[0] ?? pool[0]);
+  };
 
-  // No stack preference (or no pinned chart matched): prefer stackless,
-  // else any.
-  const stackless = base.filter(s => s.effective_bb == null);
-  return (stackless[0] ?? base[0]);
+  // Try each scenario candidate in order; pick from the first that has
+  // any chart matching folder+position.
+  for (const sc of scenarioRanking) {
+    const filtered = inFolder.filter(s => s.scenario_type === sc);
+    const hit = stackPick(filtered);
+    if (hit) return hit;
+  }
+  // Last resort: any chart for folder+position regardless of scenario.
+  return stackPick(inFolder);
 }
 
 export function useGtoAutoRange(
@@ -113,13 +153,18 @@ export function useGtoAutoRange(
     if (lastKey.current === key) return;
     lastKey.current = key;
 
+    // Folder path = "<game>/<scenarioType>" lowercased game (matches the
+    // bundled chart id format like "cash/6max_100bb").
+    const folderPath = `${gameContext.gameType.toLowerCase()}/${gameContext.scenarioType}`;
+    const potType = matchup.potType;  // "SRP" | "3BET"
+
     const ipChart  = findBestChart(
-      scenarios, gameContext.gameType, gameContext.scenarioType,
-      chartHeroFor(matchup.ip), gameContext.effectiveBB,
+      scenarios, folderPath, chartHeroFor(matchup.ip),
+      scenarioCandidates(potType, 'IP'), gameContext.effectiveBB,
     );
     const oopChart = findBestChart(
-      scenarios, gameContext.gameType, gameContext.scenarioType,
-      chartHeroFor(matchup.oop), gameContext.effectiveBB,
+      scenarios, folderPath, chartHeroFor(matchup.oop),
+      scenarioCandidates(potType, 'OOP'), gameContext.effectiveBB,
     );
 
     const newApplied: AppliedGtoRange[] = [];

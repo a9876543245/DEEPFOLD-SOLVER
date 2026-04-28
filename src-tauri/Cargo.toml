@@ -1,6 +1,6 @@
 [package]
 name = "deepsolver-app"
-version = "1.0.8"
+version = "1.0.11"
 description = "DEEPFOLD-SOLVER - GPU-Accelerated GTO Poker Solver with Training Mode"
 authors = ["DEEPFOLD"]
 edition = "2021"
