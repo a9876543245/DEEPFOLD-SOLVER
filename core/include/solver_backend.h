@@ -23,6 +23,8 @@
 #include "types.h"
 #include "isomorphism.h"
 
+#include <algorithm>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <string>
@@ -30,6 +32,53 @@
 #include <vector>
 
 namespace deepsolver {
+
+// ============================================================================
+// DCFR discount-factor computation (shared by CPU + GPU backends)
+// ============================================================================
+//
+// STANDARD: textbook DCFR exponent decay. (t/(t+1))^alpha, ((t+1)/(t+2))^gamma.
+// POSTFLOP_STYLE: matches wasm-postflop / postflop-solver schedule —
+//   pos_disc = t^1.5 / (t^1.5 + 1)
+//   neg_disc = 0.5 (constant)
+//   strat_weight = (t' / (t' + 1))^3   where t' = iteration - nearest_lower_pow_4(iteration)
+//   strategy_sum update is decay-and-add (no reach), not accumulative.
+inline void compute_dcfr_factors(
+    int iteration, const SolverConfig& config,
+    float& pos_disc, float& neg_disc, float& strat_weight)
+{
+    if (config.dcfr_schedule == SolverConfig::DcfrSchedule::POSTFLOP_STYLE) {
+        double t_alpha = static_cast<double>(std::max(0, iteration - 1));
+        double pow_alpha = t_alpha * std::sqrt(t_alpha);
+        pos_disc = static_cast<float>(pow_alpha / (pow_alpha + 1.0));
+        neg_disc = 0.5f;
+
+        unsigned t = static_cast<unsigned>(std::max(0, iteration));
+        unsigned nearest_lower_pow4 = 0;
+        if (t > 0) {
+            int hi = 0;
+            for (unsigned x = t; x > 1; x >>= 1) ++hi;
+            nearest_lower_pow4 = 1u << (hi & ~1u);
+        }
+        double t_gamma = static_cast<double>(t - nearest_lower_pow4);
+        double r = t_gamma / (t_gamma + 1.0);
+        strat_weight = static_cast<float>(r * r * r);
+    } else {
+        if (iteration <= 0) {
+            pos_disc = neg_disc = 0.0f;
+            strat_weight = 1.0f;
+            return;
+        }
+        float t = static_cast<float>(iteration);
+        pos_disc = std::pow(t / (t + 1.0f), config.dcfr_alpha);
+        neg_disc = std::pow(t / (t + 1.0f), config.dcfr_beta);
+        strat_weight = std::pow((t + 1.0f) / (t + 2.0f), config.dcfr_gamma);
+    }
+}
+
+inline bool dcfr_decay_and_add(const SolverConfig& config) {
+    return config.dcfr_schedule == SolverConfig::DcfrSchedule::POSTFLOP_STYLE;
+}
 
 // ============================================================================
 // Context passed from Solver orchestrator → backend
@@ -103,6 +152,33 @@ public:
     /// Human-readable backend name, e.g. "CPU-DCFR", "CUDA (RTX 4060, 8GB)".
     /// Shown in UI as the active backend indicator.
     virtual const char* name() const = 0;
+
+    // ------------------------------------------------------------------------
+    // Optional GPU postsolve hooks
+    // ------------------------------------------------------------------------
+    //
+    // Backends that can reuse their device-resident state (tree, matchup
+    // tables, averaged strategy, root reach) to compute per-combo EV and
+    // best-response values on-device override these. The CPU backend leaves
+    // the defaults — the Solver orchestrator falls back to its own
+    // CPU parallel postsolve loop in that case.
+    //
+    // Vectors are returned in canonical-combo order, length = num_canonical.
+    // Empty return means "not supported / fall back to CPU"; callers must
+    // be prepared for that.
+
+    /// Returns true if compute_combo_evs_gpu() / compute_best_response_gpu()
+    /// produce meaningful results. Solver checks this before dispatching.
+    virtual bool supports_gpu_postsolve() const { return false; }
+
+    /// OOP-perspective per-combo EV at root, before the 1/total_ip_weight
+    /// scaling applied by Solver::compute_combo_evs(). Empty on backends
+    /// that don't support GPU postsolve.
+    virtual std::vector<float> compute_combo_evs_gpu() { return {}; }
+
+    /// Per-combo best-response value at root for the given player
+    /// (0 = OOP, 1 = IP). Empty on backends that don't support GPU postsolve.
+    virtual std::vector<float> compute_best_response_gpu(int /*player*/) { return {}; }
 };
 
 // ============================================================================

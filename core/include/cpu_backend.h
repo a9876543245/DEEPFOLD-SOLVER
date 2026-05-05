@@ -127,11 +127,10 @@ inline void CpuBackend::compute_strategy() {
 // ============================================================================
 
 inline void CpuBackend::apply_dcfr_discount(int iteration) {
-    if (iteration <= 0) return;
+    float pos_disc, neg_disc, strat_weight;
+    compute_dcfr_factors(iteration, *ctx_.config, pos_disc, neg_disc, strat_weight);
+    (void)strat_weight;  // applied separately in cfr_traverse
     uint16_t nc = ctx_.iso->num_canonical;
-    float t = static_cast<float>(iteration);
-    float pos_disc = std::pow(t / (t + 1.0f), ctx_.config->dcfr_alpha);
-    float neg_disc = std::pow(t / (t + 1.0f), ctx_.config->dcfr_beta);
 
     for (uint32_t n = 0; n < ctx_.tree->total_nodes; ++n) {
         auto nt = static_cast<NodeType>(ctx_.tree->node_types[n]);
@@ -167,7 +166,16 @@ inline std::vector<float> CpuBackend::cfr_traverse(
     if (nt == NodeType::TERMINAL) {
         std::vector<float> values(nc, 0.0f);
         auto tt = static_cast<TerminalType>(tree.terminal_types[node_idx]);
-        float half_pot = tree.pots[node_idx] / 2.0f;
+        float pot_total = tree.pots[node_idx];
+        float half_pot = pot_total * 0.5f;
+        // Cash rake: skim min(pot * rate, cap) from the winner. On a tie each
+        // player loses rake/2 (split evenly). Set both to 0 for rake-free.
+        float rake = std::min(pot_total * ctx_.config->rake_rate,
+                              ctx_.config->rake_cap);
+        if (rake < 0.0f) rake = 0.0f;
+        float win_payoff  = half_pot - rake;     // winner's net (gain over contribution)
+        float lose_payoff = -half_pot;           // loser's net  (unchanged by rake)
+        float tie_payoff  = -0.5f * rake;        // each player on a tie
         // Pick the matchup table that corresponds to this terminal's full
         // board (root flop + any runout cards dealt by chance ancestors).
         // Falls back to root matchup if the per-runout tables haven't been
@@ -188,19 +196,39 @@ inline std::vector<float> CpuBackend::cfr_traverse(
         const auto& canonical_weights = ctx_.iso->canonical_weights;
 
         if (tt == TerminalType::SHOWDOWN) {
+            // Per-pair payoff branches on sign of matchup_ev:
+            //   +1 (this perspective wins)  -> win_payoff = half_pot - rake
+            //   -1 (this perspective loses) -> lose_payoff = -half_pot
+            //    0 (tie)                    -> tie_payoff = -rake/2
+            // m_ev is OOP-perspective. For IP traverser we negate the sign,
+            // so a +1 m_ev means OOP wins, i.e. IP loses.
             for (uint16_t c = 0; c < nc; ++c) {
                 float val = 0.0f;
                 if (traverser == 0) {
                     for (uint16_t cj = 0; cj < nc; ++cj) {
                         size_t idx = static_cast<size_t>(c) * nc + cj;
-                        val += reach_ip[cj] * matchup_ev[idx] * matchup_valid[idx]
-                               * static_cast<float>(canonical_weights[cj]) * half_pot;
+                        float ev = matchup_ev[idx];
+                        float valid = matchup_valid[idx];
+                        if (valid <= 0.0f) continue;
+                        float payoff;
+                        if (ev > 0.5f)        payoff = win_payoff;
+                        else if (ev < -0.5f)  payoff = lose_payoff;
+                        else                  payoff = tie_payoff;
+                        val += reach_ip[cj] * valid
+                             * static_cast<float>(canonical_weights[cj]) * payoff;
                     }
                 } else {
                     for (uint16_t ci = 0; ci < nc; ++ci) {
                         size_t idx = static_cast<size_t>(ci) * nc + c;
-                        val += reach_oop[ci] * (-matchup_ev[idx]) * matchup_valid[idx]
-                               * static_cast<float>(canonical_weights[ci]) * half_pot;
+                        float ev = matchup_ev[idx];  // OOP perspective
+                        float valid = matchup_valid[idx];
+                        if (valid <= 0.0f) continue;
+                        float payoff;
+                        if (ev > 0.5f)        payoff = lose_payoff;  // OOP wins → IP loses
+                        else if (ev < -0.5f)  payoff = win_payoff;   // OOP loses → IP wins
+                        else                  payoff = tie_payoff;
+                        val += reach_oop[ci] * valid
+                             * static_cast<float>(canonical_weights[ci]) * payoff;
                     }
                 }
                 values[c] = val;
@@ -225,11 +253,22 @@ inline std::vector<float> CpuBackend::cfr_traverse(
             uint32_t parent = tree.parent_indices[node_idx];
             float unmatched_bet = (parent < tree.total_nodes)
                 ? tree.bet_into[parent] : 0.0f;
-            float matched_pot = tree.pots[node_idx] - unmatched_bet;
-            float gain = matched_pot * 0.5f;
+            float matched_pot = pot_total - unmatched_bet;
+            // Winner's net gain = matched_pot/2 - rake. Loser's loss = -matched_pot/2
+            // (rake comes out of winner's winnings only).
+            float fold_win_gain  = matched_pot * 0.5f - rake;
+            float fold_lose_loss = -matched_pot * 0.5f;
 
             float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
-            float sign = (traverser == 0) ? sign_oop : -sign_oop;
+            // For traverser=OOP (this perspective), sign_oop=+1 means OOP wins
+            // (FOLD_IP), -1 means OOP loses (FOLD_OOP). Pick the signed payoff
+            // accordingly. For traverser=IP, swap.
+            float self_payoff;
+            if ((traverser == 0 && sign_oop > 0) || (traverser == 1 && sign_oop < 0)) {
+                self_payoff = fold_win_gain;     // I win this fold
+            } else {
+                self_payoff = fold_lose_loss;    // I lose this fold
+            }
             for (uint16_t c = 0; c < nc; ++c) {
                 float opp_total = 0.0f;
                 if (traverser == 0) {
@@ -245,7 +284,7 @@ inline std::vector<float> CpuBackend::cfr_traverse(
                                    * static_cast<float>(canonical_weights[ci]);
                     }
                 }
-                values[c] = sign * gain * opp_total;
+                values[c] = self_payoff * opp_total;
             }
         }
         return values;
@@ -298,14 +337,30 @@ inline std::vector<float> CpuBackend::cfr_traverse(
     auto& strat = current_strategy_[node_idx];
     auto& acting_reach = (acting == 0) ? reach_oop : reach_ip;
 
-    // strategy_sum update at traverser nodes (per-node reach weighting)
+    // strategy_sum update at traverser nodes
     if (acting == traverser) {
-        float sw = std::pow((iteration + 1.0f) / (iteration + 2.0f),
-                             ctx_.config->dcfr_gamma);
-        for (uint8_t a = 0; a < na; ++a) {
-            for (uint16_t c = 0; c < nc; ++c) {
-                strategy_sum_[node_idx][a * nc + c] +=
-                    sw * acting_reach[c] * strat[a * nc + c];
+        float pos_unused, neg_unused, sw;
+        compute_dcfr_factors(iteration, *ctx_.config, pos_unused, neg_unused, sw);
+
+        if (ctx_.config->dcfr_schedule ==
+            SolverConfig::DcfrSchedule::POSTFLOP_STYLE) {
+            // Decay-and-add (matches postflop-solver):
+            //   strategy_sum = strategy_sum * gamma_t + current_strategy
+            // No per-node reach weighting; the gamma_t epoch reset (every
+            // power-of-4 iteration) effectively forgets early iterations.
+            for (uint8_t a = 0; a < na; ++a) {
+                for (uint16_t c = 0; c < nc; ++c) {
+                    float& s = strategy_sum_[node_idx][a * nc + c];
+                    s = s * sw + strat[a * nc + c];
+                }
+            }
+        } else {
+            // STANDARD: accumulative reach-weighted average
+            for (uint8_t a = 0; a < na; ++a) {
+                for (uint16_t c = 0; c < nc; ++c) {
+                    strategy_sum_[node_idx][a * nc + c] +=
+                        sw * acting_reach[c] * strat[a * nc + c];
+                }
             }
         }
     }

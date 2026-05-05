@@ -29,13 +29,21 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <functional>
+#include <future>
 #include <iomanip>
 #include <map>
 #include <memory>
 #include <numeric>
+#include <queue>
+#include <set>
+#include <stdexcept>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <type_traits>
+#include <utility>
 
 namespace deepsolver {
 
@@ -44,6 +52,138 @@ namespace deepsolver {
 // ============================================================================
 
 using ProgressCallback = std::function<void(int iteration, float exploitability, float elapsed_ms)>;
+
+namespace detail {
+
+inline uint32_t effective_postsolve_threads(uint32_t requested) {
+    uint32_t hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 2;
+    uint32_t limit = (requested == 0) ? hw : requested;
+    return std::max<uint32_t>(1, std::min<uint32_t>(limit, hw));
+}
+
+class PostsolveThreadPool {
+public:
+    explicit PostsolveThreadPool(uint32_t thread_count) {
+        thread_count = std::max<uint32_t>(1, thread_count);
+        workers_.reserve(thread_count);
+        for (uint32_t i = 0; i < thread_count; ++i) {
+            workers_.emplace_back([this]() { worker_loop(); });
+        }
+    }
+
+    ~PostsolveThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+    PostsolveThreadPool(const PostsolveThreadPool&) = delete;
+    PostsolveThreadPool& operator=(const PostsolveThreadPool&) = delete;
+
+    uint32_t thread_count() const {
+        return static_cast<uint32_t>(workers_.size());
+    }
+
+    template <typename F>
+    auto enqueue(F&& f) -> std::future<std::invoke_result_t<F>> {
+        using ReturnT = std::invoke_result_t<F>;
+        auto task = std::make_shared<std::packaged_task<ReturnT()>>(std::forward<F>(f));
+        auto fut = task->get_future();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_) throw std::runtime_error("postsolve thread pool is stopping");
+            tasks_.emplace([task]() { (*task)(); });
+        }
+        cv_.notify_one();
+        return fut;
+    }
+
+private:
+    void worker_loop() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [&]() { return stopping_ || !tasks_.empty(); });
+                if (stopping_ && tasks_.empty()) return;
+                task = std::move(tasks_.front());
+                tasks_.pop();
+            }
+            task();
+        }
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::queue<std::function<void()>> tasks_;
+    std::vector<std::thread> workers_;
+    bool stopping_ = false;
+};
+
+inline PostsolveThreadPool& postsolve_pool() {
+    static PostsolveThreadPool pool(effective_postsolve_threads(0));
+    return pool;
+}
+
+template <typename Fn>
+inline void postsolve_parallel_for(
+    uint32_t total,
+    bool enabled,
+    uint32_t requested_threads,
+    Fn&& fn)
+{
+    if (!enabled || total < 32) {
+        for (uint32_t i = 0; i < total; ++i) fn(i);
+        return;
+    }
+
+    auto& pool = postsolve_pool();
+    uint32_t threads = effective_postsolve_threads(requested_threads);
+    threads = std::min<uint32_t>(threads, pool.thread_count());
+    threads = std::min<uint32_t>(threads, total);
+    if (threads <= 1) {
+        for (uint32_t i = 0; i < total; ++i) fn(i);
+        return;
+    }
+
+    uint32_t chunk = (total + threads - 1) / threads;
+    std::vector<std::future<void>> futures;
+    futures.reserve(threads);
+    for (uint32_t begin = 0; begin < total; begin += chunk) {
+        uint32_t end = std::min<uint32_t>(total, begin + chunk);
+        futures.emplace_back(pool.enqueue([begin, end, &fn]() {
+            for (uint32_t i = begin; i < end; ++i) fn(i);
+        }));
+    }
+    for (auto& fut : futures) fut.get();
+}
+
+} // namespace detail
+
+inline bool should_auto_select_gpu(
+    const SolverConfig& config,
+    const FlatGameTree& tree,
+    size_t matchup_table_count)
+{
+    if (!GPU_BACKEND_FUNCTIONAL || !has_cuda_gpu()) return false;
+
+    (void)matchup_table_count;
+
+    // With the current CUDA backend, real solves on turn/river spots already
+    // beat the CPU path on supported NVIDIA hardware. Keep AUTO on CPU only
+    // for diagnostics/no-iteration calls where GPU upload would be pure fixed
+    // overhead. Explicit --backend cpu remains available for parity testing.
+    if (config.max_iterations <= 0) return false;
+    if (tree.total_nodes < 128 && config.max_iterations < 25) return false;
+
+    return true;
+}
 
 // ============================================================================
 // Solver (orchestrator)
@@ -148,8 +288,39 @@ public:
     /// UI consumers that show a board image with the cached strategies must
     /// either (a) display the actual lex-min runout cards, or (b) trigger a
     /// fresh solve when the user wants strategies for a specific runout.
+    ///
+    /// Phase 3 (10-point plan) — `StrategyTreeEvMode` controls how much memory
+    /// the EV cache spends. `VISIBLE` (recommended default) only computes EVs
+    /// for the nodes actually emitted in the strategy tree, instead of every
+    /// inner node. `NONE` skips EV computation entirely. `FULL` is the legacy
+    /// behavior — caches every visited node × 2 perspectives, which can blow
+    /// host RAM on deep multi-bet trees (this is the `solver.h:1739-1745` flag
+    /// the maturity plan called out).
+    enum class StrategyTreeEvMode : uint8_t {
+        NONE    = 0, ///< Don't compute combo EVs. Smallest response.
+        VISIBLE = 1, ///< Compute EVs only for emitted nodes (default).
+        FULL    = 2, ///< Cache every visited node (legacy behavior).
+    };
+
+    /// Sprint 1 (market-beating plan): `max_nodes` caps the emitted set.
+    /// 0 = use `config.memory_budget.strategy_tree_max_nodes`. When the cap
+    /// is hit, the walker returns without descending deeper into the
+    /// remaining branches and `*out_truncated` (if non-null) is set to true
+    /// so the caller can surface the truncation in the response payload.
     std::map<std::string, StrategyTreeEntry>
-        build_strategy_tree(int max_player_depth = 8) const;
+        build_strategy_tree(int max_player_depth = 8,
+                            StrategyTreeEvMode ev_mode = StrategyTreeEvMode::VISIBLE,
+                            uint32_t max_nodes = 0,
+                            bool* out_truncated = nullptr) const;
+
+    /// Backward-compat overload — `include_combo_evs=true` ⇒ VISIBLE,
+    /// `false` ⇒ NONE. Existing call sites keep working.
+    std::map<std::string, StrategyTreeEntry>
+        build_strategy_tree(int max_player_depth, bool include_combo_evs) const {
+        return build_strategy_tree(max_player_depth,
+            include_combo_evs ? StrategyTreeEvMode::VISIBLE
+                              : StrategyTreeEvMode::NONE);
+    }
 
     /// Name of the active backend (for logging / UI indicator)
     const char* backend_name() const { return backend_ ? backend_->name() : "none"; }
@@ -193,11 +364,12 @@ private:
     float compute_exploitability();
     std::vector<float> cpu_best_response_traverse(uint32_t node_idx, int player,
                                                    std::vector<float>& reach_oop,
-                                                   std::vector<float>& reach_ip);
+                                                   std::vector<float>& reach_ip) const;
     std::vector<float> cpu_ev_traverse(uint32_t node_idx, int perspective,
                                         std::vector<float>& reach_oop,
                                         std::vector<float>& reach_ip,
-                                        std::map<uint32_t, std::vector<float>>* out_node_values = nullptr) const;
+                                        std::map<uint32_t, std::vector<float>>* out_node_values = nullptr,
+                                        const std::set<uint32_t>* visible_filter = nullptr) const;
     void compute_combo_evs();
 
     // ---- Helpers ----
@@ -262,20 +434,155 @@ inline uint16_t Solver::evaluate_combo(const Combo& combo) const {
 // ============================================================================
 
 inline SolverResult Solver::solve(ProgressCallback progress_cb) {
-    auto start_time = std::chrono::high_resolution_clock::now();
+    using Clock = std::chrono::high_resolution_clock;
 
-    // Step 1-2: tree + isomorphism
+    auto start_time = Clock::now();
+    auto stage_start = start_time;
+    SolverTiming timing;
+    timing.postsolve_threads = config_.parallel_postsolve
+        ? detail::effective_postsolve_threads(config_.postsolve_threads)
+        : 1;
+    actual_iterations_run_ = 0;
+
+    auto elapsed_since = [](Clock::time_point begin, Clock::time_point end) {
+        return std::chrono::duration<float, std::milli>(end - begin).count();
+    };
+
+    // Phase 2 (10-point plan): isomorphism first, so the tree builder can
+    // make a byte-based runout-enumeration decision (needs nc to estimate
+    // matchup table size). compute_isomorphism is pure and only reads the
+    // flop/turn/river board cards already in config_, so reordering is safe.
+    stage_start = Clock::now();
+    iso_ = compute_isomorphism(config_.board.data(), config_.board_size);
+    auto stage_end = Clock::now();
+    timing.isomorphism_ms = elapsed_since(stage_start, stage_end);
+
+    // Step 1-2: tree (now with memory-budget-aware runout cap)
+    stage_start = Clock::now();
     GameTreeBuilder builder(config_);
+    builder.set_memory_policy(iso_.num_canonical, config_.memory_budget);
     tree_ = builder.build();
-    iso_  = compute_isomorphism(config_.board.data(), config_.board_size);
+    stage_end = Clock::now();
+    timing.tree_build_ms = elapsed_since(stage_start, stage_end);
+    timing.tree_nodes = tree_.total_nodes;
+    timing.tree_edges = tree_.total_edges;
 
     // Step 3: precompute matchup matrix + reach probs + node locks
+    stage_start = Clock::now();
     precompute_matchups();
-    initialize_reach_probs();
-    resolve_node_locks();
+    stage_end = Clock::now();
+    timing.precompute_matchups_ms = elapsed_since(stage_start, stage_end);
+    timing.matchup_tables = static_cast<uint32_t>(matchup_ev_per_runout_.size());
 
-    // Step 4: create backend (Phase 3.4 wires up the factory; for now default to CPU)
-    backend_ = create_backend(backend_type_);
+    stage_start = Clock::now();
+    initialize_reach_probs();
+    stage_end = Clock::now();
+    timing.reach_init_ms = elapsed_since(stage_start, stage_end);
+
+    stage_start = Clock::now();
+    resolve_node_locks();
+    stage_end = Clock::now();
+    timing.node_locks_ms = elapsed_since(stage_start, stage_end);
+
+    // ----------------------------------------------------------------
+    // Sprint 1 (resource policy guide): pre-backend budget gate.
+    // This is the single point where we say "we will / won't / can't"
+    // BEFORE the backend allocates the regrets / strategy_sum / device
+    // arrays that dominate per-iteration memory. Three outcomes:
+    //   - OK         → keep selected_backend, proceed to prepare()
+    //   - downgrade  → AUTO+GPU → CPU, record fallback_reason
+    //   - reject     → throw structured runtime_error (main.cpp emits JSON)
+    // ----------------------------------------------------------------
+    SolveFootprintEstimate gate_est;
+    {
+        const uint64_t nc      = iso_.num_canonical;
+        const uint64_t total_n = tree_.total_nodes;
+        uint32_t player_nodes = 0;
+        for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
+            auto t = static_cast<NodeType>(tree_.node_types[n]);
+            if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) ++player_nodes;
+        }
+        gate_est.matchup_tables_bytes   = bytes_for_matchup_tables(
+            matchup_ev_per_runout_.size(), nc);
+        gate_est.cpu_state_bytes        = bytes_for_cpu_state(player_nodes, MAX_ACTIONS, nc);
+        gate_est.gpu_state_bytes        = bytes_for_gpu_state(total_n, MAX_ACTIONS, nc);
+        gate_est.strategy_tree_ev_bytes = bytes_for_strategy_tree_ev_cache(player_nodes, nc);
+        gate_est.json_response_bytes    = bytes_for_json_response(
+            std::min<uint64_t>(player_nodes,
+                               config_.memory_budget.strategy_tree_max_nodes));
+    }
+
+    std::string fallback_reason;  // surfaced into result.resources below.
+
+    // Step 4: create backend. AUTO uses a size-aware heuristic because the
+    // CUDA path has a meaningful fixed cost on small/medium solves.
+    stage_start = Clock::now();
+    BackendType selected_backend = backend_type_;
+    if (backend_type_ == BackendType::AUTO) {
+        selected_backend = should_auto_select_gpu(
+            config_, tree_, matchup_ev_per_runout_.size())
+            ? BackendType::GPU
+            : BackendType::CPU;
+    }
+
+    // GPU budget check. `gpu_bytes == 0` means "let backend probe at
+    // runtime" — we don't reject in that case (host can't predict free
+    // VRAM accurately for arbitrary devices). When a budget IS set:
+    //   - Explicit `--backend gpu` + over budget → reject hard.
+    //   - AUTO + over budget → downgrade to CPU, record reason.
+    if (selected_backend == BackendType::GPU &&
+        config_.memory_budget.gpu_bytes > 0 &&
+        gate_est.gpu_state_bytes > config_.memory_budget.gpu_bytes) {
+        char msg[384];
+        snprintf(msg, sizeof(msg),
+            "GPU state estimate %.2f GB exceeds VRAM budget %.2f GB "
+            "(N=%u nodes, A=%u actions, nc=%u canonical). ",
+            static_cast<double>(gate_est.gpu_state_bytes) / (1024.0 * 1024.0 * 1024.0),
+            static_cast<double>(config_.memory_budget.gpu_bytes) / (1024.0 * 1024.0 * 1024.0),
+            tree_.total_nodes, static_cast<unsigned>(MAX_ACTIONS),
+            static_cast<unsigned>(iso_.num_canonical));
+
+        if (backend_type_ == BackendType::AUTO) {
+            // Downgrade. Don't fail the solve.
+            selected_backend = BackendType::CPU;
+            fallback_reason = std::string(msg) + "Auto-downgraded to CPU.";
+        } else {
+            // Explicit --backend gpu. Refuse so the user can decide.
+            throw std::runtime_error(std::string(msg) +
+                "Use --backend cpu, --backend auto, or raise --gpu-memory-mb.");
+        }
+    }
+
+    // CPU host budget check applies whenever we end up on CPU (either by
+    // request or via the AUTO-downgrade above). Matchup tables already
+    // exist at this point — they were the FIRST line of defence in
+    // precompute_matchups. Now we add the per-iteration CPU state and
+    // strategy-tree EV cache + JSON response on top.
+    if (selected_backend == BackendType::CPU &&
+        config_.memory_budget.host_bytes > 0) {
+        const uint64_t total_host =
+              gate_est.matchup_tables_bytes
+            + gate_est.cpu_state_bytes
+            + gate_est.strategy_tree_ev_bytes
+            + gate_est.json_response_bytes;
+        if (total_host > config_.memory_budget.host_bytes) {
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                "Host RAM estimate %.2f GB exceeds budget %.2f GB "
+                "(matchup=%.1f MB, cpu_state=%.1f MB, strategy_tree=%.1f MB, "
+                "json=%.1f MB). Raise --host-memory-mb, reduce bet sizes, or "
+                "use --strategy-tree-evs none.",
+                static_cast<double>(total_host) / (1024.0 * 1024.0 * 1024.0),
+                static_cast<double>(config_.memory_budget.host_bytes) / (1024.0 * 1024.0 * 1024.0),
+                static_cast<double>(gate_est.matchup_tables_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(gate_est.cpu_state_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(gate_est.strategy_tree_ev_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(gate_est.json_response_bytes) / (1024.0 * 1024.0));
+            throw std::runtime_error(msg);
+        }
+    }
+
+    backend_ = create_backend(selected_backend);
     if (!backend_) backend_ = std::make_unique<CpuBackend>();
 
     SolverContext ctx;
@@ -290,35 +597,125 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     ctx.oop_reach                  = &oop_reach_;
     ctx.resolved_locks             = &resolved_locks_;
     backend_->prepare(ctx);
+    stage_end = Clock::now();
+    timing.backend_prepare_ms = elapsed_since(stage_start, stage_end);
 
     // Step 5: run DCFR iterations through backend
+    stage_start = Clock::now();
     for (int t = 0; t < config_.max_iterations; ++t) {
         backend_->iterate(t);
         actual_iterations_run_ = t + 1;
 
         if (progress_cb && (t + 1) % config_.exploitability_check_interval == 0) {
-            auto now = std::chrono::high_resolution_clock::now();
-            float elapsed = std::chrono::duration<float, std::milli>(now - start_time).count();
+            auto now = Clock::now();
+            float elapsed = elapsed_since(start_time, now);
             progress_cb(t + 1, 0.0f, elapsed);
         }
     }
+    stage_end = Clock::now();
+    timing.iterations_ms = elapsed_since(stage_start, stage_end);
 
     // Step 6: finalize (normalize strategy_sum → strategy)
+    stage_start = Clock::now();
     backend_->finalize();
     strategy_ = backend_->strategy();  // copy out for post-solve passes
     apply_node_locks();
     solved_ = true;
+    stage_end = Clock::now();
+    timing.finalize_ms = elapsed_since(stage_start, stage_end);
 
-    // Step 7: post-solve CPU passes (EV + exploitability)
-    compute_combo_evs();
-    exploitability_pct_ = compute_exploitability();
+    // Step 7: optional post-solve CPU passes (EV + exploitability)
+    stage_start = Clock::now();
+    if (config_.parallel_postsolve &&
+        config_.compute_combo_evs &&
+        config_.compute_exploitability) {
+        auto ev_future = std::async(std::launch::async, [&]() {
+            auto pass_start = Clock::now();
+            compute_combo_evs();
+            auto pass_end = Clock::now();
+            return elapsed_since(pass_start, pass_end);
+        });
+        auto exploit_future = std::async(std::launch::async, [&]() {
+            auto pass_start = Clock::now();
+            float exploit = compute_exploitability();
+            auto pass_end = Clock::now();
+            return std::make_pair(exploit, elapsed_since(pass_start, pass_end));
+        });
+
+        timing.combo_evs_ms = ev_future.get();
+        auto exploit_result = exploit_future.get();
+        exploitability_pct_ = exploit_result.first;
+        timing.exploitability_ms = exploit_result.second;
+    } else {
+        if (config_.compute_combo_evs) {
+            auto pass_start = Clock::now();
+            compute_combo_evs();
+            auto pass_end = Clock::now();
+            timing.combo_evs_ms = elapsed_since(pass_start, pass_end);
+        } else {
+            ev_.assign(iso_.num_canonical, 0.0f);
+        }
+
+        if (config_.compute_exploitability) {
+            auto pass_start = Clock::now();
+            exploitability_pct_ = compute_exploitability();
+            auto pass_end = Clock::now();
+            timing.exploitability_ms = elapsed_since(pass_start, pass_end);
+        } else {
+            exploitability_pct_ = 0.0f;
+        }
+    }
+    stage_end = Clock::now();
+    timing.postsolve_ms = elapsed_since(stage_start, stage_end);
+    timing.total_ms = elapsed_since(start_time, stage_end);
 
     SolverResult result;
     result.iterations_run      = actual_iterations_run_;
     result.exploitability_pct  = exploitability_pct_;
+    result.combo_evs_computed  = config_.compute_combo_evs;
+    result.exploitability_computed = config_.compute_exploitability;
     result.action_labels       = get_action_labels_at(0);
     result.global_strategy     = extract_global_strategy_at(0);
     result.combo_strategies    = extract_combo_strategies_at(0);
+    if (config_.compute_combo_evs) {
+        result.ev_vector = ev_;  // expose per-canonical-combo OOP EVs
+    }
+    result.timing              = timing;
+
+    // Sprint 1 (market-beating plan): every solve fills the resources block
+    // with byte estimates and the budget decision so the UI / benchmark can
+    // diagnose "where did the RAM go" without re-running with profiling.
+    // Reuses gate_est computed before backend allocation.
+    {
+        SolveResources r;
+        r.canonical_combos = iso_.num_canonical;
+        uint32_t player_nodes = 0;
+        for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
+            auto t = static_cast<NodeType>(tree_.node_types[n]);
+            if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) ++player_nodes;
+        }
+        r.player_nodes = player_nodes;
+
+        r.estimated_matchup_bytes        = gate_est.matchup_tables_bytes;
+        r.estimated_cpu_state_bytes      = gate_est.cpu_state_bytes;
+        r.estimated_gpu_state_bytes      = gate_est.gpu_state_bytes;
+        r.estimated_strategy_tree_bytes  = gate_est.strategy_tree_ev_bytes;
+        r.estimated_json_bytes           = gate_est.json_response_bytes;
+
+        r.host_budget_bytes        = config_.memory_budget.host_bytes;
+        r.gpu_budget_bytes         = config_.memory_budget.gpu_bytes;
+        r.strategy_tree_max_nodes  = config_.memory_budget.strategy_tree_max_nodes;
+
+        BudgetDecision d = evaluate_budget(gate_est, config_.memory_budget);
+        r.budget_decision            = budget_decision_str(d);
+        if (d != BudgetDecision::OK) {
+            r.diagnostic = format_budget_failure(d, gate_est, config_.memory_budget);
+        }
+        // Sprint 1: surface the AUTO→CPU downgrade reason recorded by the
+        // pre-backend gate. Empty string means no fallback happened.
+        r.fallback_reason = fallback_reason;
+        result.resources = std::move(r);
+    }
     return result;
 }
 
@@ -362,6 +759,12 @@ inline void compute_matchup_for_board(
     const auto& combo_table = get_combo_table();
     CardMask board_mask = board_to_mask(board_cards, board_size);
 
+    std::array<CardMask, NUM_COMBOS> combo_masks{};
+    for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+        combo_masks[i] = card_to_mask(combo_table[i].cards[0])
+                       | card_to_mask(combo_table[i].cards[1]);
+    }
+
     std::vector<uint16_t> ranks(NUM_COMBOS, UINT16_MAX);
     for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
         if (combo_table[i].conflicts_with(board_mask)) continue;
@@ -375,12 +778,10 @@ inline void compute_matchup_for_board(
             int oop_wins = 0, ip_wins = 0, valid = 0;
             for (uint16_t oi : originals_i) {
                 if (ranks[oi] == UINT16_MAX) continue;
-                CardMask mask_i = card_to_mask(combo_table[oi].cards[0])
-                                | card_to_mask(combo_table[oi].cards[1]);
+                CardMask mask_i = combo_masks[oi];
                 for (uint16_t oj : originals_j) {
                     if (ranks[oj] == UINT16_MAX) continue;
-                    CardMask mask_j = card_to_mask(combo_table[oj].cards[0])
-                                    | card_to_mask(combo_table[oj].cards[1]);
+                    CardMask mask_j = combo_masks[oj];
                     if (mask_i & mask_j) continue;
                     ++valid;
                     if (ranks[oi] < ranks[oj]) ++oop_wins;
@@ -449,11 +850,42 @@ inline void Solver::precompute_matchups() {
         return sig;
     };
 
+    // Sprint 1 (market-beating plan): hard byte cap at the actual allocation
+    // site. The tree builder's gate is the FIRST line of defence (refuses to
+    // enumerate runouts that wouldn't fit). This is the SECOND — even if the
+    // tree somehow ends up with more matchup signatures than budgeted, refuse
+    // to allocate. Throws a structured runtime_error which main.cpp formats
+    // as JSON for the UI.
+    const uint64_t per_table_bytes =
+        2ULL * static_cast<uint64_t>(nc) * static_cast<uint64_t>(nc) * sizeof(float);
+    // Reserve half the host budget for matchup tables (same split as the
+    // tree builder gate). Floor of 3 GB matches the builder's safety floor.
+    const uint64_t matchup_byte_cap = (config_.memory_budget.host_bytes > 0)
+        ? (config_.memory_budget.host_bytes / 2ULL)
+        : (3ULL * 1024 * 1024 * 1024);
+
     auto register_signature = [&](const std::vector<uint8_t>& runouts) -> int32_t {
         auto sig = signature_for(runouts);
         auto it = sig_to_idx.find(sig);
         if (it != sig_to_idx.end()) return it->second;
         int32_t new_idx = static_cast<int32_t>(matchup_ev_per_runout_.size());
+
+        // Bytes already allocated + this new table. Refuse before push_back
+        // so a mid-allocation bad_alloc can't kill the process.
+        const uint64_t cur_bytes  = static_cast<uint64_t>(new_idx) * per_table_bytes;
+        const uint64_t next_bytes = cur_bytes + per_table_bytes;
+        if (next_bytes > matchup_byte_cap) {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                "precompute_matchups would allocate %.2f GB (cap %.2f GB, "
+                "%d tables × %u canonical² × 8 B). Reduce flop runout enumeration, "
+                "use --strategy-tree-evs none, or raise --host-memory-mb.",
+                static_cast<double>(next_bytes)  / (1024.0 * 1024.0 * 1024.0),
+                static_cast<double>(matchup_byte_cap) / (1024.0 * 1024.0 * 1024.0),
+                new_idx + 1, static_cast<unsigned>(nc));
+            throw std::runtime_error(buf);
+        }
+
         sig_to_idx[sig] = new_idx;
         // Compute matchup table for this board signature.
         std::vector<float> ev, valid;
@@ -540,13 +972,25 @@ inline void Solver::apply_node_locks() {
 inline std::vector<float> Solver::cpu_ev_traverse(
     uint32_t node_idx, int perspective,
     std::vector<float>& reach_oop, std::vector<float>& reach_ip,
-    std::map<uint32_t, std::vector<float>>* out_node_values) const
+    std::map<uint32_t, std::vector<float>>* out_node_values,
+    const std::set<uint32_t>* visible_filter) const
 {
     // Helper: write the per-combo values to the out-map (if requested) and
     // then return them. Used at every return point so the map records every
     // visited node's values during a single root traversal.
+    //
+    // Phase 3 (10-point plan): when `visible_filter` is non-null we only
+    // record nodes the strategy tree will actually emit. The traversal still
+    // recurses through every node — we need their EVs to compute parents
+    // correctly — but we drop the per-combo vector once we've used it,
+    // saving O(visited_nodes × nc × 4 B) of host RAM for the typical
+    // 8-deep tree where only a few hundred nodes get emitted.
     auto record = [&](std::vector<float>&& vals) -> std::vector<float> {
-        if (out_node_values) (*out_node_values)[node_idx] = vals;
+        if (out_node_values) {
+            const bool keep = (visible_filter == nullptr) ||
+                              (visible_filter->find(node_idx) != visible_filter->end());
+            if (keep) (*out_node_values)[node_idx] = vals;
+        }
         return std::move(vals);
     };
     uint16_t nc = iso_.num_canonical;
@@ -565,22 +1009,44 @@ inline std::vector<float> Solver::cpu_ev_traverse(
             ? matchup_valid_per_runout_[mi] : matchup_valid_;
 
         if (tt == TerminalType::SHOWDOWN) {
-            for (uint16_t c = 0; c < nc; ++c) {
-                float val = 0.0f;
-                if (perspective == 0) {
-                    for (uint16_t cj = 0; cj < nc; ++cj) {
-                        size_t idx = static_cast<size_t>(c) * nc + cj;
-                        val += reach_ip[cj] * m_ev[idx] * m_valid[idx]
-                               * static_cast<float>(iso_.canonical_weights[cj]) * half_pot;
-                    }
-                } else {
-                    for (uint16_t ci = 0; ci < nc; ++ci) {
-                        size_t idx = static_cast<size_t>(ci) * nc + c;
-                        val += reach_oop[ci] * (-m_ev[idx]) * m_valid[idx]
-                               * static_cast<float>(iso_.canonical_weights[ci]) * half_pot;
-                    }
+            if (perspective == 0) {
+                std::vector<float> weighted_ip(nc, 0.0f);
+                for (uint16_t cj = 0; cj < nc; ++cj) {
+                    weighted_ip[cj] = reach_ip[cj] *
+                        static_cast<float>(iso_.canonical_weights[cj]);
                 }
-                values[c] = val;
+                detail::postsolve_parallel_for(
+                    static_cast<uint32_t>(nc),
+                    config_.parallel_postsolve,
+                    config_.postsolve_threads,
+                    [&](uint32_t cidx) {
+                        uint16_t c = static_cast<uint16_t>(cidx);
+                        float val = 0.0f;
+                        for (uint16_t cj = 0; cj < nc; ++cj) {
+                            size_t idx = static_cast<size_t>(c) * nc + cj;
+                            val += weighted_ip[cj] * m_ev[idx] * m_valid[idx];
+                        }
+                        values[c] = val * half_pot;
+                    });
+            } else {
+                std::vector<float> weighted_oop(nc, 0.0f);
+                for (uint16_t ci = 0; ci < nc; ++ci) {
+                    weighted_oop[ci] = reach_oop[ci] *
+                        static_cast<float>(iso_.canonical_weights[ci]);
+                }
+                detail::postsolve_parallel_for(
+                    static_cast<uint32_t>(nc),
+                    config_.parallel_postsolve,
+                    config_.postsolve_threads,
+                    [&](uint32_t cidx) {
+                        uint16_t c = static_cast<uint16_t>(cidx);
+                        float val = 0.0f;
+                        for (uint16_t ci = 0; ci < nc; ++ci) {
+                            size_t idx = static_cast<size_t>(ci) * nc + c;
+                            val += weighted_oop[ci] * (-m_ev[idx]) * m_valid[idx];
+                        }
+                        values[c] = val * half_pot;
+                    });
             }
         } else {
             uint32_t parent = tree_.parent_indices[node_idx];
@@ -590,22 +1056,44 @@ inline std::vector<float> Solver::cpu_ev_traverse(
 
             float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
             float sign = (perspective == 0) ? sign_oop : -sign_oop;
-            for (uint16_t c = 0; c < nc; ++c) {
-                float opp_total = 0.0f;
-                if (perspective == 0) {
-                    for (uint16_t cj = 0; cj < nc; ++cj) {
-                        size_t idx = static_cast<size_t>(c) * nc + cj;
-                        opp_total += reach_ip[cj] * m_valid[idx]
-                                   * static_cast<float>(iso_.canonical_weights[cj]);
-                    }
-                } else {
-                    for (uint16_t ci = 0; ci < nc; ++ci) {
-                        size_t idx = static_cast<size_t>(ci) * nc + c;
-                        opp_total += reach_oop[ci] * m_valid[idx]
-                                   * static_cast<float>(iso_.canonical_weights[ci]);
-                    }
+            if (perspective == 0) {
+                std::vector<float> weighted_ip(nc, 0.0f);
+                for (uint16_t cj = 0; cj < nc; ++cj) {
+                    weighted_ip[cj] = reach_ip[cj] *
+                        static_cast<float>(iso_.canonical_weights[cj]);
                 }
-                values[c] = sign * gain * opp_total;
+                detail::postsolve_parallel_for(
+                    static_cast<uint32_t>(nc),
+                    config_.parallel_postsolve,
+                    config_.postsolve_threads,
+                    [&](uint32_t cidx) {
+                        uint16_t c = static_cast<uint16_t>(cidx);
+                        float opp_total = 0.0f;
+                        for (uint16_t cj = 0; cj < nc; ++cj) {
+                            size_t idx = static_cast<size_t>(c) * nc + cj;
+                            opp_total += weighted_ip[cj] * m_valid[idx];
+                        }
+                        values[c] = sign * gain * opp_total;
+                    });
+            } else {
+                std::vector<float> weighted_oop(nc, 0.0f);
+                for (uint16_t ci = 0; ci < nc; ++ci) {
+                    weighted_oop[ci] = reach_oop[ci] *
+                        static_cast<float>(iso_.canonical_weights[ci]);
+                }
+                detail::postsolve_parallel_for(
+                    static_cast<uint32_t>(nc),
+                    config_.parallel_postsolve,
+                    config_.postsolve_threads,
+                    [&](uint32_t cidx) {
+                        uint16_t c = static_cast<uint16_t>(cidx);
+                        float opp_total = 0.0f;
+                        for (uint16_t ci = 0; ci < nc; ++ci) {
+                            size_t idx = static_cast<size_t>(ci) * nc + c;
+                            opp_total += weighted_oop[ci] * m_valid[idx];
+                        }
+                        values[c] = sign * gain * opp_total;
+                    });
             }
         }
         return record(std::move(values));
@@ -627,7 +1115,7 @@ inline std::vector<float> Solver::cpu_ev_traverse(
                                 ? tree_.runout_weight[child] : 1;
             if (weight == 0) weight = 1;
             std::vector<float> child_vals = cpu_ev_traverse(
-                child, perspective, reach_oop, reach_ip, out_node_values);
+                child, perspective, reach_oop, reach_ip, out_node_values, visible_filter);
             for (uint16_t c = 0; c < nc; ++c) {
                 avg[c] += static_cast<float>(weight) * child_vals[c];
             }
@@ -647,28 +1135,31 @@ inline std::vector<float> Solver::cpu_ev_traverse(
     }
     const auto& strat = strategy_[node_idx];
 
-    std::vector<std::vector<float>> action_vals(na);
-    for (uint8_t a = 0; a < na; ++a) {
-        uint32_t child = tree_.children[tree_.children_offset[node_idx] + a];
+    std::vector<float> node_vals(nc, 0.0f);
+    uint32_t action_offset = tree_.children_offset[node_idx];
+    if (acting == perspective) {
+        for (uint8_t a = 0; a < na; ++a) {
+            uint32_t child = tree_.children[action_offset + a];
+            std::vector<float> child_vals =
+                cpu_ev_traverse(child, perspective, reach_oop, reach_ip, out_node_values, visible_filter);
+            for (uint16_t c = 0; c < nc; ++c) {
+                node_vals[c] += strat[a * nc + c] * child_vals[c];
+            }
+        }
+    } else {
         auto& acting_reach = (acting == 0) ? reach_oop : reach_ip;
         std::vector<float> saved(nc);
-        for (uint16_t c = 0; c < nc; ++c) {
-            saved[c] = acting_reach[c];
-            acting_reach[c] *= strat[a * nc + c];
+        for (uint8_t a = 0; a < na; ++a) {
+            uint32_t child = tree_.children[action_offset + a];
+            for (uint16_t c = 0; c < nc; ++c) {
+                saved[c] = acting_reach[c];
+                acting_reach[c] *= strat[a * nc + c];
+            }
+            std::vector<float> child_vals =
+                cpu_ev_traverse(child, perspective, reach_oop, reach_ip, out_node_values, visible_filter);
+            for (uint16_t c = 0; c < nc; ++c) acting_reach[c] = saved[c];
+            for (uint16_t c = 0; c < nc; ++c) node_vals[c] += child_vals[c];
         }
-        action_vals[a] = cpu_ev_traverse(child, perspective, reach_oop, reach_ip, out_node_values);
-        for (uint16_t c = 0; c < nc; ++c) acting_reach[c] = saved[c];
-    }
-
-    std::vector<float> node_vals(nc, 0.0f);
-    if (acting == perspective) {
-        for (uint8_t a = 0; a < na; ++a)
-            for (uint16_t c = 0; c < nc; ++c)
-                node_vals[c] += strat[a * nc + c] * action_vals[a][c];
-    } else {
-        for (uint8_t a = 0; a < na; ++a)
-            for (uint16_t c = 0; c < nc; ++c)
-                node_vals[c] += action_vals[a][c];
     }
     return record(std::move(node_vals));
 }
@@ -678,9 +1169,18 @@ inline void Solver::compute_combo_evs() {
     ev_.assign(nc, 0.0f);
     if (strategy_.empty() || nc == 0) return;
 
-    auto r_oop = oop_reach_;
-    auto r_ip  = ip_reach_;
-    auto oop_evs_raw = cpu_ev_traverse(0, 0, r_oop, r_ip);
+    // Prefer GPU postsolve when the backend supports it. Falls back to CPU
+    // traversal on empty / size-mismatched return (treated as "not supported").
+    std::vector<float> oop_evs_raw;
+    if (!config_.force_cpu_postsolve &&
+        backend_ && backend_->supports_gpu_postsolve()) {
+        oop_evs_raw = backend_->compute_combo_evs_gpu();
+    }
+    if (oop_evs_raw.size() != nc) {
+        auto r_oop = oop_reach_;
+        auto r_ip  = ip_reach_;
+        oop_evs_raw = cpu_ev_traverse(0, 0, r_oop, r_ip);
+    }
 
     float total_ip_weight = 0.0f;
     for (uint16_t cj = 0; cj < nc; ++cj) {
@@ -698,7 +1198,7 @@ inline void Solver::compute_combo_evs() {
 
 inline std::vector<float> Solver::cpu_best_response_traverse(
     uint32_t node_idx, int player,
-    std::vector<float>& reach_oop, std::vector<float>& reach_ip)
+    std::vector<float>& reach_oop, std::vector<float>& reach_ip) const
 {
     uint16_t nc = iso_.num_canonical;
     auto nt = static_cast<NodeType>(tree_.node_types[node_idx]);
@@ -716,22 +1216,44 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
             ? matchup_valid_per_runout_[mi] : matchup_valid_;
 
         if (tt == TerminalType::SHOWDOWN) {
-            for (uint16_t c = 0; c < nc; ++c) {
-                float val = 0.0f;
-                if (player == 0) {
-                    for (uint16_t cj = 0; cj < nc; ++cj) {
-                        size_t idx = static_cast<size_t>(c) * nc + cj;
-                        val += reach_ip[cj] * m_ev[idx] * m_valid[idx]
-                               * static_cast<float>(iso_.canonical_weights[cj]) * half_pot;
-                    }
-                } else {
-                    for (uint16_t ci = 0; ci < nc; ++ci) {
-                        size_t idx = static_cast<size_t>(ci) * nc + c;
-                        val += reach_oop[ci] * (-m_ev[idx]) * m_valid[idx]
-                               * static_cast<float>(iso_.canonical_weights[ci]) * half_pot;
-                    }
+            if (player == 0) {
+                std::vector<float> weighted_ip(nc, 0.0f);
+                for (uint16_t cj = 0; cj < nc; ++cj) {
+                    weighted_ip[cj] = reach_ip[cj] *
+                        static_cast<float>(iso_.canonical_weights[cj]);
                 }
-                values[c] = val;
+                detail::postsolve_parallel_for(
+                    static_cast<uint32_t>(nc),
+                    config_.parallel_postsolve,
+                    config_.postsolve_threads,
+                    [&](uint32_t cidx) {
+                        uint16_t c = static_cast<uint16_t>(cidx);
+                        float val = 0.0f;
+                        for (uint16_t cj = 0; cj < nc; ++cj) {
+                            size_t idx = static_cast<size_t>(c) * nc + cj;
+                            val += weighted_ip[cj] * m_ev[idx] * m_valid[idx];
+                        }
+                        values[c] = val * half_pot;
+                    });
+            } else {
+                std::vector<float> weighted_oop(nc, 0.0f);
+                for (uint16_t ci = 0; ci < nc; ++ci) {
+                    weighted_oop[ci] = reach_oop[ci] *
+                        static_cast<float>(iso_.canonical_weights[ci]);
+                }
+                detail::postsolve_parallel_for(
+                    static_cast<uint32_t>(nc),
+                    config_.parallel_postsolve,
+                    config_.postsolve_threads,
+                    [&](uint32_t cidx) {
+                        uint16_t c = static_cast<uint16_t>(cidx);
+                        float val = 0.0f;
+                        for (uint16_t ci = 0; ci < nc; ++ci) {
+                            size_t idx = static_cast<size_t>(ci) * nc + c;
+                            val += weighted_oop[ci] * (-m_ev[idx]) * m_valid[idx];
+                        }
+                        values[c] = val * half_pot;
+                    });
             }
         } else {
             uint32_t parent = tree_.parent_indices[node_idx];
@@ -741,22 +1263,44 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
 
             float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
             float sign = (player == 0) ? sign_oop : -sign_oop;
-            for (uint16_t c = 0; c < nc; ++c) {
-                float opp_total = 0.0f;
-                if (player == 0) {
-                    for (uint16_t cj = 0; cj < nc; ++cj) {
-                        size_t idx = static_cast<size_t>(c) * nc + cj;
-                        opp_total += reach_ip[cj] * m_valid[idx]
-                                   * static_cast<float>(iso_.canonical_weights[cj]);
-                    }
-                } else {
-                    for (uint16_t ci = 0; ci < nc; ++ci) {
-                        size_t idx = static_cast<size_t>(ci) * nc + c;
-                        opp_total += reach_oop[ci] * m_valid[idx]
-                                   * static_cast<float>(iso_.canonical_weights[ci]);
-                    }
+            if (player == 0) {
+                std::vector<float> weighted_ip(nc, 0.0f);
+                for (uint16_t cj = 0; cj < nc; ++cj) {
+                    weighted_ip[cj] = reach_ip[cj] *
+                        static_cast<float>(iso_.canonical_weights[cj]);
                 }
-                values[c] = sign * gain * opp_total;
+                detail::postsolve_parallel_for(
+                    static_cast<uint32_t>(nc),
+                    config_.parallel_postsolve,
+                    config_.postsolve_threads,
+                    [&](uint32_t cidx) {
+                        uint16_t c = static_cast<uint16_t>(cidx);
+                        float opp_total = 0.0f;
+                        for (uint16_t cj = 0; cj < nc; ++cj) {
+                            size_t idx = static_cast<size_t>(c) * nc + cj;
+                            opp_total += weighted_ip[cj] * m_valid[idx];
+                        }
+                        values[c] = sign * gain * opp_total;
+                    });
+            } else {
+                std::vector<float> weighted_oop(nc, 0.0f);
+                for (uint16_t ci = 0; ci < nc; ++ci) {
+                    weighted_oop[ci] = reach_oop[ci] *
+                        static_cast<float>(iso_.canonical_weights[ci]);
+                }
+                detail::postsolve_parallel_for(
+                    static_cast<uint32_t>(nc),
+                    config_.parallel_postsolve,
+                    config_.postsolve_threads,
+                    [&](uint32_t cidx) {
+                        uint16_t c = static_cast<uint16_t>(cidx);
+                        float opp_total = 0.0f;
+                        for (uint16_t ci = 0; ci < nc; ++ci) {
+                            size_t idx = static_cast<size_t>(ci) * nc + c;
+                            opp_total += weighted_oop[ci] * m_valid[idx];
+                        }
+                        values[c] = sign * gain * opp_total;
+                    });
             }
         }
         return values;
@@ -795,20 +1339,16 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
 
     if (acting == player) {
         // BR: each combo picks its best action independently
-        std::vector<std::vector<float>> action_vals(na);
-        for (uint8_t a = 0; a < na; ++a) {
-            uint32_t child = tree_.children[tree_.children_offset[node_idx] + a];
-            action_vals[a] = cpu_best_response_traverse(child, player, reach_oop, reach_ip);
-        }
-        std::vector<float> best(nc, 0.0f);
-        std::vector<bool>  has_val(nc, false);
-        for (uint16_t c = 0; c < nc; ++c) {
-            for (uint8_t a = 0; a < na; ++a) {
-                float v = action_vals[a][c];
-                if (!has_val[c] || v > best[c]) {
-                    best[c] = v;
-                    has_val[c] = true;
-                }
+        uint32_t action_offset = tree_.children_offset[node_idx];
+        uint32_t first_child = tree_.children[action_offset];
+        std::vector<float> best =
+            cpu_best_response_traverse(first_child, player, reach_oop, reach_ip);
+        for (uint8_t a = 1; a < na; ++a) {
+            uint32_t child = tree_.children[action_offset + a];
+            std::vector<float> child_vals =
+                cpu_best_response_traverse(child, player, reach_oop, reach_ip);
+            for (uint16_t c = 0; c < nc; ++c) {
+                best[c] = std::max(best[c], child_vals[c]);
             }
         }
         return best;
@@ -816,24 +1356,23 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
 
     // Opponent: play averaged strategy, absorbed into reach, then sum children
     bool has_strat = (node_idx < strategy_.size() && !strategy_[node_idx].empty());
-    std::vector<std::vector<float>> action_vals(na);
+    std::vector<float> node_vals(nc, 0.0f);
+    uint32_t action_offset = tree_.children_offset[node_idx];
+    auto& acting_reach = (acting == 0) ? reach_oop : reach_ip;
+    std::vector<float> saved(nc);
     for (uint8_t a = 0; a < na; ++a) {
-        uint32_t child = tree_.children[tree_.children_offset[node_idx] + a];
-        auto& acting_reach = (acting == 0) ? reach_oop : reach_ip;
-        std::vector<float> saved(nc);
+        uint32_t child = tree_.children[action_offset + a];
         for (uint16_t c = 0; c < nc; ++c) {
             saved[c] = acting_reach[c];
             if (has_strat) {
                 acting_reach[c] *= strategy_[node_idx][a * nc + c];
             }
         }
-        action_vals[a] = cpu_best_response_traverse(child, player, reach_oop, reach_ip);
+        std::vector<float> child_vals =
+            cpu_best_response_traverse(child, player, reach_oop, reach_ip);
         for (uint16_t c = 0; c < nc; ++c) acting_reach[c] = saved[c];
-    }
-    std::vector<float> node_vals(nc, 0.0f);
-    for (uint8_t a = 0; a < na; ++a) {
         for (uint16_t c = 0; c < nc; ++c) {
-            node_vals[c] += action_vals[a][c];
+            node_vals[c] += child_vals[c];
         }
     }
     return node_vals;
@@ -843,13 +1382,43 @@ inline float Solver::compute_exploitability() {
     if (!solved_ || strategy_.empty()) return 0.0f;
     uint16_t nc = iso_.num_canonical;
 
-    auto r_oop = oop_reach_;
-    auto r_ip  = ip_reach_;
-    auto br_oop_per_combo = cpu_best_response_traverse(0, 0, r_oop, r_ip);
+    std::vector<float> br_oop_per_combo;
+    std::vector<float> br_ip_per_combo;
 
-    r_oop = oop_reach_;
-    r_ip  = ip_reach_;
-    auto br_ip_per_combo = cpu_best_response_traverse(0, 1, r_oop, r_ip);
+    // Prefer GPU postsolve. Both BR vectors must be size==nc to count as a
+    // success — anything else falls back to CPU traversal.
+    if (!config_.force_cpu_postsolve &&
+        backend_ && backend_->supports_gpu_postsolve()) {
+        br_oop_per_combo = backend_->compute_best_response_gpu(0);
+        br_ip_per_combo  = backend_->compute_best_response_gpu(1);
+    }
+    bool gpu_ok = (br_oop_per_combo.size() == nc &&
+                   br_ip_per_combo.size()  == nc);
+
+    if (!gpu_ok) {
+        if (config_.parallel_postsolve) {
+            auto oop_future = std::async(std::launch::async, [&]() {
+                auto r_oop = oop_reach_;
+                auto r_ip  = ip_reach_;
+                return cpu_best_response_traverse(0, 0, r_oop, r_ip);
+            });
+            auto ip_future = std::async(std::launch::async, [&]() {
+                auto r_oop = oop_reach_;
+                auto r_ip  = ip_reach_;
+                return cpu_best_response_traverse(0, 1, r_oop, r_ip);
+            });
+            br_oop_per_combo = oop_future.get();
+            br_ip_per_combo = ip_future.get();
+        } else {
+            auto r_oop = oop_reach_;
+            auto r_ip  = ip_reach_;
+            br_oop_per_combo = cpu_best_response_traverse(0, 0, r_oop, r_ip);
+
+            r_oop = oop_reach_;
+            r_ip  = ip_reach_;
+            br_ip_per_combo = cpu_best_response_traverse(0, 1, r_oop, r_ip);
+        }
+    }
 
     float br_oop_total = 0.0f, br_ip_total = 0.0f;
     float total_oop_w = 0.0f,  total_ip_w  = 0.0f;
@@ -1363,21 +1932,92 @@ inline ComboAnalysis Solver::analyze_combo(const std::string& combo_str) const {
 // ============================================================================
 
 inline std::map<std::string, Solver::StrategyTreeEntry>
-Solver::build_strategy_tree(int max_player_depth) const {
+Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
+                             uint32_t max_nodes, bool* out_truncated) const {
     std::map<std::string, StrategyTreeEntry> out;
+    if (out_truncated) *out_truncated = false;
     if (!solved_) return out;
+
+    const bool need_evs = (ev_mode != StrategyTreeEvMode::NONE);
+
+    // Sprint 1: resolve the emitted-node cap. 0 = inherit from config.
+    // Final 0 = unlimited (legacy behavior). We compare against `out.size()`
+    // inside the walk lambda below.
+    uint32_t effective_max_nodes = max_nodes;
+    if (effective_max_nodes == 0) {
+        effective_max_nodes = config_.memory_budget.strategy_tree_max_nodes;
+    }
+    bool truncated = false;
+
+    // Phase 3 (10-point plan): cap the EV cache size by computing the set of
+    // nodes the strategy tree will actually emit BEFORE running the EV pass,
+    // then telling cpu_ev_traverse to drop everything else. The pre-walk
+    // mirrors the recursion structure of the main `walk` below but only
+    // collects node ids — no allocation per node — so it's effectively free.
+    //
+    // FULL mode skips this and records every visited node, matching the
+    // pre-Phase-3 behavior (kept as an escape hatch for tests / debugging).
+    std::set<uint32_t> visible_nodes;
+    if (need_evs && ev_mode == StrategyTreeEvMode::VISIBLE) {
+        std::function<void(uint32_t, int, int)> precount;
+        precount = [&](uint32_t node, int player_depth, int chance_levels_seen) {
+            // Mirror the chance-handling in `walk`: at first chance level
+            // enumerate every runout option; afterwards auto-skip to lex-min.
+            int chance_seen = chance_levels_seen;
+            while (node < tree_.total_nodes &&
+                   static_cast<NodeType>(tree_.node_types[node]) == NodeType::CHANCE) {
+                uint8_t nch = tree_.num_children[node];
+                if (nch == 0) return;
+                if (chance_seen == 0) {
+                    uint32_t off = tree_.children_offset[node];
+                    bool any_real = false;
+                    for (uint8_t k = 0; k < nch; ++k) {
+                        uint32_t child = tree_.children[off + k];
+                        uint8_t dc = (child < tree_.dealt_card.size())
+                            ? tree_.dealt_card[child] : 0xFFu;
+                        if (dc == 0xFFu) continue;
+                        any_real = true;
+                        precount(child, player_depth, chance_seen + 1);
+                    }
+                    if (any_real) return;
+                    // single-option chance: fall through to auto-skip
+                    uint32_t child = tree_.children[off];
+                    node = child;
+                    ++chance_seen;
+                    continue;
+                }
+                uint32_t child = tree_.children[tree_.children_offset[node]];
+                node = child;
+                ++chance_seen;
+            }
+            if (node >= tree_.total_nodes) return;
+            auto nt = static_cast<NodeType>(tree_.node_types[node]);
+            if (nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) return;
+            visible_nodes.insert(node);
+            if (player_depth >= max_player_depth) return;
+            uint8_t na = tree_.num_children[node];
+            uint32_t off = tree_.children_offset[node];
+            for (uint8_t a = 0; a < na; ++a) {
+                precount(tree_.children[off + a], player_depth + 1, chance_seen);
+            }
+        };
+        precount(0, 0, 0);
+    }
 
     // Pre-compute per-node EVs from each player's perspective by running
     // cpu_ev_traverse from root with capture maps. One pass per perspective
-    // gets values for ALL inner nodes — way cheaper than re-traversing per
-    // cache entry. Memory: ~nodes × nc × 4B (~few MB for typical solves).
+    // gets values for the visible-or-all set — depending on ev_mode.
     std::map<uint32_t, std::vector<float>> node_vals_oop;
     std::map<uint32_t, std::vector<float>> node_vals_ip;
-    {
+    if (need_evs) {
+        const std::set<uint32_t>* filter = nullptr;
+        if (ev_mode == StrategyTreeEvMode::VISIBLE) {
+            filter = &visible_nodes;
+        }
         auto roop = oop_reach_, rip = ip_reach_;
-        cpu_ev_traverse(0, 0, roop, rip, &node_vals_oop);
+        cpu_ev_traverse(0, 0, roop, rip, &node_vals_oop, filter);
         roop = oop_reach_; rip = ip_reach_;
-        cpu_ev_traverse(0, 1, roop, rip, &node_vals_ip);
+        cpu_ev_traverse(0, 1, roop, rip, &node_vals_ip, filter);
     }
 
     // Aggregate per-canonical-combo values into per-grid-label EVs at one
@@ -1399,6 +2039,7 @@ Solver::build_strategy_tree(int max_player_depth) const {
     float ip_norm  = 1.0f / std::max(1e-6f, opp_total_weight(true));  // IP acting  → OOP opp
 
     auto evs_at = [&](uint32_t node) -> std::vector<std::pair<std::string, float>> {
+        if (!need_evs) return {};
         auto nt = static_cast<NodeType>(tree_.node_types[node]);
         if (nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) return {};
         bool acting_is_ip = (nt == NodeType::PLAYER_IP);
@@ -1538,6 +2179,16 @@ Solver::build_strategy_tree(int max_player_depth) const {
         if (nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) return;
         if (out.count(path)) return;  // already cached (shared sub-path)
 
+        // Sprint 1: emitted-node cap. Once we've cached `effective_max_nodes`
+        // unique entries, refuse to add more — any further `walk` recursion
+        // returns immediately. We mark `truncated` so the caller can show
+        // "tree truncated at N nodes" in the UI instead of silently dropping
+        // branches.
+        if (effective_max_nodes > 0 && out.size() >= effective_max_nodes) {
+            truncated = true;
+            return;
+        }
+
         StrategyTreeEntry entry;
         entry.acting          = acting_player_at(node);
         entry.action_labels   = get_action_labels_at(node);
@@ -1574,6 +2225,7 @@ Solver::build_strategy_tree(int max_player_depth) const {
     std::vector<uint8_t> empty_cards;
     std::vector<RunoutOption> empty_runouts;
     walk(0, "", empty_cards, empty_runouts, 0, 0);
+    if (out_truncated) *out_truncated = truncated;
     return out;
 }
 

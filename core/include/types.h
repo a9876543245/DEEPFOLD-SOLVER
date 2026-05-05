@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include "memory_budget.h"
+
 #include <cstdint>
 #include <vector>
 #include <array>
@@ -216,10 +218,35 @@ struct SolverConfig {
     /// The engine defaults to true so the root offers meaningful action to the UI.
     bool oop_has_initiative = true;
 
-    // DCFR hyperparameters
+    // DCFR hyperparameters (used when dcfr_schedule == STANDARD)
     float dcfr_alpha = 1.5f;
     float dcfr_beta  = 0.5f;
     float dcfr_gamma = 2.0f;
+
+    // DCFR discount schedule selector. STANDARD uses (t/(t+1))^alpha-style
+    // exponent decay + accumulative reach-weighted strategy_sum (textbook
+    // DCFR). POSTFLOP_STYLE matches wasm-postflop / postflop-solver:
+    //   alpha_t = t^1.5 / (t^1.5 + 1), beta_t = 0.5 (constant), gamma_t
+    //   resets every power-of-4 iteration. strategy_sum is decay-and-add
+    //   (no reach weighting), giving an "average over recent iterations of
+    //   the current epoch" instead of "average over all iterations". This
+    //   converges to less-mixed equilibria on deep trees, which appears to
+    //   match published Pio outputs better than our STANDARD schedule on
+    //   over-checking-prone spots.
+    enum class DcfrSchedule : uint8_t {
+        STANDARD = 0,
+        POSTFLOP_STYLE = 1,
+    };
+    DcfrSchedule dcfr_schedule = DcfrSchedule::STANDARD;
+
+    // Cash-game rake. Applied at every fold/showdown terminal:
+    //   rake = min(pot_at_terminal * rake_rate, rake_cap)
+    // Winner takes (pot - rake), losers take pot's share unchanged. On a
+    // showdown tie each player loses rake/2 (split rake equally).
+    // Default 0/0 = rake-free (matches solver-textbook / Pio cash mode).
+    // NL25 typical: 0.05 / 2.0 (5% capped at 2bb). NL100+: lower cap usually.
+    float rake_rate = 0.0f;
+    float rake_cap  = 0.0f;
 
     // Preflop range weights: [1326] floats, 0.0 = not in range, 1.0 = full weight
     // Default: all 1.0 (no filtering)
@@ -229,6 +256,30 @@ struct SolverConfig {
 
     // Node locks: force strategy at specific (node, combo) pairs
     std::vector<NodeLockEntry> node_locks;
+
+    // Post-solve reporting passes. Full UI solves keep both enabled; batch
+    // benchmarks can disable them to isolate pure CFR iteration throughput.
+    bool compute_combo_evs = true;
+    bool compute_exploitability = true;
+    bool parallel_postsolve = true;
+    // 0 = auto (hardware concurrency). Used by the CPU postsolve thread pool.
+    uint32_t postsolve_threads = 0;
+    // Skip the GPU-postsolve fast path even if the backend supports it.
+    // Used by tests that want to validate CPU postsolve on a GPU-solved
+    // strategy (or vice-versa).
+    bool force_cpu_postsolve = false;
+
+    /// Sprint 1 (market-beating plan): the host RAM / GPU VRAM / JSON /
+    /// strategy-tree budget that gates every large allocation in the solve
+    /// pipeline. Defaults are sane (6 GB host, 100 MB JSON, 2000 emitted
+    /// nodes); CLI flags override per-solve.
+    MemoryBudget memory_budget = MemoryBudget::defaults();
+
+    /// Hard cap on emitted strategy-tree nodes. 0 = use memory_budget value.
+    /// Surfaced as `--strategy-tree-max-nodes`. When tree generation hits
+    /// this cap, remaining branches are pruned and SolverResult.resources
+    /// records `strategy_tree_truncated=true`.
+    uint32_t strategy_tree_max_nodes = 0;
 
     SolverConfig() {
         ip_range_weights.fill(1.0f);
@@ -249,10 +300,57 @@ struct ComboAnalysis {
     std::vector<std::pair<std::string, float>> strategy_mix;
 };
 
+struct SolverTiming {
+    float tree_build_ms = 0.0f;
+    float isomorphism_ms = 0.0f;
+    float precompute_matchups_ms = 0.0f;
+    float reach_init_ms = 0.0f;
+    float node_locks_ms = 0.0f;
+    float backend_prepare_ms = 0.0f;
+    float iterations_ms = 0.0f;
+    float finalize_ms = 0.0f;
+    float combo_evs_ms = 0.0f;
+    float exploitability_ms = 0.0f;
+    float postsolve_ms = 0.0f;
+    float total_ms = 0.0f;
+
+    uint32_t tree_nodes = 0;
+    uint32_t tree_edges = 0;
+    uint32_t matchup_tables = 0;
+    uint32_t postsolve_threads = 1;
+};
+
+/// Sprint 1 (market-beating plan): per-solve resource report. Every solve
+/// fills this with byte-level estimates and the budget decision so the UI
+/// (and benchmark harness) can show "this run cost X MB host, Y MB GPU,
+/// Z MB JSON; reduced runouts? truncated tree? fell back to CPU?".
+struct SolveResources {
+    uint32_t canonical_combos          = 0;
+    uint32_t player_nodes              = 0;
+    uint64_t estimated_matchup_bytes   = 0;
+    uint64_t estimated_cpu_state_bytes = 0;
+    uint64_t estimated_gpu_state_bytes = 0;
+    uint64_t estimated_strategy_tree_bytes = 0;
+    uint64_t estimated_json_bytes      = 0;
+    uint64_t host_budget_bytes         = 0;
+    uint64_t gpu_budget_bytes          = 0;
+    uint32_t strategy_tree_max_nodes   = 0;
+    uint32_t strategy_tree_emitted_nodes = 0;
+    bool     strategy_tree_truncated   = false;
+    /// Stringified BudgetDecision (see memory_budget.h).
+    std::string budget_decision        = "ok";
+    /// Free-text describing why we fell back / downgraded, if any.
+    std::string fallback_reason;
+    /// Human-readable diagnostic when budget_decision != "ok".
+    std::string diagnostic;
+};
+
 /// Full solver result
 struct SolverResult {
     int iterations_run = 0;
     float exploitability_pct = 0.0f;
+    bool combo_evs_computed = false;
+    bool exploitability_computed = false;
 
     /// Action labels for the current node (e.g., "Check", "Bet_33", "Bet_75")
     std::vector<std::string> action_labels;
@@ -286,6 +384,11 @@ struct SolverResult {
     /// heaviest label at this node. Used for the "view opponent" toggle.
     std::string opponent_side;  // "OOP" | "IP" (who the opponent is)
     std::vector<std::pair<std::string, float>> opponent_range;
+
+    SolverTiming timing;
+
+    /// Sprint 1: per-solve resource estimate + budget decision.
+    SolveResources resources;
 };
 
 } // namespace deepsolver

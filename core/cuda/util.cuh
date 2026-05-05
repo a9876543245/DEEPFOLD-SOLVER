@@ -9,20 +9,74 @@
 #include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 // ============================================================================
-// Error Checking Macro
+// Error Checking — throws CudaError instead of exit()
 // ============================================================================
+//
+// Phase 4 of the 10-point maturity plan: CUDA failures must be recoverable.
+// Calling exit(EXIT_FAILURE) skips all destructors, leaks device memory,
+// and prevents the CLI's structured JSON error path (and the Tauri/Rust
+// CPU-fallback detector) from running.
+//
+// Now: every cudaError_t failure throws a CudaError. main.cpp catches
+// std::exception and emits {"status":"error","message":"..."} on stderr.
+// Rust's engine.rs scans that message for "CUDA"/"out of memory" to decide
+// whether to retry on CPU.
+//
+// Non-zero return codes inside __device__ code are not affected — these
+// macros only run on the host side (cudaMalloc / cudaMemcpy / kernel launch
+// errors) where exception unwinding is well-defined.
+
+namespace deepsolver {
+namespace gpu {
+
+class CudaError : public std::runtime_error {
+public:
+    CudaError(const char* file, int line, cudaError_t err)
+        : std::runtime_error(build_message(file, line, err)),
+          file_(file), line_(line), code_(err) {}
+
+    cudaError_t code() const noexcept { return code_; }
+    const char* file() const noexcept { return file_; }
+    int         line() const noexcept { return line_; }
+
+private:
+    static std::string build_message(const char* file, int line, cudaError_t err) {
+        // Keep the literal substrings "CUDA" and the cudaGetErrorString text so
+        // Rust's GPU-error sniffer (engine.rs:looks_like_gpu_err) and humans
+        // can see what happened. cudaGetErrorString includes "out of memory"
+        // for cudaErrorMemoryAllocation, which the Rust side also matches on.
+        std::string msg = "CUDA error at ";
+        msg += file ? file : "<unknown>";
+        msg += ":";
+        msg += std::to_string(line);
+        msg += ": ";
+        const char* es = cudaGetErrorString(err);
+        msg += es ? es : "<no error string>";
+        msg += " (code=";
+        msg += std::to_string(static_cast<int>(err));
+        msg += ")";
+        return msg;
+    }
+
+    const char* file_;
+    int         line_;
+    cudaError_t code_;
+};
+
+} // namespace gpu
+} // namespace deepsolver
 
 #define CUDA_CHECK(call)                                                        \
     do {                                                                         \
-        cudaError_t err = (call);                                               \
-        if (err != cudaSuccess) {                                               \
-            fprintf(stderr, "CUDA Error at %s:%d: %s\n",                       \
-                    __FILE__, __LINE__, cudaGetErrorString(err));               \
-            exit(EXIT_FAILURE);                                                 \
-        }                                                                       \
+        cudaError_t _cuda_err = (call);                                          \
+        if (_cuda_err != cudaSuccess) {                                          \
+            throw ::deepsolver::gpu::CudaError(__FILE__, __LINE__, _cuda_err);   \
+        }                                                                        \
     } while (0)
 
 // ============================================================================

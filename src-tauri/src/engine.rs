@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
-use crate::types::{GpuInfo, SolverRequest, SolverResponse};
+use crate::types::{GpuInfo, ResolvedMemoryBudget, SolverRequest, SolverResponse};
 
 /// Diagnostic log file location. Writes CLI args and engine stderr on each
 /// run so we can diagnose user-reported crashes without reproducing state.
@@ -239,6 +239,28 @@ async fn try_run_solver(
         }
     }
 
+    // Sprint 3 (resource policy guide): forward resolved memory budget.
+    // The C++ CLI treats 0 as "use built-in default", so we only send a
+    // flag when the resolved value is non-zero. GPU specifically: gpu_mb
+    // == 0 means "let backend probe at runtime", so omit the flag.
+    let mb = ResolvedMemoryBudget::resolve(request);
+    if mb.host_mb > 0 {
+        args.push("--host-memory-mb".to_string());
+        args.push(mb.host_mb.to_string());
+    }
+    if mb.gpu_mb > 0 {
+        args.push("--gpu-memory-mb".to_string());
+        args.push(mb.gpu_mb.to_string());
+    }
+    if mb.json_mb > 0 {
+        args.push("--json-memory-mb".to_string());
+        args.push(mb.json_mb.to_string());
+    }
+    if mb.strategy_tree_max_nodes > 0 {
+        args.push("--strategy-tree-max-nodes".to_string());
+        args.push(mb.strategy_tree_max_nodes.to_string());
+    }
+
     // Log the command for post-hoc debugging of crashes.
     let quoted_args: Vec<String> = args.iter().map(|a| {
         if a.contains(' ') || a.contains('"') {
@@ -258,6 +280,12 @@ async fn try_run_solver(
     cmd.args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Phase 5 (10-point maturity plan): if the Tauri command future is dropped
+    // (frontend reload, app shutdown, parent task cancelled), `kill_on_drop`
+    // makes Tokio reap the child instead of leaving it as a 100% CPU/GPU
+    // orphan. Without this a runaway solve survives the UI closing.
+    cmd.kill_on_drop(true);
 
     // Hide the console window that Windows would otherwise pop up for every
     // subprocess call. CREATE_NO_WINDOW = 0x08000000.
@@ -301,7 +329,7 @@ async fn try_run_solver(
         900,
     );
 
-    let stdout_result = timeout(Duration::from_secs(timeout_secs), async {
+    let stdout_result = match timeout(Duration::from_secs(timeout_secs), async {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
         let mut json_output = String::new();
@@ -310,10 +338,34 @@ async fn try_run_solver(
             json_output.push('\n');
         }
         json_output
-    }).await.map_err(|_| format!(
-        "Engine timed out after {} seconds ({} iterations requested). Try reducing iterations.",
-        timeout_secs, request.iterations
-    ))?;
+    }).await {
+        Ok(s) => s,
+        Err(_) => {
+            // Phase 5: previously we returned without killing the child, so the
+            // engine kept burning CPU/GPU/RAM in the background after the user
+            // saw a "timeout" toast. Now we explicitly:
+            //   1. SIGKILL/TerminateProcess the child
+            //   2. await child.wait so the OS reaps it (no zombie / locked exe)
+            //   3. drain the stderr collector so its task ends cleanly
+            //   4. log pid + backend + iters + board for post-hoc diagnosis
+            let pid = child.id();
+            log_to_file(&format!(
+                "TIMEOUT killing engine pid={:?} backend={} iterations={} board={:?} timeout_secs={}",
+                pid,
+                backend_override.unwrap_or("(none)"),
+                request.iterations,
+                request.board,
+                timeout_secs
+            ));
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stderr_handle.await;
+            return Err(format!(
+                "Engine timed out after {} seconds ({} iterations requested). Try reducing iterations.",
+                timeout_secs, request.iterations
+            ));
+        }
+    };
 
     let status = child.wait().await
         .map_err(|e| format!("Engine process error: {}", e))?;

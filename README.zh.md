@@ -4,19 +4,55 @@
 
 **[English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)**
 
+📘 **[使用說明 (中文)](USER_GUIDE.zh.md)** · **[User Guide (English)](USER_GUIDE.md)**
+
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.0.4-green)
+![Version](https://img.shields.io/badge/version-1.1.0-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
-DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。把 GPU 加速的 DCFR 引擎（含 CPU fallback）跟 **2,500+ preflop 場景圖庫**綁在一起，單一 Windows 安裝檔搞定。
+DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GPU 加速的 DCFR 引擎（含 CPU fallback）+ **runout 聚合報告、per-combo blocker 分析、2,500+ preflop 圖庫**，單一 Windows 安裝檔搞定。
 
-## v1.0.4 新功能
+## v1.1.0 新功能
 
-- **Phase 2 花色同構** — runout 列舉採用 PioSolver / GTO+ 風格的對稱壓縮。Monotone 跟三花色板可加速 **3-7 倍**，策略品質完全沒退步
-- **GPU per-runout matchup table** — chance node 列舉走 CUDA。iso 啟用時 **6-10 倍** 比 CPU 快
-- **Route A 導航 cache** — 解一次，到處點。UI 動作切換現在是 **O(1) cache 查找**，不用每次重 solve。再也不用每點一下等 8 秒
-- **Path B runout 選擇器** — iso 把多張 canonical river card 列出來時，UI 會顯示 runout 選擇器。點任一張 canonical card 切換到該子樹策略。PioSolver 風格的 chance-aware 導航
-- **GTO 圖庫** — 內建 2,550+ preflop 場景（Cash 6max/8max + MTT），可在 app 內瀏覽，一鍵套用為 IP / OOP range
+> v1.1.0 是 feature drop，主打**市面 solver 沒有的解後分析工具**。
+> 引擎本體也做了一輪嚴肅的資源安全升級。
+
+### 三個旗艦功能
+
+- **Runout Report**（runout 聚合報告） — 解完一次按一鍵，所有 canonical
+  turn card 攤成 13×4 grid，按 dominant action 上色。切到 **By Class**
+  view，23+ 張 turns 自動分到 **Pair / Flush / Straight / Overcard /
+  Brick** 五個 texture bucket，每 bucket 有 weighted strategy + EV。可按
+  Best EV / Worst EV / Most aggressive 排序。一鍵匯出 CSV。
+- **1326 Combo Drill**（specific combo 拆解） — 點任一 169-class label，
+  展開成 4/6/12 specific combos，每張附 **per-combo blocker analysis**：
+  你的 hand 擋掉對手 range 的百分比 + Top-5 最常被擋到的對手 class。
+  撲克 mixed-strategy 的標準 tie-breaker，終於是一級 UI。
+- **Memory Profile** 預設 — `safe / balanced / performance` 三種 profile
+  在 solve 前就把 host RAM / JSON / strategy-tree-node 預算定死。Solver
+  全程遵守預算 — 不會再有沉默 OOM。
+
+### 引擎資源安全
+
+- **Pre-backend budget gate** — CPU host / GPU VRAM / AUTO fallback 全
+  在 allocation **前**評估完。OOM 變成結構化錯誤 + UI badge，不是 crash。
+- **CUDA exception-based 錯誤處理** — `CUDA_CHECK` 改成 throw `CudaError`
+  而非 `exit()`。失敗時 partial allocation 乾淨 rollback。
+- **Chunked GPU matchup 上傳** — 拿掉 host-side `flat_ev` / `flat_valid`
+  duplication。改成 per-runout 的 `cudaMemset + cudaMemcpy`。GPU prep 時
+  peak host RAM 降低。
+- **Strategy tree EV emission 模式** — `none | visible | full` 讓你裁
+  JSON 輸出（例 headless benchmark 場景）。
+- **測試分層** — ctest 現在有 labeled suite：`smoke`（~13s）、
+  `correctness`（~106s）、`stress`（nightly），加 `gpu` / `memory`。
+
+### v1.0.4–1.0.11 延續
+
+- Phase 2 花色同構（monotone / 三花色板 3–7× 加速）
+- GPU per-runout matchup table（iso 啟用時 6–10× 比 CPU 快）
+- Route A 導航 cache（O(1) 動作切換，不用重 solve）
+- Path B runout 選擇器（PioSolver 風格 chance-aware 導航）
+- GameContextSelector — Cash 6max/8max + MTT + stack picker
 
 ## 下載
 
@@ -51,8 +87,11 @@ GPU 自動偵測。右上角的狀態指示燈一眼就能看出 **CUDA** / **CP
 | **GTO Solver** | Discounted CFR 配上向量化 GPU kernel。一般 turn spot 幾秒內收斂到 sub-percent exploitability |
 | **每手策略 grid** | 13×13 grid 在當前決策點按動作 mix 上色。hover 看花色變體拆解 |
 | **行動方／對手視角切換** | 同節點切換你的策略 vs 對手的 reach-weighted range |
-| **Runout 選擇器 (v1.0.4)** | iso 列舉啟用時，點任一 canonical river card 切換子樹 |
-| **GTO 圖庫 (v1.0.4)** | 內建 2,550+ preflop 場景，app 內瀏覽。一鍵套用為 IP / OOP range |
+| **🆕 Runout Report (v1.1.0)** | 解完任何 spot 後一鍵把所有 turn card 攤成 13×4 grid + texture bucket view + 4 種排序 + CSV 匯出。看[使用說明](USER_GUIDE.zh.md#2-runout-report--一眼看完所有-turn-走勢) |
+| **🆕 1326 Combo Drill (v1.1.0)** | 任一 169-class 展開成 4/6/12 specific combos，附 per-combo blocker analysis。看[使用說明](USER_GUIDE.zh.md#3-combo-drill--用-blocker-拆-1326-specific-combos) |
+| **🆕 Memory Profile (v1.1.0)** | `safe / balanced / performance` 預設管 host RAM / JSON / strategy-tree-node 預算。不再沉默 OOM |
+| **Runout 選擇器** | iso 列舉啟用時，點任一 canonical river card 切換子樹 |
+| **GTO 圖庫** | 內建 2,550+ preflop 場景，app 內瀏覽。一鍵套用為 IP / OOP range |
 | **下注尺度預設** | Standard / Polar / Small Ball — 同時影響 solver tree 跟 UI 按鈕 |
 | **訓練模式** | 10 題 drill 對你的答案打分（vs 均衡） |
 | **預解 spot 圖庫** | 120+ 常見 flop spot，一鍵載入 |

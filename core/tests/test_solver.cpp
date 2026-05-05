@@ -130,7 +130,11 @@ static void test_global_strategy_shape() {
     auto& eval = get_evaluator();
     eval.initialize();
 
-    auto config = make_flop_config(100);
+    // Sprint 5: was 100 iter (~80s on this binary). Strategy shape is a
+    // structural check ("frequencies sum to ~100%, each in [0,100]"), not
+    // a convergence check, so 50 iter is plenty and keeps the fast suite
+    // under the 60-second budget.
+    auto config = make_flop_config(50);
     Solver solver(config);
     auto result = solver.solve();
 
@@ -262,16 +266,46 @@ static void test_polar_oop_produces_bets() {
 // ----------------------------------------------------------------------------
 // Main
 // ----------------------------------------------------------------------------
+//
+// Sprint 5 (resource policy guide): the binary now accepts a `--suite=NAME`
+// filter so ctest can register multiple targets with different labels and
+// timeouts:
+//
+//   --suite=fast      → ev sanity + strategy shape + root-has-bet
+//                       (correctness label, < 60s)
+//   --suite=stress    → convergence + ev monotonicity + polar OOP
+//                       (stress label, can take minutes)
+//   --suite=all       → run everything (default — keeps the previous
+//                       behavior for callers without --suite)
+//
+// Splitting was driven by test_polar_oop_produces_bets and test_convergence
+// blowing past the original "<60s" comment: the old single binary hit
+// 240s+ which made `ctest -L correctness` useless as a daily gate.
 
-int main() {
-    std::cout << "=== DeepSolver CPU correctness test suite ===\n\n";
+int main(int argc, char* argv[]) {
+    std::string suite = "all";
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        const std::string prefix = "--suite=";
+        if (a.rfind(prefix, 0) == 0) suite = a.substr(prefix.size());
+    }
 
-    RUN_TEST(test_ev_sanity);
-    RUN_TEST(test_convergence);
-    RUN_TEST(test_global_strategy_shape);
-    RUN_TEST(test_ev_combo_monotonicity);
-    RUN_TEST(test_root_has_bet_action);
-    RUN_TEST(test_polar_oop_produces_bets);
+    std::cout << "=== DeepSolver CPU correctness test suite (" << suite
+              << ") ===\n\n";
+
+    auto want_fast   = (suite == "all" || suite == "fast");
+    auto want_stress = (suite == "all" || suite == "stress");
+
+    if (want_fast) {
+        RUN_TEST(test_ev_sanity);
+        RUN_TEST(test_global_strategy_shape);
+        RUN_TEST(test_root_has_bet_action);
+    }
+    if (want_stress) {
+        RUN_TEST(test_convergence);
+        RUN_TEST(test_ev_combo_monotonicity);
+        RUN_TEST(test_polar_oop_produces_bets);
+    }
 
     std::cout << "=== " << g_tests_passed << " / " << g_tests_run
               << " tests passed ===\n";

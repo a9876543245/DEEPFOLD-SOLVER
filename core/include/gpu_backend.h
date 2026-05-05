@@ -43,6 +43,19 @@ public:
     const std::vector<std::vector<float>>& strategy() const override { return strategy_; }
     const char* name() const override { return name_.c_str(); }
 
+    // GPU postsolve fast paths. Both reuse the device buffers already
+    // populated by iterate()+finalize() (averaged strategy lives in
+    // current_strategy after finalize, root reach in reach.{oop,ip}_reach).
+    //   compute_combo_evs_gpu():    OOP-perspective per-combo EV at root,
+    //                               returned in canonical-combo order, length nc.
+    //                               Caller applies the same 1/total_ip_weight
+    //                               scaling that compute_combo_evs() does on CPU.
+    //   compute_best_response_gpu(player): per-combo BR value at root for
+    //                               player ∈ {0=OOP, 1=IP}, length nc.
+    bool supports_gpu_postsolve() const override { return true; }
+    std::vector<float> compute_combo_evs_gpu() override;
+    std::vector<float> compute_best_response_gpu(int player) override;
+
 private:
     // pimpl hides CUDA types from this header
     struct Impl;

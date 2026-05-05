@@ -4,19 +4,59 @@
 
 **[English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)**
 
+📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
+
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.0.4-green)
+![Version](https://img.shields.io/badge/version-1.1.0-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
-DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). It pairs a GPU-accelerated DCFR engine (with full CPU fallback) with a chart browser drawing on **2,500+ preflop scenarios** extracted from training material — all in a single Windows installer.
+DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). It pairs a GPU-accelerated DCFR engine (with full CPU fallback) with **runout aggregation, per-combo blocker analysis, and a 2,500+ preflop chart browser** — all in a single Windows installer.
 
-## Highlights in v1.0.4
+## What's new in v1.1.0
 
-- **Phase 2 suit isomorphism** — runout enumeration mirrors PioSolver / GTO+ symmetry compression. Monotone & three-of-suit boards solve **3-7× faster** with no loss of strategy quality.
-- **GPU per-runout matchup tables** — chance-node enumeration runs on CUDA. **6-10× speedup** vs CPU on iso-engaged trees.
-- **Route A navigation cache** — solve once, click anywhere. Action navigation in the UI is now an **O(1) cache lookup** instead of a fresh solve. No more 8-second waits between clicks.
-- **Path B runout selector** — when isomorphism enumerates multiple canonical river cards, the UI now shows a runout picker. Click any canonical card to switch to that subtree's strategy. PioSolver-style chance-aware navigation.
-- **GTO chart library** — 2,550+ bundled preflop scenarios (Cash 6max/8max + MTT) browsable in-app, with one-click "apply as IP / OOP range".
+> v1.1.0 is a feature drop focused on **post-solve insight tools** that other
+> solvers don't have. The engine itself also got a serious resource-safety pass.
+
+### Three flagship features
+
+- **Runout Report** — One click after a solve fans out every canonical turn
+  card into a single 13×4 grid colored by dominant action. Switch to **By
+  Class** view and the 23+ turns are grouped into **Pair / Flush / Straight /
+  Overcard / Brick** texture buckets with weighted strategy + EV per bucket.
+  Sort by Best EV / Worst EV / Most aggressive. Export to CSV.
+- **1326 Combo Drill** — Click any 169-class label to expand the 4/6/12
+  specific combos in that class with **per-combo blocker analysis**. See
+  exactly how much of the opponent's range each specific hand removes,
+  with the top-5 most-blocked opponent classes called out. The standard
+  poker tie-breaker for mixed strategies, finally first-class in the UI.
+- **Memory Profile presets** — `safe / balanced / performance` profiles
+  pick host-RAM, JSON, and strategy-tree-node budgets up front. The
+  solver respects the budget end-to-end — no more silent OOM kills.
+
+### Engine resource safety
+
+- **Pre-backend budget gate** — CPU host / GPU VRAM / AUTO fallback all
+  evaluated *before* allocation. OOM scenarios become structured errors
+  with a UI badge, not crashes.
+- **CUDA exception-based error handling** — `CUDA_CHECK` throws
+  `CudaError` instead of `exit()`. Partial allocations roll back cleanly
+  on failure.
+- **Chunked GPU matchup upload** — host-side `flat_ev` / `flat_valid`
+  duplication eliminated. Upload happens per-runout via `cudaMemset +
+  cudaMemcpy`. Lower peak host RAM during GPU prep.
+- **Strategy tree EV emission modes** — `none | visible | full` lets you
+  trim the JSON output for narrow workflows (e.g. headless benchmarks).
+- **Test layering** — ctest now has labeled suites: `smoke` (~13s),
+  `correctness` (~106s), `stress` (nightly), plus dedicated `gpu` and
+  `memory` labels.
+
+### Carried forward from v1.0.4–1.0.11
+
+- Phase 2 suit isomorphism (3–7× speedup on monotone / three-of-suit boards)
+- GPU per-runout matchup tables (6–10× over CPU on iso-engaged trees)
+- Route A navigation cache (O(1) action switching, no re-solve)
+- Path B runout selector (PioSolver-style chance-aware navigation)
+- GameContextSelector — Cash 6max/8max + MTT + stack picker
 
 ## Download
 
@@ -51,8 +91,11 @@ Not a member yet? Upgrade at [deepfold.co](https://deepfold.co).
 | **GTO Solver** | Discounted CFR with vectorized GPU kernels. Sub-percent exploitability in seconds for typical turn spots. |
 | **Per-combo strategy grid** | 13×13 grid colored by action mix at the current decision node. Hover for suited-variant breakdown. |
 | **Acting ↔ Opponent view** | Toggle between your strategy and the opponent's reach-weighted range at the same node. |
-| **Runout picker (v1.0.4)** | When iso enumeration is engaged, click any canonical river card to switch subtrees. |
-| **GTO chart library (v1.0.4)** | 2,550+ bundled preflop scenarios browsable in-app. One click applies as IP / OOP range. |
+| **🆕 Runout Report (v1.1.0)** | After any solve, fan out all enumerated turn cards into a 13×4 grid + texture-bucket view + 4 sort modes + CSV export. See the [User Guide](USER_GUIDE.md#2-runout-report--see-every-turn-at-once). |
+| **🆕 1326 Combo Drill (v1.1.0)** | Expand any 169-class into its 4/6/12 specific combos with per-combo blocker analysis vs the opponent's range. See the [User Guide](USER_GUIDE.md#3-combo-drill--break-169-classes-into-specific-combos). |
+| **🆕 Memory Profile (v1.1.0)** | `safe / balanced / performance` presets to bound host-RAM, JSON, and strategy-tree-node budgets. No more silent OOM kills. |
+| **Runout picker** | When iso enumeration is engaged, click any canonical river card to switch subtrees. |
+| **GTO chart library** | 2,550+ bundled preflop scenarios browsable in-app. One click applies as IP / OOP range. |
 | **Bet sizing presets** | Standard / Polar / Small Ball — flows through to the solver tree AND the UI buttons. |
 | **Training mode** | 10-question drills that score your answers against the equilibrium. |
 | **Pre-solved spot library** | 120+ common flop spots, one click to load. |

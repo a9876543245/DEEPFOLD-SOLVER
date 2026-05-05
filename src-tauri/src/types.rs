@@ -40,6 +40,81 @@ pub struct SolverRequest {
     pub turn_sizes: Option<Vec<f64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub river_sizes: Option<Vec<f64>>,
+
+    // ---- Sprint 3 (resource policy guide): memory budget controls ----
+    //
+    // memory_profile: high-level preset. "safe" | "balanced" | "performance".
+    // Default = "balanced". Each preset maps to a (host, gpu, json,
+    // strategy_tree_max_nodes) tuple in `resolve_memory_profile()`. Manual
+    // numeric fields override the profile's default for that field only.
+    /// "safe" | "balanced" | "performance". Defaults to "balanced".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_profile: Option<String>,
+    /// Override host RAM cap in MB. 0/None = use profile default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_memory_mb: Option<u64>,
+    /// Override GPU VRAM cap in MB. 0/None = let backend probe at runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_memory_mb: Option<u64>,
+    /// Override JSON response cap in MB. 0/None = use profile default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json_memory_mb: Option<u64>,
+    /// Override emitted strategy-tree node cap. 0/None = use profile default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy_tree_max_nodes: Option<u32>,
+}
+
+/// Sprint 3 (resource policy guide): resolved memory budget tuple after
+/// applying profile defaults + manual overrides. Used by engine.rs to
+/// build CLI args.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedMemoryBudget {
+    pub host_mb: u64,
+    pub gpu_mb: u64,
+    pub json_mb: u64,
+    pub strategy_tree_max_nodes: u32,
+}
+
+impl ResolvedMemoryBudget {
+    /// Built-in presets. Match the GUIDE.md table exactly. GPU=0 means
+    /// "let the backend probe at runtime"; we don't gate on a hard VRAM
+    /// number for arbitrary devices.
+    fn from_profile(profile: &str) -> Self {
+        match profile {
+            "safe" => Self {
+                host_mb: 2048,
+                gpu_mb: 0,
+                json_mb: 50,
+                strategy_tree_max_nodes: 500,
+            },
+            "performance" => Self {
+                host_mb: 12288,
+                gpu_mb: 0,
+                json_mb: 150,
+                strategy_tree_max_nodes: 5000,
+            },
+            // "balanced" is the default and applies for any unknown profile.
+            _ => Self {
+                host_mb: 6144,
+                gpu_mb: 0,
+                json_mb: 100,
+                strategy_tree_max_nodes: 2000,
+            },
+        }
+    }
+
+    /// Apply per-field overrides on top of a profile.
+    pub fn resolve(req: &SolverRequest) -> Self {
+        let profile = req.memory_profile.as_deref().unwrap_or("balanced");
+        let mut b = Self::from_profile(profile);
+        if let Some(v) = req.host_memory_mb { if v > 0 { b.host_mb = v; } }
+        if let Some(v) = req.gpu_memory_mb  { b.gpu_mb = v; } // 0 is meaningful
+        if let Some(v) = req.json_memory_mb { if v > 0 { b.json_mb = v; } }
+        if let Some(v) = req.strategy_tree_max_nodes {
+            if v > 0 { b.strategy_tree_max_nodes = v; }
+        }
+        b
+    }
 }
 
 fn default_iterations() -> i32 { 500 }
@@ -94,6 +169,50 @@ pub struct SolverResponse {
     /// instead of re-invoking the engine. Populated on every solve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy_tree: Option<std::collections::HashMap<String, StrategyTreeEntry>>,
+    /// Sprint 2 (resource policy guide): per-solve resource estimate +
+    /// budget decision. Populated by the C++ engine on every solve. Lets
+    /// the UI show "tree truncated", "fell back to CPU because …",
+    /// "estimated 12 MB host, 4 MB JSON" without re-running the solve.
+    /// `default` so older saved .dsolver files (no `resources`) keep loading.
+    #[serde(default)]
+    pub resources: SolveResources,
+}
+
+/// Sprint 2: per-solve resource estimate. Mirrors C++ `SolveResources`
+/// (core/include/types.h). Every field has a sane default so older save
+/// files / older engine versions parse without error.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SolveResources {
+    #[serde(default)]
+    pub canonical_combos: u32,
+    #[serde(default)]
+    pub player_nodes: u32,
+    #[serde(default)]
+    pub estimated_matchup_bytes: u64,
+    #[serde(default)]
+    pub estimated_cpu_state_bytes: u64,
+    #[serde(default)]
+    pub estimated_gpu_state_bytes: u64,
+    #[serde(default)]
+    pub estimated_strategy_tree_bytes: u64,
+    #[serde(default)]
+    pub estimated_json_bytes: u64,
+    #[serde(default)]
+    pub host_budget_bytes: u64,
+    #[serde(default)]
+    pub gpu_budget_bytes: u64,
+    #[serde(default)]
+    pub strategy_tree_max_nodes: u32,
+    #[serde(default)]
+    pub strategy_tree_emitted_nodes: u32,
+    #[serde(default)]
+    pub strategy_tree_truncated: bool,
+    #[serde(default)]
+    pub budget_decision: String,
+    #[serde(default)]
+    pub diagnostic: String,
+    #[serde(default)]
+    pub fallback_reason: String,
 }
 
 /// Per-node strategy bundle, keyed by player-action history in `strategy_tree`.

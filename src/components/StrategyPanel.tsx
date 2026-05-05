@@ -1,11 +1,14 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import type { SolverResponse, ComboStrategy } from '../lib/poker';
 import { getActionColor, parseBoardCards, expandComboLabel, SUIT_SYMBOLS, SUIT_COLORS } from '../lib/poker';
 import { parseRange } from '../lib/ranges';
 import type { SolverProgress } from '../hooks/useSolver';
 import { useT } from '../lib/i18n';
+import { aggregateTurns } from '../lib/aggregateRunouts';
+import { RunoutReportModal } from './RunoutReportModal';
+import { ComboDrillPanel } from './ComboDrillPanel';
 
-import { Lock } from 'lucide-react';
+import { Lock, BarChart3, Layers } from 'lucide-react';
 
 interface Props {
   result: SolverResponse | null;
@@ -16,6 +19,11 @@ interface Props {
   board?: string;
   heroRange?: string;
   onLockNode?: () => void;
+  /** Sprint Aggregated-Report-Lite: history string for the current node
+   *  (e.g. "Check,Bet_33,Call"). Drives the per-turn runout aggregation.
+   *  When undefined or empty the report button still renders for the root,
+   *  letting the user see how root strategy diverges across turn cards. */
+  currentHistory?: string;
 }
 
 /** Full-width strategy bar for a combo variant — taller than the old 6px
@@ -82,8 +90,22 @@ function ComboDisplay({ rank1, suit1, rank2, suit2, isDead }: {
   );
 }
 
-export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress, board, heroRange, onLockNode }: Props) {
+export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress, board, heroRange, onLockNode, currentHistory }: Props) {
   const t = useT();
+  const [showRunoutReport, setShowRunoutReport] = useState(false);
+  const [showComboDrill, setShowComboDrill] = useState(false);
+
+  // Aggregated Report Lite — only show the trigger button when the solve
+  // produced enumerable runouts at the current history. We compute the
+  // count once and reuse it both for the badge ("N turns") and the
+  // disabled state. Cheap: linear over strategy_tree keys.
+  const runoutAggregateCount = useMemo(() => {
+    if (!result?.strategy_tree) return 0;
+    // Strip the runout suffix from the current history if any — the
+    // aggregation lives at the path WITHOUT the user's chosen runout.
+    const histRoot = (currentHistory ?? '').split('#')[0];
+    return aggregateTurns(result.strategy_tree, histRoot).length;
+  }, [result?.strategy_tree, currentHistory]);
 
   // Expand hovered/target combo into specific variants
   const comboVariants = useMemo(() => {
@@ -206,7 +228,143 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
             </div>
           </div>
         </div>
+
+        {/* Sprint 2 (resource policy guide): minimal resource badge.
+            Renders only when something user-visible happened — tree truncated,
+            backend fell back, or budget decision was not ok. We intentionally
+            do NOT show MB numbers in the steady state (avoid information
+            overload). The full numbers live in the JSON / save file for power
+            users. */}
+        {result.resources && (() => {
+          const r = result.resources;
+          const showTruncation = r.strategy_tree_truncated;
+          const showFallback   = r.fallback_reason && r.fallback_reason.length > 0;
+          const showDecision   = r.budget_decision && r.budget_decision !== 'ok';
+          if (!showTruncation && !showFallback && !showDecision) return null;
+          return (
+            <div style={{
+              marginTop: 10,
+              padding: '8px 10px',
+              borderRadius: 'var(--radius-sm)',
+              background: 'var(--color-bg-tertiary)',
+              borderLeft: '3px solid var(--color-orange)',
+              fontSize: 11,
+              color: 'var(--color-text-secondary)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 4,
+            }}>
+              {showTruncation && (
+                <div>
+                  <span style={{ color: 'var(--color-orange)', fontWeight: 600 }}>
+                    Tree truncated
+                  </span>
+                  {' — '}
+                  emitted {r.strategy_tree_emitted_nodes} of cap {r.strategy_tree_max_nodes}.
+                </div>
+              )}
+              {showFallback && (
+                <div>
+                  <span style={{ color: 'var(--color-orange)', fontWeight: 600 }}>
+                    Fallback
+                  </span>
+                  {' — '}
+                  {r.fallback_reason}
+                </div>
+              )}
+              {showDecision && r.diagnostic && (
+                <div style={{ opacity: 0.85 }}>{r.diagnostic}</div>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* Aggregated Report Lite — Day 1.
+            Renders only when strategy_tree contains enumerated turn runouts
+            for the current history. Counts >= 2 to skip the trivial single-
+            child fallback case (rainbow flop). */}
+        {runoutAggregateCount >= 2 && (
+          <button
+            type="button"
+            onClick={() => setShowRunoutReport(true)}
+            style={{
+              marginTop: 10, padding: '8px 12px',
+              border: '1px solid var(--color-glass-border)',
+              borderRadius: 8, background: 'var(--color-glass)',
+              color: 'var(--color-text-primary)',
+              cursor: 'pointer', fontSize: 12, fontWeight: 600,
+              display: 'flex', alignItems: 'center', gap: 8,
+              width: '100%', justifyContent: 'center',
+            }}
+          >
+            <BarChart3 size={14} />
+            Runout Report
+            <span style={{
+              padding: '1px 8px', borderRadius: 999,
+              background: 'var(--color-bg-tertiary)',
+              fontSize: 10, fontWeight: 700,
+              color: 'var(--color-text-secondary)',
+            }}>
+              {runoutAggregateCount} turns
+            </span>
+          </button>
+        )}
+
+        {/* 1326 Combo Drill — Day 3.
+            Renders whenever the solve produced per-class strategies. Default
+            class on open: target_combo_analysis.combo if user clicked a cell,
+            otherwise the most-played class (computed inside the modal). */}
+        {result.combo_strategies && Object.keys(result.combo_strategies).length > 0 && (
+          <button
+            type="button"
+            onClick={() => setShowComboDrill(true)}
+            style={{
+              marginTop: 8, padding: '8px 12px',
+              border: '1px solid var(--color-glass-border)',
+              borderRadius: 8, background: 'var(--color-glass)',
+              color: 'var(--color-text-primary)',
+              cursor: 'pointer', fontSize: 12, fontWeight: 600,
+              display: 'flex', alignItems: 'center', gap: 8,
+              width: '100%', justifyContent: 'center',
+            }}
+          >
+            <Layers size={14} />
+            Combo Drill
+            {result.target_combo_analysis?.combo && (
+              <span style={{
+                padding: '1px 8px', borderRadius: 999,
+                background: 'var(--color-bg-tertiary)',
+                fontSize: 10, fontWeight: 700,
+                color: 'var(--color-text-secondary)',
+              }}>
+                {result.target_combo_analysis.combo}
+              </span>
+            )}
+          </button>
+        )}
       </div>
+
+      {/* Aggregated Report Lite modal — lazy mounted. */}
+      {showRunoutReport && result?.strategy_tree && (
+        <RunoutReportModal
+          strategyTree={result.strategy_tree}
+          flopHistory={(currentHistory ?? '').split('#')[0]}
+          flopCards={board ? parseBoardCards(board).slice(0, 3) : []}
+          onClose={() => setShowRunoutReport(false)}
+        />
+      )}
+
+      {/* 1326 Combo Drill modal — lazy mounted. */}
+      {showComboDrill && (
+        <ComboDrillPanel
+          comboStrategies={result.combo_strategies}
+          comboEvs={result.combo_evs}
+          opponentRange={result.opponent_range}
+          boardCards={board ? parseBoardCards(board) : []}
+          initialLabel={result.target_combo_analysis?.combo}
+          onClose={() => setShowComboDrill(false)}
+        />
+      )}
 
       {/* Quick Read — simplified human-readable recommendation */}
       {(() => {

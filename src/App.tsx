@@ -40,7 +40,8 @@ import { GameContextSelector } from './components/GameContextSelector';
  * Set back to `true` once the chart data passes the 5-rule sanity check
  * documented in STATUS-AND-ROADMAP.md.
  */
-const GTO_CHART_LIBRARY_ENABLED = false;
+// Re-enabled: gto_output is now generated from TexasSolverGPU text ranges.
+const GTO_CHART_LIBRARY_ENABLED = true;
 import { RunoutPicker } from './components/RunoutPicker';
 import { useGtoAutoRange } from './hooks/useGtoAutoRange';
 import { HelpCircle, BookOpen, Crosshair } from 'lucide-react';
@@ -81,7 +82,7 @@ function App() {
   // ranges. Default = Cash 6max 100bb (matches the legacy MATCHUPS dataset).
   const [gameContext, setGameContext] = useState<GameContext>({
     gameType: 'Cash',
-    scenarioType: '6max_100bb',
+    scenarioType: 'texassolver_6max_100bb_2_5x_500rake',
     effectiveBB: 100,
   });
 
@@ -918,6 +919,7 @@ function App() {
           progress={progress}
           board={fullBoard}
           heroRange={getHeroRange()}
+          currentHistory={currentNode ? pathToHistory(currentNode.path) : ''}
           onLockNode={() => {
             const targetCombo = result?.target_combo_analysis?.combo;
             if (!result || !targetCombo || !currentNode) return;

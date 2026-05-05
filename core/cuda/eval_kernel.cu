@@ -25,6 +25,12 @@
 namespace deepsolver {
 namespace gpu {
 
+// Mirror host enum values. Keep in sync with types.h.
+constexpr uint8_t NT_TERMINAL = 3;
+constexpr uint8_t TT_FOLD_OOP = 0;
+constexpr uint8_t TT_FOLD_IP  = 1;
+constexpr uint8_t TT_SHOWDOWN = 2;
+
 // ============================================================================
 // Device-side hand evaluator using lookup tables
 // ============================================================================
@@ -304,6 +310,116 @@ __global__ void fold_terminal_kernel(
 }
 
 // ============================================================================
+// Batched per-level terminal kernel
+// ============================================================================
+
+__global__ void terminal_level_kernel(
+    const uint8_t* __restrict__ node_types,
+    const uint8_t* __restrict__ terminal_types,
+    const float* __restrict__ pots,
+    const uint32_t* __restrict__ parent_indices,
+    const float* __restrict__ bet_into,
+    const int32_t* __restrict__ matchup_idx,
+    const uint32_t* __restrict__ level_node_indices,
+    uint32_t num_level_nodes,
+    const float* __restrict__ matchup_ev_concat,
+    const float* __restrict__ matchup_valid_concat,
+    const float* __restrict__ canonical_weights,
+    uint32_t num_runouts,
+    const float* __restrict__ reach_opp_base,
+    uint16_t num_canonical,
+    int perspective,
+    float rake_rate,
+    float rake_cap,
+    float* __restrict__ node_values)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = static_cast<int>(num_level_nodes) * num_canonical;
+    if (tid >= total) return;
+
+    int local_idx = tid / num_canonical;
+    int c = tid % num_canonical;
+    uint32_t n = level_node_indices[local_idx];
+    if (node_types[n] != NT_TERMINAL) return;
+
+    int32_t mi = matchup_idx[n];
+    if (mi < 0 || static_cast<uint32_t>(mi) >= num_runouts) mi = 0;
+    size_t per_table = static_cast<size_t>(num_canonical) * num_canonical;
+    size_t table_off = static_cast<size_t>(mi) * per_table;
+    const float* matchup_ev = matchup_ev_concat + table_off;
+    const float* matchup_valid = matchup_valid_concat + table_off;
+    const float* reach_opp = reach_opp_base + static_cast<size_t>(n) * num_canonical;
+    float* out_values = node_values + static_cast<size_t>(n) * num_canonical;
+
+    float pot_total = pots[n];
+    float half_pot = pot_total * 0.5f;
+    float rake = fminf(pot_total * rake_rate, rake_cap);
+    if (rake < 0.0f) rake = 0.0f;
+    float win_payoff  = half_pot - rake;
+    float lose_payoff = -half_pot;
+    float tie_payoff  = -0.5f * rake;
+
+    uint8_t tt = terminal_types[n];
+    if (tt == TT_SHOWDOWN) {
+        // Per-pair payoff: branch on signed matchup_ev. m_ev is OOP-perspective
+        // (+1 = OOP wins, -1 = OOP loses, 0 = tie).
+        float val = 0.0f;
+        if (perspective == 0) {
+            for (int cj = 0; cj < num_canonical; ++cj) {
+                size_t idx = static_cast<size_t>(c) * num_canonical + cj;
+                float ev = matchup_ev[idx];
+                float valid = matchup_valid[idx];
+                if (valid <= 0.0f) continue;
+                float payoff;
+                if (ev > 0.5f)        payoff = win_payoff;
+                else if (ev < -0.5f)  payoff = lose_payoff;
+                else                  payoff = tie_payoff;
+                val += reach_opp[cj] * valid * canonical_weights[cj] * payoff;
+            }
+        } else {
+            for (int ci = 0; ci < num_canonical; ++ci) {
+                size_t idx = static_cast<size_t>(ci) * num_canonical + c;
+                float ev = matchup_ev[idx];  // OOP perspective
+                float valid = matchup_valid[idx];
+                if (valid <= 0.0f) continue;
+                float payoff;
+                if (ev > 0.5f)        payoff = lose_payoff;  // OOP wins → IP loses
+                else if (ev < -0.5f)  payoff = win_payoff;
+                else                  payoff = tie_payoff;
+                val += reach_opp[ci] * valid * canonical_weights[ci] * payoff;
+            }
+        }
+        out_values[c] = val;
+        return;
+    }
+
+    uint32_t parent = parent_indices[n];
+    float unmatched = bet_into[parent];
+    float matched_pot = pot_total - unmatched;
+    float fold_win_gain  = matched_pot * 0.5f - rake;
+    float fold_lose_loss = -matched_pot * 0.5f;
+
+    // FOLD_OOP = OOP folded → IP wins. FOLD_IP = IP folded → OOP wins.
+    bool i_win = ((perspective == 0 && tt == TT_FOLD_IP) ||
+                  (perspective == 1 && tt == TT_FOLD_OOP));
+    float self_payoff = i_win ? fold_win_gain : fold_lose_loss;
+
+    float opp_total = 0.0f;
+    if (perspective == 0) {
+        for (int cj = 0; cj < num_canonical; ++cj) {
+            size_t idx = static_cast<size_t>(c) * num_canonical + cj;
+            opp_total += reach_opp[cj] * matchup_valid[idx] * canonical_weights[cj];
+        }
+    } else {
+        for (int ci = 0; ci < num_canonical; ++ci) {
+            size_t idx = static_cast<size_t>(ci) * num_canonical + c;
+            opp_total += reach_opp[ci] * matchup_valid[idx] * canonical_weights[ci];
+        }
+    }
+    out_values[c] = self_payoff * opp_total;
+}
+
+// ============================================================================
 // Host-side launch helpers
 // ============================================================================
 
@@ -331,6 +447,42 @@ void launch_fold_terminal(
     fold_terminal_kernel<<<grid, block>>>(
         d_matchup_valid, d_canonical_weights, d_reach_opp,
         nc, half_pot, sign_for_perspective, perspective, d_out);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_terminal_level(
+    const uint8_t* d_node_types,
+    const uint8_t* d_terminal_types,
+    const float* d_pots,
+    const uint32_t* d_parent_indices,
+    const float* d_bet_into,
+    const int32_t* d_matchup_idx,
+    const uint32_t* d_level_indices,
+    uint32_t num_level_nodes,
+    const float* d_matchup_ev_concat,
+    const float* d_matchup_valid_concat,
+    const float* d_canonical_weights,
+    uint32_t num_runouts,
+    const float* d_reach_opp_base,
+    uint16_t nc,
+    int perspective,
+    float rake_rate,
+    float rake_cap,
+    float* d_node_values)
+{
+    int block = 256;
+    int total = static_cast<int>(num_level_nodes) * nc;
+    int grid = (total + block - 1) / block;
+    if (grid == 0) return;
+
+    terminal_level_kernel<<<grid, block>>>(
+        d_node_types, d_terminal_types, d_pots,
+        d_parent_indices, d_bet_into, d_matchup_idx,
+        d_level_indices, num_level_nodes,
+        d_matchup_ev_concat, d_matchup_valid_concat,
+        d_canonical_weights, num_runouts,
+        d_reach_opp_base, nc, perspective,
+        rake_rate, rake_cap, d_node_values);
     CUDA_CHECK(cudaGetLastError());
 }
 

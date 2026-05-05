@@ -18,6 +18,7 @@
 #include "solver.h"
 #include "solver_backend.h"
 
+#include <algorithm>
 #include <iostream>
 #include <string>
 #include <sstream>
@@ -26,6 +27,7 @@
 #include <chrono>
 #include <cstring>
 #include <map>
+#include <stdexcept>
 
 using namespace deepsolver;
 
@@ -58,6 +60,30 @@ struct CLIArgs {
 
     // Node locks (JSON string)
     std::string node_locks_str;
+    bool emit_strategy_tree = true;
+    bool emit_strategy_tree_evs = true;
+    /// Phase 3 (10-point plan): "visible" caches EVs only for emitted nodes
+    /// (typical: hundreds of MB → few MB). "none" skips EV computation
+    /// entirely. "full" is the legacy behavior (cache everything). Set via
+    /// --strategy-tree-evs <mode>; the older --no-strategy-tree-evs flag
+    /// still works and maps to "none".
+    std::string strategy_tree_ev_mode = "visible";
+    std::string postsolve = "full";  // full | ev | exploitability | none
+    bool parallel_postsolve = true;
+    uint32_t postsolve_threads = 0;
+    bool force_cpu_postsolve = false;  // skip GPU postsolve fast path
+    std::string dcfr_schedule = "standard";  // "standard" | "postflop"
+    float rake_rate = 0.0f;
+    float rake_cap  = 0.0f;
+
+    // Sprint 1 (market-beating plan): per-solve memory budget overrides.
+    // Default 0 = use the SolverConfig defaults (6 GB host, 100 MB JSON,
+    // 2000 emitted strategy-tree nodes). Any non-zero value supersedes
+    // memory_budget.h defaults for THIS solve only.
+    uint64_t host_memory_mb        = 0;
+    uint64_t gpu_memory_mb         = 0;
+    uint64_t json_memory_mb        = 0;
+    uint32_t strategy_tree_max_nodes = 0;
 
     // Tree construction flags (expose SolverConfig defaults)
     int  oop_has_initiative = 1;     // 0/1 (default 1: OOP can bet at root)
@@ -92,6 +118,53 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.oop_range_str = argv[++i];
         } else if (arg == "--node-locks" && i + 1 < argc) {
             args.node_locks_str = argv[++i];
+        } else if (arg == "--no-strategy-tree") {
+            args.emit_strategy_tree = false;
+        } else if (arg == "--no-strategy-tree-evs") {
+            args.emit_strategy_tree_evs = false;
+            args.strategy_tree_ev_mode = "none";
+        } else if (arg == "--strategy-tree-evs" && i + 1 < argc) {
+            args.strategy_tree_ev_mode = argv[++i];
+            if (args.strategy_tree_ev_mode == "none") {
+                args.emit_strategy_tree_evs = false;
+            } else {
+                args.emit_strategy_tree_evs = true;
+            }
+        } else if (arg == "--postsolve" && i + 1 < argc) {
+            args.postsolve = argv[++i];
+        } else if (arg == "--fast-postsolve") {
+            args.postsolve = "none";
+        } else if (arg == "--single-thread-postsolve") {
+            args.parallel_postsolve = false;
+        } else if (arg == "--parallel-postsolve") {
+            args.parallel_postsolve = true;
+        } else if (arg == "--postsolve-threads" && i + 1 < argc) {
+            int v = std::stoi(argv[++i]);
+            args.postsolve_threads = static_cast<uint32_t>(std::max(0, v));
+        } else if (arg == "--force-cpu-postsolve") {
+            args.force_cpu_postsolve = true;
+        } else if (arg == "--gpu-postsolve") {
+            args.force_cpu_postsolve = false;
+        } else if (arg == "--dcfr-schedule" && i + 1 < argc) {
+            args.dcfr_schedule = argv[++i];
+        } else if (arg == "--rake-rate" && i + 1 < argc) {
+            args.rake_rate = std::stof(argv[++i]);
+        } else if (arg == "--rake-cap" && i + 1 < argc) {
+            args.rake_cap = std::stof(argv[++i]);
+        } else if (arg == "--rake-nl25") {
+            // NL25 standard: 5% capped at 2bb. Caller is expected to use
+            // pot/stack in the SAME unit (e.g. 1bb=1 → cap=2.0,
+            // 1bb=10 → cap=20, 1bb=100 → cap=200).
+            args.rake_rate = 0.05f;
+            args.rake_cap  = 2.0f;
+        } else if (arg == "--host-memory-mb" && i + 1 < argc) {
+            args.host_memory_mb = static_cast<uint64_t>(std::max(0, std::stoi(argv[++i])));
+        } else if (arg == "--gpu-memory-mb" && i + 1 < argc) {
+            args.gpu_memory_mb = static_cast<uint64_t>(std::max(0, std::stoi(argv[++i])));
+        } else if (arg == "--json-memory-mb" && i + 1 < argc) {
+            args.json_memory_mb = static_cast<uint64_t>(std::max(0, std::stoi(argv[++i])));
+        } else if (arg == "--strategy-tree-max-nodes" && i + 1 < argc) {
+            args.strategy_tree_max_nodes = static_cast<uint32_t>(std::max(0, std::stoi(argv[++i])));
         } else if (arg == "--backend" && i + 1 < argc) {
             args.backend = argv[++i];
         } else if (arg == "--oop-initiative" && i + 1 < argc) {
@@ -150,6 +223,14 @@ Arguments:
   --iterations <int>       Max DCFR iterations (default: 500)
   --exploitability <float> Target exploitability % (default: 0.5)
   --backend <string>       Execution backend: auto | cpu | gpu (default: auto)
+  --postsolve <string>     Reporting pass: full | ev | exploitability | none
+  --fast-postsolve         Alias for --postsolve none
+  --single-thread-postsolve Disable parallel postsolve passes
+  --postsolve-threads <int> CPU postsolve worker cap (0 = auto)
+  --force-cpu-postsolve    Skip the GPU postsolve fast path (CPU traversal)
+  --gpu-postsolve          Re-enable GPU postsolve (default when supported)
+  --no-strategy-tree       Omit the client navigation cache from JSON output
+  --no-strategy-tree-evs   Keep strategy tree but omit per-node EV cache
   --gpu-info               Print detected GPU info and exit
   --help, -h               Show this help message
 
@@ -305,6 +386,7 @@ std::vector<NodeLockEntry> parse_node_locks(const std::string& json_str) {
 
 std::string escape_json(const std::string& s) {
     std::string result;
+    result.reserve(s.size());
     for (char c : s) {
         switch (c) {
             case '"': result += "\\\""; break;
@@ -323,14 +405,72 @@ std::string result_to_json(
     const std::string& backend_name,
     const std::map<std::string, deepsolver::Solver::StrategyTreeEntry>*
         strategy_tree = nullptr) {
+    (void)args;
     std::ostringstream json;
     json << std::fixed << std::setprecision(2);
 
     json << "{\n";
     json << "  \"status\": \"success\",\n";
     json << "  \"backend\": \"" << escape_json(backend_name) << "\",\n";
+    json << "  \"postsolve_mode\": \"" << escape_json(args.postsolve) << "\",\n";
+    json << "  \"parallel_postsolve\": "
+         << (args.parallel_postsolve ? "true" : "false") << ",\n";
+    json << "  \"postsolve_threads_requested\": " << args.postsolve_threads << ",\n";
+    json << "  \"force_cpu_postsolve\": "
+         << (args.force_cpu_postsolve ? "true" : "false") << ",\n";
+    json << "  \"dcfr_schedule\": \"" << escape_json(args.dcfr_schedule) << "\",\n";
+    json << "  \"rake_rate\": " << args.rake_rate << ",\n";
+    json << "  \"rake_cap\": " << args.rake_cap << ",\n";
     json << "  \"iterations_run\": " << result.iterations_run << ",\n";
     json << "  \"exploitability_pct\": " << result.exploitability_pct << ",\n";
+    json << "  \"combo_evs_computed\": "
+         << (result.combo_evs_computed ? "true" : "false") << ",\n";
+    json << "  \"exploitability_computed\": "
+         << (result.exploitability_computed ? "true" : "false") << ",\n";
+    json << "  \"timing\": {\n";
+    json << std::setprecision(3);
+    json << "    \"tree_build_ms\": " << result.timing.tree_build_ms << ",\n";
+    json << "    \"isomorphism_ms\": " << result.timing.isomorphism_ms << ",\n";
+    json << "    \"precompute_matchups_ms\": " << result.timing.precompute_matchups_ms << ",\n";
+    json << "    \"reach_init_ms\": " << result.timing.reach_init_ms << ",\n";
+    json << "    \"node_locks_ms\": " << result.timing.node_locks_ms << ",\n";
+    json << "    \"backend_prepare_ms\": " << result.timing.backend_prepare_ms << ",\n";
+    json << "    \"iterations_ms\": " << result.timing.iterations_ms << ",\n";
+    json << "    \"finalize_ms\": " << result.timing.finalize_ms << ",\n";
+    json << "    \"combo_evs_ms\": " << result.timing.combo_evs_ms << ",\n";
+    json << "    \"exploitability_ms\": " << result.timing.exploitability_ms << ",\n";
+    json << "    \"postsolve_ms\": " << result.timing.postsolve_ms << ",\n";
+    json << "    \"total_ms\": " << result.timing.total_ms << ",\n";
+    json << "    \"tree_nodes\": " << result.timing.tree_nodes << ",\n";
+    json << "    \"tree_edges\": " << result.timing.tree_edges << ",\n";
+    json << "    \"matchup_tables\": " << result.timing.matchup_tables << ",\n";
+    json << "    \"postsolve_threads\": " << result.timing.postsolve_threads << "\n";
+    json << "  },\n";
+    json << std::setprecision(2);
+
+    // Sprint 1 (market-beating plan): per-solve resource estimate. Lets the
+    // UI / benchmark show "this run was 12 MB host, 4 MB JSON, tree truncated
+    // at 2000 nodes, fell back to CPU because of …" without re-running.
+    {
+        const auto& r = result.resources;
+        json << "  \"resources\": {\n";
+        json << "    \"canonical_combos\": " << r.canonical_combos << ",\n";
+        json << "    \"player_nodes\": " << r.player_nodes << ",\n";
+        json << "    \"estimated_matchup_bytes\": " << r.estimated_matchup_bytes << ",\n";
+        json << "    \"estimated_cpu_state_bytes\": " << r.estimated_cpu_state_bytes << ",\n";
+        json << "    \"estimated_gpu_state_bytes\": " << r.estimated_gpu_state_bytes << ",\n";
+        json << "    \"estimated_strategy_tree_bytes\": " << r.estimated_strategy_tree_bytes << ",\n";
+        json << "    \"estimated_json_bytes\": " << r.estimated_json_bytes << ",\n";
+        json << "    \"host_budget_bytes\": " << r.host_budget_bytes << ",\n";
+        json << "    \"gpu_budget_bytes\": " << r.gpu_budget_bytes << ",\n";
+        json << "    \"strategy_tree_max_nodes\": " << r.strategy_tree_max_nodes << ",\n";
+        json << "    \"strategy_tree_emitted_nodes\": " << r.strategy_tree_emitted_nodes << ",\n";
+        json << "    \"strategy_tree_truncated\": " << (r.strategy_tree_truncated ? "true" : "false") << ",\n";
+        json << "    \"budget_decision\": \"" << escape_json(r.budget_decision) << "\",\n";
+        json << "    \"diagnostic\": \"" << escape_json(r.diagnostic) << "\",\n";
+        json << "    \"fallback_reason\": \"" << escape_json(r.fallback_reason) << "\"\n";
+        json << "  },\n";
+    }
 
     // Global strategy
     json << "  \"global_strategy\": {\n";
@@ -553,6 +693,62 @@ int main(int argc, char* argv[]) {
         config.bet_sizing.river_sizes = args.river_sizes;
         config.oop_has_initiative = (args.oop_has_initiative != 0);
         config.allow_donk_bet = (args.allow_donk_bet != 0);
+        config.parallel_postsolve = args.parallel_postsolve;
+        config.postsolve_threads = args.postsolve_threads;
+        config.force_cpu_postsolve = args.force_cpu_postsolve;
+        {
+            std::string sched = args.dcfr_schedule;
+            for (char& ch : sched) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (sched == "postflop" || sched == "postflop_style" || sched == "wasm") {
+                config.dcfr_schedule = SolverConfig::DcfrSchedule::POSTFLOP_STYLE;
+            } else {
+                config.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
+            }
+        }
+        config.rake_rate = args.rake_rate;
+        config.rake_cap  = args.rake_cap;
+
+        // Sprint 1: per-run memory budget overrides. Only apply non-zero values
+        // so callers that don't care fall back to MemoryBudget defaults.
+        if (args.host_memory_mb > 0) {
+            config.memory_budget.host_bytes = args.host_memory_mb * 1024ULL * 1024ULL;
+        }
+        if (args.gpu_memory_mb > 0) {
+            config.memory_budget.gpu_bytes = args.gpu_memory_mb * 1024ULL * 1024ULL;
+        }
+        if (args.json_memory_mb > 0) {
+            config.memory_budget.json_bytes = args.json_memory_mb * 1024ULL * 1024ULL;
+        }
+        if (args.strategy_tree_max_nodes > 0) {
+            config.memory_budget.strategy_tree_max_nodes = args.strategy_tree_max_nodes;
+            config.strategy_tree_max_nodes = args.strategy_tree_max_nodes;
+        }
+
+        std::string postsolve_mode = args.postsolve;
+        for (char& ch : postsolve_mode) {
+            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        if (postsolve_mode == "full") {
+            config.compute_combo_evs = true;
+            config.compute_exploitability = true;
+        } else if (postsolve_mode == "ev" || postsolve_mode == "combo-evs") {
+            config.compute_combo_evs = true;
+            config.compute_exploitability = false;
+        } else if (postsolve_mode == "exploitability") {
+            config.compute_combo_evs = false;
+            config.compute_exploitability = true;
+        } else if (postsolve_mode == "none" || postsolve_mode == "off") {
+            config.compute_combo_evs = false;
+            config.compute_exploitability = false;
+        } else {
+            throw std::invalid_argument("Invalid --postsolve value: " + args.postsolve);
+        }
+
+        // Target combo analysis reads Solver::ev_, so keep the EV pass enabled
+        // even when a batch caller requested a lighter postsolve mode.
+        if (!args.target_combo.empty()) {
+            config.compute_combo_evs = true;
+        }
 
         // Apply custom ranges
         if (!args.ip_range_str.empty()) {
@@ -610,12 +806,37 @@ int main(int argc, char* argv[]) {
         }
 
         // Build strategy tree for client-side navigation cache (Route A).
-        // The frontend caches this and walks it on every action click,
-        // skipping the engine subprocess entirely until a board change.
-        auto strategy_tree = solver.build_strategy_tree(/*max_player_depth=*/8);
+        // Benchmarks can disable this to avoid measuring large JSON output.
+        std::map<std::string, deepsolver::Solver::StrategyTreeEntry> strategy_tree;
+        const std::map<std::string, deepsolver::Solver::StrategyTreeEntry>* strategy_tree_ptr = nullptr;
+        if (args.emit_strategy_tree) {
+            // Phase 3: pick the explicit mode if --strategy-tree-evs was set,
+            // otherwise honor --no-strategy-tree-evs (NONE) or default to
+            // VISIBLE (only emitted nodes cache an EV vector).
+            using Mode = deepsolver::Solver::StrategyTreeEvMode;
+            Mode ev_mode = Mode::VISIBLE;
+            if (args.strategy_tree_ev_mode == "none" || !args.emit_strategy_tree_evs) {
+                ev_mode = Mode::NONE;
+            } else if (args.strategy_tree_ev_mode == "full") {
+                ev_mode = Mode::FULL;
+            } else {
+                ev_mode = Mode::VISIBLE;
+            }
+            // Sprint 1: surface truncation back into result.resources so the
+            // UI can show a "tree truncated" badge instead of silently
+            // dropping branches.
+            bool tree_truncated = false;
+            strategy_tree = solver.build_strategy_tree(
+                /*max_player_depth=*/8, ev_mode,
+                /*max_nodes=*/args.strategy_tree_max_nodes, &tree_truncated);
+            strategy_tree_ptr = &strategy_tree;
+            result.resources.strategy_tree_emitted_nodes =
+                static_cast<uint32_t>(strategy_tree.size());
+            result.resources.strategy_tree_truncated = tree_truncated;
+        }
 
         // Output JSON to stdout (with the strategy tree appended).
-        std::cout << result_to_json(result, args, backend_name, &strategy_tree);
+        std::cout << result_to_json(result, args, backend_name, strategy_tree_ptr);
 
     } catch (const std::exception& e) {
         std::cerr << "{\"status\": \"error\", \"message\": \""

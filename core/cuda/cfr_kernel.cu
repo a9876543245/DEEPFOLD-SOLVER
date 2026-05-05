@@ -178,6 +178,7 @@ __global__ void propagate_reach_forward_kernel(
  * For chance nodes: copy first child's node_value.
  * For terminals: node_value is set separately by terminal kernels (eval_kernel.cu).
  */
+template <bool BestResponse>
 __global__ void aggregate_node_values_kernel(
     const uint8_t*  __restrict__ node_types,
     const uint8_t*  __restrict__ active_player,
@@ -250,21 +251,41 @@ __global__ void aggregate_node_values_kernel(
     size_t strat_base = av_base;
     size_t stride = num_canonical;
 
-    float sum = 0.0f;
     if (acting == traverser) {
-        for (int a = 0; a < na; ++a) {
-            float s  = current_strategy[strat_base + a * stride];
-            float av = action_values   [av_base    + a * stride];
-            sum += s * av;
+        // Traverser-acting branch differs by mode:
+        //   BR (postsolve):  per-combo MAX over actions — traverser plays the
+        //                    pointwise best response, ignoring averaged strategy.
+        //   EV / CFR:        weighted SUM by current_strategy (= averaged strategy
+        //                    after finalize, or regret-matched strategy mid-CFR).
+        if constexpr (BestResponse) {
+            float best = action_values[av_base];
+            for (int a = 1; a < na; ++a) {
+                float av = action_values[av_base + a * stride];
+                best = fmaxf(best, av);
+            }
+            node_values[node_idx] = best;
+        } else {
+            float sum = 0.0f;
+            for (int a = 0; a < na; ++a) {
+                float s  = current_strategy[strat_base + a * stride];
+                float av = action_values   [av_base    + a * stride];
+                sum += s * av;
+            }
+            node_values[node_idx] = sum;
         }
     } else {
         // Opponent's strategy absorbed into reach; just SUM action values
+        float sum = 0.0f;
         for (int a = 0; a < na; ++a) {
             sum += action_values[av_base + a * stride];
         }
+        node_values[node_idx] = sum;
     }
-    node_values[node_idx] = sum;
 }
+
+// Both <false> (CFR/EV) and <true> (BR/postsolve) instantiations are
+// implicitly produced by the launcher calls in this same TU, so no explicit
+// instantiation is needed.
 
 // ============================================================================
 // Kernel 4: Copy children's node_values into parent's action_values slots
@@ -339,9 +360,8 @@ __global__ void update_regrets_kernel(
     uint16_t num_canonical,
     uint8_t max_actions,
     int traverser,
-    int iteration,
-    float alpha,
-    float beta)
+    float pos_disc,
+    float neg_disc)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = static_cast<int>(num_nodes) * num_canonical;
@@ -358,12 +378,6 @@ __global__ void update_regrets_kernel(
     if (na == 0) return;
 
     float nv = node_values[static_cast<size_t>(node) * num_canonical + combo];
-
-    // DCFR discount factors (applied to existing regret)
-    float t = static_cast<float>(iteration);
-    float ratio = (t <= 0.0f) ? 0.0f : (t / (t + 1.0f));
-    float pos_disc = (t <= 0.0f) ? 1.0f : powf(ratio, alpha);
-    float neg_disc = (t <= 0.0f) ? 1.0f : powf(ratio, beta);
 
     size_t reg_base = (static_cast<size_t>(node) * max_actions) * num_canonical
                     + static_cast<size_t>(combo);
@@ -400,8 +414,8 @@ __global__ void update_strategy_sum_kernel(
     uint16_t num_canonical,
     uint8_t max_actions,
     int traverser,
-    int iteration,
-    float gamma)
+    float strat_weight,    // STANDARD: ((t+1)/(t+2))^gamma; POSTFLOP: (t'/(t'+1))^3
+    int decay_and_add)     // 0 = standard accumulative; 1 = postflop decay-and-add
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = static_cast<int>(num_nodes) * num_canonical;
@@ -417,17 +431,28 @@ __global__ void update_strategy_sum_kernel(
     uint8_t na = num_children[node];
     if (na == 0) return;
 
-    float t = static_cast<float>(iteration);
-    float weight = powf((t + 1.0f) / (t + 2.0f), gamma);
-    float reach = reach_own[static_cast<size_t>(node) * num_canonical + combo];
-
     size_t base = (static_cast<size_t>(node) * max_actions) * num_canonical
                 + static_cast<size_t>(combo);
     size_t stride = num_canonical;
 
-    for (int a = 0; a < na; ++a) {
-        float s = current_strategy[base + a * stride];
-        strategy_sum[base + a * stride] += weight * reach * s;
+    if (decay_and_add) {
+        // POSTFLOP: strategy_sum = strategy_sum * gamma_t + current_strategy
+        // No reach weighting (matches postflop-solver). Epoch-reset gamma_t
+        // (passed in as strat_weight) makes this an "average over recent
+        // iterations of the current epoch."
+        for (int a = 0; a < na; ++a) {
+            float s = current_strategy[base + a * stride];
+            float old = strategy_sum[base + a * stride];
+            strategy_sum[base + a * stride] = old * strat_weight + s;
+        }
+    } else {
+        // STANDARD: strategy_sum += weight * reach * current_strategy
+        // Textbook DCFR reach-weighted accumulative average.
+        float reach = reach_own[static_cast<size_t>(node) * num_canonical + combo];
+        for (int a = 0; a < na; ++a) {
+            float s = current_strategy[base + a * stride];
+            strategy_sum[base + a * stride] += strat_weight * reach * s;
+        }
     }
 }
 
@@ -482,7 +507,31 @@ void launch_aggregate_node_values(
 {
     int total = static_cast<int>(num_level_nodes) * nc;
     int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
-    aggregate_node_values_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
+    aggregate_node_values_kernel<false><<<grid, DEFAULT_BLOCK_SIZE>>>(
+        d_node_types, d_active_player, d_num_children,
+        d_children_offset, d_children, d_runout_weight,
+        d_level_indices, num_level_nodes,
+        d_current_strategy, max_actions,
+        d_action_values, d_node_values, nc, traverser);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Postsolve variant: at traverser's own decision nodes, take max over actions
+// instead of strategy-weighted sum. Used by best-response / exploitability
+// computation. Opponent and chance nodes behave identically to the EV variant.
+void launch_aggregate_node_values_br(
+    const uint8_t* d_node_types, const uint8_t* d_active_player,
+    const uint8_t* d_num_children,
+    const uint32_t* d_children_offset, const uint32_t* d_children,
+    const uint8_t*  d_runout_weight,
+    const uint32_t* d_level_indices, uint32_t num_level_nodes,
+    const float* d_current_strategy, uint8_t max_actions,
+    const float* d_action_values, float* d_node_values,
+    uint16_t nc, int traverser)
+{
+    int total = static_cast<int>(num_level_nodes) * nc;
+    int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+    aggregate_node_values_kernel<true><<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_node_types, d_active_player, d_num_children,
         d_children_offset, d_children, d_runout_weight,
         d_level_indices, num_level_nodes,
@@ -514,7 +563,7 @@ void launch_update_regrets(
     const uint8_t* d_node_types, const uint8_t* d_active_player,
     const uint8_t* d_num_children,
     uint32_t num_nodes, uint16_t nc, uint8_t max_actions,
-    int traverser, int iteration, float alpha, float beta)
+    int traverser, float pos_disc, float neg_disc)
 {
     int total = static_cast<int>(num_nodes) * nc;
     int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
@@ -522,7 +571,7 @@ void launch_update_regrets(
         d_regrets, d_action_values, d_node_values,
         d_node_types, d_active_player, d_num_children,
         num_nodes, nc, max_actions,
-        traverser, iteration, alpha, beta);
+        traverser, pos_disc, neg_disc);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -532,7 +581,7 @@ void launch_update_strategy_sum(
     const uint8_t* d_node_types, const uint8_t* d_active_player,
     const uint8_t* d_num_children,
     uint32_t num_nodes, uint16_t nc, uint8_t max_actions,
-    int traverser, int iteration, float gamma)
+    int traverser, float strat_weight, int decay_and_add)
 {
     int total = static_cast<int>(num_nodes) * nc;
     int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
@@ -540,7 +589,7 @@ void launch_update_strategy_sum(
         d_strategy_sum, d_current_strategy, d_reach_own,
         d_node_types, d_active_player, d_num_children,
         num_nodes, nc, max_actions,
-        traverser, iteration, gamma);
+        traverser, strat_weight, decay_and_add);
     CUDA_CHECK(cudaGetLastError());
 }
 

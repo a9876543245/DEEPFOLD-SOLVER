@@ -103,7 +103,33 @@ export interface SolverRequest {
   flop_sizes?: number[];
   turn_sizes?: number[];
   river_sizes?: number[];
+
+  // ---- Sprint 3 (resource policy guide): memory budget controls ----
+  /** Preset: "safe" | "balanced" | "performance". Default "balanced".
+   *  Maps to (host, gpu, json, strategy_tree_max_nodes) tuple in Rust. */
+  memory_profile?: MemoryProfile;
+  /** Override host RAM cap in MB. 0/undefined = use profile default. */
+  host_memory_mb?: number;
+  /** Override GPU VRAM cap in MB. 0/undefined = let backend probe at runtime. */
+  gpu_memory_mb?: number;
+  /** Override JSON response cap in MB. 0/undefined = use profile default. */
+  json_memory_mb?: number;
+  /** Override emitted strategy-tree node cap. */
+  strategy_tree_max_nodes?: number;
 }
+
+export type MemoryProfile = 'safe' | 'balanced' | 'performance';
+
+/** Mirrors `ResolvedMemoryBudget::from_profile()` in src-tauri/src/types.rs.
+ *  Exposed so the UI can show "balanced will allow up to 6 GB host" etc.
+ *  without round-tripping to Rust. */
+export const MEMORY_PROFILE_PRESETS: Record<MemoryProfile, {
+  host_mb: number; gpu_mb: number; json_mb: number; strategy_tree_max_nodes: number;
+}> = {
+  safe:        { host_mb:  2048, gpu_mb: 0, json_mb:  50, strategy_tree_max_nodes:  500 },
+  balanced:    { host_mb:  6144, gpu_mb: 0, json_mb: 100, strategy_tree_max_nodes: 2000 },
+  performance: { host_mb: 12288, gpu_mb: 0, json_mb: 150, strategy_tree_max_nodes: 5000 },
+};
 
 export interface ComboAnalysis {
   combo: string;
@@ -148,6 +174,37 @@ export interface SolverResponse {
   /** Path B: canonical runout reps available at the immediate prior chance,
    *  for the CURRENTLY-DISPLAYED node. Mirrors strategy_tree entry field. */
   runout_options?: RunoutOption[];
+  /** Sprint 2 (resource policy guide): per-solve resource estimate +
+   *  budget decision. Lets the UI show "tree truncated", "fell back to
+   *  CPU because …", or estimated bytes without re-running the solve.
+   *  Optional because older saved solutions / older engine versions
+   *  don't include it — components MUST tolerate it being undefined. */
+  resources?: SolveResources;
+}
+
+/** Mirrors C++ `SolveResources` (core/include/types.h) and Rust
+ *  `SolveResources` (src-tauri/src/types.rs). Every field has a sane
+ *  default in C++/Rust so older `.dsolver` files load unchanged. */
+export interface SolveResources {
+  canonical_combos: number;
+  player_nodes: number;
+  estimated_matchup_bytes: number;
+  estimated_cpu_state_bytes: number;
+  estimated_gpu_state_bytes: number;
+  estimated_strategy_tree_bytes: number;
+  estimated_json_bytes: number;
+  host_budget_bytes: number;
+  gpu_budget_bytes: number;
+  strategy_tree_max_nodes: number;
+  strategy_tree_emitted_nodes: number;
+  strategy_tree_truncated: boolean;
+  /** "ok" | "reduce_runouts" | "reduce_tree" | "reduce_json" |
+   *  "gpu_oom_likely" | "host_oom_likely" — see memory_budget.h. */
+  budget_decision: string;
+  /** Human-readable diagnostic when budget_decision != "ok". */
+  diagnostic: string;
+  /** Set when AUTO backend downgraded GPU→CPU due to budget; otherwise "". */
+  fallback_reason: string;
 }
 
 /** One entry in `strategy_tree`. Mirrors the per-node fields the UI reads
