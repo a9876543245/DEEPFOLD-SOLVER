@@ -20,6 +20,7 @@
    - [3.3 Blocker 解讀](#33-blocker-解讀)
 4. [Memory Profile — solver 資源策略](#4-memory-profile--solver-資源策略)
 5. [常見問題](#5-常見問題)
+6. [附錄: 首次安裝 Windows SmartScreen 警告](#附錄-首次安裝-windows-smartscreen-警告)
 
 ---
 
@@ -373,6 +374,79 @@ A: 視 board 跟 backend：
 | flop, full ranges | 5–15s | 1–5s |
 | turn, full ranges | 30–120s | 5–30s |
 | river full tree | 不建議 | 視 VRAM |
+
+---
+
+## 附錄: 首次安裝 Windows SmartScreen 警告
+
+### 你會看到什麼
+
+雙擊安裝檔後，Windows 會跳出**藍色全螢幕**警告視窗：
+
+```
+┌──────────────────────────────────────────────┐
+│  Windows 已保護你的電腦                       │
+│                                              │
+│  Microsoft Defender SmartScreen 已防止無法    │
+│  辨識的應用程式啟動。執行此應用程式可能會    │
+│  讓您的電腦面臨風險。                        │
+│                                              │
+│  [更多資訊]                                   │  ← 點這裡（不是「不執行」）
+│                                              │
+│              [不要執行]                       │
+└──────────────────────────────────────────────┘
+```
+
+點 **「更多資訊」** 之後，視窗會展開多兩行文字 + 一個新按鈕：
+
+```
+┌──────────────────────────────────────────────┐
+│  Windows 已保護你的電腦                       │
+│  ...（同上）                                  │
+│                                              │
+│  應用程式: DEEPFOLD-SOLVER_1.x.x_x64-setup.exe │
+│  發行者: 不明的發行者                          │
+│                                              │
+│  [仍要執行]                  [不要執行]        │  ← 點「仍要執行」
+└──────────────────────────────────────────────┘
+```
+
+點 **「仍要執行」** → 進入正常 NSIS 安裝流程。
+
+### 為什麼會跳這個警告
+
+Windows SmartScreen 對所有**沒有 code signing 憑證**的 .exe 都會顯示
+這個警告。原因不是「我們的 app 不安全」，而是 **Microsoft 不認識
+publisher**（任何人都可以叫自己「DEEPFOLD」，沒有第三方驗證過）。
+
+要消除這個警告，需要購買 **EV (Extended Validation) Code Signing
+Certificate**（一年約 $300–600 USD）。**目前我們在等使用者數累積到一定
+規模再投資這筆費用**，先請使用者忍耐這一個多餘步驟。
+
+### 安全性
+
+- DEEPFOLD-SOLVER 的所有 source code **公開在 GitHub** 可審視：
+  https://github.com/a9876543245/DEEPFOLD-SOLVER
+- 安裝檔 hash 在每次 release 的 GitHub release page 可比對
+- 全程**本機執行**，不上傳任何 solver 資料 — 唯一的網路請求是登入時跟
+  deepfold.co 確認會員資格
+- 不會跳警告 = 沒有惡意，也不代表跳警告 = 有惡意。判斷依據應該是
+  **source code 公開度** + **下載來源**
+
+### 自動更新會不會再跳警告
+
+**會**。每個版本的 installer hash 不同，SmartScreen 對 unsigned executable
+的 reputation 是 per-file 的，不會延續。意思是 v1.1.0 點過「仍要執行」，
+v1.1.1 還是要再點一次。
+
+這也是我們把 EV code signing 列在 roadmap 的原因 — 簽完之後**所有**新
+版本都會自動信任。
+
+### 還是不放心？
+
+可以從原始碼編譯（README 有完整步驟）。編出來的 .exe 沒有 publisher
+資訊但也不會跳警告（因為是你自己執行你自己編的東西，不是從網路下載
+的 unknown publisher）。
 
 ---
 

@@ -64,6 +64,13 @@ DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). 
 
 After install, the app self-updates: a banner appears in the top-left when a new release is available; one click installs and restarts.
 
+> ⚠️ **First-run Windows warning**: when you launch the installer, Windows
+> will show a "**Windows protected your PC**" (SmartScreen) prompt. This is
+> expected — DEEPFOLD-SOLVER doesn't yet ship with an EV code-signing
+> certificate, so Windows doesn't recognize the publisher. Click
+> **More info** → **Run anyway** to continue. Full walkthrough in the
+> [User Guide — SmartScreen warning](USER_GUIDE.md#appendix-first-install-windows-smartscreen-warning).
+
 ## System requirements
 
 | | Minimum | Recommended |

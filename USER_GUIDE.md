@@ -20,6 +20,7 @@
    - [3.3 Reading the blocker numbers](#33-reading-the-blocker-numbers)
 4. [Memory Profile — solver resource policy](#4-memory-profile--solver-resource-policy)
 5. [FAQ](#5-faq)
+6. [Appendix: First-install Windows SmartScreen warning](#appendix-first-install-windows-smartscreen-warning)
 
 ---
 
@@ -383,6 +384,83 @@ A: Depends on the board and backend:
 | Flop, full ranges | 5–15s | 1–5s |
 | Turn, full ranges | 30–120s | 5–30s |
 | River full tree | not recommended | depends on VRAM |
+
+---
+
+## Appendix: First-install Windows SmartScreen warning
+
+### What you'll see
+
+When you double-click the installer, Windows shows a **full-screen blue
+warning**:
+
+```
+┌──────────────────────────────────────────────┐
+│  Windows protected your PC                   │
+│                                              │
+│  Microsoft Defender SmartScreen prevented an │
+│  unrecognized app from starting. Running this │
+│  app might put your PC at risk.              │
+│                                              │
+│  [More info]                                 │  ← click this (NOT "Don't run")
+│                                              │
+│              [Don't run]                     │
+└──────────────────────────────────────────────┘
+```
+
+After clicking **More info**, two more lines + a new button appear:
+
+```
+┌──────────────────────────────────────────────┐
+│  Windows protected your PC                   │
+│  ...(same as above)                          │
+│                                              │
+│  App: DEEPFOLD-SOLVER_1.x.x_x64-setup.exe    │
+│  Publisher: Unknown publisher                 │
+│                                              │
+│  [Run anyway]              [Don't run]       │  ← click "Run anyway"
+└──────────────────────────────────────────────┘
+```
+
+Click **Run anyway** → the normal NSIS installer takes over.
+
+### Why this warning appears
+
+Windows SmartScreen warns about every `.exe` that **lacks a code signing
+certificate**. It's not "your app is unsafe" — it's "Microsoft doesn't
+recognize the publisher" (anyone can call themselves "DEEPFOLD" without
+third-party verification).
+
+To remove the warning entirely, we'd need an **EV (Extended Validation)
+Code Signing Certificate** ($300–600 USD/year). **We're holding off on
+that investment until the user base grows enough to justify the cost** —
+in the meantime, please bear with the extra click.
+
+### Safety
+
+- DEEPFOLD-SOLVER's full source is **public on GitHub** for inspection:
+  https://github.com/a9876543245/DEEPFOLD-SOLVER
+- Every release page shows the installer's hash for verification
+- Everything runs **locally** — the only network call is the OAuth
+  membership check against deepfold.co
+- Lack of warning ≠ safe; presence of warning ≠ unsafe. The right signal
+  is **source transparency** + **download provenance**
+
+### Will auto-update trigger the warning again?
+
+**Yes.** Each version's installer has a different hash, and SmartScreen
+reputation for unsigned executables is per-file, not per-publisher.
+v1.1.0 → v1.1.1 will require another **Run anyway** click.
+
+This is exactly why EV code signing is on the roadmap — once signed,
+**all future versions** are trusted automatically.
+
+### Still uneasy?
+
+Build from source (full instructions in the README). The `.exe` you
+build will lack publisher info but won't trigger the warning either —
+SmartScreen doesn't apply to local builds you run yourself, only to
+downloads from the internet.
 
 ---
 

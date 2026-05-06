@@ -60,6 +60,12 @@ DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GP
 
 裝完後 app 會自動更新：有新版時左上角會出現 banner，點一下即可安裝重啟。
 
+> ⚠️ **首次安裝會看到 Windows 警告**：執行安裝檔時，Windows 會跳出
+> 「**Windows 已保護你的電腦**」(SmartScreen) 警告 — 這是正常的，因為
+> DEEPFOLD-SOLVER 還沒申請 EV code signing 憑證，Windows 不認識這個 publisher。
+> 請點 **更多資訊 (More info)** → **仍要執行 (Run anyway)** 繼續安裝。
+> 完整步驟見 [使用說明 — 首次安裝警告](USER_GUIDE.zh.md#附錄-首次安裝-windows-smartscreen-警告)。
+
 ## 系統需求
 
 | | 最低 | 建議 |
