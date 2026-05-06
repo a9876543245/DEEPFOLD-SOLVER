@@ -13,9 +13,17 @@
 # Prerequisites:
 #   - Tauri signing private key at $env:TAURI_SIGNING_PRIVATE_KEY_PATH
 #     (default: $HOME\.tauri\deepfold_updater.key)
-#   - Key password via $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD (empty if none)
 #   - Public key in src-tauri\tauri.conf.json (already set — don't change
 #     after the first release or existing installs will reject updates)
+#
+# Signing strategy:
+#   The build is run with `createUpdaterArtifacts: false` to skip Tauri's
+#   in-build signing (it hangs on stdin password prompts in PowerShell 5.1 +
+#   npm.cmd in some setups, even when TAURI_SIGNING_PRIVATE_KEY_PASSWORD is
+#   set to ""). The .sig file is then created manually post-build via
+#   `tauri-cli signer sign --password ""` which is reliable across shells.
+#   `createUpdaterArtifacts: true` in tauri.conf.json is kept so the runtime
+#   updater plugin still verifies signatures normally on end-user machines.
 #
 # Output:
 #   release\
@@ -83,23 +91,60 @@ if (-not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
 Write-Host "Signing key: $keyPath" -ForegroundColor DarkGray
 
 # ----- 3. Build (unless skipped) --------------------------------------------
+#
+# We DISABLE Tauri's in-build minisign signing here (`--config` override) and
+# do it manually in step 3.5 below. Reason: Tauri's bundler reads
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD from the env, but in some Windows shells
+# (notably PowerShell 5.1 invoking npm.cmd) the empty-string password doesn't
+# propagate cleanly through the npm → cargo → tauri-bundler → signer chain.
+# When that fails the signer prompts on stdin and the build hangs forever
+# (bundling completes, .exe lands in target/release/bundle/nsis/, then nothing).
+# Doing signing as an explicit post-build step with the `--password` CLI flag
+# is reliable across all shells. The override only affects build-time signing;
+# `createUpdaterArtifacts: true` in tauri.conf.json stays so the runtime
+# updater plugin still verifies signatures normally.
 if (-not $SkipBuild) {
     Write-Host ""
-    Write-Host "Building (cargo tauri build)..." -ForegroundColor Cyan
-    npm run tauri build
-    if ($LASTEXITCODE -ne 0) { throw "Tauri build failed" }
+    Write-Host "Building (cargo tauri build, in-build signing disabled)..." -ForegroundColor Cyan
+    # Pass --config via a temp JSON file rather than an inline argument —
+    # PowerShell quoting + npm.cmd argument forwarding mangle inline JSON
+    # ("{\"bundle\":...}") in subtle ways that vary by shell version.
+    $tmpConfig = New-TemporaryFile
+    try {
+        Set-Content -Path $tmpConfig.FullName -Value '{"bundle":{"createUpdaterArtifacts":false}}' -Encoding ASCII -NoNewline
+        npm run tauri build -- --config $tmpConfig.FullName
+        if ($LASTEXITCODE -ne 0) { throw "Tauri build failed" }
+    } finally {
+        Remove-Item $tmpConfig.FullName -ErrorAction SilentlyContinue
+    }
 } else {
     Write-Host "Skipping build (-SkipBuild)" -ForegroundColor DarkGray
 }
 
-# ----- 4. Collect artifacts -------------------------------------------------
+# ----- 3.5 Sign NSIS installer (manual, post-build) -------------------------
 $bundleDir = "src-tauri\target\release\bundle"
-$nsisExe  = Get-ChildItem "$bundleDir\nsis\*$Version*setup.exe" -File | Select-Object -First 1
-$nsisSig  = Get-ChildItem "$bundleDir\nsis\*$Version*setup.exe.sig" -File | Select-Object -First 1
-$msi      = Get-ChildItem "$bundleDir\msi\*$Version*.msi" -File | Select-Object -First 1
+$nsisExeForSigning = Get-ChildItem "$bundleDir\nsis\*$Version*setup.exe" -File | Select-Object -First 1
+if (-not $nsisExeForSigning) { throw "NSIS installer not found in $bundleDir\nsis\ — build must have failed" }
 
-if (-not $nsisExe) { throw "NSIS installer not found in $bundleDir\nsis\" }
-if (-not $nsisSig) { throw "NSIS signature (.sig) not found. Is `createUpdaterArtifacts: true` in tauri.conf.json?" }
+$existingSig = Get-ChildItem "$bundleDir\nsis\*$Version*setup.exe.sig" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $existingSig -or $SkipBuild) {
+    Write-Host ""
+    Write-Host "Signing $($nsisExeForSigning.Name) (manual, --password CLI flag)..." -ForegroundColor Cyan
+    # Pass password via flag, not env, so we don't inherit stdin-prompt bugs
+    # from previous failed attempts. `--yes` on npx avoids the install
+    # confirmation prompt.
+    & npx --yes @tauri-apps/cli signer sign -f $keyPath -p "" $nsisExeForSigning.FullName
+    if ($LASTEXITCODE -ne 0) { throw "Manual signer failed (see output above)" }
+} else {
+    Write-Host "Existing signature found — skipping manual sign" -ForegroundColor DarkGray
+}
+
+# ----- 4. Collect artifacts -------------------------------------------------
+$nsisExe  = $nsisExeForSigning
+$nsisSig  = Get-ChildItem "$bundleDir\nsis\*$Version*setup.exe.sig" -File | Select-Object -First 1
+$msi      = Get-ChildItem "$bundleDir\msi\*$Version*.msi" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+
+if (-not $nsisSig) { throw "NSIS signature (.sig) not found after manual signing — check signer output above" }
 
 Write-Host ""
 Write-Host "Artifacts:" -ForegroundColor Cyan
