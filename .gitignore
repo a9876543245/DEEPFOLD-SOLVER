@@ -25,3 +25,4 @@ logs/
 # Claude Code session state (per-developer)
 .claude/
 CLAUDE.md
+/gto_output/
