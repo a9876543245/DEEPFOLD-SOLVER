@@ -128,6 +128,10 @@ export interface SolverRequest {
   /** v1.4.0 Phase 2: CPU CFR thread count. undefined / 0 = auto (currently
    *  caps at 2 — the OOP/IP traverser parallelism). */
   cpu_threads?: number;
+  /** v1.5.0 Phase 4: CPU backend variant.
+   *  "reference" — recursive scratch-arena (parity oracle, capped at 2 threads).
+   *  "levelized" — BFS-flat traversal, scales to all cores. */
+  cpu_backend?: 'reference' | 'levelized';
 }
 
 export type MemoryProfile = 'safe' | 'balanced' | 'performance';
@@ -262,6 +266,9 @@ export interface SolveResources {
   cpu_simd?: string;
   /** v1.4.0 Phase 2: effective CFR thread count. 1 = serial, 2 = OOP||IP. */
   cpu_threads_effective?: number;
+  /** v1.5.0 Phase 4: "reference" or "levelized" — which CPU backend variant
+   *  the engine used. Empty on GPU solves. */
+  cpu_backend_kind?: string;
 }
 
 /** v1.2.2: response shape of the `estimate_solve` Tauri command.

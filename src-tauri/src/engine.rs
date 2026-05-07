@@ -327,6 +327,12 @@ fn build_solver_args(request: &SolverRequest, backend_override: Option<&str>) ->
         args.push("--cpu-threads".to_string());
         args.push(threads.to_string());
     }
+    if let Some(kind) = &request.cpu_backend {
+        if !kind.is_empty() {
+            args.push("--cpu-backend".to_string());
+            args.push(kind.clone());
+        }
+    }
 
     args
 }

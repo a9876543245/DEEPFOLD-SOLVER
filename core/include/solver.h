@@ -25,6 +25,11 @@
 #include "isomorphism.h"
 #include "solver_backend.h"
 #include "cpu_backend.h"
+#include "cpu_backend_levelized.h"
+
+#ifdef _OPENMP
+#  include <omp.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -706,6 +711,21 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     backend_ = create_backend(selected_backend);
     if (!backend_) backend_ = std::make_unique<CpuBackend>();
 
+    // v1.5.0 Phase 4: if AUTO/CPU resolved to a CPU backend AND user picked
+    // the levelized variant, swap in LevelizedCpuBackend instead. The factory
+    // doesn't know about cpu_backend_kind (it's a per-solve config detail
+    // separate from BackendType selection), so we patch here.
+    if (selected_backend != BackendType::GPU &&
+        config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED)
+    {
+        const std::string nm = backend_->name();
+        if (nm.find("CPU") != std::string::npos &&
+            nm.find("Levelized") == std::string::npos)
+        {
+            backend_ = std::make_unique<LevelizedCpuBackend>();
+        }
+    }
+
     SolverContext ctx;
     ctx.tree                       = &tree_;
     ctx.iso                        = &iso_;
@@ -918,7 +938,21 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         // the UI can suppress the CPU-only label there.
         if (selected_backend != BackendType::GPU) {
             r.cpu_simd = cpu_simd::mode_label();
-            r.cpu_threads_effective = (config_.cpu_threads == 1) ? 1u : 2u;
+            // v1.5.0 Phase 4: levelized backend uses all CPU cores via OMP,
+            // not a fixed pair like the reference backend's parallel sections.
+            // For diagnostics we report the OMP team size when known, else
+            // fall back to the cpu_threads config (capped at 2 for reference).
+            if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
+#ifdef _OPENMP
+                r.cpu_threads_effective = static_cast<uint32_t>(omp_get_max_threads());
+#else
+                r.cpu_threads_effective = 1u;
+#endif
+                r.cpu_backend_kind = "levelized";
+            } else {
+                r.cpu_threads_effective = (config_.cpu_threads == 1) ? 1u : 2u;
+                r.cpu_backend_kind = "reference";
+            }
         }
 
         result.resources = std::move(r);
@@ -1028,7 +1062,17 @@ inline SolveResources Solver::estimate_only() {
     // v1.4.0 Phase 2: same CPU mode diagnostics on the estimate-only path.
     if (predicted_backend != BackendType::GPU) {
         r.cpu_simd = cpu_simd::mode_label();
-        r.cpu_threads_effective = (config_.cpu_threads == 1) ? 1u : 2u;
+        if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
+#ifdef _OPENMP
+            r.cpu_threads_effective = static_cast<uint32_t>(omp_get_max_threads());
+#else
+            r.cpu_threads_effective = 1u;
+#endif
+            r.cpu_backend_kind = "levelized";
+        } else {
+            r.cpu_threads_effective = (config_.cpu_threads == 1) ? 1u : 2u;
+            r.cpu_backend_kind = "reference";
+        }
     }
 
     // Lightweight budget-decision label so the UI can flag "this will fail

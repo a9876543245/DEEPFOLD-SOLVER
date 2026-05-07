@@ -285,6 +285,18 @@ struct SolverConfig {
     /// can label "CPU (AVX2 · 2 threads)".
     uint32_t cpu_threads = 0;
 
+    /// v1.5.0 Phase 4: which CPU CFR backend to use.
+    ///   REFERENCE = recursive scratch-arena CpuBackend (the parity oracle).
+    ///   LEVELIZED = BFS-flat traversal LevelizedCpuBackend, scales past
+    ///               the 2-thread cap of the reference backend.
+    /// Surfaced as `--cpu-backend reference|levelized`. Default REFERENCE
+    /// until the levelized backend's parity tests stabilize.
+    enum class CpuBackendKind {
+        REFERENCE = 0,
+        LEVELIZED = 1,
+    };
+    CpuBackendKind cpu_backend_kind = CpuBackendKind::REFERENCE;
+
     /// Sprint 1 (market-beating plan): the host RAM / GPU VRAM / JSON /
     /// strategy-tree budget that gates every large allocation in the solve
     /// pipeline. Defaults are sane (6 GB host, 100 MB JSON, 2000 emitted
@@ -384,6 +396,11 @@ struct SolveResources {
     /// Effective CFR thread count. 1 = serial traversers, 2 = OOP||IP via OMP.
     /// Phase 4 will allow values > 2 once levelized backend lands.
     uint32_t cpu_threads_effective = 0;
+    /// v1.5.0 Phase 4: CPU backend variant — "reference" or "levelized".
+    /// Reference is the recursive scratch-arena CpuBackend (capped at 2
+    /// threads). Levelized is BFS-flat with per-level OMP and scales to
+    /// all available cores.
+    std::string cpu_backend_kind;
 };
 
 /// Full solver result

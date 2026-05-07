@@ -79,6 +79,10 @@ pub struct SolverRequest {
     /// traversers, 2 = OOP||IP via OMP. Higher values become useful in v1.5+.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_threads: Option<u32>,
+    /// v1.5.0 Phase 4: CPU backend variant — "reference" or "levelized".
+    /// Default reference (parity oracle). Levelized scales to all cores.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_backend: Option<String>,
 }
 
 /// Sprint 3 (resource policy guide): resolved memory budget tuple after
@@ -249,6 +253,9 @@ pub struct SolveResources {
     pub cpu_simd: String,
     #[serde(default)]
     pub cpu_threads_effective: u32,
+    /// v1.5.0 Phase 4: "reference" or "levelized". Empty on GPU solves.
+    #[serde(default)]
+    pub cpu_backend_kind: String,
 }
 
 /// v1.2.2: Lightweight pre-solve estimate response. Returned by the

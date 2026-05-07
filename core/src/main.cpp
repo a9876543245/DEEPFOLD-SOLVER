@@ -99,6 +99,11 @@ struct CLIArgs {
     std::string cpu_simd = "auto";
     uint32_t cpu_threads = 0;
 
+    // v1.5.0 Phase 4: CPU CFR backend variant.
+    //   reference (default) — recursive scratch-arena CpuBackend
+    //   levelized           — BFS-flat traversal, scales past 2 threads
+    std::string cpu_backend_kind = "reference";
+
     // Sprint 1 (market-beating plan): per-solve memory budget overrides.
     // Default 0 = use the SolverConfig defaults (6 GB host, 100 MB JSON,
     // 2000 emitted strategy-tree nodes). Any non-zero value supersedes
@@ -230,6 +235,8 @@ CLIArgs parse_args(int argc, char* argv[]) {
         } else if (arg == "--cpu-threads" && i + 1 < argc) {
             int v = std::stoi(argv[++i]);
             args.cpu_threads = static_cast<uint32_t>(std::max(0, v));
+        } else if (arg == "--cpu-backend" && i + 1 < argc) {
+            args.cpu_backend_kind = argv[++i];
         }
     }
 
@@ -280,6 +287,10 @@ Arguments:
   --cpu-threads <int>      CPU CFR thread count. 0 = auto. Currently capped at 2
                            (the OOP/IP traverser parallelism). Use 1 to force
                            serial traversal. Higher values become useful in v1.5+.
+  --cpu-backend <kind>     CPU CFR variant: reference | levelized.
+                           reference (default): recursive scratch-arena.
+                           levelized: BFS-flat traversal, scales to all cores
+                           via per-level OMP. Pick this when you have 4+ cores.
   --help, -h               Show this help message
 
 Output:
@@ -525,7 +536,8 @@ std::string result_to_json(
         json << "    \"estimated_solve_seconds\": " << r.estimated_solve_seconds << ",\n";
         // v1.4.0 Phase 2: CPU mode diagnostics (empty/0 on GPU solves).
         json << "    \"cpu_simd\": \"" << escape_json(r.cpu_simd) << "\",\n";
-        json << "    \"cpu_threads_effective\": " << r.cpu_threads_effective << "\n";
+        json << "    \"cpu_threads_effective\": " << r.cpu_threads_effective << ",\n";
+        json << "    \"cpu_backend_kind\": \"" << escape_json(r.cpu_backend_kind) << "\"\n";
         json << "  },\n";
     }
 
@@ -782,6 +794,18 @@ int main(int argc, char* argv[]) {
         config.force_cpu_postsolve = args.force_cpu_postsolve;
         config.cpu_threads = args.cpu_threads;
 
+        // v1.5.0 Phase 4: --cpu-backend reference|levelized
+        {
+            std::string kind = args.cpu_backend_kind;
+            for (char& ch : kind)
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (kind == "levelized") {
+                config.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
+            } else {
+                config.cpu_backend_kind = SolverConfig::CpuBackendKind::REFERENCE;
+            }
+        }
+
         // v1.4.0 Phase 2: apply --cpu-simd policy. set_policy() is idempotent
         // and re-resolves the kernel table on next call to kernels(). Done
         // before backend creation so the CpuBackend's first prepare() picks
@@ -908,7 +932,8 @@ int main(int argc, char* argv[]) {
                       << "    \"backend_for_estimate\": \"" << escape_json(r.backend_for_estimate) << "\",\n"
                       << "    \"estimated_solve_seconds\": " << r.estimated_solve_seconds << ",\n"
                       << "    \"cpu_simd\": \"" << escape_json(r.cpu_simd) << "\",\n"
-                      << "    \"cpu_threads_effective\": " << r.cpu_threads_effective << "\n"
+                      << "    \"cpu_threads_effective\": " << r.cpu_threads_effective << ",\n"
+                      << "    \"cpu_backend_kind\": \"" << escape_json(r.cpu_backend_kind) << "\"\n"
                       << "  }\n"
                       << "}\n";
             return 0;
@@ -1011,7 +1036,8 @@ int main(int argc, char* argv[]) {
                       << "  \"tree_nodes\": " << tree_nodes << ",\n"
                       << "  \"cpu\": {\n"
                       << "    \"simd\": \"" << escape_json(result.resources.cpu_simd) << "\",\n"
-                      << "    \"threads\": " << result.resources.cpu_threads_effective << "\n"
+                      << "    \"threads\": " << result.resources.cpu_threads_effective << ",\n"
+                      << "    \"backend_kind\": \"" << escape_json(result.resources.cpu_backend_kind) << "\"\n"
                       << "  },\n"
                       << "  \"timing\": {\n"
                       << "    \"total_ms\": " << result.timing.total_ms << ",\n"

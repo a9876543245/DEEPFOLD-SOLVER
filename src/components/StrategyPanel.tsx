@@ -208,32 +208,41 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
                 resources fields are empty/0 on GPU runs). Lets users see
                 why their CPU solve was fast or slow (AVX2 vs scalar) and
                 whether the OOP/IP parallel sections kicked in. */}
-            {result.resources?.cpu_simd && result.resources.cpu_simd.length > 0 && (
-              <div
-                title={`CPU CFR kernels: ${result.resources.cpu_simd.toUpperCase()} ` +
-                       `· ${result.resources.cpu_threads_effective ?? 1} thread${(result.resources.cpu_threads_effective ?? 1) > 1 ? 's' : ''}`}
-                style={{
-                  display: 'inline-flex', alignItems: 'center', gap: 4,
-                  padding: '3px 8px', borderRadius: 999,
-                  background: result.resources.cpu_simd === 'avx2'
-                    ? 'rgba(10, 132, 255, 0.12)'
-                    : 'rgba(245, 158, 11, 0.15)',
-                  border: `1px solid ${result.resources.cpu_simd === 'avx2'
-                    ? 'rgba(10, 132, 255, 0.35)'
-                    : 'rgba(245, 158, 11, 0.4)'}`,
-                  fontSize: 10, fontWeight: 700, letterSpacing: 0.3,
-                  color: result.resources.cpu_simd === 'avx2'
-                    ? 'var(--color-accent, #0A84FF)'
-                    : '#f59e0b',
-                  cursor: 'help',
-                }}
-              >
-                CPU · {result.resources.cpu_simd.toUpperCase()}
-                {(result.resources.cpu_threads_effective ?? 0) > 1 && (
-                  <span style={{ opacity: 0.85 }}>· {result.resources.cpu_threads_effective}T</span>
-                )}
-              </div>
-            )}
+            {result.resources?.cpu_simd && result.resources.cpu_simd.length > 0 && (() => {
+              const r = result.resources!;
+              const kind = r.cpu_backend_kind || 'reference';
+              const isLevelized = kind === 'levelized';
+              const tooltip =
+                `CPU CFR: ${r.cpu_simd!.toUpperCase()} kernels` +
+                ` · ${kind} backend` +
+                ` · ${r.cpu_threads_effective ?? 1} thread${(r.cpu_threads_effective ?? 1) > 1 ? 's' : ''}`;
+              return (
+                <div
+                  title={tooltip}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 4,
+                    padding: '3px 8px', borderRadius: 999,
+                    background: r.cpu_simd === 'avx2'
+                      ? 'rgba(10, 132, 255, 0.12)'
+                      : 'rgba(245, 158, 11, 0.15)',
+                    border: `1px solid ${r.cpu_simd === 'avx2'
+                      ? 'rgba(10, 132, 255, 0.35)'
+                      : 'rgba(245, 158, 11, 0.4)'}`,
+                    fontSize: 10, fontWeight: 700, letterSpacing: 0.3,
+                    color: r.cpu_simd === 'avx2'
+                      ? 'var(--color-accent, #0A84FF)'
+                      : '#f59e0b',
+                    cursor: 'help',
+                  }}
+                >
+                  CPU · {r.cpu_simd!.toUpperCase()}
+                  {isLevelized && <span style={{ opacity: 0.85 }}>· LVL</span>}
+                  {(r.cpu_threads_effective ?? 0) > 1 && (
+                    <span style={{ opacity: 0.85 }}>· {r.cpu_threads_effective}T</span>
+                  )}
+                </div>
+              );
+            })()}
             {/* v1.3.0: post-solve quality at-a-glance. Reads exploitability +
                 early_stop_reason — surfaces "stopped at budget, may be rough"
                 without making the user dig into resources fields. */}
