@@ -102,12 +102,15 @@ if (-not $keyPath) {
 if (-not (Test-Path $keyPath)) {
     throw "Signing key not found at $keyPath. Regenerate with:`n  npx tauri signer generate -w $keyPath"
 }
-# Tauri v2 reads TAURI_SIGNING_PRIVATE_KEY (a path OR the base64 secret).
-# Pass the path — passing the file content includes the rsign comment
-# header line which fails base64 decode. Empty password is set explicitly
-# so the signer doesn't block on a stdin prompt during a non-interactive
-# build (this is the pattern that hung the build before).
-$env:TAURI_SIGNING_PRIVATE_KEY = $keyPath
+# NOTE: don't set TAURI_SIGNING_PRIVATE_KEY here. Newer tauri-cli versions
+# (≥ 2.x) reject the combination of `-f <path>` (which step 3.5 passes via
+# CLI) AND the env var being set with the same path — error: "the argument
+# '--private-key-path' cannot be used with '--private-key'". The variable
+# was originally set to feed the in-build signer; we disabled in-build
+# signing back in v1.2.0, so the env var is no longer load-bearing.
+# Also unset it preemptively in case the calling shell exported it (the
+# error above appeared on a session that had it pre-exported).
+Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
 if (-not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
     $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
 }
