@@ -7,10 +7,50 @@
 📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.2.2-green)
+![Version](https://img.shields.io/badge/version-1.3.0-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
 DEEPFOLD-SOLVER は [DEEPFOLD](https://deepfold.co) のデスクトップ GTO ソルバーです。GPU アクセラレーション DCFR エンジン（CPU フォールバック完備）に **runout 集計、コンボ別ブロッカー解析、EV/アグレ度ヒートマップ、2,500+ プリフロップ チャート** を加え、Windows 用ワンクリックインストーラーに同梱しています。
+
+## v1.3.0 のハイライト（時間予算 + Stop ボタン）
+
+待ち時間崖の解決。v1.2.2 のユーザーフィードバック「5 分で停止するのに 3 時間
+ETA を見せるのは無意味」が発端。
+
+### Solve mode プリセット
+
+Solve ボタン上に 3 つのピル — iter 上限 + 時間予算 + 達成目標を一括設定：
+
+| モード | iter 上限 | 時間予算 | exploit 目標 | 用途 |
+|---|---|---|---|---|
+| **Quick**    | 100  | 60 秒    | 1.5%  | 大方向確認 |
+| **Standard** | 300  | 5 分    | 0.5%   | **デフォルト** — Pro グレード |
+| **Deep**     | 1000 | 15 分   | 0.2%   | 詳細研究 |
+
+いずれか先に達した時点で停止。CFR は anytime アルゴリズム — iter N の running
+average が戦略なので、予算で停めても使える結果。
+
+### Stop ボタン + Quality バッジ
+
+- **Stop ボタン** — 完全 abort、部分結果は保存しない。「今あるものを返せ」は
+  時間予算経由（自動）。
+- **Quality バッジ**：🟢/🟡/🟠/🔴 で exploitability 別品質ラベル。
+
+### ETA バナー再設計
+
+ヘッドラインは `min(estimate, time_budget)`。「Estimated 5 hours on CPU」と
+出して 5 分で停めるのではなく、実際の待ち時間を表示。
+
+### スループット再キャリブレーション
+
+GPU 推定が 50× 悲観的だった（実測 568 Gops/s on RTX 5090 で再キャリブレーション）。
+CPU レートも 3× 引き上げ。以前 11 分と推定された spot が 12 秒に。
+
+### エンジン
+
+- 新 `--time-budget-seconds <s>` CLI フラグ
+- 新 `early_stop_reason` JSON フィールド
+- 新 `cancel_solve` Tauri コマンド
 
 ## v1.2.2 のハイライト（解算前 ETA + マルチアーキ CUDA）
 

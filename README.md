@@ -7,10 +7,61 @@
 📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.2.2-green)
+![Version](https://img.shields.io/badge/version-1.3.0-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
 DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). It pairs a GPU-accelerated DCFR engine (with full CPU fallback) with **runout aggregation, per-combo blocker analysis, EV / aggression heatmaps, and a 2,500+ preflop chart browser** — all in a single Windows installer.
+
+## What's new in v1.3.0 (time-budgeted solves + Stop button)
+
+The wait-cliff fix. Triggered by user feedback on v1.2.2: "if you're going to
+stop at 5 minutes anyway, showing me a 3-hour ETA is useless."
+
+### Solve mode presets
+
+Three pills above the Solve button bundle iteration cap + time budget +
+exploitability target into one click:
+
+| Mode | Iter cap | Time budget | Exploit target | Use when |
+|---|---|---|---|---|
+| **Quick**    | 100  | 60s   | 1.5%   | Sanity check, exploration |
+| **Standard** | 300  | 5 min | 0.5%   | **Default** — pro-grade play |
+| **Deep**     | 1000 | 15 min | 0.2%  | Research, nuanced spots |
+
+The solver stops at whichever fires first. CFR is anytime — at any iteration
+*N* the running average is the strategy, so stopping at the budget gives a
+usable result, not a half-baked one.
+
+### Stop button + Quality badge
+
+- **Stop button** (replaces Solve while loading) — pure abort; no partial
+  result preserved. Time budget is the path for "stop with what we have"
+  (auto-fires when budget hits).
+- **Quality badge** in the result panel: 🟢 high / 🟡 good / 🟠 rough /
+  🔴 low confidence based on final exploitability%. Surfaces "stopped at
+  budget — try Deep mode" when relevant.
+
+### ETA banner reworked
+
+Headline is now `min(estimate, time_budget)` instead of an unbounded
+estimate. No more "Estimated 5 hours on CPU" for spots the user will only
+wait 5 minutes for. Side note shows the unbounded estimate so users
+understand the budget is fire-the-stop, not "we'll converge in time".
+
+### Throughput recalibration
+
+The pre-solve estimator was 50× pessimistic on GPU (calibrated against a
+hand-wave; now calibrated against actual `--benchmark standard` numbers
+on a real RTX 5090: 568 Gops/s sustained). CPU rate also bumped 3×. Same
+spot that previously estimated "11 minutes" on a top-end GPU now
+estimates ~12 seconds — matching reality.
+
+### Engine
+
+- New `--time-budget-seconds <s>` CLI flag, checked **every iter** so slow
+  per-iter spots stop precisely at the budget (not 5 minutes late).
+- New `early_stop_reason` field in result JSON: `iter_cap` / `time_budget`.
+- New `cancel_solve` Tauri command (terminate via taskkill).
 
 ## What's new in v1.2.2 (pre-solve ETA + multi-arch CUDA)
 

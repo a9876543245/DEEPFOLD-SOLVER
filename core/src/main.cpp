@@ -43,6 +43,9 @@ struct CLIArgs {
     std::string target_combo;
     int iterations = 500;
     float exploitability = 0.5f;    // percentage
+    /// v1.3.0: hard wall-clock cap on the iteration phase. 0 = no cap.
+    /// UI presets: Quick=60, Standard=300, Deep=900.
+    int time_budget_seconds = 0;
     bool help = false;
     bool gpu_info = false;
 
@@ -212,6 +215,8 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.benchmark = argv[++i];
         } else if (arg == "--estimate-only") {
             args.estimate_only = true;
+        } else if (arg == "--time-budget-seconds" && i + 1 < argc) {
+            args.time_budget_seconds = std::max(0, std::stoi(argv[++i]));
         }
     }
 
@@ -253,6 +258,9 @@ Arguments:
   --estimate-only          Build tree + estimate solve time/memory, emit JSON, exit.
                            Skips precompute_matchups + iterations. Sub-second on most
                            spots — used by the UI to show ETA before committing.
+  --time-budget-seconds <s> Hard wall-clock cap on the iteration phase. Stops at
+                           min(iter cap, time budget). 0 = no time cap (default).
+                           UI presets: Quick=60, Standard=300, Deep=900.
   --help, -h               Show this help message
 
 Output:
@@ -444,6 +452,8 @@ std::string result_to_json(
     json << "  \"rake_cap\": " << args.rake_cap << ",\n";
     json << "  \"iterations_run\": " << result.iterations_run << ",\n";
     json << "  \"exploitability_pct\": " << result.exploitability_pct << ",\n";
+    // v1.3.0: which stop condition fired ("iter_cap" / "time_budget").
+    json << "  \"early_stop_reason\": \"" << escape_json(result.early_stop_reason) << "\",\n";
     json << "  \"combo_evs_computed\": "
          << (result.combo_evs_computed ? "true" : "false") << ",\n";
     json << "  \"exploitability_computed\": "
@@ -739,6 +749,7 @@ int main(int argc, char* argv[]) {
         }
         config.max_iterations = args.iterations;
         config.target_exploitability = args.exploitability / 100.0f;
+        config.time_budget_seconds = args.time_budget_seconds;
         config.bet_sizing.flop_sizes = args.flop_sizes;
         config.bet_sizing.turn_sizes = args.turn_sizes;
         config.bet_sizing.river_sizes = args.river_sizes;

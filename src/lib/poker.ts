@@ -116,9 +116,40 @@ export interface SolverRequest {
   json_memory_mb?: number;
   /** Override emitted strategy-tree node cap. */
   strategy_tree_max_nodes?: number;
+  /** v1.3.0: hard wall-clock cap on the iteration phase. 0 / undefined =
+   *  no time cap. Frontend mode presets fill this in:
+   *    Quick=60, Standard=300, Deep=900. CFR is anytime — at any iter N the
+   *  running average is the strategy, so stopping at the budget is fine. */
+  time_budget_seconds?: number;
 }
 
 export type MemoryProfile = 'safe' | 'balanced' | 'performance';
+
+/** v1.3.0: solve mode preset. Bundles iter cap + time budget + exploit
+ *  target. Defaults below; UI shows them as 3 pills next to the Solve
+ *  button. Standard is the default since it's the right balance for most
+ *  spots — Deep is for "I really need 0.2% exploit", Quick for "I just
+ *  want a sanity check". */
+export type SolveMode = 'quick' | 'standard' | 'deep';
+
+export const SOLVE_MODE_PRESETS: Record<SolveMode, {
+  /** Engine-side iter cap. */
+  iterations: number;
+  /** Wall-clock seconds before forced stop. */
+  time_budget_seconds: number;
+  /** Target exploitability % (engine stops early if reached — currently
+   *  computed in postsolve only, so this is mostly informational). */
+  exploitability: number;
+  /** Short user-facing description for tooltips. */
+  description: string;
+}> = {
+  quick:    { iterations:  100, time_budget_seconds:  60, exploitability: 1.5,
+              description: 'Sanity check — up to 1 min' },
+  standard: { iterations:  300, time_budget_seconds: 300, exploitability: 0.5,
+              description: 'Pro-grade quality — up to 5 min' },
+  deep:     { iterations: 1000, time_budget_seconds: 900, exploitability: 0.2,
+              description: 'Research-grade — up to 15 min' },
+};
 
 /** Mirrors `ResolvedMemoryBudget::from_profile()` in src-tauri/src/types.rs.
  *  Exposed so the UI can show "balanced will allow up to 6 GB host" etc.
@@ -142,6 +173,9 @@ export interface SolverResponse {
   status: string;
   iterations_run: number;
   exploitability_pct: number;
+  /** v1.3.0: which stop condition ended the solve. Empty when the engine
+   *  predates v1.3.0 (e.g. loaded from an old .dsolver file). */
+  early_stop_reason?: EarlyStopReason;
   global_strategy: Record<string, string>;
   /** Per-combo strategy frequencies: { "AA": { "Check": 0.1, "Bet_33": 0.6, ... }, ... } */
   combo_strategies?: Record<string, ComboStrategy>;
@@ -226,6 +260,13 @@ export interface EstimateResponse {
   status: string;
   resources: SolveResources;
 }
+
+/** v1.3.0: which stop condition fired in the solve loop.
+ *  "iter_cap" = ran the full max_iterations
+ *  "time_budget" = wall-clock budget hit first (anytime stop)
+ *  "exploit_target" = converged below target exploitability (future)
+ *  Empty string = legacy behavior (no early-stop tracking). */
+export type EarlyStopReason = 'iter_cap' | 'time_budget' | 'exploit_target' | '';
 
 /** One entry in `strategy_tree`. Mirrors the per-node fields the UI reads
  *  from SolverResponse. Lets `useSolver.navigate(history)` synthesize a

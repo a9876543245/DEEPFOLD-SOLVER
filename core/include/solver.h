@@ -722,16 +722,55 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     timing.backend_prepare_ms = elapsed_since(stage_start, stage_end);
 
     // Step 5: run DCFR iterations through backend
+    //
+    // v1.3.0: stop conditions, in priority order each iteration:
+    //   1. time_budget — wall-clock exceeds time_budget_seconds (NEW)
+    //   2. iter_cap    — hit max_iterations (legacy default)
+    // (exploit-target early-stop is on the v1.4.0 roadmap — needs per-iter
+    // compute_exploitability which is expensive, would need a cheaper
+    // approximation to sample at every check interval.)
+    //
+    // CFR is anytime — the strategy at any iter N is the running average,
+    // useful even if we stop early. So time_budget=300 gives the user
+    // "whatever fits in 5 minutes" rather than the previous behavior
+    // ("estimated 5 hours, just sit there waiting").
     stage_start = Clock::now();
+    std::string early_stop_reason;
+    const int exp_check_interval = std::max(1, config_.exploitability_check_interval);
+    const auto iter_start = Clock::now();
     for (int t = 0; t < config_.max_iterations; ++t) {
         backend_->iterate(t);
         actual_iterations_run_ = t + 1;
 
-        if (progress_cb && (t + 1) % config_.exploitability_check_interval == 0) {
+        // Time-budget check (v1.3.0): EVERY iter, not just at the
+        // exploitability interval. On slow-per-iter spots (deep-stack turn
+        // on a CPU laptop), each iter can take 5+ seconds — checking only
+        // every 50 iter would mean a "10s budget" actually runs 5 minutes.
+        // Clock::now() + a comparison is nanoseconds; safe to do per-iter.
+        if (config_.time_budget_seconds > 0) {
+            auto now = Clock::now();
+            const float iter_elapsed_s =
+                elapsed_since(iter_start, now) / 1000.0f;
+            if (iter_elapsed_s >= static_cast<float>(config_.time_budget_seconds)) {
+                early_stop_reason = "time_budget";
+                if (progress_cb) {
+                    progress_cb(t + 1, 0.0f, elapsed_since(start_time, now));
+                }
+                break;
+            }
+        }
+
+        // Progress callback at the slower cadence (it's an stderr write,
+        // each one costs more than the time check).
+        if (progress_cb && (t + 1) % exp_check_interval == 0) {
             auto now = Clock::now();
             float elapsed = elapsed_since(start_time, now);
             progress_cb(t + 1, 0.0f, elapsed);
         }
+    }
+    if (early_stop_reason.empty() &&
+        actual_iterations_run_ >= config_.max_iterations) {
+        early_stop_reason = "iter_cap";
     }
     stage_end = Clock::now();
     timing.iterations_ms = elapsed_since(stage_start, stage_end);
@@ -795,6 +834,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     result.exploitability_pct  = exploitability_pct_;
     result.combo_evs_computed  = config_.compute_combo_evs;
     result.exploitability_computed = config_.compute_exploitability;
+    result.early_stop_reason   = early_stop_reason;
     result.action_labels       = get_action_labels_at(0);
     result.global_strategy     = extract_global_strategy_at(0);
     result.combo_strategies    = extract_combo_strategies_at(0);

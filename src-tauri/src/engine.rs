@@ -2,12 +2,50 @@
 /// Spawns the C++ deepsolver_core executable and communicates via stdin/stdout.
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 use crate::types::{EstimateResponse, GpuInfo, ResolvedMemoryBudget, SolverRequest, SolverResponse};
+
+/// v1.3.0: PID of the currently-running solve subprocess (0 = none).
+/// `cancel_solve` reads this and kills the process. Single global atomic
+/// is fine because the UI only allows one solve at a time and the
+/// `try_run_solver` path serialises through `run_solver`.
+static CURRENT_SOLVE_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Cancel the currently-running solve, if any. Returns true if a process
+/// was killed. Called by the `cancel_solve` Tauri command bound to the
+/// frontend Stop button. Uses `taskkill /F` on Windows; the kill_on_drop
+/// path on the Rust side will also reap the child after the process dies.
+pub fn cancel_current_solve() -> Result<bool, String> {
+    let pid = CURRENT_SOLVE_PID.load(Ordering::SeqCst);
+    if pid == 0 { return Ok(false); }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .output()
+            .map_err(|e| format!("taskkill failed: {}", e))?;
+        if !out.status.success() {
+            // Already dead is fine — race between user click and natural exit.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.contains("not found") && !stderr.contains("找不到") {
+                return Err(format!("taskkill {}: {}", pid, stderr));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // SIGKILL via `kill -9` for unix portability (when we get there).
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output();
+    }
+    Ok(true)
+}
 
 /// Diagnostic log file location. Writes CLI args and engine stderr on each
 /// run so we can diagnose user-reported crashes without reproducing state.
@@ -248,6 +286,15 @@ fn build_solver_args(request: &SolverRequest, backend_override: Option<&str>) ->
         args.push(mb.strategy_tree_max_nodes.to_string());
     }
 
+    // v1.3.0: time budget — stops iteration phase at min(time, iter, exploit).
+    // 0/None = no cap. UI mode presets fill this in based on Quick/Std/Deep.
+    if let Some(budget) = request.time_budget_seconds {
+        if budget > 0 {
+            args.push("--time-budget-seconds".to_string());
+            args.push(budget.to_string());
+        }
+    }
+
     args
 }
 
@@ -294,6 +341,14 @@ async fn try_run_solver(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn engine: {} (path: {:?})", e, binary))?;
+
+    // v1.3.0: register PID so the cancel_solve Tauri command can kill us.
+    // Cleared in every exit path below — RAII would be nicer but the rest
+    // of this function reads the child move-by-move so a guard struct
+    // would tangle with the borrow checker.
+    if let Some(pid) = child.id() {
+        CURRENT_SOLVE_PID.store(pid, Ordering::SeqCst);
+    }
 
     let stdout = child.stdout.take()
         .ok_or_else(|| "Failed to capture stdout".to_string())?;
@@ -359,6 +414,7 @@ async fn try_run_solver(
             let _ = child.kill().await;
             let _ = child.wait().await;
             let _ = stderr_handle.await;
+            CURRENT_SOLVE_PID.store(0, Ordering::SeqCst);
             return Err(format!(
                 "Engine timed out after {} seconds ({} iterations requested). Try reducing iterations.",
                 timeout_secs, request.iterations
@@ -368,6 +424,9 @@ async fn try_run_solver(
 
     let status = child.wait().await
         .map_err(|e| format!("Engine process error: {}", e))?;
+    // v1.3.0: child has been reaped — PID no longer valid for cancel.
+    // Clear here so cancel_solve doesn't try to taskkill an exited PID.
+    CURRENT_SOLVE_PID.store(0, Ordering::SeqCst);
     let stderr_str = stderr_handle.await.unwrap_or_default();
 
     if !status.success() {

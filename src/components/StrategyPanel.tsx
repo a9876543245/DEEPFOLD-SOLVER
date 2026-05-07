@@ -7,6 +7,7 @@ import { useT } from '../lib/i18n';
 import { aggregateTurns } from '../lib/aggregateRunouts';
 import { RunoutReportModal } from './RunoutReportModal';
 import { ComboDrillPanel } from './ComboDrillPanel';
+import { SolveQualityBadge } from './SolveQualityBadge';
 
 import { Lock, BarChart3, Layers } from 'lucide-react';
 
@@ -196,9 +197,20 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       {/* Solver Stats */}
       <div className="glass-panel" style={{ padding: 14 }}>
-        <span className="text-label" style={{ marginBottom: 8, display: 'block' }}>
-          {t('panel.solverResult')}
-        </span>
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          marginBottom: 8, gap: 8, flexWrap: 'wrap',
+        }}>
+          <span className="text-label">{t('panel.solverResult')}</span>
+          {/* v1.3.0: post-solve quality at-a-glance. Reads exploitability +
+              early_stop_reason — surfaces "stopped at budget, may be rough"
+              without making the user dig into resources fields. */}
+          <SolveQualityBadge
+            exploitability={result.exploitability_pct}
+            iterationsRun={result.iterations_run}
+            earlyStopReason={result.early_stop_reason}
+          />
+        </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
           <div style={{ background: 'var(--color-bg-tertiary)', borderRadius: 'var(--radius-sm)', padding: '6px 10px' }}>
             <div style={{ fontSize: 10, color: 'var(--color-text-tertiary)' }}>{t('panel.iterations')}</div>

@@ -62,6 +62,14 @@ pub struct SolverRequest {
     /// Override emitted strategy-tree node cap. 0/None = use profile default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strategy_tree_max_nodes: Option<u32>,
+    /// v1.3.0: hard wall-clock cap on the iteration phase. None / 0 = no
+    /// cap (legacy). UI mode presets pick the right value:
+    ///   Quick=60, Standard=300, Deep=900.
+    /// CFR is anytime, so stopping early just means "we ran for the budget,
+    /// here's the running average so far". Better than letting CPU users
+    /// stare at "estimated 5 hours" and walk away.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_budget_seconds: Option<u32>,
 }
 
 /// Sprint 3 (resource policy guide): resolved memory budget tuple after
@@ -143,6 +151,10 @@ pub struct SolverResponse {
     pub status: String,
     pub iterations_run: i32,
     pub exploitability_pct: f64,
+    /// v1.3.0: which stop condition ended the iteration loop.
+    /// "iter_cap" / "time_budget" / "exploit_target" / "" (legacy).
+    #[serde(default)]
+    pub early_stop_reason: String,
     pub global_strategy: std::collections::HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_combo_analysis: Option<ComboAnalysis>,

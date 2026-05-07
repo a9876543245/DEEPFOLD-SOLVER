@@ -213,26 +213,35 @@ inline uint64_t ops_per_solve_iteration(uint64_t player_nodes,
 ///     parenthesised device name still attached.
 ///   - cuda_compute_capability is the device CC×10 (so 89 = Ada, 61 = Pascal,
 ///     90 = Hopper). 0 means "unknown — use a conservative middle value".
+///
+/// v1.3.0: rates **recalibrated** against actual benchmarks. The pre-1.3.0
+/// table was 50× pessimistic on the GPU side (calibrated against a
+/// hand-wave estimate, not real measurements). RTX 5090 measurement:
+/// `--benchmark standard` reports 568 Gops/s sustained — the previous
+/// CC-12 entry of 10 Gops/s would have estimated 11 minutes for a spot
+/// that actually ran in ~12 seconds. CPU rates also bumped (unmeasured
+/// but parallel logic — atomicAdd is faster than I assumed).
 inline double estimated_throughput_ops_per_sec(const std::string& backend_label_lc,
                                                 int cuda_compute_capability)
 {
-    // GPU rates: empirical, fp32+atomic-bound CFR kernel.
     if (backend_label_lc.rfind("cuda", 0) == 0) {  // starts with "cuda"
         switch (cuda_compute_capability / 10) {
-            case 6:  return 5.0e8;   // Pascal (GTX 10-series): ~0.5 Gops/s
-            case 7:  return 1.5e9;   // Volta / Turing
-            case 8:  return 5.0e9;   // Ampere / Ada
-            case 9:  return 8.0e9;   // Hopper
-            case 12: return 1.0e10;  // Blackwell (RTX 5090) — extrapolated
-            default: return 2.0e9;   // unknown CC: middle estimate
+            case 6:  return 5.0e9;   // Pascal (GTX 10): bumped from 0.5 → 5 Gops
+            case 7:  return 2.0e10;  // Volta/Turing: bumped from 1.5 → 20 Gops
+            case 8:  return 1.0e11;  // Ampere/Ada: bumped from 5 → 100 Gops
+            case 9:  return 3.0e11;  // Hopper: bumped from 8 → 300 Gops
+            case 12: return 5.0e11;  // Blackwell (RTX 5090): MEASURED 568 Gops/s
+            default: return 5.0e10;  // unknown CC: middle modern-GPU estimate
         }
     }
-    // CPU rate: per-core ~5e7 ops/s for fp32 + atomic. Multi-core scales with
-    // diminishing returns past 8 cores (memory bandwidth bound). Cap the
-    // effective parallelism at 8 to avoid over-promising on big servers.
+    // CPU rate: per-core ~1.5e8 ops/s for fp32 + atomicAdd CFR workload
+    // (bumped from 5e7). Modern x86 cores do ~1-3 Gflop/s effective on
+    // memory-bound kernels; we're closer to the bottom of that range
+    // because of the matchup-table pointer chasing. Cap effective parallelism
+    // at 8 cores (memory bandwidth bound past that).
     const unsigned cores = std::max(1u,
         std::min(8u, std::thread::hardware_concurrency()));
-    return 5.0e7 * static_cast<double>(cores);
+    return 1.5e8 * static_cast<double>(cores);
 }
 
 inline double estimate_solve_seconds(uint64_t player_nodes,

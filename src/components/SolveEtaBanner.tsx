@@ -1,20 +1,14 @@
 /**
- * v1.2.2: pre-solve ETA banner.
+ * Pre-solve ETA banner.
  *
- * Renders during the loading state when `useSolver().estimate` is populated
- * (set by the `estimate_solve` Tauri command, fires in parallel with the
- * actual solve). Surfaces three pieces of context users want BEFORE
- * committing to a long wait:
- *
- *   1. ETA: humanized — "1 second", "12 seconds", "2 minutes", "1.5 hours".
- *   2. Backend: which engine path will run ("CPU" or "CUDA <gpu>").
- *   3. Warning: when ETA > 60s on CPU AND GPU was rejected, point at the
- *      reject reason (e.g. "Pascal needs CUDA-12.x build") so the user
- *      knows whether they can switch.
- *
- * Designed to NOT be modal — never blocks the solve. Just informs.
- * The existing cancel button on the loading overlay (if any) still works
- * for explicit aborts.
+ * v1.2.2 introduced this; v1.3.0 reworked it around time budgets:
+ *  - The headline number is now `min(estimate, time_budget)`. Showing
+ *    "Estimated 5 hours" when the user-set budget will stop at 5 minutes
+ *    is misleading. Show what they'll ACTUALLY wait.
+ *  - When the estimate exceeds the budget significantly we surface that
+ *    as a quality warning ("solve may not converge fully in budget —
+ *    Standard mode usually fine; for more accuracy switch to Deep").
+ *  - GPU-rejected users still see the fallback_reason inline.
  */
 
 import type { EstimateResponse } from '../lib/poker';
@@ -22,6 +16,10 @@ import type { EstimateResponse } from '../lib/poker';
 interface Props {
   estimate: EstimateResponse | null;
   loading: boolean;
+  /** v1.3.0: time budget the user picked (Quick=60, Standard=300, Deep=900).
+   *  When set, the headline shows "up to <budget>" with the model estimate
+   *  as a side note. */
+  timeBudgetSeconds?: number;
 }
 
 function humanizeSeconds(s: number): string {
@@ -47,25 +45,36 @@ function shortBackend(b: string | undefined): string {
   return b;
 }
 
-export function SolveEtaBanner({ estimate, loading }: Props) {
+export function SolveEtaBanner({ estimate, loading, timeBudgetSeconds }: Props) {
   if (!loading) return null;
   if (!estimate || estimate.status !== 'estimate') return null;
 
   const r = estimate.resources;
-  const seconds = r.estimated_solve_seconds ?? 0;
+  const rawEstimate = r.estimated_solve_seconds ?? 0;
   const backend = shortBackend(r.backend_for_estimate);
   const isCpu = backend === 'CPU';
-  const isLong = seconds >= 60;
   const wasRejected = !!r.fallback_reason;
 
-  // Tier the visual urgency. Solid neutral for OK, amber for "this'll take
-  // a bit", red for "are you sure" (>30 min CPU).
+  // v1.3.0: when a time budget is set, the actual wait is `min(estimate,
+  // budget)` — that's what we headline. The unbounded estimate goes in a
+  // smaller side note for context.
+  const headlineSeconds = timeBudgetSeconds && timeBudgetSeconds > 0
+    ? Math.min(rawEstimate, timeBudgetSeconds)
+    : rawEstimate;
+  const willHitBudget = timeBudgetSeconds !== undefined && timeBudgetSeconds > 0
+    && rawEstimate > timeBudgetSeconds;
+
+  // Visual tier: budget guarantees the wait — once budget is set, urgency
+  // tracks "will the budget produce a converged answer?" not "how long
+  // will I wait?". Without budget (legacy), tier by raw estimate.
   let bg = 'var(--color-glass)';
   let border = 'var(--color-glass-border)';
   let icon = 'ⓘ';
-  if (seconds >= 1800 && isCpu) {
+  if (willHitBudget && isCpu) {
+    bg = 'rgba(245, 158, 11, 0.15)'; border = '#f59e0b'; icon = '⏱';
+  } else if (!timeBudgetSeconds && rawEstimate >= 1800 && isCpu) {
     bg = 'rgba(220, 38, 38, 0.15)'; border = '#dc2626'; icon = '⚠';
-  } else if (isLong) {
+  } else if (!timeBudgetSeconds && rawEstimate >= 60) {
     bg = 'rgba(245, 158, 11, 0.15)'; border = '#f59e0b'; icon = '⏱';
   }
 
@@ -85,11 +94,16 @@ export function SolveEtaBanner({ estimate, loading }: Props) {
       <span style={{ fontSize: 16, lineHeight: 1, marginTop: 1 }}>{icon}</span>
       <div style={{ flex: 1 }}>
         <div style={{ fontWeight: 600 }}>
-          Estimated <strong>{humanizeSeconds(seconds)}</strong> on {backend}
+          {timeBudgetSeconds && timeBudgetSeconds > 0
+            ? <>Up to <strong>{humanizeSeconds(headlineSeconds)}</strong> on {backend}</>
+            : <>Estimated <strong>{humanizeSeconds(rawEstimate)}</strong> on {backend}</>}
         </div>
         <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginTop: 2 }}>
-          {r.player_nodes.toLocaleString()} player nodes · ETA may vary ±2× —
-          DCFR can stop early on convergence.
+          {r.player_nodes.toLocaleString()} player nodes
+          {willHitBudget && (
+            <> · model estimate {humanizeSeconds(rawEstimate)}, budget will fire first</>
+          )}
+          {!willHitBudget && <> · ETA may vary ±2×</>}
         </div>
         {wasRejected && (
           <div style={{
@@ -100,12 +114,11 @@ export function SolveEtaBanner({ estimate, loading }: Props) {
             <strong>Heads up:</strong> {r.fallback_reason}
           </div>
         )}
-        {seconds >= 1800 && isCpu && !wasRejected && (
-          <div style={{
-            fontSize: 11, color: '#fca5a5', marginTop: 6,
-          }}>
-            That's a long wait. Consider <code>--backend gpu</code> if you have
-            a supported GPU, or reduce iterations / bet sizes / range width.
+        {willHitBudget && isCpu && (
+          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginTop: 6 }}>
+            Budget will stop the solve before convergence. Strategy will be
+            usable but rougher than full solve. Consider Deep mode for
+            longer budget, or wait for GPU support.
           </div>
         )}
       </div>

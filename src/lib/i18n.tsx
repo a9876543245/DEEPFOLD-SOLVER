@@ -133,6 +133,12 @@ const dict: Dict = {
   'config.memory.nodes':       { en: 'Tree nodes',      zh: '策略樹節點',     ja: '戦略木ノード' },
   'solve': { en: 'Solve', zh: '求解', ja: '求解' },
   'solving': { en: 'Solving...', zh: '求解中...', ja: '求解中...' },
+  'solve.stop': { en: 'Stop', zh: '停止', ja: '停止' },
+  // v1.3.0 solve mode preset
+  'config.solveMode.label':    { en: 'Solve Mode',  zh: '求解模式',  ja: '求解モード' },
+  'config.solveMode.quick':    { en: 'Quick',       zh: '快速',      ja: 'クイック' },
+  'config.solveMode.standard': { en: 'Standard',    zh: '標準',      ja: 'スタンダード' },
+  'config.solveMode.deep':     { en: 'Deep',        zh: '深度',      ja: 'ディープ' },
 
   // ---- Strategy Panel ----
   'panel.solverResult': { en: 'Solver Result', zh: '求解結果', ja: '求解結果' },

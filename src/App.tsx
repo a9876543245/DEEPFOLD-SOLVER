@@ -10,8 +10,8 @@ import { ActionNavigator } from './components/ActionNavigator';
 import { ActionBar } from './components/ActionBar';
 import { TurnRiverCardSelector } from './components/TurnRiverCardSelector';
 import { useSolver } from './hooks/useSolver';
-import type { SolverRequest, NodeLock, ComboAnalysis, GameContext, MemoryProfile } from './lib/poker';
-import { getHandStrength, RANK_VALUES } from './lib/poker';
+import type { SolverRequest, NodeLock, ComboAnalysis, GameContext, MemoryProfile, SolveMode } from './lib/poker';
+import { getHandStrength, RANK_VALUES, SOLVE_MODE_PRESETS } from './lib/poker';
 import type { Position, PositionMatchup } from './lib/ranges';
 import { createRootNode, takeAction, dealCard, BET_SIZINGS } from './lib/gameTree';
 import type { GameTreeNode, GameAction, ActionStep } from './lib/gameTree';
@@ -128,6 +128,12 @@ function App() {
   // src-tauri/src/types.rs::ResolvedMemoryBudget::from_profile.
   const [memoryProfile, setMemoryProfile] = useState<MemoryProfile>('balanced');
 
+  // v1.3.0: solve mode preset (Quick/Standard/Deep). Bundles iter cap +
+  // time budget. Threaded into buildRequest so the engine respects the
+  // budget. Default 'standard' = 300 iter / 5 min budget, the right
+  // balance for most spots.
+  const [solveMode, setSolveMode] = useState<SolveMode>('standard');
+
   // Modals
   const [showGuide, setShowGuide] = useState(false);
   const [showSpotLibrary, setShowSpotLibrary] = useState(false);
@@ -234,8 +240,13 @@ function App() {
       turn_sizes: sz.turnBetSizes,
       river_sizes: sz.riverBetSizes,
       memory_profile: memoryProfile,
+      // v1.3.0: solve mode picks iter cap + time budget. The user-set
+      // `iterations` field above acts as a manual override that wins when
+      // the user types a custom value into Advanced settings; otherwise
+      // we use the mode preset.
+      time_budget_seconds: SOLVE_MODE_PRESETS[solveMode].time_budget_seconds,
     };
-  }, [pot, stack, iterations, selectedMatchup, getHeroRange, customIpRange, customOopRange, nodeLocks, sizingKey, memoryProfile]);
+  }, [pot, stack, iterations, selectedMatchup, getHeroRange, customIpRange, customOopRange, nodeLocks, sizingKey, memoryProfile, solveMode]);
 
   // Initial solve (root node)
   const handleSolve = useCallback(() => {
@@ -689,11 +700,36 @@ function App() {
           onSolve={handleSolve} loading={loading}
           sizingKey={sizingKey} onSizingChange={setSizingKey}
           memoryProfile={memoryProfile} onMemoryProfileChange={setMemoryProfile}
+          solveMode={solveMode}
+          onSolveModeChange={(m) => {
+            // v1.3.0: changing mode resets iter cap to the preset, but the
+            // user can still override via Advanced.maxIter afterwards.
+            setSolveMode(m);
+            setIterations(SOLVE_MODE_PRESETS[m].iterations);
+          }}
+          onStop={async () => {
+            // Pure abort — kills the engine subprocess. No partial result;
+            // useSolver will see the killed process as an error and reset
+            // its loading state. Time-budget is the path for "stop with
+            // what we have" (auto-fires when budget hits).
+            try {
+              if ((window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) {
+                const { invoke } = await import('@tauri-apps/api/core');
+                await invoke('cancel_solve');
+              }
+            } catch (e) {
+              console.warn('cancel_solve failed (non-fatal):', e);
+            }
+          }}
         />
-        {/* v1.2.2: pre-solve ETA banner — informs user of expected wait time
-            BEFORE the loading bar finishes. Only renders during loading and
-            once the estimate has come back from the engine. */}
-        <SolveEtaBanner estimate={estimate} loading={loading} />
+        {/* v1.2.2 → v1.3.0: pre-solve ETA banner. Now budget-aware — when
+            a time budget is set (always, via solve mode), the headline is
+            min(estimate, budget) so we don't lie about the wait. */}
+        <SolveEtaBanner
+          estimate={estimate}
+          loading={loading}
+          timeBudgetSeconds={SOLVE_MODE_PRESETS[solveMode].time_budget_seconds}
+        />
         {error && (
           <div className="glass-panel animate-fade-in" style={{
             padding: 12, borderColor: 'var(--color-red)', background: 'var(--color-red-dim)',

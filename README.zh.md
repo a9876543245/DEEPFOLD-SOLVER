@@ -7,10 +7,53 @@
 📘 **[使用說明 (中文)](USER_GUIDE.zh.md)** · **[User Guide (English)](USER_GUIDE.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.2.2-green)
+![Version](https://img.shields.io/badge/version-1.3.0-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
 DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GPU 加速的 DCFR 引擎（含 CPU fallback）+ **runout 聚合報告、per-combo blocker 分析、EV / 激進度熱力圖、2,500+ preflop 圖庫**，單一 Windows 安裝檔搞定。
+
+## v1.3.0 新功能（時間預算 + Stop 按鈕）
+
+解決等待懸崖。源於 v1.2.2 使用者回報：「既然 5 分鐘要停了，秀 3 小時 ETA 沒意義」。
+
+### Solve mode 預設
+
+Solve 按鈕上方多了三個 pill，把 iter cap + 時間預算 + exploitability 目標一鍵打包：
+
+| 模式 | iter 上限 | 時間預算 | exploit 目標 | 用途 |
+|---|---|---|---|---|
+| **Quick**    | 100  | 60 秒   | 1.5%   | 快速看大方向 |
+| **Standard** | 300  | 5 分鐘  | 0.5%   | **預設** — Pro 等級玩家可用 |
+| **Deep**     | 1000 | 15 分鐘 | 0.2%   | 細部研究 |
+
+任一條件先到就停。CFR 是 anytime — iter N 的 running average 就是當前策略，
+budget 到就停拿到的是「夠用」的結果，不是半成品。
+
+### Stop 按鈕 + Quality badge
+
+- **Stop 按鈕**（loading 時取代 Solve）— 純 abort，不保留部分結果。「停下來給我現在這版」
+  走時間預算（自動觸發）。
+- **Quality badge** 在結果面板：🟢 高品質 / 🟡 可用 / 🟠 粗略 / 🔴 低信心，
+  按最終 exploitability 分級。如果是因為 budget 停的，會提示「換 Deep 模式」。
+
+### ETA banner 重做
+
+標題現在顯示 `min(estimate, time_budget)`，不再無上限預估。不會再對使用者說
+「Estimated 5 hours on CPU」結果只等 5 分鐘。下方副標仍給原始 estimate
+讓使用者了解「budget 是真的會停下來，不是說我們會在那時間內收斂」。
+
+### Throughput 重 calibrate
+
+Pre-solve estimator 之前 GPU 端低估 50×（用 hand-wave 估的；現在用 RTX 5090
+跑 `--benchmark standard` 實測 568 Gops/s 重訂）。CPU rate 也提 3×。
+之前估「11 分鐘」的 spot 現在估「12 秒」，跟實際對得起來。
+
+### 引擎
+
+- 新 `--time-budget-seconds <s>` CLI flag，**每個 iter** 檢查，慢 per-iter
+  的 spot 也能精準到 budget 停（不會晚個 5 分鐘）。
+- 新 `early_stop_reason` field 在 result JSON：`iter_cap` / `time_budget`。
+- 新 `cancel_solve` Tauri command（taskkill 殺 process）。
 
 ## v1.2.2 新功能（解算前 ETA + 多 arch CUDA）
 

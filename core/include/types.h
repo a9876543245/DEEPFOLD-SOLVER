@@ -206,6 +206,14 @@ struct SolverConfig {
     int max_iterations = 500;
     float target_exploitability = 0.005f;   ///< 0.5%
     int exploitability_check_interval = 50;
+    /// v1.3.0: hard wall-clock cap on the iteration phase. The loop stops
+    /// at min(time_budget, max_iter, exploit_target). Default 0 = no time
+    /// cap (legacy behavior). UI presets:
+    ///   Quick = 60, Standard = 300, Deep = 900.
+    /// Goal: keep "estimated 5 hours on CPU" from being the ACTUAL wait —
+    /// stop at the budget, surface what we got. CFR is anytime: any
+    /// strategy at iter N is the running average and is usable.
+    int time_budget_seconds = 0;
 
     // Tree pruning
     int raise_cap = 3;                      ///< Max raises per street
@@ -369,6 +377,15 @@ struct SolverResult {
     float exploitability_pct = 0.0f;
     bool combo_evs_computed = false;
     bool exploitability_computed = false;
+
+    /// v1.3.0: why did the iteration loop stop?
+    ///   "iter_cap"        — hit max_iterations (full run)
+    ///   "time_budget"     — wall-clock exceeded time_budget_seconds
+    ///   "exploit_target"  — exploitability < target (early convergence)
+    /// Used by the UI Quality badge to label the result honestly:
+    /// time-budgeted runs may have higher exploit% than usual and the
+    /// strategy is "what we got in the budget", not "fully converged".
+    std::string early_stop_reason;
 
     /// Action labels for the current node (e.g., "Check", "Bet_33", "Bet_75")
     std::vector<std::string> action_labels;

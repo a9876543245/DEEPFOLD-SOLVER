@@ -22,6 +22,16 @@ pub async fn estimate_solve(request: SolverRequest) -> Result<EstimateResponse, 
     engine::run_estimate(&request).await
 }
 
+/// v1.3.0: cancel the currently-running solve. Frontend Stop button calls
+/// this. Returns true if a process was actually killed, false if there was
+/// no active solve. Pure abort — does NOT preserve partial results (use
+/// `time_budget_seconds` on SolverRequest for the "stop with what we have"
+/// behavior; the budget is precise to within one in-flight iteration).
+#[tauri::command]
+pub fn cancel_solve() -> Result<bool, String> {
+    engine::cancel_current_solve()
+}
+
 /// Get solver engine status / health check.
 #[tauri::command]
 pub fn engine_status() -> String {

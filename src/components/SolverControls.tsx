@@ -1,6 +1,9 @@
 import React, { useState } from 'react';
 import { useT } from '../lib/i18n';
-import { MEMORY_PROFILE_PRESETS, type MemoryProfile } from '../lib/poker';
+import {
+  MEMORY_PROFILE_PRESETS, SOLVE_MODE_PRESETS,
+  type MemoryProfile, type SolveMode,
+} from '../lib/poker';
 
 export type BetSizingKey = 'standard' | 'polar' | 'small_ball';
 
@@ -20,6 +23,13 @@ interface Props {
    *  Rust `ResolvedMemoryBudget::from_profile` resolver. */
   memoryProfile?: MemoryProfile;
   onMemoryProfileChange?: (profile: MemoryProfile) => void;
+  /** v1.3.0: solve mode preset (Quick/Standard/Deep). Drives iter cap +
+   *  time budget. Defaults 'standard'. */
+  solveMode?: SolveMode;
+  onSolveModeChange?: (mode: SolveMode) => void;
+  /** v1.3.0: called when the user clicks Stop during loading. Should
+   *  invoke the cancel_solve Tauri command. */
+  onStop?: () => void;
 }
 
 /**
@@ -32,6 +42,7 @@ export function SolverControls({
   onSolve, loading,
   sizingKey = 'standard', onSizingChange,
   memoryProfile = 'balanced', onMemoryProfileChange,
+  solveMode = 'standard', onSolveModeChange, onStop,
 }: Props) {
   const t = useT();
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -120,21 +131,56 @@ export function SolverControls({
         </div>
       </div>
 
-      {/* Solve Button */}
+      {/* v1.3.0: Solve mode (Quick / Standard / Deep) — picks iter cap +
+          time budget. Displayed as 3 pills right above the Solve button so
+          users see the trade-off (sanity check vs pro vs research). */}
+      <div style={{ marginBottom: 8 }}>
+        <label style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginBottom: 6, display: 'block' }}>
+          {t('config.solveMode.label')}
+        </label>
+        <div style={{ display: 'flex', gap: 6 }} role="radiogroup">
+          {(['quick','standard','deep'] as SolveMode[]).map(m => {
+            const preset = SOLVE_MODE_PRESETS[m];
+            const active = solveMode === m;
+            return (
+              <button
+                key={m}
+                role="radio"
+                aria-checked={active}
+                disabled={loading}
+                className={`btn-pill ${active ? 'active' : ''}`}
+                onClick={() => onSolveModeChange?.(m)}
+                title={preset.description}
+                style={{ flex: 1 }}
+              >
+                {t(`config.solveMode.${m}`)}
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginTop: 4 }}>
+          {SOLVE_MODE_PRESETS[solveMode].description}
+        </div>
+      </div>
+
+      {/* Solve / Stop Button — switches role based on loading state.
+          Stop is pure abort (no result preserved); time budget gives the
+          "stop with what we have" semantics automatically when it fires. */}
       <button
-        className="btn-primary"
-        onClick={onSolve}
-        disabled={loading}
-        style={{ width: '100%', height: 44, fontSize: 15 }}
+        className={loading ? 'btn-secondary' : 'btn-primary'}
+        onClick={loading ? onStop : onSolve}
+        disabled={loading && !onStop}
+        style={{
+          width: '100%', height: 44, fontSize: 15,
+          ...(loading && onStop ? { background: 'var(--color-red, #dc2626)', color: '#fff' } : {}),
+        }}
       >
         {loading ? (
           <>
-            <span className="animate-spin" style={{
-              display: 'inline-block', width: 16, height: 16,
-              border: '2px solid rgba(255,255,255,0.3)',
-              borderTopColor: 'white', borderRadius: '50%'
-            }} />
-            {t('solving')}
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="6" y="6" width="12" height="12" rx="1" />
+            </svg>
+            {t('solve.stop')}
           </>
         ) : (
           <>
