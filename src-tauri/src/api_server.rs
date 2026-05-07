@@ -19,7 +19,11 @@ async fn health() -> &'static str {
 /// Solve endpoint — accepts JSON request, returns solver response.
 /// Context protection: never returns full 1326-combo matrix, only aggregated data.
 async fn solve_handler(Json(request): Json<SolverRequest>) -> Json<serde_json::Value> {
-    match engine::run_solver(&request).await {
+    // HTTP API has no AppHandle (it's not a Tauri command), so progress
+    // events are skipped — clients of the HTTP server don't subscribe to
+    // them. Engine still parses progress lines internally; they just don't
+    // get emitted anywhere.
+    match engine::run_solver(&request, None).await {
         Ok(response) => {
             // Context protection: strip any large arrays before returning
             // The C++ engine already implements this, but double-check here

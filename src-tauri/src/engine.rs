@@ -4,11 +4,27 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 use crate::types::{EstimateResponse, GpuInfo, ResolvedMemoryBudget, SolverRequest, SolverResponse};
+
+/// v1.4.1: payload for the `engine-progress` event the frontend listens
+/// for to drive the real progress bar. Emitted once per `[Iter N]` stderr
+/// line written by the C++ engine. Replaces the old setInterval-based
+/// fake animation that capped at 95% / iter 285.
+#[derive(serde::Serialize, Clone)]
+struct EngineProgress {
+    /// 1-based iteration number that just completed (matches `[Iter N]`).
+    iteration: u32,
+    /// Exploitability % at this iteration. May be 0 if engine reported 0.00
+    /// (early iterations / postsolve disabled at the running cadence).
+    exploitability_pct: f32,
+    /// Cumulative ms inside the iteration phase, as reported by the engine.
+    elapsed_ms: f32,
+}
 
 /// v1.3.0: PID of the currently-running solve subprocess (0 = none).
 /// `cancel_solve` reads this and kills the process. Single global atomic
@@ -141,10 +157,13 @@ fn find_engine_binary() -> PathBuf {
 ///     (CUDA/device/GPU errors), automatically retry with backend=cpu and
 ///     annotate the response so the UI can show a toast.
 ///   - Non-GPU failures (timeout, bad input, etc.) bubble up as-is.
-pub async fn run_solver(request: &SolverRequest) -> Result<SolverResponse, String> {
+pub async fn run_solver(
+    request: &SolverRequest,
+    app: Option<AppHandle>,
+) -> Result<SolverResponse, String> {
     let first_attempt = request.backend.as_deref().unwrap_or("auto");
 
-    match try_run_solver(request, None).await {
+    match try_run_solver(request, None, app.as_ref()).await {
         Ok(response) => Ok(response),
         Err(err) => {
             let gpu_attempted = first_attempt != "cpu";
@@ -179,7 +198,7 @@ pub async fn run_solver(request: &SolverRequest) -> Result<SolverResponse, Strin
                     "[DeepSolver] GPU run failed ({}); falling back to CPU",
                     err
                 );
-                let mut cpu_response = try_run_solver(request, Some("cpu")).await?;
+                let mut cpu_response = try_run_solver(request, Some("cpu"), app.as_ref()).await?;
                 // Annotate backend name so UI knows a fallback happened
                 let original = cpu_response.backend.unwrap_or_else(|| "CPU".to_string());
                 cpu_response.backend = Some(format!(
@@ -317,6 +336,7 @@ fn build_solver_args(request: &SolverRequest, backend_override: Option<&str>) ->
 async fn try_run_solver(
     request: &SolverRequest,
     backend_override: Option<&str>,
+    app: Option<&AppHandle>,
 ) -> Result<SolverResponse, String> {
     let binary = find_engine_binary();
     let args = build_solver_args(request, backend_override);
@@ -369,12 +389,26 @@ async fn try_run_solver(
     let stderr = child.stderr.take()
         .ok_or_else(|| "Failed to capture stderr".to_string())?;
 
-    // Collect stderr (contains error JSON on failure, progress lines on success)
+    // Collect stderr (contains error JSON on failure, progress lines on success).
+    //
+    // v1.4.1: as we drain stderr we also parse `[Iter N] Exploitability: X%
+    // (Yms)` progress lines and emit `engine-progress` events to the frontend.
+    // The full string is still collected for error extraction in the failure
+    // path. Replaces the old fake setInterval progress that capped at 95% /
+    // iter 285 because it was based on a guessed iteration rate, not real
+    // engine output.
+    let app_for_progress = app.cloned();
     let stderr_handle = tokio::spawn(async move {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
         let mut collected = String::new();
         while let Ok(Some(line)) = lines.next_line().await {
+            // Parse: "[Iter N] Exploitability: X% (Yms)"
+            if let Some(progress) = parse_iter_line(&line) {
+                if let Some(handle) = app_for_progress.as_ref() {
+                    let _ = handle.emit("engine-progress", progress);
+                }
+            }
             collected.push_str(&line);
             collected.push('\n');
         }
@@ -508,6 +542,38 @@ async fn try_run_solver(
         ))?;
 
     Ok(response)
+}
+
+/// v1.4.1: Parse an engine progress line like
+/// `[Iter 50] Exploitability: 0.00% (1771.25ms)` into an `EngineProgress`.
+/// Returns None for any line that doesn't match (regular engine logs, blank
+/// lines, JSON error payloads, etc.). Line format is set by solver.h's
+/// progress callback — keep them in sync if either side changes.
+fn parse_iter_line(line: &str) -> Option<EngineProgress> {
+    // Quick reject before doing real work.
+    if !line.starts_with("[Iter ") { return None; }
+
+    // "[Iter " consumed. Pull integer up to ']'.
+    let rest = &line[6..];
+    let end_iter = rest.find(']')?;
+    let iter: u32 = rest[..end_iter].trim().parse().ok()?;
+
+    // " Exploitability: " expected next.
+    let after_bracket = &rest[end_iter + 1..];
+    let exp_marker = "Exploitability:";
+    let exp_start = after_bracket.find(exp_marker)? + exp_marker.len();
+    let after_exp = after_bracket[exp_start..].trim_start();
+    let pct_end = after_exp.find('%')?;
+    let exploitability_pct: f32 = after_exp[..pct_end].trim().parse().ok()?;
+
+    // "(Yms)" trailing.
+    let after_pct = &after_exp[pct_end + 1..];
+    let paren_open = after_pct.find('(')? + 1;
+    let paren_after = &after_pct[paren_open..];
+    let ms_end = paren_after.find("ms")?;
+    let elapsed_ms: f32 = paren_after[..ms_end].trim().parse().ok()?;
+
+    Some(EngineProgress { iteration: iter, exploitability_pct, elapsed_ms })
 }
 
 /// Parse the C++ engine's stderr for a JSON error payload and extract `.message`.

@@ -760,9 +760,15 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             }
         }
 
-        // Progress callback at the slower cadence (it's an stderr write,
-        // each one costs more than the time check).
-        if (progress_cb && (t + 1) % exp_check_interval == 0) {
+        // v1.4.1: progress callback fires EVERY iter so the UI progress bar
+        // tracks real iter count instead of a fake setInterval timer.
+        // Previously cadenced to every `exploitability_check_interval` iters
+        // (default 50) — left the bar stuck at 95% / iter 285 on long solves
+        // because the fake timer ran out of headroom before the next real
+        // event. The cb itself is a single-line stderr write (~µs), trivial
+        // even for slow per-iter spots; exploitability is still 0.0f here
+        // (real computation runs in the postsolve pass).
+        if (progress_cb) {
             auto now = Clock::now();
             float elapsed = elapsed_since(start_time, now);
             progress_cb(t + 1, 0.0f, elapsed);
@@ -1094,7 +1100,22 @@ inline void compute_matchup_for_board(
         ranks[i] = eval_for_board(combo_table[i]);
     }
 
-    for (uint16_t ci = 0; ci < nc; ++ci) {
+    // v1.4.1 Phase 3: row-parallel matchup precompute. Each ci writes a
+    // disjoint row of out_ev/out_valid (idx = ci*nc+cj is unique per ci),
+    // and ranks/combo_masks/iso are read-only — no synchronization needed.
+    //
+    // Parity guarantee: per-row sums use a fixed (ci, cj, oi, oj) iteration
+    // order, so the result is bit-exact regardless of thread count. We do
+    // NOT introduce cross-row reductions here for that reason.
+    //
+    // Speeds up both CPU and GPU solves: GPU's `prepare()` waits for these
+    // tables before the device upload starts, so faster precompute = lower
+    // backend_prepare_ms across the board.
+    #if defined(_OPENMP)
+    #pragma omp parallel for schedule(dynamic, 4)
+    #endif
+    for (int ci_signed = 0; ci_signed < static_cast<int>(nc); ++ci_signed) {
+        uint16_t ci = static_cast<uint16_t>(ci_signed);
         const auto& originals_i = iso.canonical_to_originals[ci];
         for (uint16_t cj = 0; cj < nc; ++cj) {
             const auto& originals_j = iso.canonical_to_originals[cj];

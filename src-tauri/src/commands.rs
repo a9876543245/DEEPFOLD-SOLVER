@@ -7,9 +7,14 @@ use crate::oauth::{self, OAuthSession};
 use crate::types::{EstimateResponse, GpuInfo, SolverRequest, SolverResponse};
 
 /// Solve a poker position. Called from React via `invoke('solve', { request })`.
+///
+/// AppHandle is taken so the engine can emit `engine-progress` events while
+/// the solver runs (real iter / exploit values parsed from C++ stderr). The
+/// frontend's useSolver hook listens for these and replaces the previous
+/// fake setInterval-based progress animation that capped at 95%/iter 285.
 #[tauri::command]
-pub async fn solve(request: SolverRequest) -> Result<SolverResponse, String> {
-    engine::run_solver(&request).await
+pub async fn solve(app: AppHandle, request: SolverRequest) -> Result<SolverResponse, String> {
+    engine::run_solver(&request, Some(app)).await
 }
 
 /// v1.2.2: estimate solve time + memory BEFORE running the actual solve.

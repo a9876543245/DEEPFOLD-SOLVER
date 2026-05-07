@@ -354,21 +354,54 @@ export function useSolver() {
       })();
     }
 
-    // Start elapsed timer for Tauri mode
+    // v1.4.1: in Tauri mode, listen for real `engine-progress` events the
+    // Rust shell emits while parsing engine stderr line-by-line. Each event
+    // carries the actual iteration number, exploitability, and elapsed ms
+    // from the C++ solver. Replaces the previous setInterval-based fake
+    // progress that estimated ~70ms/iter and capped at 95% — that broke
+    // entirely on slow CPU spots (5+ s/iter) where the bar would freeze at
+    // 95% / iter 285 within 20 seconds and stay there for the rest of the
+    // run. We keep a small JS-side ticker for "elapsed" so the UI doesn't
+    // feel frozen between engine ticks, but the iter count is real.
+    let progressUnlisten: (() => void) | null = null;
+    let lastIter = 0;
+    let lastExploit = 0;
+    if (isTauri()) {
+      const { listen } = await import('@tauri-apps/api/event');
+      progressUnlisten = await listen<{ iteration: number; exploitability_pct: number; elapsed_ms: number }>(
+        'engine-progress',
+        (e) => {
+          lastIter = e.payload.iteration;
+          lastExploit = e.payload.exploitability_pct;
+          const total = request.iterations ?? 300;
+          const pct = Math.min(99, (lastIter / total) * 100);
+          const phase = `Solving iteration ${lastIter}/${total}...`;
+          setProgress({
+            iteration: lastIter,
+            total,
+            elapsed: e.payload.elapsed_ms,
+            phase,
+            pct,
+          });
+        },
+      );
+    }
+
+    // Lightweight elapsed-only ticker so the UI doesn't appear frozen
+    // between engine progress events on slow per-iter spots. Doesn't fake
+    // the iter count anymore — that comes from `engine-progress`.
     if (timerRef.current) clearInterval(timerRef.current);
     timerRef.current = window.setInterval(() => {
       const now = Date.now();
       const total = request.iterations ?? 300;
       const elapsedMs = now - start;
-      // Estimate ~70ms per iteration for Tauri, smooth progress
-      const estimatedTotal = total * 70;
-      const pct = Math.min(95, (elapsedMs / estimatedTotal) * 100);
-      const estIter = Math.min(total - 1, Math.floor((pct / 100) * total));
-      let phase = 'Building tree...';
-      if (pct > 5) phase = `Solving iteration ${estIter}/${total}...`;
-      if (pct > 90) phase = 'Finalizing...';
-      setProgress({ iteration: estIter, total, elapsed: elapsedMs, phase, pct });
-    }, 100);
+      const pct = Math.min(99, (lastIter / total) * 100);
+      const phase = lastIter > 0
+        ? `Solving iteration ${lastIter}/${total}...`
+        : 'Building tree...';
+      setProgress({ iteration: lastIter, total, elapsed: elapsedMs, phase, pct });
+      void lastExploit;
+    }, 250);
 
     try {
       let response: SolverResponse;
@@ -403,6 +436,7 @@ export function useSolver() {
       setProgress(null);
     } finally {
       if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+      if (progressUnlisten) { progressUnlisten(); progressUnlisten = null; }
       setLoading(false);
     }
   }, []);
