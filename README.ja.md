@@ -7,10 +7,36 @@
 📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.2.1-green)
+![Version](https://img.shields.io/badge/version-1.2.2-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
 DEEPFOLD-SOLVER は [DEEPFOLD](https://deepfold.co) のデスクトップ GTO ソルバーです。GPU アクセラレーション DCFR エンジン（CPU フォールバック完備）に **runout 集計、コンボ別ブロッカー解析、EV/アグレ度ヒートマップ、2,500+ プリフロップ チャート** を加え、Windows 用ワンクリックインストーラーに同梱しています。
+
+## v1.2.2 のハイライト（解算前 ETA + マルチアーキ CUDA）
+
+ユーザー向け：
+
+- **解算前 ETA バナー** — *Solve* クリック時に sub-second の
+  `--estimate-only` エンジン呼び出しが走り、イテレーション開始前に
+  「Estimated 12 minutes on CPU」のような予測を表示。5 分待っても結果が
+  出ない、何が起きているか分からないという問題を解消。60s 超で琥珀警告、
+  30 分超で赤警告。AUTO が GPU 除外（Pascal カードは CUDA 12.x build が必要、
+  等）で CPU にフォールバックした場合の理由もバナーに表示。
+- **マルチアーキ CUDA build** — インストーラに Turing (RTX 20 シリーズ)、
+  Ampere (RTX 30)、Ada (RTX 40)、Hopper (H100) のネイティブ SASS を同梱、
+  Blackwell (RTX 5090) は PTX-JIT 前方互換。これまで Ada のみネイティブで、
+  他のカードは初回起動時に JIT コスト発生。
+- **AUTO フォールバック診断** — AUTO が GPU 除外で CPU に降格した場合、
+  実際の理由を resources ブロックに載せる。Pascal (GTX 10 シリーズ) と
+  Volta (Titan V) のカードは「現行 build は CUDA 13.x で Pascal/Volta が
+  drop された」旨が表示され、Pascal 対応の CUDA-12.x build は v1.3.0 予定。
+
+エンジン内部：
+
+- `SolveResources` に `ops_per_iteration` / `backend_for_estimate` /
+  `estimated_solve_seconds` を追加。
+- 新 `Solver::estimate_only()` メソッド — iso + tree build のみ実行。
+- 新 `--estimate-only` CLI フラグと Tauri `estimate_solve` コマンド。
 
 ## v1.2.1 のハイライト（メモリ制御の堅牢化）
 

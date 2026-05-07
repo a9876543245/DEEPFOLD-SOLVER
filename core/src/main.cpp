@@ -52,6 +52,12 @@ struct CLIArgs {
     //                 tracking and CI smoke timing.
     std::string benchmark;
 
+    // v1.2.2: --estimate-only runs iso + tree build only, then emits a
+    // SolveResources JSON block (memory + ETA estimates) and exits. Frontend
+    // calls this before kicking off the real solve so the UI can show
+    // "Estimated 12 minutes on CPU" before the user commits.
+    bool estimate_only = false;
+
     // Backend selection: "auto" | "cpu" | "gpu"
     std::string backend = "auto";
 
@@ -204,6 +210,8 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.gpu_info = true;
         } else if (arg == "--benchmark" && i + 1 < argc) {
             args.benchmark = argv[++i];
+        } else if (arg == "--estimate-only") {
+            args.estimate_only = true;
         }
     }
 
@@ -242,6 +250,9 @@ Arguments:
   --gpu-info               Print detected GPU info and exit
   --benchmark <preset>     Run a fixed scenario for perf tracking, emit benchmark JSON.
                            Presets: standard (AsKd7c rainbow, full ranges, 100 iter)
+  --estimate-only          Build tree + estimate solve time/memory, emit JSON, exit.
+                           Skips precompute_matchups + iterations. Sub-second on most
+                           spots — used by the UI to show ETA before committing.
   --help, -h               Show this help message
 
 Output:
@@ -478,7 +489,11 @@ std::string result_to_json(
         json << "    \"strategy_tree_truncated\": " << (r.strategy_tree_truncated ? "true" : "false") << ",\n";
         json << "    \"budget_decision\": \"" << escape_json(r.budget_decision) << "\",\n";
         json << "    \"diagnostic\": \"" << escape_json(r.diagnostic) << "\",\n";
-        json << "    \"fallback_reason\": \"" << escape_json(r.fallback_reason) << "\"\n";
+        json << "    \"fallback_reason\": \"" << escape_json(r.fallback_reason) << "\",\n";
+        // v1.2.2: pre-iteration solve-time estimate
+        json << "    \"ops_per_iteration\": " << r.ops_per_iteration << ",\n";
+        json << "    \"backend_for_estimate\": \"" << escape_json(r.backend_for_estimate) << "\",\n";
+        json << "    \"estimated_solve_seconds\": " << r.estimated_solve_seconds << "\n";
         json << "  },\n";
     }
 
@@ -815,8 +830,37 @@ int main(int argc, char* argv[]) {
         // Parse backend selection
         BackendType backend_type = parse_backend_type(args.backend);
 
-        // Run solver
         Solver solver(config, backend_type);
+
+        // v1.2.2: --estimate-only — build tree + estimate, emit JSON, exit.
+        // Used by frontend to show ETA banner before committing to the
+        // real solve. Sub-second on most spots, ~100ms on monotone iso.
+        if (args.estimate_only) {
+            SolveResources r = solver.estimate_only();
+            std::cout << "{\n"
+                      << "  \"status\": \"estimate\",\n"
+                      << "  \"resources\": {\n"
+                      << "    \"canonical_combos\": " << r.canonical_combos << ",\n"
+                      << "    \"player_nodes\": " << r.player_nodes << ",\n"
+                      << "    \"estimated_matchup_bytes\": " << r.estimated_matchup_bytes << ",\n"
+                      << "    \"estimated_cpu_state_bytes\": " << r.estimated_cpu_state_bytes << ",\n"
+                      << "    \"estimated_gpu_state_bytes\": " << r.estimated_gpu_state_bytes << ",\n"
+                      << "    \"estimated_strategy_tree_bytes\": " << r.estimated_strategy_tree_bytes << ",\n"
+                      << "    \"estimated_json_bytes\": " << r.estimated_json_bytes << ",\n"
+                      << "    \"host_budget_bytes\": " << r.host_budget_bytes << ",\n"
+                      << "    \"gpu_budget_bytes\": " << r.gpu_budget_bytes << ",\n"
+                      << "    \"strategy_tree_max_nodes\": " << r.strategy_tree_max_nodes << ",\n"
+                      << "    \"budget_decision\": \"" << escape_json(r.budget_decision) << "\",\n"
+                      << "    \"diagnostic\": \"" << escape_json(r.diagnostic) << "\",\n"
+                      << "    \"fallback_reason\": \"" << escape_json(r.fallback_reason) << "\",\n"
+                      << "    \"ops_per_iteration\": " << r.ops_per_iteration << ",\n"
+                      << "    \"backend_for_estimate\": \"" << escape_json(r.backend_for_estimate) << "\",\n"
+                      << "    \"estimated_solve_seconds\": " << r.estimated_solve_seconds << "\n"
+                      << "  }\n"
+                      << "}\n";
+            return 0;
+        }
+
         SolverResult result = solver.solve(progress);
         std::string backend_name = solver.backend_name();
 

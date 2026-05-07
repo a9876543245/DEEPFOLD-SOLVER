@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from 'react';
-import type { SolverRequest, SolverResponse, ComboStrategy } from '../lib/poker';
+import type { SolverRequest, SolverResponse, ComboStrategy, EstimateResponse } from '../lib/poker';
 import {
   GRID_LABELS,
   SUITS,
@@ -297,6 +297,10 @@ export function useSolver() {
   const [error, setError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [progress, setProgress] = useState<SolverProgress | null>(null);
+  // v1.2.2: pre-solve ETA + memory preview from `--estimate-only`. Set by
+  // `solve()` before the actual subprocess fires (sub-second cost) so the
+  // UI can show "Estimated 12 minutes on CPU" before the user commits.
+  const [estimate, setEstimate] = useState<EstimateResponse | null>(null);
   const timerRef = useRef<number | null>(null);
   // Always-fresh mirror of `result` so `navigate()` can decide hit/miss
   // synchronously without a stale closure (state updates may be batched and
@@ -326,8 +330,29 @@ export function useSolver() {
     setLoading(true);
     setError(null);
     setResult(null);  // ref kept in sync by wrapped setter
+    setEstimate(null);  // clear stale estimate from previous solve
     setProgress({ iteration: 0, total: request.iterations ?? 300, elapsed: 0, phase: 'Starting...', pct: 0 });
     const start = Date.now();
+
+    // v1.2.2: fire the pre-solve estimate in parallel with the loading
+    // state. Sub-second on most spots, ~1s on monotone iso boards. The
+    // banner appears as soon as the estimate lands, well before iterations
+    // start showing progress. If the estimate call itself fails (engine
+    // missing, broken request), we silently skip — better to start the
+    // real solve than block on an estimator hiccup.
+    if (isTauri()) {
+      (async () => {
+        try {
+          const { invoke } = await import('@tauri-apps/api/core');
+          const est = await invoke<EstimateResponse>('estimate_solve', { request });
+          setEstimate(est);
+        } catch (e) {
+          // Don't surface — the actual solve provides the same data on
+          // completion. This only suppresses the pre-solve banner.
+          console.warn('estimate_solve failed (non-fatal):', e);
+        }
+      })();
+    }
 
     // Start elapsed timer for Tauri mode
     if (timerRef.current) clearInterval(timerRef.current);
@@ -387,6 +412,7 @@ export function useSolver() {
     setError(null);
     setElapsed(0);
     setProgress(null);
+    setEstimate(null);
   }, [setResult]);
 
   /**
@@ -424,5 +450,5 @@ export function useSolver() {
     return true;
   }, [setResult]);
 
-  return { result, setResult, loading, error, elapsed, progress, solve, reset, navigate };
+  return { result, setResult, loading, error, elapsed, progress, estimate, solve, reset, navigate };
 }

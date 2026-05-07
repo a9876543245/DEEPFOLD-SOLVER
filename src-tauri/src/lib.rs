@@ -6,7 +6,7 @@ mod types;
 mod api_server;
 
 use commands::{
-    solve, engine_status, save_solution, load_solution, get_gpu_info, start_google_oauth,
+    solve, estimate_solve, engine_status, save_solution, load_solution, get_gpu_info, start_google_oauth,
 };
 use gto_charts::{list_gto_scenarios, load_gto_chart};
 
@@ -18,6 +18,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             solve,
+            estimate_solve,
             engine_status,
             save_solution,
             load_solution,

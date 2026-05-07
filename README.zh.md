@@ -7,10 +7,38 @@
 📘 **[使用說明 (中文)](USER_GUIDE.zh.md)** · **[User Guide (English)](USER_GUIDE.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.2.1-green)
+![Version](https://img.shields.io/badge/version-1.2.2-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
 DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GPU 加速的 DCFR 引擎（含 CPU fallback）+ **runout 聚合報告、per-combo blocker 分析、EV / 激進度熱力圖、2,500+ preflop 圖庫**，單一 Windows 安裝檔搞定。
+
+## v1.2.2 新功能（解算前 ETA + 多 arch CUDA）
+
+使用者看得到的：
+
+- **解算前 ETA banner** — 按 *Solve* 之後在 iteration 開始前，先用 sub-second
+  的 `--estimate-only` 引擎呼叫拿到「Estimated 12 minutes on CPU」這種預估。
+  以前等了 5 分鐘還沒結果不知道在幹嘛的 spot，現在 click solve 馬上就知道
+  wall-clock 大概多久。超過 60s 是琥珀色警告、超過 30 分鐘是紅色警告。
+  AUTO 因 GPU 被排除（例如 Pascal 卡需要 CUDA 12.x build）而 fallback 到 CPU
+  時，原因會直接顯示在 banner 上。
+- **多 arch CUDA build** — installer 現在內建 Turing (RTX 20 系列)、Ampere
+  (RTX 30)、Ada (RTX 40)、Hopper (H100) 的原生 SASS，加上給 Blackwell
+  (RTX 5090) 的 PTX-JIT 前向相容。之前只有 Ada 是原生的，其他卡每次第一次
+  跑都要付 JIT 編譯成本。
+- **AUTO fallback 診斷** — AUTO 因 GPU 被排除而走 CPU 時，resources block
+  會載明實際原因。Pascal (GTX 10 系列) 跟 Volta (Titan V) 的卡會看到
+  「current build uses CUDA 13.x which dropped Pascal/Volta」說明，並指出
+  Pascal-friendly CUDA-12.x build 預計 v1.3.0 推出。
+
+引擎內部：
+
+- `SolveResources` 加了 `ops_per_iteration` / `backend_for_estimate` /
+  `estimated_solve_seconds`，post-solve calibration 跟 pre-solve estimate 對
+  得起來（benchmark CLI / regression tracking 也用得到）。
+- 新 `Solver::estimate_only()` method — 只跑 iso + tree build，不做
+  precompute_matchups 也不跑 iterations。一般 spot sub-second。
+- 新 `--estimate-only` CLI flag 跟 Tauri `estimate_solve` command。
 
 ## v1.2.1 新功能（記憶體控制強化）
 

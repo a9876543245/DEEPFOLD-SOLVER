@@ -7,10 +7,41 @@
 📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.2.1-green)
+![Version](https://img.shields.io/badge/version-1.2.2-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
 DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). It pairs a GPU-accelerated DCFR engine (with full CPU fallback) with **runout aggregation, per-combo blocker analysis, EV / aggression heatmaps, and a 2,500+ preflop chart browser** — all in a single Windows installer.
+
+## What's new in v1.2.2 (pre-solve ETA + multi-arch CUDA)
+
+User-visible:
+
+- **Pre-solve ETA banner** — clicking *Solve* now fires a sub-second
+  `--estimate-only` engine call that returns "Estimated 12 minutes on CPU"
+  before the iterations even start. Spots that would have made you wait
+  five minutes wondering if anything was happening now show their wall-clock
+  upfront, with an amber warning past 60s and a red one past 30 minutes.
+  Also surfaces the `fallback_reason` if AUTO downgraded to CPU (e.g.
+  "Pascal needs CUDA-12.x build").
+- **Multi-arch CUDA build** — installer now ships native SASS for Turing
+  (RTX 20-series), Ampere (RTX 30-series), Ada (RTX 40-series), and Hopper
+  (H100), with PTX-JIT forward-compat for Blackwell (RTX 5090). Previously
+  only Ada was native — every other supported card paid a one-time JIT
+  penalty on first kernel launch.
+- **AUTO fallback diagnostics** — when AUTO routes to CPU because the GPU
+  was rejected, the resources block now carries the actual reason. Pascal
+  (GTX 10-series) and Volta (Titan V) hardware get a specific note that
+  the current build uses CUDA 13.x which dropped those archs; CUDA-12.x
+  Pascal-friendly build planned for v1.3.0.
+
+Engine internals:
+
+- `SolveResources` got `ops_per_iteration`, `backend_for_estimate`,
+  `estimated_solve_seconds` so the post-solve calibration matches the
+  pre-solve estimate (useful for benchmark CLI / regression tracking).
+- New `Solver::estimate_only()` method — runs iso + tree build only, no
+  precompute_matchups or iterations. Sub-second on most spots.
+- New `--estimate-only` CLI flag and Tauri `estimate_solve` command.
 
 ## What's new in v1.2.1 (memory-control hardening)
 

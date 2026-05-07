@@ -343,6 +343,24 @@ struct SolveResources {
     std::string fallback_reason;
     /// Human-readable diagnostic when budget_decision != "ok".
     std::string diagnostic;
+
+    // ---- v1.2.2: pre-iteration solve-time estimate ----
+    // Populated post-gate, pre-iteration so the UI can show users an ETA
+    // before they commit to a long solve. Useful for the "5-minute CPU
+    // turn solve still no result" wait-cliff problem.
+    //
+    // Calculation: ops_per_iteration ≈ player_nodes × MAX_ACTIONS × nc²
+    // (per-combo cfr regret update, dominant cost on every iter).
+    // Throughput is a hardcoded backend table — not accurate to 10%, but
+    // accurate enough to distinguish "30 seconds" from "30 minutes" which
+    // is what the user actually needs.
+    uint64_t ops_per_iteration         = 0;
+    /// Selected backend for THIS solve, used in UI to label the estimate.
+    /// E.g., "CPU-DCFR", "CUDA (NVIDIA GeForce GTX 1070, ...)".
+    std::string backend_for_estimate;
+    /// Estimated wall-clock seconds to complete the configured iterations.
+    /// 0 if estimation isn't possible (e.g. no iterations requested).
+    double   estimated_solve_seconds   = 0.0;
 };
 
 /// Full solver result

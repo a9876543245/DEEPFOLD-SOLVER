@@ -205,6 +205,26 @@ export interface SolveResources {
   diagnostic: string;
   /** Set when AUTO backend downgraded GPU→CPU due to budget; otherwise "". */
   fallback_reason: string;
+  // v1.2.2: pre-iteration solve cost prediction. Populated by both the
+  // normal solve flow (post-solve calibration) AND `--estimate-only`
+  // (pre-solve preview, served by Tauri command `estimate_solve`).
+  ops_per_iteration?: number;
+  /** Backend the estimate was computed for, e.g. "CPU-DCFR" or
+   *  "CUDA (NVIDIA GeForce RTX 5090, ...)". */
+  backend_for_estimate?: string;
+  /** Estimated wall-clock seconds to complete the configured iterations.
+   *  Goal is order-of-magnitude accuracy — distinguishing "30 seconds"
+   *  from "30 minutes" so users know whether to commit. */
+  estimated_solve_seconds?: number;
+}
+
+/** v1.2.2: response shape of the `estimate_solve` Tauri command.
+ *  Lightweight pre-solve cost preview (memory + ETA) returned in
+ *  sub-second time. */
+export interface EstimateResponse {
+  /** "estimate" on success, "error" on failure. */
+  status: string;
+  resources: SolveResources;
 }
 
 /** One entry in `strategy_tree`. Mirrors the per-node fields the UI reads

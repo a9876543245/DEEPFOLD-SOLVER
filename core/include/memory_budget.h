@@ -25,9 +25,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <thread>
 
 namespace deepsolver {
 
@@ -177,6 +179,76 @@ inline uint64_t bytes_for_json_response(uint64_t emitted_nodes,
                             + opponent_range_entries * kBytesPerEntry
                             + combo_strategies_count * kBytesPerEntry * 2; // strategy + EV
     return emitted_nodes * per_node;
+}
+
+// ============================================================================
+// v1.2.2: solve-time estimate (so UI can show ETA pre-iteration)
+// ============================================================================
+//
+// Cost model: dominant per-iter work is the cfr regret update — for every
+// player node, we touch every action × every canonical combo × every opponent
+// canonical combo (the matchup matrix multiply). So:
+//   ops_per_iter ≈ player_nodes × MAX_ACTIONS × nc × nc
+//
+// Throughput is a hardcoded backend table calibrated against the
+// `--benchmark standard` scenario on a few reference machines. Goal is NOT
+// 10% accuracy — goal is to distinguish "30 seconds" from "30 minutes" so
+// the user knows whether to commit. Real measurements often within 2× of the
+// estimate, sometimes 3-4× off on edge cases (very deep stacks with lots of
+// bet sizes have higher constant overhead).
+//
+// CC-aware GPU rate: Pascal (6.x) is ~10× slower than Ada (8.9) at the kind
+// of fp32 + atomicAdd workload our kernels do. Don't lump them together.
+
+inline uint64_t ops_per_solve_iteration(uint64_t player_nodes,
+                                         uint64_t max_actions,
+                                         uint64_t canonical_combos)
+{
+    return player_nodes * max_actions * canonical_combos * canonical_combos;
+}
+
+/// Returns rough ops/second throughput for the named backend.
+///   - backend_label_lc is the lowercased backend name as it appears in the
+///     SolverResult.backend field, e.g. "cpu-dcfr" or "cuda (...)" with the
+///     parenthesised device name still attached.
+///   - cuda_compute_capability is the device CC×10 (so 89 = Ada, 61 = Pascal,
+///     90 = Hopper). 0 means "unknown — use a conservative middle value".
+inline double estimated_throughput_ops_per_sec(const std::string& backend_label_lc,
+                                                int cuda_compute_capability)
+{
+    // GPU rates: empirical, fp32+atomic-bound CFR kernel.
+    if (backend_label_lc.rfind("cuda", 0) == 0) {  // starts with "cuda"
+        switch (cuda_compute_capability / 10) {
+            case 6:  return 5.0e8;   // Pascal (GTX 10-series): ~0.5 Gops/s
+            case 7:  return 1.5e9;   // Volta / Turing
+            case 8:  return 5.0e9;   // Ampere / Ada
+            case 9:  return 8.0e9;   // Hopper
+            case 12: return 1.0e10;  // Blackwell (RTX 5090) — extrapolated
+            default: return 2.0e9;   // unknown CC: middle estimate
+        }
+    }
+    // CPU rate: per-core ~5e7 ops/s for fp32 + atomic. Multi-core scales with
+    // diminishing returns past 8 cores (memory bandwidth bound). Cap the
+    // effective parallelism at 8 to avoid over-promising on big servers.
+    const unsigned cores = std::max(1u,
+        std::min(8u, std::thread::hardware_concurrency()));
+    return 5.0e7 * static_cast<double>(cores);
+}
+
+inline double estimate_solve_seconds(uint64_t player_nodes,
+                                     uint64_t max_actions,
+                                     uint64_t canonical_combos,
+                                     int max_iterations,
+                                     const std::string& backend_label_lc,
+                                     int cuda_compute_capability)
+{
+    if (max_iterations <= 0 || player_nodes == 0 || canonical_combos == 0) return 0.0;
+    const uint64_t ops = ops_per_solve_iteration(player_nodes, max_actions, canonical_combos);
+    const double rate = estimated_throughput_ops_per_sec(backend_label_lc, cuda_compute_capability);
+    if (rate <= 0.0) return 0.0;
+    // Add a fixed 0.5s for backend prepare + final postsolve so very small
+    // spots don't show "0.01s" — too good to be true.
+    return (static_cast<double>(ops) * static_cast<double>(max_iterations)) / rate + 0.5;
 }
 
 // ============================================================================

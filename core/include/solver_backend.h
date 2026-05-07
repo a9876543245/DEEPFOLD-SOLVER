@@ -203,13 +203,34 @@ constexpr bool GPU_BACKEND_FUNCTIONAL = true;
 /// Defaults to AUTO on unrecognized input.
 BackendType parse_backend_type(const std::string& s);
 
-/// Returns true if a CUDA-capable GPU (compute capability 7.0+) is available.
-/// Safe to call even on builds without CUDA support (returns false).
+/// Returns true if a CUDA-capable GPU is available AND its compute
+/// capability is at or above the binary's minimum SASS arch. The threshold
+/// is set in backend_factory.cpp::kMinCudaMajor/kMinCudaMinor and
+/// currently matches the CUDA toolkit floor (13.x → CC 7.5 / Turing).
+/// Safe to call on builds without CUDA support (returns false).
 bool has_cuda_gpu();
 
 /// Returns a human-readable description of the detected GPU, or empty string
 /// if no GPU is available. E.g. "NVIDIA GeForce RTX 4060 (8192 MB, CC 8.9)".
 std::string describe_cuda_gpu();
+
+/// Returns the reason the CUDA backend was rejected, or empty string when
+/// the GPU IS usable. Reasons:
+///   - "No CUDA-capable GPU detected." (no device)
+///   - "GPU '<name>' has compute capability X.Y, below required N.M ..."
+///     For Pascal/Volta hardware the message specifically calls out that
+///     these archs need a CUDA-12.x build (planned for v1.3.0).
+///   - "Built without CUDA support." (CPU-only build)
+///   - Driver query failures with the cudaError_t string
+/// Used to populate resources.fallback_reason in solve(), so the UI can
+/// distinguish "no GPU at all" from "GPU detected but excluded".
+std::string cuda_gpu_reject_reason();
+
+/// Returns CUDA compute capability of device 0 as major*10 + minor
+/// (Ada=89, Pascal=61, Blackwell=120). Returns 0 when no CUDA device.
+/// v1.2.2: used by ETA estimator since Pascal is ~10× slower than Ada at
+/// fp32+atomic CFR workloads.
+int cuda_compute_capability();
 
 /// Factory: construct a backend of the requested type.
 ///

@@ -2,6 +2,7 @@ import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react'
 import { BoardSelector } from './components/BoardSelector';
 import { PositionSelector } from './components/PositionSelector';
 import { SolverControls } from './components/SolverControls';
+import { SolveEtaBanner } from './components/SolveEtaBanner';
 import { RangeGrid } from './components/RangeGrid';
 import type { GridDisplayMode } from './components/RangeGrid';
 import { StrategyPanel } from './components/StrategyPanel';
@@ -142,7 +143,7 @@ function App() {
     return b;
   }, [flopBoard, turnCard, riverCard]);
 
-  const { result, setResult, loading, error, elapsed, progress, solve, reset, navigate } = useSolver();
+  const { result, setResult, loading, error, elapsed, progress, estimate, solve, reset, navigate } = useSolver();
 
   // Off-range combo cache (#2 from roadmap). After a target_combo solve
   // completes (~10s), keep its analysis so a re-click on the same hand is
@@ -689,6 +690,10 @@ function App() {
           sizingKey={sizingKey} onSizingChange={setSizingKey}
           memoryProfile={memoryProfile} onMemoryProfileChange={setMemoryProfile}
         />
+        {/* v1.2.2: pre-solve ETA banner — informs user of expected wait time
+            BEFORE the loading bar finishes. Only renders during loading and
+            once the estimate has come back from the engine. */}
+        <SolveEtaBanner estimate={estimate} loading={loading} />
         {error && (
           <div className="glass-panel animate-fade-in" style={{
             padding: 12, borderColor: 'var(--color-red)', background: 'var(--color-red-dim)',

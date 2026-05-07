@@ -4,12 +4,22 @@ use tauri;
 use tauri::AppHandle;
 use crate::engine;
 use crate::oauth::{self, OAuthSession};
-use crate::types::{GpuInfo, SolverRequest, SolverResponse};
+use crate::types::{EstimateResponse, GpuInfo, SolverRequest, SolverResponse};
 
 /// Solve a poker position. Called from React via `invoke('solve', { request })`.
 #[tauri::command]
 pub async fn solve(request: SolverRequest) -> Result<SolverResponse, String> {
     engine::run_solver(&request).await
+}
+
+/// v1.2.2: estimate solve time + memory BEFORE running the actual solve.
+/// Calls `deepsolver_core --estimate-only` which builds tree + iso then
+/// returns a SolveResources block (sub-second on most spots, ~100ms on
+/// monotone iso). Frontend uses the result to show an ETA banner so users
+/// can decide whether to commit before a 10-minute CPU wait.
+#[tauri::command]
+pub async fn estimate_solve(request: SolverRequest) -> Result<EstimateResponse, String> {
+    engine::run_estimate(&request).await
 }
 
 /// Get solver engine status / health check.

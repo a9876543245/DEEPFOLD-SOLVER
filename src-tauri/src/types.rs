@@ -213,6 +213,28 @@ pub struct SolveResources {
     pub diagnostic: String,
     #[serde(default)]
     pub fallback_reason: String,
+    // v1.2.2: pre-iteration solve cost prediction. ops_per_iteration ≈
+    // player_nodes × MAX_ACTIONS × nc² (dominant cost per CFR iteration).
+    // estimated_solve_seconds is ops × max_iterations / backend_throughput.
+    // backend_for_estimate names the backend the estimate was computed for.
+    #[serde(default)]
+    pub ops_per_iteration: u64,
+    #[serde(default)]
+    pub backend_for_estimate: String,
+    #[serde(default)]
+    pub estimated_solve_seconds: f64,
+}
+
+/// v1.2.2: Lightweight pre-solve estimate response. Returned by the
+/// `estimate_solve` Tauri command which calls `deepsolver_core
+/// --estimate-only` (sub-second on most spots). Frontend uses this to
+/// show an ETA banner before the user commits to a long solve.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EstimateResponse {
+    /// Engine status: "estimate" on success, "error" on failure.
+    pub status: String,
+    /// All the SolveResources fields (memory + ETA + budget decision).
+    pub resources: SolveResources,
 }
 
 /// Per-node strategy bundle, keyed by player-action history in `strategy_tree`.

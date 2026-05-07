@@ -198,6 +198,17 @@ public:
     /// Run the full solve. Returns final result.
     SolverResult solve(ProgressCallback progress_cb = nullptr);
 
+    /// v1.2.2: estimate solve cost without actually running iterations.
+    /// Builds the game tree + iso enumeration (fast — milliseconds), computes
+    /// SolveFootprintEstimate (memory) + ops_per_iter (time), then returns
+    /// without ever allocating matchup tables or per-iter regret state.
+    /// The returned SolveResources has all fields populated for the UI to
+    /// show "ETA: X minutes, Y MB host RAM, Z MB GPU VRAM" as a pre-solve
+    /// preview. Cheap enough to call on every solve request before the
+    /// actual solve fires (tree build is the only non-trivial cost; on
+    /// monotone iso-engaged spots ~100ms, on rainbow ~10ms).
+    SolveResources estimate_only();
+
     /// Analyze a specific target combo after solve()
     ComboAnalysis analyze_combo(const std::string& combo_str) const;
 
@@ -575,10 +586,23 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     stage_start = Clock::now();
     BackendType selected_backend = backend_type_;
     if (backend_type_ == BackendType::AUTO) {
-        selected_backend = should_auto_select_gpu(
-            config_, tree_, matchup_ev_per_runout_.size())
-            ? BackendType::GPU
-            : BackendType::CPU;
+        const bool want_gpu = should_auto_select_gpu(
+            config_, tree_, matchup_ev_per_runout_.size());
+        selected_backend = want_gpu ? BackendType::GPU : BackendType::CPU;
+
+        // v1.2.2: when AUTO falls back to CPU because GPU is rejected
+        // (no device / CC too low / driver issue), surface the actual
+        // reason in fallback_reason. Without this, users with eg a
+        // GTX 1070 (CC 6.1, fully capable) would silently end up on CPU
+        // for a deep turn solve and wonder why it takes 30 minutes.
+        // Empty reason means "GPU was usable, just picked CPU due to
+        // size heuristic" — don't mislead the user with that case.
+        if (!want_gpu) {
+            std::string r = cuda_gpu_reject_reason();
+            if (!r.empty()) {
+                fallback_reason = std::move(r);
+            }
+        }
     }
 
     // GPU budget check. `gpu_bytes == 0` means "let backend probe at
@@ -821,9 +845,148 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         // Sprint 1: surface the AUTO→CPU downgrade reason recorded by the
         // pre-backend gate. Empty string means no fallback happened.
         r.fallback_reason = fallback_reason;
+
+        // v1.2.2: pre-iteration ETA. Computed from player_nodes × actions ×
+        // nc² ops per iter, divided by a backend-throughput table. Goal is
+        // distinguishing "30 seconds" from "30 minutes" — that's the
+        // wait-cliff users actually need warned about. Detail comments live
+        // in memory_budget.h beside the formulas.
+        r.ops_per_iteration = ops_per_solve_iteration(
+            player_nodes, MAX_ACTIONS, iso_.num_canonical);
+        std::string backend_label;
+        if (backend_) {
+            backend_label = backend_->name();
+        }
+        r.backend_for_estimate = backend_label;
+        std::string backend_label_lc = backend_label;
+        for (auto& ch : backend_label_lc) {
+            if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        const int cc = (selected_backend == BackendType::GPU)
+                       ? cuda_compute_capability() : 0;
+        r.estimated_solve_seconds = estimate_solve_seconds(
+            player_nodes, MAX_ACTIONS, iso_.num_canonical,
+            config_.max_iterations, backend_label_lc, cc);
+
         result.resources = std::move(r);
     }
     return result;
+}
+
+// ============================================================================
+// v1.2.2: estimate_only — pre-solve cost preview without running iterations
+// ============================================================================
+//
+// Runs ONLY iso enumeration + tree build (typically <100ms even on monotone
+// boards, vs. the full solve which takes seconds-to-minutes). Skips
+// precompute_matchups, reach init, and the iteration loop entirely.
+//
+// Memory estimates: same formulas as solve()'s gate_est. Matchup table
+// count uses the chance-child count from the built tree as a proxy — exact
+// for non-iso boards, slight under-count on iso-engaged boards because we
+// don't actually walk the matchup precompute. The difference doesn't change
+// the order of magnitude of the byte estimate, which is what the UI cares
+// about for the "X MB host" banner.
+//
+// Time estimate: same `estimate_solve_seconds()` helper as the post-solve
+// path uses — backend-throughput table calibrated against `--benchmark
+// standard`. Picks the GPU rate when AUTO would select GPU (so the user
+// sees the right number BEFORE backend allocation).
+inline SolveResources Solver::estimate_only() {
+    iso_ = compute_isomorphism(config_.board.data(), config_.board_size);
+
+    GameTreeBuilder builder(config_);
+    builder.set_memory_policy(iso_.num_canonical, config_.memory_budget);
+    tree_ = builder.build();
+
+    SolveResources r;
+    r.canonical_combos = iso_.num_canonical;
+
+    uint32_t player_nodes = 0;
+    uint32_t chance_child_count = 0;
+    for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
+        auto t = static_cast<NodeType>(tree_.node_types[n]);
+        if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) ++player_nodes;
+        if (t == NodeType::CHANCE) {
+            // Each chance child with a real dealt card maps to one matchup
+            // table in precompute_matchups — count them as the proxy.
+            uint8_t nch = tree_.num_children[n];
+            uint32_t off = tree_.children_offset[n];
+            for (uint8_t k = 0; k < nch; ++k) {
+                uint32_t child = tree_.children[off + k];
+                uint8_t dc = (child < tree_.dealt_card.size())
+                    ? tree_.dealt_card[child] : 0xFFu;
+                if (dc != 0xFFu) ++chance_child_count;
+            }
+        }
+    }
+    r.player_nodes = player_nodes;
+
+    const uint64_t nc      = iso_.num_canonical;
+    const uint64_t total_n = tree_.total_nodes;
+    const uint64_t matchup_count_est = std::max<uint64_t>(chance_child_count, 1);
+
+    r.estimated_matchup_bytes        = bytes_for_matchup_tables(matchup_count_est, nc);
+    r.estimated_cpu_state_bytes      = bytes_for_cpu_state(player_nodes, MAX_ACTIONS, nc);
+    r.estimated_gpu_state_bytes      = bytes_for_gpu_state(total_n, MAX_ACTIONS, nc);
+
+    const uint64_t ev_cache_cap = config_.memory_budget.strategy_tree_max_nodes > 0
+        ? std::min<uint64_t>(player_nodes, config_.memory_budget.strategy_tree_max_nodes)
+        : player_nodes;
+    r.estimated_strategy_tree_bytes  = bytes_for_strategy_tree_ev_cache(ev_cache_cap, nc);
+    r.estimated_json_bytes           = bytes_for_json_response(
+        std::min<uint64_t>(player_nodes,
+                           config_.memory_budget.strategy_tree_max_nodes));
+
+    r.host_budget_bytes        = config_.memory_budget.host_bytes;
+    r.gpu_budget_bytes         = config_.memory_budget.gpu_bytes;
+    r.strategy_tree_max_nodes  = config_.memory_budget.strategy_tree_max_nodes;
+
+    // Predict which backend AUTO would pick — same heuristic solve() uses.
+    BackendType predicted_backend = backend_type_;
+    if (backend_type_ == BackendType::AUTO) {
+        const bool want_gpu = should_auto_select_gpu(config_, tree_, matchup_count_est);
+        predicted_backend = want_gpu ? BackendType::GPU : BackendType::CPU;
+        if (!want_gpu) {
+            std::string why = cuda_gpu_reject_reason();
+            if (!why.empty()) r.fallback_reason = std::move(why);
+        }
+    }
+
+    // Backend label without actually allocating the backend — synthesize.
+    std::string backend_label;
+    if (predicted_backend == BackendType::GPU) {
+        std::string desc = describe_cuda_gpu();
+        backend_label = std::string("CUDA (") + (desc.empty() ? "no device" : desc) + ")";
+    } else {
+        backend_label = "CPU-DCFR";
+    }
+    r.backend_for_estimate = backend_label;
+    std::string lc = backend_label;
+    for (auto& ch : lc) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    const int cc = (predicted_backend == BackendType::GPU) ? cuda_compute_capability() : 0;
+
+    r.ops_per_iteration = ops_per_solve_iteration(player_nodes, MAX_ACTIONS, nc);
+    r.estimated_solve_seconds = estimate_solve_seconds(
+        player_nodes, MAX_ACTIONS, nc, config_.max_iterations, lc, cc);
+
+    // Lightweight budget-decision label so the UI can flag "this will fail
+    // the gate" before the user commits.
+    SolveFootprintEstimate gate_est;
+    gate_est.matchup_tables_bytes   = r.estimated_matchup_bytes;
+    gate_est.cpu_state_bytes        = r.estimated_cpu_state_bytes;
+    gate_est.gpu_state_bytes        = r.estimated_gpu_state_bytes;
+    gate_est.strategy_tree_ev_bytes = r.estimated_strategy_tree_bytes;
+    gate_est.json_response_bytes    = r.estimated_json_bytes;
+    BudgetDecision d = evaluate_budget(gate_est, config_.memory_budget);
+    r.budget_decision = budget_decision_str(d);
+    if (d != BudgetDecision::OK) {
+        r.diagnostic = format_budget_failure(d, gate_est, config_.memory_budget);
+    }
+
+    return r;
 }
 
 // ============================================================================

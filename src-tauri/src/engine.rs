@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
-use crate::types::{GpuInfo, ResolvedMemoryBudget, SolverRequest, SolverResponse};
+use crate::types::{EstimateResponse, GpuInfo, ResolvedMemoryBudget, SolverRequest, SolverResponse};
 
 /// Diagnostic log file location. Writes CLI args and engine stderr on each
 /// run so we can diagnose user-reported crashes without reproducing state.
@@ -156,15 +156,12 @@ pub async fn run_solver(request: &SolverRequest) -> Result<SolverResponse, Strin
     }
 }
 
-/// One attempt at running the solver subprocess. Used by run_solver for the
-/// initial call and for the CPU fallback retry.
-async fn try_run_solver(
-    request: &SolverRequest,
-    backend_override: Option<&str>,
-) -> Result<SolverResponse, String> {
-    let binary = find_engine_binary();
-
-    // Build CLI arguments
+/// v1.2.2: build the CLI argv vector for `deepsolver_core` from a
+/// SolverRequest. Extracted from `try_run_solver` so the estimate-only
+/// path (`run_estimate`) uses byte-identical args — that way the ETA
+/// reflects exactly what the real solve would do (same memory profile,
+/// same iterations, same backend, same bet sizing).
+fn build_solver_args(request: &SolverRequest, backend_override: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "--pot".to_string(), request.pot_size.to_string(),
         "--stack".to_string(), request.effective_stack.to_string(),
@@ -194,7 +191,6 @@ async fn try_run_solver(
         args.push(locks.clone());
     }
 
-    // Backend: override wins over request.backend
     let effective_backend = backend_override
         .map(String::from)
         .or_else(|| request.backend.clone());
@@ -212,13 +208,8 @@ async fn try_run_solver(
         args.push(if dk { "1".to_string() } else { "0".to_string() });
     }
 
-    // Bet sizing per street (fractions of pot). Pass to CLI as comma-separated
-    // floats so the backend's tree uses the same action set the UI presents.
     fn join_floats(v: &[f64]) -> String {
-        v.iter()
-            .map(|f| format!("{}", f))
-            .collect::<Vec<_>>()
-            .join(",")
+        v.iter().map(|f| format!("{}", f)).collect::<Vec<_>>().join(",")
     }
     if let Some(ref v) = request.flop_sizes {
         if !v.is_empty() {
@@ -239,10 +230,6 @@ async fn try_run_solver(
         }
     }
 
-    // Sprint 3 (resource policy guide): forward resolved memory budget.
-    // The C++ CLI treats 0 as "use built-in default", so we only send a
-    // flag when the resolved value is non-zero. GPU specifically: gpu_mb
-    // == 0 means "let backend probe at runtime", so omit the flag.
     let mb = ResolvedMemoryBudget::resolve(request);
     if mb.host_mb > 0 {
         args.push("--host-memory-mb".to_string());
@@ -260,6 +247,18 @@ async fn try_run_solver(
         args.push("--strategy-tree-max-nodes".to_string());
         args.push(mb.strategy_tree_max_nodes.to_string());
     }
+
+    args
+}
+
+/// One attempt at running the solver subprocess. Used by run_solver for the
+/// initial call and for the CPU fallback retry.
+async fn try_run_solver(
+    request: &SolverRequest,
+    backend_override: Option<&str>,
+) -> Result<SolverResponse, String> {
+    let binary = find_engine_binary();
+    let args = build_solver_args(request, backend_override);
 
     // Log the command for post-hoc debugging of crashes.
     let quoted_args: Vec<String> = args.iter().map(|a| {
@@ -417,6 +416,53 @@ fn extract_engine_error(stderr: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// v1.2.2: Run the engine with `--estimate-only` to get a pre-solve cost
+/// preview (memory + ETA). Short-lived subprocess (~50-300ms typically;
+/// monotone iso boards ~1s). Frontend calls this before kicking off the
+/// real solve so the UI can show "Estimated 12 minutes on CPU" before the
+/// user commits.
+///
+/// Reuses the same arg-builder as run_solver so the estimate matches what
+/// the real solve would actually do (same memory profile, same iterations,
+/// same backend selection). Skips the streaming-progress / timeout
+/// machinery — estimate-only is fast enough to await directly.
+pub async fn run_estimate(request: &SolverRequest) -> Result<EstimateResponse, String> {
+    let binary = find_engine_binary();
+
+    let mut args = build_solver_args(request, None);
+    args.push("--estimate-only".to_string());
+
+    let mut cmd = Command::new(&binary);
+    cmd.args(&args);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+
+    // 30 s ceiling — estimate-only should complete in well under 1 s; this
+    // is just a safety net for pathological cases (e.g. a broken binary
+    // hanging at startup). If it ever gets close to this, something else
+    // is wrong.
+    let output = match timeout(Duration::from_secs(30), cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("Failed to spawn engine for estimate: {}", e)),
+        Err(_) => return Err("Engine estimate timed out (>30s)".to_string()),
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Engine estimate exited with code {:?}: {}",
+            output.status.code(),
+            stderr.lines().next().unwrap_or("")
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout)
+        .map_err(|e| format!("Failed to parse estimate JSON: {}. Raw: {}", e, stdout))
 }
 
 /// Run the engine with `--gpu-info` to detect CUDA GPU availability.

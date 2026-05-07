@@ -44,7 +44,23 @@ endif()
 if(HAVE_CUDA)
     set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-    set(CMAKE_CUDA_ARCHITECTURES "89")
+    # v1.2.2: multi-arch fat binary so installed releases run natively on
+    # all GPUs supported by the CUDA toolkit we build with.
+    #
+    # CUDA 13.x dropped Pascal (compute_61) AND Volta (compute_70) — minimum
+    # supported arch is now Turing (compute_75). Owners of GTX 10-series
+    # cards need a separate CUDA-12.x build (tracked for v1.3.0). For now
+    # they auto-fall-back to CPU with a clear diagnostic instead of silent
+    # routing.
+    #
+    #   75: Turing     (RTX 20-series, GTX 16-series)
+    #   80: Ampere A100
+    #   86: Ampere     (RTX 30-series)
+    #   89: Ada        (RTX 40-series)
+    #   90: Hopper     (H100); also serves as PTX-JIT source for Blackwell
+    # Build size grows ~5× (one SASS per arch), but each device gets a
+    # native binary instead of paying a JIT cost on first launch.
+    set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
 
     add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
     if(MSVC)
