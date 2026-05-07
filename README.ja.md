@@ -7,10 +7,21 @@
 📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.3.0-green)
+![Version](https://img.shields.io/badge/version-1.3.1-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
 DEEPFOLD-SOLVER は [DEEPFOLD](https://deepfold.co) のデスクトップ GTO ソルバーです。GPU アクセラレーション DCFR エンジン（CPU フォールバック完備）に **runout 集計、コンボ別ブロッカー解析、EV/アグレ度ヒートマップ、2,500+ プリフロップ チャート** を加え、Windows 用ワンクリックインストーラーに同梱しています。
+
+## v1.3.1 のハイライト（遅い CPU でも時間予算が正しく発火）
+
+v1.3.0 で発覚したバグ：GTX 1070 Max-Q laptop でエンジン内部の time_budget
+(300s) が発火する前に Tauri 外側のサブプロセス timeout (720s) が先に
+キル。原因：遅い CPU で 9k ノードの turn solve は単一 iter が 720s を
+超え、loop が次の budget チェック点に到達できない。
+
+Tauri 外側 timeout を time_budget に連動：`min(budget × 3 + 90s, 1800s)`。
+進行中の iter に余裕を与え、エンジン自身の budget チェックが発火できる
+ように。
 
 ## v1.3.0 のハイライト（時間予算 + Stop ボタン）
 

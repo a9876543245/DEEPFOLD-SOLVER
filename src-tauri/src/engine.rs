@@ -378,10 +378,25 @@ async fn try_run_solver(
     //   300 iter → max(300, 720)       = 720 s
     //   500 iter → max(300, 1120)      =  900 s (capped)
     //   1000 iter → 900 s (capped)
-    let timeout_secs = std::cmp::min(
-        std::cmp::max(300u64, request.iterations as u64 * 2 + 120),
-        900,
-    );
+    //
+    // v1.3.1: when the user set a time_budget, Tauri's outer timeout MUST
+    // be generous enough for the engine's internal budget to fire BEFORE
+    // Tauri kills the subprocess. The engine checks budget BETWEEN
+    // iterations, so on slow hardware a single iter can exceed the budget
+    // (Pascal CPU laptop on a 9k-node turn solve hits ~150-300s/iter).
+    // Allow 3× the budget plus 90s for postsolve — that gives the engine
+    // room to finish the in-flight iter and run finalize+postsolve before
+    // Tauri's outer killswitch fires. Capped at 30 min to keep runaway
+    // bounded.
+    let timeout_secs = if let Some(budget) = request.time_budget_seconds {
+        if budget > 0 {
+            std::cmp::min((budget as u64).saturating_mul(3).saturating_add(90), 1800)
+        } else {
+            std::cmp::min(std::cmp::max(300u64, (request.iterations as u64) * 2 + 120), 900)
+        }
+    } else {
+        std::cmp::min(std::cmp::max(300u64, (request.iterations as u64) * 2 + 120), 900)
+    };
 
     let stdout_result = match timeout(Duration::from_secs(timeout_secs), async {
         let reader = BufReader::new(stdout);
@@ -415,10 +430,32 @@ async fn try_run_solver(
             let _ = child.wait().await;
             let _ = stderr_handle.await;
             CURRENT_SOLVE_PID.store(0, Ordering::SeqCst);
-            return Err(format!(
-                "Engine timed out after {} seconds ({} iterations requested). Try reducing iterations.",
-                timeout_secs, request.iterations
-            ));
+            // v1.3.1: clearer message when time_budget was active. The
+            // engine should have stopped at the budget but didn't get
+            // there before Tauri's killswitch — almost always means a
+            // single iter exceeded our budget×3 envelope, i.e. spot is
+            // too big for this hardware.
+            let msg = if let Some(b) = request.time_budget_seconds {
+                if b > 0 {
+                    format!(
+                        "Engine timed out after {}s. Your spot is too large for the {}-second budget on this hardware — \
+                         a single iteration exceeded the {}s wall-clock allowance. \
+                         Reduce iterations / bet sizes / range width, switch to a smaller spot, or use a faster machine.",
+                        timeout_secs, b, timeout_secs
+                    )
+                } else {
+                    format!(
+                        "Engine timed out after {} seconds ({} iterations requested). Try reducing iterations.",
+                        timeout_secs, request.iterations
+                    )
+                }
+            } else {
+                format!(
+                    "Engine timed out after {} seconds ({} iterations requested). Try reducing iterations.",
+                    timeout_secs, request.iterations
+                )
+            };
+            return Err(msg);
         }
     };
 

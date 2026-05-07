@@ -7,10 +7,28 @@
 📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.3.0-green)
+![Version](https://img.shields.io/badge/version-1.3.1-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
 DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). It pairs a GPU-accelerated DCFR engine (with full CPU fallback) with **runout aggregation, per-combo blocker analysis, EV / aggression heatmaps, and a 2,500+ preflop chart browser** — all in a single Windows installer.
+
+## What's new in v1.3.1 (time-budget honored on slow CPUs)
+
+Field bug from v1.3.0: a user with a GTX 1070 Max-Q laptop hit Tauri's
+outer subprocess timeout (720s for 300 iter) before the engine's
+internal time_budget (300s) could fire. Root cause: a single CFR
+iteration on a 9k-node turn solve took longer than 720s on that laptop's
+CPU, so the loop never got to its between-iter budget check.
+
+Tauri's outer timeout now scales with the user-set time_budget:
+\`min(budget × 3 + 90s, 1800s)\`. That gives the in-flight iter room to
+finish so the engine's budget check can fire. Bigger spots on slower
+hardware now correctly stop at the budget instead of dying with a
+"Engine timed out" error.
+
+The error message also got smarter — when the timeout fires WITH a
+budget set, we now say "your spot is too large for the X-second budget
+on this hardware" rather than the generic "try reducing iterations".
 
 ## What's new in v1.3.0 (time-budgeted solves + Stop button)
 

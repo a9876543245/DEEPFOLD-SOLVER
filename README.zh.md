@@ -7,10 +7,25 @@
 📘 **[使用說明 (中文)](USER_GUIDE.zh.md)** · **[User Guide (English)](USER_GUIDE.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.3.0-green)
+![Version](https://img.shields.io/badge/version-1.3.1-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
 DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GPU 加速的 DCFR 引擎（含 CPU fallback）+ **runout 聚合報告、per-combo blocker 分析、EV / 激進度熱力圖、2,500+ preflop 圖庫**，單一 Windows 安裝檔搞定。
+
+## v1.3.1 新功能（慢 CPU 上時間預算正確生效）
+
+v1.3.0 ship 後使用者用 GTX 1070 Max-Q laptop 撞到 bug：300 iter 的 spot
+在 engine 的 time_budget(300s) 來得及觸發前，Tauri 外層 subprocess timeout
+(720s) 先把 engine 砍了。Root cause：那台 laptop CPU 太慢，9k 節點的
+turn solve **單一 iter 就跑了超過 720s**，永遠走不到下一個 budget check 點。
+
+Tauri 外層 timeout 現在會跟 time_budget 連動：
+`min(budget × 3 + 90s, 1800s)`。給正在跑的 iter 足夠時間完成，engine 自己
+的 budget 檢查才能觸發。大 spot 在慢機器上現在會正確在 budget 停下，
+而不是死在「Engine timed out」。
+
+錯誤訊息也變聰明了 — timeout 觸發 + budget 有設時，會說「**你的 spot
+太大、超過這台機器在 X 秒預算內能解的範圍**」而不是泛用的「請減少 iter」。
 
 ## v1.3.0 新功能（時間預算 + Stop 按鈕）
 
