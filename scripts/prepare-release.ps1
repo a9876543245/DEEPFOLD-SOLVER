@@ -25,6 +25,17 @@
 #   `createUpdaterArtifacts: true` in tauri.conf.json is kept so the runtime
 #   updater plugin still verifies signatures normally on end-user machines.
 #
+# PowerShell quirks handled:
+#   - `git fetch --tags` runs early so the changelog step can resolve the
+#     previous release tag (gh release create pushes tags but doesn't pull
+#     them back locally).
+#   - The `npm run tauri build` invocation runs with `$ErrorActionPreference
+#     = 'Continue'` and stderr merged via `2>&1`. PowerShell 5.1 wraps every
+#     line on a native command's stderr as an ErrorRecord, and npm/tauri
+#     log benign progress on stderr ("Info Looking up installed tauri
+#     packages...") that would otherwise crash the script under the
+#     top-level `Stop` preference even when the build itself succeeded.
+#
 # Output:
 #   release\
 #     latest.json                                       (upload to endpoint)
@@ -50,6 +61,18 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
+
+# Fetch tags from origin so the changelog step (`git log v<prev>..HEAD`)
+# can find the previous release tag. `gh release create` pushes the tag to
+# the remote but doesn't pull it back to local refs — so a fresh clone (or
+# a machine that hasn't fetched recently) will silently produce empty
+# release notes if we don't do this. `--quiet` suppresses progress chatter,
+# `2>$null` swallows the "couldn't reach remote" case (offline / detached).
+& git fetch --tags --quiet origin 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  [!] git fetch --tags failed (offline?). Notes may be incomplete." -ForegroundColor Yellow
+    $global:LASTEXITCODE = 0  # don't poison the rest of the script
+}
 
 # ----- 1. Resolve version ---------------------------------------------------
 if (-not $Version) {
@@ -112,8 +135,24 @@ if (-not $SkipBuild) {
     $tmpConfig = New-TemporaryFile
     try {
         Set-Content -Path $tmpConfig.FullName -Value '{"bundle":{"createUpdaterArtifacts":false}}' -Encoding ASCII -NoNewline
-        npm run tauri build -- --config $tmpConfig.FullName
-        if ($LASTEXITCODE -ne 0) { throw "Tauri build failed" }
+
+        # PowerShell 5.1 wraps every line on a native command's stderr as
+        # an ErrorRecord, and `$ErrorActionPreference = 'Stop'` (set at the
+        # top of this script) treats those wrappers as fatal. npm/tauri
+        # routinely log benign progress on stderr ("Info Looking up
+        # installed tauri packages..."), which would crash the script even
+        # though the build itself succeeds (.exe lands in bundle/nsis/).
+        # Relax the preference around the npm call AND merge stderr into
+        # stdout (`2>&1`) so PS forwards lines as plain strings instead of
+        # ErrorRecords. We still trust $LASTEXITCODE for actual failure.
+        $prevPref = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & npm run tauri build -- --config $tmpConfig.FullName 2>&1 | ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -ne 0) { throw "Tauri build failed (exit $LASTEXITCODE)" }
+        } finally {
+            $ErrorActionPreference = $prevPref
+        }
     } finally {
         Remove-Item $tmpConfig.FullName -ErrorAction SilentlyContinue
     }
