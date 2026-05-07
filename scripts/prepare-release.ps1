@@ -186,11 +186,20 @@ $existingSig = Get-ChildItem "$bundleDir\nsis\*$Version*setup.exe.sig" -File -Er
 if (-not $existingSig -or $SkipBuild) {
     Write-Host ""
     Write-Host "Signing $($nsisExeForSigning.Name) (manual, --password CLI flag)..." -ForegroundColor Cyan
-    # Pass password via flag, not env, so we don't inherit stdin-prompt bugs
-    # from previous failed attempts. `--yes` on npx avoids the install
-    # confirmation prompt.
-    & npx --yes @tauri-apps/cli signer sign -f $keyPath -p "" $nsisExeForSigning.FullName
-    if ($LASTEXITCODE -ne 0) { throw "Manual signer failed (see output above)" }
+    # Wrap via cmd.exe for the same reason the build call does (above):
+    # PowerShell 5.1's `& npx @tauri-apps/cli ... -p "" ...` mangles args
+    # — the `@` prefix can be misread as splat, the empty-string `""` for
+    # password gets stripped, and PS wraps npx's stderr lines as
+    # ErrorRecords that trip $ErrorActionPreference. cmd.exe handles
+    # native command quoting and stderr cleanly.
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        cmd.exe /c "npx --yes @tauri-apps/cli signer sign -f `"$keyPath`" -p `"`" `"$($nsisExeForSigning.FullName)`""
+        if ($LASTEXITCODE -ne 0) { throw "Manual signer failed (exit $LASTEXITCODE)" }
+    } finally {
+        $ErrorActionPreference = $prevPref
+    }
 } else {
     Write-Host "Existing signature found — skipping manual sign" -ForegroundColor DarkGray
 }
