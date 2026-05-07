@@ -46,6 +46,12 @@ struct CLIArgs {
     bool help = false;
     bool gpu_info = false;
 
+    // Polish #2: benchmark mode. Empty = normal solve. Recognized presets:
+    //   "standard" — AsKd7c rainbow, full ranges, 100 iter. Emits benchmark JSON
+    //                 instead of normal solver JSON. Useful for perf regression
+    //                 tracking and CI smoke timing.
+    std::string benchmark;
+
     // Backend selection: "auto" | "cpu" | "gpu"
     std::string backend = "auto";
 
@@ -196,6 +202,8 @@ CLIArgs parse_args(int argc, char* argv[]) {
             }
         } else if (arg == "--gpu-info") {
             args.gpu_info = true;
+        } else if (arg == "--benchmark" && i + 1 < argc) {
+            args.benchmark = argv[++i];
         }
     }
 
@@ -232,6 +240,8 @@ Arguments:
   --no-strategy-tree       Omit the client navigation cache from JSON output
   --no-strategy-tree-evs   Keep strategy tree but omit per-node EV cache
   --gpu-info               Print detected GPU info and exit
+  --benchmark <preset>     Run a fixed scenario for perf tracking, emit benchmark JSON.
+                           Presets: standard (AsKd7c rainbow, full ranges, 100 iter)
   --help, -h               Show this help message
 
 Output:
@@ -655,6 +665,32 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // Polish #2: --benchmark <preset> overrides scenario inputs with a known
+    // fixed setup so perf regression tracking is reproducible across runs.
+    // Output is replaced with a benchmark-only JSON (see end of main).
+    bool benchmark_mode = false;
+    if (!args.benchmark.empty()) {
+        benchmark_mode = true;
+        if (args.benchmark == "standard") {
+            // AsKd7c rainbow flop, both players defaulting to full 1326 range,
+            // standard bet sizing, 100 DCFR iterations. Picked because:
+            //  - rainbow flop hits the default (no-iso-fallback) code path;
+            //  - 100 iter is enough to measure throughput without dominating
+            //    setup costs (tree build / matchups).
+            args.board_str = "AsKd7c";
+            args.pot       = 100.0f;
+            args.stack     = 500.0f;
+            args.iterations = 100;
+            args.ip_range_str.clear();   // empty = default full range
+            args.oop_range_str.clear();
+            // Keep postsolve full so combo_evs + exploitability are measured too.
+        } else {
+            std::cerr << "{\"status\":\"error\",\"message\":\"unknown --benchmark preset: "
+                      << args.benchmark << "\"}\n";
+            return 1;
+        }
+    }
+
     // Handle --gpu-info: print detected GPU info and exit (for Tauri diagnostics)
     if (args.gpu_info) {
         bool has = has_cuda_gpu();
@@ -825,18 +861,70 @@ int main(int argc, char* argv[]) {
             // Sprint 1: surface truncation back into result.resources so the
             // UI can show a "tree truncated" badge instead of silently
             // dropping branches.
+            //
+            // Polish #4: read max_nodes from result.resources (NOT args)
+            // because the JSON-cap auto-action inside solver.solve() may
+            // have lowered it. Using args here would build the full tree
+            // and silently exceed the JSON budget the user set.
             bool tree_truncated = false;
+            const uint32_t effective_max_nodes =
+                result.resources.strategy_tree_max_nodes > 0
+                    ? result.resources.strategy_tree_max_nodes
+                    : args.strategy_tree_max_nodes;
             strategy_tree = solver.build_strategy_tree(
                 /*max_player_depth=*/8, ev_mode,
-                /*max_nodes=*/args.strategy_tree_max_nodes, &tree_truncated);
+                /*max_nodes=*/effective_max_nodes, &tree_truncated);
             strategy_tree_ptr = &strategy_tree;
             result.resources.strategy_tree_emitted_nodes =
                 static_cast<uint32_t>(strategy_tree.size());
             result.resources.strategy_tree_truncated = tree_truncated;
         }
 
-        // Output JSON to stdout (with the strategy tree appended).
-        std::cout << result_to_json(result, args, backend_name, strategy_tree_ptr);
+        // Polish #2: in --benchmark mode, replace the standard JSON output
+        // with a compact benchmark report so callers can grep perf metrics
+        // without parsing the full 24 MB strategy tree blob.
+        if (benchmark_mode) {
+            const double iter_ms  = static_cast<double>(result.timing.iterations_ms);
+            const uint64_t tree_nodes = result.timing.tree_nodes;
+            const double iters_per_sec = iter_ms > 0
+                ? (static_cast<double>(result.iterations_run) / (iter_ms / 1000.0))
+                : 0.0;
+            const double nodes_per_sec = iter_ms > 0
+                ? (static_cast<double>(tree_nodes) * static_cast<double>(result.iterations_run) / (iter_ms / 1000.0))
+                : 0.0;
+            // Sum the estimated memory components for a single "what does this
+            // solve cost" number. Matchup tables dominate on iso-engaged trees;
+            // CPU state dominates on rainbow flops.
+            const uint64_t total_est_bytes =
+                result.resources.estimated_matchup_bytes +
+                result.resources.estimated_cpu_state_bytes +
+                result.resources.estimated_strategy_tree_bytes +
+                result.resources.estimated_json_bytes;
+            const double mem_est_mb = static_cast<double>(total_est_bytes) / (1024.0 * 1024.0);
+
+            std::cout << "{\n"
+                      << "  \"benchmark\": \"" << escape_json(args.benchmark) << "\",\n"
+                      << "  \"board\": \"" << escape_json(args.board_str) << "\",\n"
+                      << "  \"backend\": \"" << escape_json(backend_name) << "\",\n"
+                      << "  \"iterations_run\": " << result.iterations_run << ",\n"
+                      << "  \"exploitability_pct\": " << result.exploitability_pct << ",\n"
+                      << "  \"iterations_per_sec\": " << iters_per_sec << ",\n"
+                      << "  \"nodes_per_sec\": " << nodes_per_sec << ",\n"
+                      << "  \"memory_estimate_mb\": " << mem_est_mb << ",\n"
+                      << "  \"tree_nodes\": " << tree_nodes << ",\n"
+                      << "  \"timing\": {\n"
+                      << "    \"total_ms\": " << result.timing.total_ms << ",\n"
+                      << "    \"tree_build_ms\": " << result.timing.tree_build_ms << ",\n"
+                      << "    \"backend_prepare_ms\": " << result.timing.backend_prepare_ms << ",\n"
+                      << "    \"iterations_ms\": " << result.timing.iterations_ms << ",\n"
+                      << "    \"finalize_ms\": " << result.timing.finalize_ms << ",\n"
+                      << "    \"postsolve_ms\": " << result.timing.postsolve_ms << "\n"
+                      << "  }\n"
+                      << "}\n";
+        } else {
+            // Output JSON to stdout (with the strategy tree appended).
+            std::cout << result_to_json(result, args, backend_name, strategy_tree_ptr);
+        }
 
     } catch (const std::exception& e) {
         std::cerr << "{\"status\": \"error\", \"message\": \""

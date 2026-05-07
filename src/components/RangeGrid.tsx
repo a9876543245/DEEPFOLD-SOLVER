@@ -3,8 +3,87 @@ import { GRID_LABELS, getActionColor } from '../lib/poker';
 import type { SolverResponse, ComboStrategy } from '../lib/poker';
 import { useT } from '../lib/i18n';
 
-export type GridDisplayMode = 'mix' | 'action-heatmap';
+/**
+ * Grid display modes — what to colour each 169-cell by.
+ *
+ * - `mix`             : action-mix gradient (default; same as competing solvers)
+ * - `action-heatmap`  : single-action intensity (e.g., "show only Bet 75% freq")
+ * - `ev`              : per-class EV heatmap, red→grey→green normalized to the
+ *                       in-range EV span. Surfaces "which combos are profit
+ *                       centres vs which are losing" at a glance.
+ * - `aggression`      : sum of Bet/Raise/All-in frequencies, cool→hot.
+ *                       Answers "how often does this class take an
+ *                       aggressive line vs passive (Check/Call)?"
+ */
+export type GridDisplayMode = 'mix' | 'action-heatmap' | 'ev' | 'aggression';
 export type GridViewSide = 'acting' | 'opponent';
+
+/** Actions counted as "aggressive" for the aggression heatmap. */
+function isAggressiveAction(label: string): boolean {
+  return label.startsWith('Bet_') ||
+         label.startsWith('Raise') ||
+         label === 'All-in' ||
+         label === 'Bet';
+}
+
+/** Sum of aggressive-action frequencies in a combo strategy. Returns 0..1. */
+function aggressionScore(strategy: ComboStrategy): number {
+  let s = 0;
+  for (const [action, freq] of Object.entries(strategy)) {
+    if (action === 'Not in range') continue;
+    if (isAggressiveAction(action)) s += freq;
+  }
+  return Math.max(0, Math.min(1, s));
+}
+
+/**
+ * Map a normalized value in [0, 1] to a diverging red→grey→green color.
+ * 0 = saturated red, 0.5 = neutral grey, 1 = saturated green.
+ * Used for the EV heatmap so the user can spot loss/profit centers fast.
+ */
+function divergingColor(t: number): string {
+  const tt = Math.max(0, Math.min(1, t));
+  if (tt < 0.5) {
+    // red → grey
+    const k = tt * 2;                          // 0..1
+    const r = Math.round(220 - 100 * k);       // 220 → 120
+    const g = Math.round(38 + 82 * k);         // 38 → 120
+    const b = Math.round(38 + 82 * k);         // 38 → 120
+    return `rgb(${r}, ${g}, ${b})`;
+  } else {
+    // grey → green
+    const k = (tt - 0.5) * 2;                  // 0..1
+    const r = Math.round(120 - 104 * k);       // 120 → 16
+    const g = Math.round(120 + 65 * k);        // 120 → 185
+    const b = Math.round(120 - 39 * k);        // 120 → 81
+    return `rgb(${r}, ${g}, ${b})`;
+  }
+}
+
+/**
+ * Map an aggression score [0, 1] to a cool→hot color gradient
+ * (grey → orange → red). Distinct from the EV diverging palette so the
+ * two modes don't look the same at a glance.
+ */
+function aggressionColor(score: number): string {
+  if (score < 0.005) return 'var(--color-bg-tertiary)';
+  const t = Math.max(0, Math.min(1, score));
+  const r = Math.round(120 + 135 * t);         // 120 → 255
+  const g = Math.round(120 - 90 * t);          // 120 → 30
+  const b = Math.round(120 - 110 * t);         // 120 → 10
+  return `rgb(${r}, ${g}, ${b})`;
+}
+
+/** Format an EV value for cell display. Signed, 1 decimal for small values
+ *  to avoid "+0" hiding small wins, integer for big ones. */
+function formatEv(ev: number): string {
+  if (!Number.isFinite(ev)) return '—';
+  const abs = Math.abs(ev);
+  const sign = ev >= 0 ? '+' : '';
+  if (abs >= 100) return `${sign}${ev.toFixed(0)}`;
+  if (abs >= 10) return `${sign}${ev.toFixed(0)}`;
+  return `${sign}${ev.toFixed(1)}`;
+}
 
 interface Props {
   result: SolverResponse | null;
@@ -86,12 +165,35 @@ export function RangeGrid({
     const data: Record<string, {
       background: string;
       entries: { action: string; frequency: number; color: string }[];
+      /** For action-heatmap and aggression: the underlying 0..1 frequency. */
       heatFreq?: number;
+      /** For ev mode: the raw EV value to render in the cell label. */
+      ev?: number;
+      /** For aggression mode: aggression score 0..1. */
+      aggScore?: number;
     }> = {};
 
     const flat = GRID_LABELS.flat();
     const isHeatmap = displayMode === 'action-heatmap' && heatmapAction;
     const actionColor = isHeatmap ? getActionColor(heatmapAction) : '';
+
+    // EV mode needs a min/max sweep to normalize colors against the in-range
+    // EV span. We do this once up front so each cell can look up its
+    // normalized t in O(1). Cells with combo_strategies but missing combo_evs
+    // fall back to their strategy gradient (better than a misleading colour).
+    let evMin = Infinity;
+    let evMax = -Infinity;
+    if (displayMode === 'ev' && result?.combo_evs && result?.combo_strategies) {
+      for (const label of flat) {
+        const cs = result.combo_strategies[label];
+        if (!cs || cs['Not in range']) continue;
+        const ev = result.combo_evs[label];
+        if (typeof ev !== 'number' || !Number.isFinite(ev)) continue;
+        if (ev < evMin) evMin = ev;
+        if (ev > evMax) evMax = ev;
+      }
+    }
+    const evSpan = evMax - evMin;
 
     // Opponent-view mode: render a heatmap of the opponent's reach-weighted
     // range at this node. Values are already normalized to [0, 1] by the
@@ -138,6 +240,31 @@ export function RangeGrid({
             background: heatmapColor(freq, actionColor),
             entries,
             heatFreq: freq,
+          };
+        } else if (displayMode === 'ev') {
+          const ev = result?.combo_evs?.[label];
+          if (typeof ev === 'number' && Number.isFinite(ev) && evSpan > 0.01) {
+            const t = (ev - evMin) / evSpan;
+            data[label] = {
+              background: divergingColor(t),
+              entries,
+              ev,
+            };
+          } else {
+            // No EV data, or all in-range EVs identical — fall back to mix
+            // gradient so the cell isn't an opaque grey lie.
+            data[label] = {
+              background: strategyToGradient(entries),
+              entries,
+              ev: typeof ev === 'number' ? ev : undefined,
+            };
+          }
+        } else if (displayMode === 'aggression') {
+          const score = aggressionScore(comboStrategy);
+          data[label] = {
+            background: aggressionColor(score),
+            entries,
+            aggScore: score,
           };
         } else {
           data[label] = {
@@ -245,6 +372,32 @@ export function RangeGrid({
             {t('grid.strategyMix')}
           </button>
 
+          {/* EV button (Day 4) */}
+          <button onClick={() => { onDisplayModeChange('ev'); setShowActionPicker(false); }}
+            disabled={!result?.combo_evs || Object.keys(result.combo_evs).length === 0}
+            title="Per-class EV heatmap (red = losing, green = winning)"
+            style={{
+              padding: '4px 10px', borderRadius: 6, border: 'none', cursor: 'pointer',
+              background: displayMode === 'ev' ? 'var(--color-accent)' : 'var(--color-bg-tertiary)',
+              color: displayMode === 'ev' ? '#fff' : 'var(--color-text-secondary)',
+              fontSize: 11, fontWeight: 600, fontFamily: 'inherit', transition: 'all 150ms ease',
+              opacity: !result?.combo_evs ? 0.5 : 1,
+            }}>
+            {t('grid.ev')}
+          </button>
+
+          {/* Aggression button (Day 4) */}
+          <button onClick={() => { onDisplayModeChange('aggression'); setShowActionPicker(false); }}
+            title="Sum of Bet/Raise/All-in frequencies per class (cool = passive, hot = aggressive)"
+            style={{
+              padding: '4px 10px', borderRadius: 6, border: 'none', cursor: 'pointer',
+              background: displayMode === 'aggression' ? 'var(--color-accent)' : 'var(--color-bg-tertiary)',
+              color: displayMode === 'aggression' ? '#fff' : 'var(--color-text-secondary)',
+              fontSize: 11, fontWeight: 600, fontFamily: 'inherit', transition: 'all 150ms ease',
+            }}>
+            {t('grid.aggression')}
+          </button>
+
           {/* Action Heatmap button */}
           <div style={{ position: 'relative' }}>
             <button onClick={() => {
@@ -298,7 +451,15 @@ export function RangeGrid({
       <div className="range-grid animate-fade-in">
         {GRID_LABELS.flat().map((label, idx) => {
           const cell = cellData[label];
-          const isHeatmap = displayMode === 'action-heatmap';
+          // Pick what the cell label shows based on the active mode.
+          let labelText: string = label;
+          if (displayMode === 'action-heatmap' && cell?.heatFreq !== undefined) {
+            labelText = `${Math.round(cell.heatFreq * 100)}`;
+          } else if (displayMode === 'ev' && cell?.ev !== undefined) {
+            labelText = formatEv(cell.ev);
+          } else if (displayMode === 'aggression' && cell?.aggScore !== undefined) {
+            labelText = `${Math.round(cell.aggScore * 100)}`;
+          }
           return (
             <div
               key={idx}
@@ -308,14 +469,28 @@ export function RangeGrid({
               onMouseLeave={handleMouseLeave}
               onClick={() => onCellClick?.(label)}
             >
-              <span className="label">
-                {isHeatmap && cell?.heatFreq !== undefined
-                  ? `${Math.round(cell.heatFreq * 100)}`
-                  : label}
-              </span>
+              <span className="label">{labelText}</span>
               {hoveredCell === label && cell?.entries.length > 0 && (
                 <div className="tooltip">
-                  <div style={{ fontWeight: 700, marginBottom: 4, fontSize: 13 }}>{label}</div>
+                  <div style={{ fontWeight: 700, marginBottom: 4, fontSize: 13 }}>
+                    {label}
+                    {cell.ev !== undefined && (
+                      <span style={{
+                        marginLeft: 8, fontSize: 11, fontWeight: 500,
+                        color: cell.ev >= 0 ? '#10b981' : '#ef4444',
+                      }}>
+                        EV {formatEv(cell.ev)}
+                      </span>
+                    )}
+                    {cell.aggScore !== undefined && (
+                      <span style={{
+                        marginLeft: 8, fontSize: 11, fontWeight: 500,
+                        color: 'var(--color-text-tertiary)',
+                      }}>
+                        AGG {Math.round(cell.aggScore * 100)}%
+                      </span>
+                    )}
+                  </div>
                   {cell.entries.map((e) => (
                     <div key={e.action} style={{
                       display: 'flex', gap: 8, alignItems: 'center',

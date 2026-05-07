@@ -9,7 +9,7 @@ import { ActionNavigator } from './components/ActionNavigator';
 import { ActionBar } from './components/ActionBar';
 import { TurnRiverCardSelector } from './components/TurnRiverCardSelector';
 import { useSolver } from './hooks/useSolver';
-import type { SolverRequest, NodeLock, ComboAnalysis, GameContext } from './lib/poker';
+import type { SolverRequest, NodeLock, ComboAnalysis, GameContext, MemoryProfile } from './lib/poker';
 import { getHandStrength, RANK_VALUES } from './lib/poker';
 import type { Position, PositionMatchup } from './lib/ranges';
 import { createRootNode, takeAction, dealCard, BET_SIZINGS } from './lib/gameTree';
@@ -122,6 +122,11 @@ function App() {
   // to the nearest backend node and shows misleading strategy.
   const [sizingKey, setSizingKey] = useState<'standard' | 'polar' | 'small_ball'>('standard');
 
+  // Memory profile preset for the next solve (Polish #1). Default 'balanced'
+  // matches the engine's `--memory-profile` default and the Rust resolver in
+  // src-tauri/src/types.rs::ResolvedMemoryBudget::from_profile.
+  const [memoryProfile, setMemoryProfile] = useState<MemoryProfile>('balanced');
+
   // Modals
   const [showGuide, setShowGuide] = useState(false);
   const [showSpotLibrary, setShowSpotLibrary] = useState(false);
@@ -227,8 +232,9 @@ function App() {
       flop_sizes: sz.flopBetSizes,
       turn_sizes: sz.turnBetSizes,
       river_sizes: sz.riverBetSizes,
+      memory_profile: memoryProfile,
     };
-  }, [pot, stack, iterations, selectedMatchup, getHeroRange, customIpRange, customOopRange, nodeLocks, sizingKey]);
+  }, [pot, stack, iterations, selectedMatchup, getHeroRange, customIpRange, customOopRange, nodeLocks, sizingKey, memoryProfile]);
 
   // Initial solve (root node)
   const handleSolve = useCallback(() => {
@@ -681,6 +687,7 @@ function App() {
           onPotChange={setPot} onStackChange={setStack} onIterationsChange={setIterations}
           onSolve={handleSolve} loading={loading}
           sizingKey={sizingKey} onSizingChange={setSizingKey}
+          memoryProfile={memoryProfile} onMemoryProfileChange={setMemoryProfile}
         />
         {error && (
           <div className="glass-panel animate-fade-in" style={{

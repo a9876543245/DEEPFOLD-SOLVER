@@ -123,6 +123,14 @@ const dict: Dict = {
   'config.show': { en: 'Show', zh: '顯示', ja: '表示' },
   'config.hide': { en: 'Hide', zh: '隱藏', ja: '非表示' },
   'config.maxIter': { en: 'Max Iterations', zh: '最大疊代次數', ja: '最大反復回数' },
+  // Memory profile (Polish #1)
+  'config.memory.label':       { en: 'Memory Profile',  zh: '記憶體配置',     ja: 'メモリプロファイル' },
+  'config.memory.safe':        { en: 'Safe',            zh: '安全',           ja: 'セーフ' },
+  'config.memory.balanced':    { en: 'Balanced',        zh: '平衡',           ja: 'バランス' },
+  'config.memory.performance': { en: 'Performance',     zh: '高效能',         ja: 'パフォーマンス' },
+  'config.memory.host':        { en: 'Host',            zh: '主機',           ja: 'ホスト' },
+  'config.memory.json':        { en: 'JSON',            zh: 'JSON',           ja: 'JSON' },
+  'config.memory.nodes':       { en: 'Tree nodes',      zh: '策略樹節點',     ja: '戦略木ノード' },
   'solve': { en: 'Solve', zh: '求解', ja: '求解' },
   'solving': { en: 'Solving...', zh: '求解中...', ja: '求解中...' },
 
@@ -174,6 +182,8 @@ const dict: Dict = {
   'grid.view': { en: 'View', zh: '檢視', ja: '表示' },
   'grid.strategyMix': { en: 'Strategy Mix', zh: '策略混合', ja: '戦略ミックス' },
   'grid.heatmap': { en: 'Heatmap', zh: '熱力圖', ja: 'ヒートマップ' },
+  'grid.ev': { en: 'EV', zh: 'EV', ja: 'EV' },
+  'grid.aggression': { en: 'Aggression', zh: '激進度', ja: 'アグレ度' },
   'grid.actingLabel': { en: "Acting player's decision", zh: '當前行動者決策', ja: '行動中プレイヤーの判断' },
   'grid.opponentLabel': { en: "Opponent's range at node", zh: '對手在此節點的範圍', ja: 'このノードでの相手のレンジ' },
   'grid.viewActing': { en: 'Acting', zh: '行動者', ja: '行動中' },

@@ -26,3 +26,4 @@ logs/
 .claude/
 CLAUDE.md
 /gto_output/
+/src-tauri/gen/

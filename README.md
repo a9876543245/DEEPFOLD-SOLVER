@@ -7,10 +7,38 @@
 📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.1.0-green)
+![Version](https://img.shields.io/badge/version-1.2.0-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
-DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). It pairs a GPU-accelerated DCFR engine (with full CPU fallback) with **runout aggregation, per-combo blocker analysis, and a 2,500+ preflop chart browser** — all in a single Windows installer.
+DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). It pairs a GPU-accelerated DCFR engine (with full CPU fallback) with **runout aggregation, per-combo blocker analysis, EV / aggression heatmaps, and a 2,500+ preflop chart browser** — all in a single Windows installer.
+
+## What's new in v1.2.0
+
+> v1.2.0 adds two new strategy-grid view modes, a memory-profile selector,
+> and several solver-side reliability improvements.
+
+### Grid view modes
+
+The 169 strategy grid now switches between four views via a toolbar:
+
+- **Strategy Mix** (default) — multi-action gradient per cell
+- **EV** *(new)* — per-class EV heatmap, red→grey→green normalized to the in-range EV span. Surfaces "which combos are profit centres vs which are losing" at a glance.
+- **Aggression** *(new)* — sum of Bet/Raise/All-in frequencies, cool→hot. Answers "how often does this class take an aggressive line vs passive?"
+- **Heatmap** — single-action intensity (e.g. "show only Bet 75% freq")
+
+### Solve controls
+
+- **Memory Profile selector** — `safe / balanced / performance` pills in advanced settings, with live preview of the host RAM / JSON / strategy-tree-node budgets each profile applies. Default `balanced` matches the engine and Rust resolver.
+
+### Engine
+
+- **JSON cap as action** — when the estimated JSON response would exceed the configured budget, the solver now auto-reduces `strategy_tree_max_nodes` to fit *before* the budget gate runs. The previous behavior was to fail the gate; users now get a usable (smaller) navigation cache plus a `resources.diagnostic` note explaining what got reduced and why.
+- **`--benchmark standard` CLI flag** — reproducible perf-tracking preset (AsKd7c rainbow, full ranges, 100 iter). Emits a compact JSON with `iterations_per_sec`, `nodes_per_sec`, `memory_estimate_mb`, plus full timing breakdown. Greppable for CI regression tracking.
+
+### Reliability
+
+- **Tauri timeout integration test** (`src-tauri/tests/timeout_kill.rs`) — regression guard for the Phase 5 engine-cleanup fix. Spawns the engine, lets the timeout fire, asserts the child is killed cleanly (no zombie process holding GPU memory).
+- **Release script reliability** — `scripts/prepare-release.ps1` now bypasses Tauri's in-build minisign signer (which hangs on stdin password prompts in PowerShell 5.1 + npm.cmd setups) and signs explicitly post-build via the `--password` CLI flag. Same end-user verification path, no more half-built releases.
 
 ## What's new in v1.1.0
 
@@ -98,9 +126,12 @@ Not a member yet? Upgrade at [deepfold.co](https://deepfold.co).
 | **GTO Solver** | Discounted CFR with vectorized GPU kernels. Sub-percent exploitability in seconds for typical turn spots. |
 | **Per-combo strategy grid** | 13×13 grid colored by action mix at the current decision node. Hover for suited-variant breakdown. |
 | **Acting ↔ Opponent view** | Toggle between your strategy and the opponent's reach-weighted range at the same node. |
-| **🆕 Runout Report (v1.1.0)** | After any solve, fan out all enumerated turn cards into a 13×4 grid + texture-bucket view + 4 sort modes + CSV export. See the [User Guide](USER_GUIDE.md#2-runout-report--see-every-turn-at-once). |
-| **🆕 1326 Combo Drill (v1.1.0)** | Expand any 169-class into its 4/6/12 specific combos with per-combo blocker analysis vs the opponent's range. See the [User Guide](USER_GUIDE.md#3-combo-drill--break-169-classes-into-specific-combos). |
-| **🆕 Memory Profile (v1.1.0)** | `safe / balanced / performance` presets to bound host-RAM, JSON, and strategy-tree-node budgets. No more silent OOM kills. |
+| **🆕 Grid view modes (v1.2.0)** | Toolbar above the 169 grid switches between Strategy Mix / **EV** / **Aggression** / single-action heatmap. EV mode normalizes red→grey→green across in-range cells so profit centres jump out. |
+| **🆕 Memory Profile selector (v1.2.0)** | UI pills for `safe / balanced / performance` in advanced settings with live budget preview. Threads through to the engine via `--memory-profile`. |
+| **🆕 Benchmark CLI (v1.2.0)** | `deepsolver_core --benchmark standard` runs a reproducible AsKd7c+100iter scenario and emits compact perf-tracking JSON. |
+| **Runout Report (v1.1.0)** | After any solve, fan out all enumerated turn cards into a 13×4 grid + texture-bucket view + 4 sort modes + CSV export. See the [User Guide](USER_GUIDE.md#2-runout-report--see-every-turn-at-once). |
+| **1326 Combo Drill (v1.1.0)** | Expand any 169-class into its 4/6/12 specific combos with per-combo blocker analysis vs the opponent's range. See the [User Guide](USER_GUIDE.md#3-combo-drill--break-169-classes-into-specific-combos). |
+| **Memory Profile (v1.1.0)** | `safe / balanced / performance` presets to bound host-RAM, JSON, and strategy-tree-node budgets. No more silent OOM kills. |
 | **Runout picker** | When iso enumeration is engaged, click any canonical river card to switch subtrees. |
 | **GTO chart library** | 2,550+ bundled preflop scenarios browsable in-app. One click applies as IP / OOP range. |
 | **Bet sizing presets** | Standard / Polar / Small Ball — flows through to the solver tree AND the UI buttons. |

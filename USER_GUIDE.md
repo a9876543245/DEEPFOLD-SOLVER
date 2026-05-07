@@ -1,6 +1,6 @@
 # DEEPFOLD-SOLVER User Guide
 
-> Complete walkthrough of the v1.1.0 features — Runout Report, Combo Drill, Memory Profile
+> Complete walkthrough of the v1.1.0–v1.2.0 features — Runout Report, Combo Drill, Memory Profile, Grid view modes
 
 **[English](USER_GUIDE.md) · [中文](USER_GUIDE.zh.md)**
 
@@ -19,8 +19,9 @@
    - [3.2 Class picker](#32-class-picker)
    - [3.3 Reading the blocker numbers](#33-reading-the-blocker-numbers)
 4. [Memory Profile — solver resource policy](#4-memory-profile--solver-resource-policy)
-5. [FAQ](#5-faq)
-6. [Appendix: First-install Windows SmartScreen warning](#appendix-first-install-windows-smartscreen-warning)
+5. [Grid view modes (v1.2.0)](#5-grid-view-modes-v120)
+6. [FAQ](#6-faq)
+7. [Appendix: First-install Windows SmartScreen warning](#appendix-first-install-windows-smartscreen-warning)
 
 ---
 
@@ -305,7 +306,50 @@ StrategyPanel (only when truncate / fallback / non-ok decision):
 
 ---
 
-## 5. FAQ
+## 5. Grid view modes (v1.2.0)
+
+The 169 strategy grid now has 4 view-mode buttons in its toolbar. Each
+answers a different question:
+
+| View | Color meaning | Cell shows | Question it answers |
+|---|---|---|---|
+| **Strategy Mix** | Action mix gradient (PioSolver-style) | 169 class label | Default — "how does this class play?" |
+| **EV** ⭐new | Red → grey → green normalized to in-range cells' EV span | Signed EV value (`+9.4`, `-2.1`) | "Which combos make money, which lose?" — at a glance |
+| **Aggression** ⭐new | Grey → orange → red by sum of Bet/Raise/All-in freq | 0–100 score | "How often does this class take an aggressive line?" |
+| **Heatmap** | Single-action intensity (blue/purple) | That action's % | "Show only Bet 75% frequency" — drill into one bet size |
+
+### How to use
+
+1. Run a solve
+2. Click **Strategy Mix / EV / Aggression / Heatmap** above the 169 grid
+3. **Heatmap** mode also reveals an action picker dropdown — pick the action you want to inspect
+4. **EV** mode is disabled when there's no `combo_evs` data (e.g. mock mode)
+
+### Reading EV mode
+
+If AKs / KK show deep green (`+12`, `+15`) and 22 / 33 show deep red
+(`-8`, `-9`) on a given spot, you make 12–15 chips on average with
+AKs / KK and lose 8–9 chips on average with 22 / 33. These are
+**per-class averages** — combine with Combo Drill blocker analysis to
+pick the right specific combo within a high-EV class.
+
+### Reading Aggression mode
+
+The number is "sum of Bet / Raise / All-in frequencies for this class":
+- `90` = the class plays aggressive 90% of the time, passive 10%
+- `30` = aggressive 30%, passive 70%
+
+Hot (red) cells = your "betting/raising hands" — usually value or semi-bluffs.
+Cool (grey) cells = your "passive hands".
+
+> ⚠️ EV mode's color scale is **relative**: min cell = red, max = green,
+> linearly interpolated. If the spot has a tight EV range (e.g. all
+> cells between +8 and +12), the color spread will look small. That's a
+> "low variance" signal, not a calibration issue.
+
+---
+
+## 6. FAQ
 
 **Q: Why doesn't the Runout Report button always show?**
 

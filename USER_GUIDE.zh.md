@@ -1,6 +1,6 @@
 # DEEPFOLD-SOLVER 使用說明
 
-> v1.1.0 新功能完整指南 — Runout Report、Combo Drill、Memory Profile
+> v1.1.0–v1.2.0 新功能完整指南 — Runout Report、Combo Drill、Memory Profile、Grid 視圖模式
 
 **[English](USER_GUIDE.md) · [中文](USER_GUIDE.zh.md)**
 
@@ -19,8 +19,9 @@
    - [3.2 Class 選擇器](#32-class-選擇器)
    - [3.3 Blocker 解讀](#33-blocker-解讀)
 4. [Memory Profile — solver 資源策略](#4-memory-profile--solver-資源策略)
-5. [常見問題](#5-常見問題)
-6. [附錄: 首次安裝 Windows SmartScreen 警告](#附錄-首次安裝-windows-smartscreen-警告)
+5. [Grid 視圖模式 (v1.2.0)](#5-grid-視圖模式-v120)
+6. [常見問題](#6-常見問題)
+7. [附錄: 首次安裝 Windows SmartScreen 警告](#附錄-首次安裝-windows-smartscreen-警告)
 
 ---
 
@@ -298,7 +299,47 @@ fallback / 非 ok decision 時出現）：
 
 ---
 
-## 5. 常見問題
+## 5. Grid 視圖模式 (v1.2.0)
+
+主畫面的 169 grid 上方有 4 個視圖切換按鈕。各視圖回答不同問題：
+
+| 視圖 | 顏色含義 | Cell 顯示 | 解什麼問題 |
+|---|---|---|---|
+| **Strategy Mix** | 動作 mix 漸層（同 PioSolver） | 169 class 標籤 | 預設 — 「這 class 怎麼打？」 |
+| **EV** ⭐新 | 紅→灰→綠按 in-range cells 範圍 normalize | 簽名 EV 值（`+9.4`、`-2.1`） | 「哪些 combo 賺錢、哪些虧錢？」一眼看出 |
+| **Aggression** ⭐新 | 灰→橘→紅按 Bet/Raise/All-in 頻率合計 | 0–100 score | 「這 class 多常打 aggressive line？」找最常下注/raise 的 hands |
+| **Heatmap** | 單一動作強度（藍紫） | 該動作 % | 「只看 Bet 75% 的頻率」深入單一 size 的策略 |
+
+### 用法
+
+1. 完成一次 solve
+2. 在 169 grid 上方工具列點 **Strategy Mix / EV / Aggression / Heatmap**
+3. **Heatmap** 模式還會多出一個動作下拉選單，選擇要看哪一個動作
+4. EV 模式如果沒有 combo_evs 資料（mock 模式），按鈕會 disabled
+
+### EV mode 解讀範例
+
+如果 grid 上 AKs / KK 顯示濃綠（`+12`、`+15`），22 / 33 顯示濃紅（`-8`、`-9`），
+表示在這個 spot 你拿 AKs / KK 平均賺 12-15 chips，22 / 33 平均虧 8-9 chips。
+這是 **per-class 平均** — 跟 Combo Drill 的 blocker 配合用：選 EV 高的 class，
+再用 blocker 挑 specific combo。
+
+### Aggression mode 解讀範例
+
+數字代表「該 class 中 Bet / Raise / All-in 動作頻率合計」。例如：
+- `90` = 該 class 90% 機率打 aggressive，10% Check/Call/Fold
+- `30` = 該 class 30% aggressive，70% passive
+
+找 grid 上最熱（紅）的 class → 你的「主動下注組合」，這些通常是強牌或半詐唬。
+找最冷（灰）的 → 你的「passive 組合」。
+
+> ⚠️ EV mode 的色階是相對的：min 紅、max 綠、中間漸層。如果整局 EV 都很接近
+> （例如 +8 ~ +12），你會看到一片色階小的綠/紅，這是正常的「低 variance」訊號，
+> 不代表 EV 不準。
+
+---
+
+## 6. 常見問題
 
 **Q: 為什麼 Runout Report 按鈕有時候不出現？**
 

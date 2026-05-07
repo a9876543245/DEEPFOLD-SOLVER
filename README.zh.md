@@ -7,10 +7,38 @@
 📘 **[使用說明 (中文)](USER_GUIDE.zh.md)** · **[User Guide (English)](USER_GUIDE.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.1.0-green)
+![Version](https://img.shields.io/badge/version-1.2.0-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
-DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GPU 加速的 DCFR 引擎（含 CPU fallback）+ **runout 聚合報告、per-combo blocker 分析、2,500+ preflop 圖庫**，單一 Windows 安裝檔搞定。
+DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GPU 加速的 DCFR 引擎（含 CPU fallback）+ **runout 聚合報告、per-combo blocker 分析、EV / 激進度熱力圖、2,500+ preflop 圖庫**，單一 Windows 安裝檔搞定。
+
+## v1.2.0 新功能
+
+> v1.2.0 加入兩個新的策略 grid 視圖、一個記憶體配置選擇器，以及多項
+> solver 端可靠性改進。
+
+### Grid 視圖模式
+
+169 策略 grid 上方多了切換工具列，4 個視圖：
+
+- **Strategy Mix**（預設）— 每格的多動作漸層
+- **EV**（新）— per-class EV 熱力圖，按 in-range cells 的 EV 範圍 normalize 紅→灰→綠。一眼看出「哪些 combo 是利潤中心、哪些在虧」
+- **Aggression**（新）— Bet/Raise/All-in 頻率合計，冷→熱漸層。回答「這個 class 多常打 aggressive line vs passive？」
+- **Heatmap** — 單一動作強度（例如「只看 Bet 75% 頻率」）
+
+### Solve 控制
+
+- **Memory Profile selector** — Advanced 區加 `safe / balanced / performance` pill 按鈕，即時顯示每個 profile 的 host RAM / JSON / strategy-tree-node 預算。預設 `balanced` 跟引擎與 Rust resolver 一致。
+
+### 引擎
+
+- **JSON cap as action** — 當預估 JSON 回應超過設定預算時，solver 現在會在 budget gate 之前**自動降低** `strategy_tree_max_nodes` 來 fit。之前的行為是直接讓 gate 失敗；現在使用者拿到較小但可用的導航 cache，加上 `resources.diagnostic` 說明降了多少、為什麼。
+- **`--benchmark standard` CLI flag** — 可重現的 perf 追蹤預設（AsKd7c rainbow、full ranges、100 iter）。輸出緊湊的 JSON 含 `iterations_per_sec` / `nodes_per_sec` / `memory_estimate_mb` + 完整 timing breakdown。CI regression 追蹤可直接 grep。
+
+### 可靠性
+
+- **Tauri timeout integration test**（`src-tauri/tests/timeout_kill.rs`）— Phase 5 引擎清理修復的 regression guard。Spawn engine、讓 timeout 觸發、確認 child process 被乾淨砍掉（不會留 zombie 佔住 GPU 記憶體）。
+- **Release script 可靠性** — `scripts/prepare-release.ps1` 現在會繞過 Tauri 內建 minisign 簽章（在 PowerShell 5.1 + npm.cmd 環境會卡 stdin 密碼提示），改在 build 後用 `--password` CLI flag 明確簽章。對使用者端驗證流程沒變，但不會再遇到「.exe 出來但 .sig 沒生」的 release 卡關。
 
 ## v1.1.0 新功能
 
@@ -93,9 +121,12 @@ GPU 自動偵測。右上角的狀態指示燈一眼就能看出 **CUDA** / **CP
 | **GTO Solver** | Discounted CFR 配上向量化 GPU kernel。一般 turn spot 幾秒內收斂到 sub-percent exploitability |
 | **每手策略 grid** | 13×13 grid 在當前決策點按動作 mix 上色。hover 看花色變體拆解 |
 | **行動方／對手視角切換** | 同節點切換你的策略 vs 對手的 reach-weighted range |
-| **🆕 Runout Report (v1.1.0)** | 解完任何 spot 後一鍵把所有 turn card 攤成 13×4 grid + texture bucket view + 4 種排序 + CSV 匯出。看[使用說明](USER_GUIDE.zh.md#2-runout-report--一眼看完所有-turn-走勢) |
-| **🆕 1326 Combo Drill (v1.1.0)** | 任一 169-class 展開成 4/6/12 specific combos，附 per-combo blocker analysis。看[使用說明](USER_GUIDE.zh.md#3-combo-drill--用-blocker-拆-1326-specific-combos) |
-| **🆕 Memory Profile (v1.1.0)** | `safe / balanced / performance` 預設管 host RAM / JSON / strategy-tree-node 預算。不再沉默 OOM |
+| **🆕 Grid 視圖模式 (v1.2.0)** | 169 grid 上方工具列切換 Strategy Mix / **EV** / **Aggression** / 單動作 heatmap。EV 模式按 in-range cells 範圍 normalize 紅→灰→綠 |
+| **🆕 Memory Profile selector (v1.2.0)** | Advanced 區加 `safe / balanced / performance` pill，即時顯示預算。透過 `--memory-profile` 通到引擎 |
+| **🆕 Benchmark CLI (v1.2.0)** | `deepsolver_core --benchmark standard` 跑可重現的 AsKd7c+100iter 場景，輸出緊湊 perf 追蹤 JSON |
+| **Runout Report (v1.1.0)** | 解完任何 spot 後一鍵把所有 turn card 攤成 13×4 grid + texture bucket view + 4 種排序 + CSV 匯出。看[使用說明](USER_GUIDE.zh.md#2-runout-report--一眼看完所有-turn-走勢) |
+| **1326 Combo Drill (v1.1.0)** | 任一 169-class 展開成 4/6/12 specific combos，附 per-combo blocker analysis。看[使用說明](USER_GUIDE.zh.md#3-combo-drill--用-blocker-拆-1326-specific-combos) |
+| **Memory Profile (v1.1.0)** | `safe / balanced / performance` 預設管 host RAM / JSON / strategy-tree-node 預算。不再沉默 OOM |
 | **Runout 選擇器** | iso 列舉啟用時，點任一 canonical river card 切換子樹 |
 | **GTO 圖庫** | 內建 2,550+ preflop 場景，app 內瀏覽。一鍵套用為 IP / OOP range |
 | **下注尺度預設** | Standard / Polar / Small Ball — 同時影響 solver tree 跟 UI 按鈕 |

@@ -494,25 +494,70 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     //   - reject     → throw structured runtime_error (main.cpp emits JSON)
     // ----------------------------------------------------------------
     SolveFootprintEstimate gate_est;
+    uint32_t gate_player_nodes = 0;  // reused below for the JSON-cap auto-action
     {
         const uint64_t nc      = iso_.num_canonical;
         const uint64_t total_n = tree_.total_nodes;
-        uint32_t player_nodes = 0;
         for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
             auto t = static_cast<NodeType>(tree_.node_types[n]);
-            if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) ++player_nodes;
+            if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) ++gate_player_nodes;
         }
         gate_est.matchup_tables_bytes   = bytes_for_matchup_tables(
             matchup_ev_per_runout_.size(), nc);
-        gate_est.cpu_state_bytes        = bytes_for_cpu_state(player_nodes, MAX_ACTIONS, nc);
+        gate_est.cpu_state_bytes        = bytes_for_cpu_state(gate_player_nodes, MAX_ACTIONS, nc);
         gate_est.gpu_state_bytes        = bytes_for_gpu_state(total_n, MAX_ACTIONS, nc);
-        gate_est.strategy_tree_ev_bytes = bytes_for_strategy_tree_ev_cache(player_nodes, nc);
+        gate_est.strategy_tree_ev_bytes = bytes_for_strategy_tree_ev_cache(gate_player_nodes, nc);
         gate_est.json_response_bytes    = bytes_for_json_response(
-            std::min<uint64_t>(player_nodes,
+            std::min<uint64_t>(gate_player_nodes,
                                config_.memory_budget.strategy_tree_max_nodes));
     }
 
     std::string fallback_reason;  // surfaced into result.resources below.
+
+    // Polish #4: JSON cap as ACTION (not just diagnostic).
+    //   If the estimated JSON response would exceed json_bytes, lower
+    //   strategy_tree_max_nodes BEFORE the gate runs so we never fail the
+    //   budget check on a problem we can solve by emitting fewer cached
+    //   nodes. The runtime solve quality is unchanged — only the size of
+    //   the navigation cache shrinks.
+    //
+    //   Formula matches the per-node estimate in bytes_for_json_response()
+    //   (256 path overhead + 169×32 opp range + 169×64 strategy+EV ≈ 16 KB).
+    //   We multiply by 0.75 to leave headroom for the schema fields not
+    //   captured by the estimate (action_labels, dealt_cards, runout_options).
+    //
+    //   Floor at 50 nodes — anything less makes the navigation cache
+    //   useless. If the budget can't even fit 50 nodes the existing gate
+    //   will reject anyway with a clear "JSON budget too small" diagnostic.
+    std::string auto_reduce_diag;
+    if (config_.memory_budget.json_bytes > 0 &&
+        gate_est.json_response_bytes > config_.memory_budget.json_bytes) {
+        constexpr uint64_t kPerNodeBytes = 256 + 169 * 32 + 169 * 32 * 2;  // ≈ 16,480
+        constexpr double   kSafetyFactor = 0.75;
+        const uint64_t safe_nodes_64 = static_cast<uint64_t>(
+            static_cast<double>(config_.memory_budget.json_bytes)
+            / static_cast<double>(kPerNodeBytes)
+            * kSafetyFactor);
+        const uint32_t old_cap = config_.memory_budget.strategy_tree_max_nodes;
+        const uint32_t safe_cap = static_cast<uint32_t>(
+            std::max<uint64_t>(safe_nodes_64, 50ULL));
+        const uint32_t new_cap = std::min(old_cap, safe_cap);
+        if (new_cap < old_cap) {
+            config_.memory_budget.strategy_tree_max_nodes = new_cap;
+            config_.strategy_tree_max_nodes               = new_cap;
+            // Re-estimate so the budget check + resources block see the new value.
+            gate_est.json_response_bytes = bytes_for_json_response(
+                std::min<uint64_t>(gate_player_nodes, new_cap));
+
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                "Auto-reduced strategy tree from %u to %u nodes for %llu MB JSON budget.",
+                old_cap, new_cap,
+                static_cast<unsigned long long>(
+                    config_.memory_budget.json_bytes / (1024ULL * 1024ULL)));
+            auto_reduce_diag = buf;
+        }
+    }
 
     // Step 4: create backend. AUTO uses a size-aware heuristic because the
     // CUDA path has a meaningful fixed cost on small/medium solves.
@@ -710,6 +755,16 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         r.budget_decision            = budget_decision_str(d);
         if (d != BudgetDecision::OK) {
             r.diagnostic = format_budget_failure(d, gate_est, config_.memory_budget);
+        }
+        // Polish #4: when the JSON cap auto-reduced strategy_tree_max_nodes,
+        // surface that as a diagnostic so the UI can show "tree capped to N
+        // nodes for budget" instead of silently emitting a smaller tree.
+        // Prepend so the auto-reduce note shows first when there's also a
+        // budget failure (the user wants to know what we DID first).
+        if (!auto_reduce_diag.empty()) {
+            r.diagnostic = r.diagnostic.empty()
+                ? auto_reduce_diag
+                : auto_reduce_diag + " " + r.diagnostic;
         }
         // Sprint 1: surface the AUTO→CPU downgrade reason recorded by the
         // pre-backend gate. Empty string means no fallback happened.
