@@ -142,16 +142,33 @@ if (-not $SkipBuild) {
         # routinely log benign progress on stderr ("Info Looking up
         # installed tauri packages..."), which would crash the script even
         # though the build itself succeeds (.exe lands in bundle/nsis/).
-        # Relax the preference around the npm call AND merge stderr into
-        # stdout (`2>&1`) so PS forwards lines as plain strings instead of
-        # ErrorRecords. We still trust $LASTEXITCODE for actual failure.
+        #
+        # Two-part fix:
+        #   1. Relax $ErrorActionPreference to 'Continue' around the call so
+        #      stderr-wrapped ErrorRecords don't terminate the script.
+        #   2. Capture stdout AND stderr to a log file via cmd.exe — this
+        #      bypasses PowerShell's `2>&1 | ForEach-Object` which can mangle
+        #      argv on npm.cmd batch files (saw "Unknown command: pm" — the
+        #      'n' got eaten by the redirection wrapper).
+        # Trust $LASTEXITCODE for the actual pass/fail decision.
         $prevPref = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
+        $buildLog = Join-Path $env:TEMP "deepfold_tauri_build_$Version.log"
         try {
-            & npm run tauri build -- --config $tmpConfig.FullName 2>&1 | ForEach-Object { Write-Host $_ }
-            if ($LASTEXITCODE -ne 0) { throw "Tauri build failed (exit $LASTEXITCODE)" }
+            cmd.exe /c "npm run tauri build -- --config `"$($tmpConfig.FullName)`" > `"$buildLog`" 2>&1"
+            $exitCode = $LASTEXITCODE
+            # Echo the captured log so the operator sees the build progress
+            # in the terminal regardless of pass/fail.
+            if (Test-Path $buildLog) {
+                Get-Content $buildLog | Out-Default
+            }
+            if ($exitCode -ne 0) { throw "Tauri build failed (exit $exitCode); log at $buildLog" }
         } finally {
             $ErrorActionPreference = $prevPref
+            # Clean up log on success; leave it on failure for diagnostics.
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $buildLog)) {
+                Remove-Item $buildLog -ErrorAction SilentlyContinue
+            }
         }
     } finally {
         Remove-Item $tmpConfig.FullName -ErrorAction SilentlyContinue

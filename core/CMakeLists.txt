@@ -215,7 +215,10 @@ if(BUILD_TESTS)
             --iterations 5 --backend cpu --host-memory-mb 30)
     set_tests_properties(CliCpuHostBudgetReject PROPERTIES
         LABELS "smoke;memory" TIMEOUT 60
-        PASS_REGULAR_EXPRESSION "Host RAM estimate")
+        # P1-2 (v1.2.1): regex matches both legacy "Host RAM estimate" and
+        # new split forms ("Common host RAM estimate", "CPU total host RAM
+        # estimate"). Lowercase 'h' is the common substring.
+        PASS_REGULAR_EXPRESSION "host RAM estimate")
 
     # GPU explicit: insufficient VRAM budget rejects without backend alloc.
     add_test(NAME CliGpuVramBudgetReject
@@ -235,6 +238,47 @@ if(BUILD_TESTS)
     set_tests_properties(CliGpuAutoFallback PROPERTIES
         LABELS "smoke;memory;gpu" TIMEOUT 60
         PASS_REGULAR_EXPRESSION "\"backend\": \"CPU-DCFR\"")
+
+    # P1-1 (v1.2.1): VISIBLE EV cache must respect strategy_tree_max_nodes.
+    # With cap=3 the estimated_strategy_tree_bytes should land in the tens
+    # of KB range (3 nodes * ~5.5 KB/node ≈ 16 KB), NOT the multi-MB range
+    # the un-capped pre-walk would produce. Regex matches 1-5 digit values
+    # which excludes the 7+ digit baseline (~11 MB on 2000 nodes).
+    # AsKd7c rainbow keeps the test light — AsKsQs would trigger heavy iso
+    # enumeration that pushes total runtime past 60s.
+    add_test(NAME CliEvCacheRespectsCap
+        COMMAND deepsolver_core
+            --pot 100 --stack 500 --board AsKd7c
+            --iterations 5 --backend cpu
+            --strategy-tree-evs visible
+            --strategy-tree-max-nodes 3
+            --postsolve none)
+    set_tests_properties(CliEvCacheRespectsCap PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 120
+        # Match "estimated_strategy_tree_bytes": <1-5 digits>, — i.e., < 100,000
+        # bytes. Baseline (un-capped) would be 7+ digits (~11 MB), so this
+        # excludes the regression. Trailing comma closes the JSON line.
+        PASS_REGULAR_EXPRESSION "\"estimated_strategy_tree_bytes\": [0-9][0-9]?[0-9]?[0-9]?[0-9]?,")
+
+    # P1-2 (v1.2.1): GPU backend must NOT bypass the host budget gate for
+    # buffers that live on host regardless of backend (matchup tables,
+    # strategy_tree EV cache, JSON response).
+    #
+    # Scenario chosen to thread two needles: matchup small enough to pass
+    # precompute_matchups (host_bytes/2 cap), but matchup+ev+json large
+    # enough to fail the new common-host gate. AsKsQs at 5 MB host budget
+    # produces matchup ≈ 0.9 MB (passes precompute's 2.5 MB cap) and common
+    # ≈ 5.4 MB (fails the common-host gate at 5 MB). Pre-P1-2 this would
+    # silently allocate ~5 MB on host during a "GPU solve".
+    add_test(NAME CliGpuCommonHostBudgetReject
+        COMMAND deepsolver_core
+            --pot 100 --stack 500 --board AsKsQs
+            --iterations 5 --backend gpu
+            --host-memory-mb 5
+            --strategy-tree-evs visible)
+    set_tests_properties(CliGpuCommonHostBudgetReject PROPERTIES
+        LABELS "smoke;memory;gpu" TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "Common host RAM estimate")
 
     # GPU postsolve parity test — only when CUDA is available, since the test
     # exercises the GPU backend path directly. Skip-marker inside the test

@@ -7,10 +7,30 @@
 📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.2.0-green)
+![Version](https://img.shields.io/badge/version-1.2.1-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
 DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). It pairs a GPU-accelerated DCFR engine (with full CPU fallback) with **runout aggregation, per-combo blocker analysis, EV / aggression heatmaps, and a 2,500+ preflop chart browser** — all in a single Windows installer.
+
+## What's new in v1.2.1 (memory-control hardening)
+
+Patch release plugging two memory-budget holes flagged by an external review:
+
+- **VISIBLE EV cache now respects `strategy_tree_max_nodes`** — the pre-walk
+  that builds the EV cache for emitted nodes was unbounded, so on big trees
+  with tight node caps the EV cache RAM (two `std::map<uint32_t,
+  std::vector<float>>`) could dwarf the eventual JSON payload by orders of
+  magnitude. Now capped at the same threshold as the JSON walk.
+  `resources.estimated_strategy_tree_bytes` correctly scales with the cap.
+- **Common host budget gate now applies on GPU backend too** — the previous
+  host budget check ran only when `selected_backend == CPU`, so GPU solves
+  silently bypassed the host RAM ceiling on matchup tables, strategy_tree
+  EV cache, and JSON response (all of which live on host regardless of
+  backend). Split into a common-host gate (always checked) plus a
+  CPU-specific add (cpu_state). Diagnostic message clarifies that switching
+  to GPU won't fix common-host overflows.
+- New ctest regression guards: `CliEvCacheRespectsCap`,
+  `CliGpuCommonHostBudgetReject`.
 
 ## What's new in v1.2.0
 

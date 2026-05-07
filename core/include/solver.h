@@ -506,7 +506,18 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             matchup_ev_per_runout_.size(), nc);
         gate_est.cpu_state_bytes        = bytes_for_cpu_state(gate_player_nodes, MAX_ACTIONS, nc);
         gate_est.gpu_state_bytes        = bytes_for_gpu_state(total_n, MAX_ACTIONS, nc);
-        gate_est.strategy_tree_ev_bytes = bytes_for_strategy_tree_ev_cache(gate_player_nodes, nc);
+
+        // P1-1: EV cache estimate must use the SAME cap as build_strategy_tree
+        // applies in VISIBLE mode. Without this, the estimate uses
+        // gate_player_nodes (the full tree) and the host budget gate either
+        // over-rejects in tight budgets or, worse, under-counts the actual
+        // cap effect when the budget is loose. Mirror the cap-resolution
+        // logic that build_strategy_tree() uses (cap=0 means "use full count").
+        const uint64_t ev_cache_cap = config_.memory_budget.strategy_tree_max_nodes > 0
+            ? std::min<uint64_t>(gate_player_nodes,
+                                 config_.memory_budget.strategy_tree_max_nodes)
+            : gate_player_nodes;
+        gate_est.strategy_tree_ev_bytes = bytes_for_strategy_tree_ev_cache(ev_cache_cap, nc);
         gate_est.json_response_bytes    = bytes_for_json_response(
             std::min<uint64_t>(gate_player_nodes,
                                config_.memory_budget.strategy_tree_max_nodes));
@@ -598,11 +609,51 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         }
     }
 
-    // CPU host budget check applies whenever we end up on CPU (either by
-    // request or via the AUTO-downgrade above). Matchup tables already
-    // exist at this point — they were the FIRST line of defence in
-    // precompute_matchups. Now we add the per-iteration CPU state and
-    // strategy-tree EV cache + JSON response on top.
+    // P1-2 (v1.2.1): split the host budget gate into two layers.
+    //
+    //   1. COMMON host check (always applies): matchup_tables + strategy_tree
+    //      EV cache + JSON response. These three buffers live in host RAM
+    //      regardless of whether DCFR runs on CPU or GPU. Skipping this
+    //      check on the GPU path was a real hole — large matchup tables on
+    //      iso-engaged trees could blow host RAM during a "GPU solve" with
+    //      no diagnostic.
+    //
+    //   2. CPU-specific add (only on CPU backend): cpu_state_bytes is the
+    //      regrets / strategy / strategy_sum buffers DCFR needs on host
+    //      when the backend is CPU. GPU keeps these in VRAM (counted in
+    //      gpu_state_bytes against the GPU budget above).
+    //
+    // Order matters: do the common check BEFORE backend prepare(), so we
+    // don't pay for matchup table allocation only to reject moments later.
+    // (Matchup tables actually allocated earlier in precompute_matchups —
+    // already the first line of defence — so this gate catches the
+    // strategy_tree_ev + json layer that didn't have a budget check before.)
+    if (config_.memory_budget.host_bytes > 0) {
+        const uint64_t common_host =
+              gate_est.matchup_tables_bytes
+            + gate_est.strategy_tree_ev_bytes
+            + gate_est.json_response_bytes;
+        if (common_host > config_.memory_budget.host_bytes) {
+            char msg[640];
+            snprintf(msg, sizeof(msg),
+                "Common host RAM estimate %.2f GB exceeds budget %.2f GB "
+                "(matchup=%.1f MB, strategy_tree_ev=%.1f MB, json=%.1f MB). "
+                "These buffers are host-side regardless of backend - switching "
+                "to --backend gpu will NOT help. Raise --host-memory-mb, "
+                "reduce bet sizes, lower --strategy-tree-max-nodes, or use "
+                "--strategy-tree-evs none.",
+                static_cast<double>(common_host) / (1024.0 * 1024.0 * 1024.0),
+                static_cast<double>(config_.memory_budget.host_bytes) / (1024.0 * 1024.0 * 1024.0),
+                static_cast<double>(gate_est.matchup_tables_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(gate_est.strategy_tree_ev_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(gate_est.json_response_bytes) / (1024.0 * 1024.0));
+            throw std::runtime_error(msg);
+        }
+    }
+
+    // CPU-specific: cpu_state on top of the common host buffers. AUTO mode
+    // doesn't help here either — if cpu_state alone busts the budget we'd
+    // need to GPU-it, and selected_backend is already finalised by this point.
     if (selected_backend == BackendType::CPU &&
         config_.memory_budget.host_bytes > 0) {
         const uint64_t total_host =
@@ -611,12 +662,13 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             + gate_est.strategy_tree_ev_bytes
             + gate_est.json_response_bytes;
         if (total_host > config_.memory_budget.host_bytes) {
-            char msg[512];
+            char msg[640];
             snprintf(msg, sizeof(msg),
-                "Host RAM estimate %.2f GB exceeds budget %.2f GB "
-                "(matchup=%.1f MB, cpu_state=%.1f MB, strategy_tree=%.1f MB, "
-                "json=%.1f MB). Raise --host-memory-mb, reduce bet sizes, or "
-                "use --strategy-tree-evs none.",
+                "CPU total host RAM estimate %.2f GB exceeds budget %.2f GB "
+                "(matchup=%.1f MB, cpu_state=%.1f MB, strategy_tree_ev=%.1f MB, "
+                "json=%.1f MB). cpu_state is the dominant term - try "
+                "--backend gpu to move regrets/strategy buffers to VRAM, raise "
+                "--host-memory-mb, or reduce bet sizes.",
                 static_cast<double>(total_host) / (1024.0 * 1024.0 * 1024.0),
                 static_cast<double>(config_.memory_budget.host_bytes) / (1024.0 * 1024.0 * 1024.0),
                 static_cast<double>(gate_est.matchup_tables_bytes) / (1024.0 * 1024.0),
@@ -2010,12 +2062,35 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
     // mirrors the recursion structure of the main `walk` below but only
     // collects node ids — no allocation per node — so it's effectively free.
     //
+    // P1-1 (v1.2.1): cap the pre-walk at `effective_max_nodes` too. Without
+    // this, on big trees with tight max_nodes the visible_nodes set (and the
+    // two per-node EV vectors keyed off it, each of length nc) dwarf the
+    // eventual JSON payload by orders of magnitude — the JSON walk would
+    // truncate but the EV cache RAM was already spent.
+    //
+    // Note on counter mismatch: visible_nodes is a `std::set` (deduped),
+    // while the JSON walk may emit the same node under several paths
+    // (runout fan-out at first chance level produces "Check#2s",
+    // "Check#3s", … all pointing at the same acting node). So
+    // visible_nodes.size() ≤ JSON emitted count in general. Capping the
+    // pre-walk at effective_max_nodes is a *conservative* upper bound on EV
+    // cache RAM; the walk may emit a few nodes past the cap with missing
+    // EV data (evs_at returns empty for missing entries — degrades
+    // gracefully, no crash). For v1.2.1 simplicity that's the trade.
+    //
     // FULL mode skips this and records every visited node, matching the
     // pre-Phase-3 behavior (kept as an escape hatch for tests / debugging).
     std::set<uint32_t> visible_nodes;
     if (need_evs && ev_mode == StrategyTreeEvMode::VISIBLE) {
         std::function<void(uint32_t, int, int)> precount;
         precount = [&](uint32_t node, int player_depth, int chance_levels_seen) {
+            // P1-1 cap: stop recursing once we've collected enough nodes to
+            // match the JSON cap. Any further recursion would only inflate
+            // EV cache RAM without affecting emitted JSON (the walk caps
+            // independently at the same threshold).
+            if (effective_max_nodes > 0 &&
+                visible_nodes.size() >= effective_max_nodes) return;
+
             // Mirror the chance-handling in `walk`: at first chance level
             // enumerate every runout option; afterwards auto-skip to lex-min.
             int chance_seen = chance_levels_seen;
@@ -2033,6 +2108,10 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
                         if (dc == 0xFFu) continue;
                         any_real = true;
                         precount(child, player_depth, chance_seen + 1);
+                        // Cap check inside the fan-out: if the recursive
+                        // call filled the budget, stop iterating siblings.
+                        if (effective_max_nodes > 0 &&
+                            visible_nodes.size() >= effective_max_nodes) return;
                     }
                     if (any_real) return;
                     // single-option chance: fall through to auto-skip
@@ -2050,10 +2129,16 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
             if (nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) return;
             visible_nodes.insert(node);
             if (player_depth >= max_player_depth) return;
+            // Cap check before recursing into children — same rationale as
+            // top of function but caught one level earlier.
+            if (effective_max_nodes > 0 &&
+                visible_nodes.size() >= effective_max_nodes) return;
             uint8_t na = tree_.num_children[node];
             uint32_t off = tree_.children_offset[node];
             for (uint8_t a = 0; a < na; ++a) {
                 precount(tree_.children[off + a], player_depth + 1, chance_seen);
+                if (effective_max_nodes > 0 &&
+                    visible_nodes.size() >= effective_max_nodes) return;
             }
         };
         precount(0, 0, 0);

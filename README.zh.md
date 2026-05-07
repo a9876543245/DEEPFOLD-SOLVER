@@ -7,10 +7,26 @@
 📘 **[使用說明 (中文)](USER_GUIDE.zh.md)** · **[User Guide (English)](USER_GUIDE.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.2.0-green)
+![Version](https://img.shields.io/badge/version-1.2.1-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
 
 DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GPU 加速的 DCFR 引擎（含 CPU fallback）+ **runout 聚合報告、per-combo blocker 分析、EV / 激進度熱力圖、2,500+ preflop 圖庫**，單一 Windows 安裝檔搞定。
+
+## v1.2.1 新功能（記憶體控制強化）
+
+外部 review 抓出兩個 memory budget 漏洞，這個 patch release 修掉：
+
+- **VISIBLE EV cache 現在會吃 `strategy_tree_max_nodes` 上限**：之前 EV cache
+  的 pre-walk 沒有 cap，大 tree + 小 node cap 時 EV cache RAM（兩個
+  `std::map<uint32_t, std::vector<float>>`）可能比實際 JSON payload 大幾個
+  數量級。現在會跟 JSON walk 用同一個 cap。`resources.estimated_strategy_tree_bytes`
+  也會隨 cap 正確下降。
+- **共同 host budget gate 現在 GPU backend 也會檢查**：之前 host gate 只在
+  `selected_backend == CPU` 時跑，GPU solve 對 matchup tables、strategy_tree
+  EV cache、JSON response 都靜默 bypass host RAM 上限（這三者不論 backend
+  都在 host RAM）。拆成 common-host gate（永遠檢查）+ CPU-specific add
+  (cpu_state)。錯誤訊息會明確說「換 GPU 也救不了 common-host 超量」。
+- 新的 ctest regression guard：`CliEvCacheRespectsCap`、`CliGpuCommonHostBudgetReject`。
 
 ## v1.2.0 新功能
 
