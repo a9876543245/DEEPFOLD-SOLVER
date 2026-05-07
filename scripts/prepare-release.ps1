@@ -263,7 +263,13 @@ $manifest = [ordered]@{
 }
 
 # ----- 6. Emit release directory --------------------------------------------
-$releaseDir = "release\$Version"
+# Anchor on the script's parent (= repo root) regardless of any CWD drift
+# that happened during build/sign. Got bitten by this in v1.3.0: relative
+# `release\$Version` was resolving against D:\DEEPFOLD-SOLVER (work dir,
+# inherited from the calling shell) instead of D:\DEEPFOLD-SOLVER-repo,
+# so WriteAllBytes blew up on a non-existent parent.
+$repoRoot = Split-Path $PSScriptRoot -Parent
+$releaseDir = Join-Path $repoRoot "release\$Version"
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 
 $manifestJson = $manifest | ConvertTo-Json -Depth 6 -Compress:$false
