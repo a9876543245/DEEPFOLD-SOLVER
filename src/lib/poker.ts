@@ -121,6 +121,13 @@ export interface SolverRequest {
    *    Quick=60, Standard=300, Deep=900. CFR is anytime — at any iter N the
    *  running average is the strategy, so stopping at the budget is fine. */
   time_budget_seconds?: number;
+  /** v1.4.0 Phase 2: CPU SIMD policy. undefined = auto (CPUID picks).
+   *  "scalar" forces the scalar fallback (parity testing).
+   *  "avx2" requires AVX2 hardware (engine aborts otherwise). */
+  cpu_simd?: 'auto' | 'scalar' | 'avx2';
+  /** v1.4.0 Phase 2: CPU CFR thread count. undefined / 0 = auto (currently
+   *  caps at 2 — the OOP/IP traverser parallelism). */
+  cpu_threads?: number;
 }
 
 export type MemoryProfile = 'safe' | 'balanced' | 'performance';
@@ -250,6 +257,11 @@ export interface SolveResources {
    *  Goal is order-of-magnitude accuracy — distinguishing "30 seconds"
    *  from "30 minutes" so users know whether to commit. */
   estimated_solve_seconds?: number;
+  /** v1.4.0 Phase 2: actual SIMD mode used by the CPU CFR kernels.
+   *  "avx2" or "scalar". Empty/missing on GPU solves. */
+  cpu_simd?: string;
+  /** v1.4.0 Phase 2: effective CFR thread count. 1 = serial, 2 = OOP||IP. */
+  cpu_threads_effective?: number;
 }
 
 /** v1.2.2: response shape of the `estimate_solve` Tauri command.

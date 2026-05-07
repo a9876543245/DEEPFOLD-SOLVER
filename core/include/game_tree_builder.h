@@ -15,6 +15,7 @@
 
 #include "types.h"
 #include "isomorphism.h"
+#include "memory_budget.h"
 #include <vector>
 #include <cmath>
 
@@ -61,6 +62,18 @@ class GameTreeBuilder {
 public:
     explicit GameTreeBuilder(const SolverConfig& config);
 
+    /// Phase 2 (10-point plan): callers can hand in the canonical-combo
+    /// count and a memory budget so the runout-enumeration gate is
+    /// byte-based instead of an arbitrary "projected <= 2000". When
+    /// `nc_canonical_estimate == 0` the builder falls back to the legacy
+    /// runout-count heuristic.
+    void set_memory_policy(uint16_t nc_canonical_estimate,
+                           const MemoryBudget& budget) {
+        nc_estimate_   = nc_canonical_estimate;
+        budget_        = budget;
+        budget_set_    = true;
+    }
+
     /// Build the full game tree and return it in SoA format.
     FlatGameTree build();
 
@@ -70,6 +83,9 @@ public:
 private:
     const SolverConfig& config_;
     std::vector<TreeNode> nodes_;
+    uint16_t      nc_estimate_ = 0;
+    MemoryBudget  budget_      = MemoryBudget::defaults();
+    bool          budget_set_  = false;
 
     /// Add a node to the tree and return its index
     uint32_t add_node(TreeNode node);
@@ -323,17 +339,40 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
 
         uint8_t cards_already = static_cast<uint8_t>(full_board.size());
         // Always enumerate at turn level (one chance step left). At flop
-        // level enumerate only if iso keeps the projected leaf count under
-        // ~2000 matchup tables (~1.3GB at 640KB/table).
+        // level enumerate only if matchup tables fit the host RAM budget.
+        //
+        // Phase 2 (10-point plan): the previous gate was `projected <= 2000`
+        // which only counted runout tables, not bytes. A monotone flop with
+        // `nc` ≈ 200 produces ~12 runouts × 47 ≈ 564 leaves, well under 2000,
+        // but the matchup tables are 564 × 200² × 8 B ≈ 180 MB. A rainbow
+        // flop with `nc` ≈ 1300 hits ~14 GB at the same projected leaf count
+        // — which silently OOMs. The byte-based gate refuses to enumerate
+        // when the matchup tables alone would blow the host budget.
         bool enumerate;
         if (cards_already >= 4) {
             enumerate = true;
         } else {
-            // Estimate level-2 (river) child count = ~47 minus iso. We don't
-            // know exact iso compression at the next level without recursing,
-            // so use canonical_turns * 47 as a worst-case bound.
-            size_t projected = cr.reps.size() * 47u;
-            enumerate = (projected <= 2000);
+            // Worst-case: river enumerates one child per remaining card
+            // (47 cards undealt at flop). We don't know exact iso compression
+            // at the next level without recursing, so use canonical_turns × 47
+            // as the upper bound.
+            const size_t projected_leaves = cr.reps.size() * 47u;
+            if (budget_set_ && nc_estimate_ > 0) {
+                // Reserve ~half the host budget for matchup tables — the rest
+                // is needed for CPU CFR state, strategy-tree EV cache, and
+                // the JSON response. This is the single decision point the
+                // 10-point plan calls out.
+                const uint64_t matchup_bytes = bytes_for_matchup_tables(
+                    static_cast<uint64_t>(projected_leaves),
+                    static_cast<uint64_t>(nc_estimate_));
+                const uint64_t matchup_cap = (budget_.host_bytes > 0)
+                    ? (budget_.host_bytes / 2ULL)
+                    : (3ULL * 1024 * 1024 * 1024); // 3 GB safety floor
+                enumerate = (matchup_bytes <= matchup_cap);
+            } else {
+                // Legacy fallback for callers that didn't set a budget.
+                enumerate = (projected_leaves <= 2000);
+            }
         }
 
         if (!enumerate) {

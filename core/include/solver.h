@@ -908,6 +908,13 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             player_nodes, MAX_ACTIONS, iso_.num_canonical,
             config_.max_iterations, backend_label_lc, cc);
 
+        // v1.4.0 Phase 2: CPU mode diagnostics. Empty / 0 on GPU solves so
+        // the UI can suppress the CPU-only label there.
+        if (selected_backend != BackendType::GPU) {
+            r.cpu_simd = cpu_simd::mode_label();
+            r.cpu_threads_effective = (config_.cpu_threads == 1) ? 1u : 2u;
+        }
+
         result.resources = std::move(r);
     }
     return result;
@@ -1011,6 +1018,12 @@ inline SolveResources Solver::estimate_only() {
     r.ops_per_iteration = ops_per_solve_iteration(player_nodes, MAX_ACTIONS, nc);
     r.estimated_solve_seconds = estimate_solve_seconds(
         player_nodes, MAX_ACTIONS, nc, config_.max_iterations, lc, cc);
+
+    // v1.4.0 Phase 2: same CPU mode diagnostics on the estimate-only path.
+    if (predicted_backend != BackendType::GPU) {
+        r.cpu_simd = cpu_simd::mode_label();
+        r.cpu_threads_effective = (config_.cpu_threads == 1) ? 1u : 2u;
+    }
 
     // Lightweight budget-decision label so the UI can flag "this will fail
     // the gate" before the user commits.

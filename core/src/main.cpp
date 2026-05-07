@@ -17,6 +17,7 @@
 #include "hand_evaluator.h"
 #include "solver.h"
 #include "solver_backend.h"
+#include "cpu_simd.h"
 
 #include <algorithm>
 #include <iostream>
@@ -90,6 +91,13 @@ struct CLIArgs {
     std::string dcfr_schedule = "standard";  // "standard" | "postflop"
     float rake_rate = 0.0f;
     float rake_cap  = 0.0f;
+
+    // v1.4.0 Phase 2: CPU SIMD policy + thread count overrides.
+    //   --cpu-simd auto|scalar|avx2  default auto (CPUID picks)
+    //   --cpu-threads N              default 0 (auto, capped at 2 for now until
+    //                                levelized backend lands in Phase 4)
+    std::string cpu_simd = "auto";
+    uint32_t cpu_threads = 0;
 
     // Sprint 1 (market-beating plan): per-solve memory budget overrides.
     // Default 0 = use the SolverConfig defaults (6 GB host, 100 MB JSON,
@@ -217,6 +225,11 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.estimate_only = true;
         } else if (arg == "--time-budget-seconds" && i + 1 < argc) {
             args.time_budget_seconds = std::max(0, std::stoi(argv[++i]));
+        } else if (arg == "--cpu-simd" && i + 1 < argc) {
+            args.cpu_simd = argv[++i];
+        } else if (arg == "--cpu-threads" && i + 1 < argc) {
+            int v = std::stoi(argv[++i]);
+            args.cpu_threads = static_cast<uint32_t>(std::max(0, v));
         }
     }
 
@@ -261,6 +274,12 @@ Arguments:
   --time-budget-seconds <s> Hard wall-clock cap on the iteration phase. Stops at
                            min(iter cap, time budget). 0 = no time cap (default).
                            UI presets: Quick=60, Standard=300, Deep=900.
+  --cpu-simd <mode>        SIMD mode for CPU CFR kernels: auto | scalar | avx2.
+                           auto (default) picks AVX2 when CPUID + OS support it,
+                           else scalar. Use "scalar" for parity tests / debugging.
+  --cpu-threads <int>      CPU CFR thread count. 0 = auto. Currently capped at 2
+                           (the OOP/IP traverser parallelism). Use 1 to force
+                           serial traversal. Higher values become useful in v1.5+.
   --help, -h               Show this help message
 
 Output:
@@ -503,7 +522,10 @@ std::string result_to_json(
         // v1.2.2: pre-iteration solve-time estimate
         json << "    \"ops_per_iteration\": " << r.ops_per_iteration << ",\n";
         json << "    \"backend_for_estimate\": \"" << escape_json(r.backend_for_estimate) << "\",\n";
-        json << "    \"estimated_solve_seconds\": " << r.estimated_solve_seconds << "\n";
+        json << "    \"estimated_solve_seconds\": " << r.estimated_solve_seconds << ",\n";
+        // v1.4.0 Phase 2: CPU mode diagnostics (empty/0 on GPU solves).
+        json << "    \"cpu_simd\": \"" << escape_json(r.cpu_simd) << "\",\n";
+        json << "    \"cpu_threads_effective\": " << r.cpu_threads_effective << "\n";
         json << "  },\n";
     }
 
@@ -758,6 +780,24 @@ int main(int argc, char* argv[]) {
         config.parallel_postsolve = args.parallel_postsolve;
         config.postsolve_threads = args.postsolve_threads;
         config.force_cpu_postsolve = args.force_cpu_postsolve;
+        config.cpu_threads = args.cpu_threads;
+
+        // v1.4.0 Phase 2: apply --cpu-simd policy. set_policy() is idempotent
+        // and re-resolves the kernel table on next call to kernels(). Done
+        // before backend creation so the CpuBackend's first prepare() picks
+        // up the right kernels.
+        {
+            std::string mode = args.cpu_simd;
+            for (char& ch : mode)
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (mode == "scalar") {
+                cpu_simd::set_policy(cpu_simd::SimdPolicy::ForceScalar);
+            } else if (mode == "avx2") {
+                cpu_simd::set_policy(cpu_simd::SimdPolicy::ForceAvx2);
+            } else {
+                cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+            }
+        }
         {
             std::string sched = args.dcfr_schedule;
             for (char& ch : sched) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
@@ -866,7 +906,9 @@ int main(int argc, char* argv[]) {
                       << "    \"fallback_reason\": \"" << escape_json(r.fallback_reason) << "\",\n"
                       << "    \"ops_per_iteration\": " << r.ops_per_iteration << ",\n"
                       << "    \"backend_for_estimate\": \"" << escape_json(r.backend_for_estimate) << "\",\n"
-                      << "    \"estimated_solve_seconds\": " << r.estimated_solve_seconds << "\n"
+                      << "    \"estimated_solve_seconds\": " << r.estimated_solve_seconds << ",\n"
+                      << "    \"cpu_simd\": \"" << escape_json(r.cpu_simd) << "\",\n"
+                      << "    \"cpu_threads_effective\": " << r.cpu_threads_effective << "\n"
                       << "  }\n"
                       << "}\n";
             return 0;
@@ -967,6 +1009,10 @@ int main(int argc, char* argv[]) {
                       << "  \"nodes_per_sec\": " << nodes_per_sec << ",\n"
                       << "  \"memory_estimate_mb\": " << mem_est_mb << ",\n"
                       << "  \"tree_nodes\": " << tree_nodes << ",\n"
+                      << "  \"cpu\": {\n"
+                      << "    \"simd\": \"" << escape_json(result.resources.cpu_simd) << "\",\n"
+                      << "    \"threads\": " << result.resources.cpu_threads_effective << "\n"
+                      << "  },\n"
                       << "  \"timing\": {\n"
                       << "    \"total_ms\": " << result.timing.total_ms << ",\n"
                       << "    \"tree_build_ms\": " << result.timing.tree_build_ms << ",\n"

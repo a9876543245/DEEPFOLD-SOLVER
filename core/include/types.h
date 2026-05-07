@@ -277,6 +277,14 @@ struct SolverConfig {
     // strategy (or vice-versa).
     bool force_cpu_postsolve = false;
 
+    /// v1.4.0 Phase 2: CPU CFR thread count (independent of postsolve_threads).
+    ///   0 = auto: today this caps at 2 (the only intra-iter parallelism is
+    ///   the 2-traverser OMP parallel sections in cpu_backend.h). Phase 4
+    ///   levelized backend will let higher values do something useful.
+    /// Surfaced as `--cpu-threads <N>`. Surfaced in SolveResources so the UI
+    /// can label "CPU (AVX2 · 2 threads)".
+    uint32_t cpu_threads = 0;
+
     /// Sprint 1 (market-beating plan): the host RAM / GPU VRAM / JSON /
     /// strategy-tree budget that gates every large allocation in the solve
     /// pipeline. Defaults are sane (6 GB host, 100 MB JSON, 2000 emitted
@@ -369,6 +377,13 @@ struct SolveResources {
     /// Estimated wall-clock seconds to complete the configured iterations.
     /// 0 if estimation isn't possible (e.g. no iterations requested).
     double   estimated_solve_seconds   = 0.0;
+
+    // ---- v1.4.0 Phase 2: CPU mode diagnostics (empty/0 on GPU solves) ----
+    /// "avx2" or "scalar". Mirrors `cpu_simd::mode_label()`.
+    std::string cpu_simd;
+    /// Effective CFR thread count. 1 = serial traversers, 2 = OOP||IP via OMP.
+    /// Phase 4 will allow values > 2 once levelized backend lands.
+    uint32_t cpu_threads_effective = 0;
 };
 
 /// Full solver result

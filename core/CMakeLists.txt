@@ -35,10 +35,23 @@ if(MSVC)
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/O2>")
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/EHsc>")
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/fp:fast>")
+    # /Oi: prefer intrinsics; /Ot: favor speed over size in inner loops.
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/Oi>")
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/Ot>")
+    # OpenMP for the two-traverser CFR parallelization.
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/openmp>")
+    # NOTE: /arch:AVX2 is intentionally NOT global. Only cpu_kernels_avx2.cpp
+    # gets it (set_source_files_properties below) so the rest of the binary
+    # stays at the SSE2 baseline and runs on pre-Haswell CPUs. Runtime CPUID
+    # dispatch in cpu_kernels_dispatch.cpp picks scalar vs AVX2 at startup.
 else()
-    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-O2>")
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-O3>")
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-Wall>")
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-Wextra>")
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-fopenmp>")
+    add_link_options("-fopenmp")
+    # AVX2 / FMA are set per-source on cpu_kernels_avx2.cpp; rest of TU stays
+    # at the default x86-64 baseline so old hardware can still load the binary.
 endif()
 
 if(HAVE_CUDA)
@@ -77,7 +90,21 @@ set(CORE_SOURCES
     src/hand_evaluator.cpp
     src/backend_factory.cpp
     src/main.cpp
+    src/cpu_kernels_scalar.cpp
+    src/cpu_kernels_avx2.cpp
+    src/cpu_kernels_dispatch.cpp
 )
+
+# Per-source AVX2 flag — confines the AVX2 opcodes to one .obj. The rest of
+# the binary stays at the platform's SSE2 baseline. CPUID dispatch at startup
+# decides whether to call into the AVX2 functions or the scalar ones.
+if(MSVC)
+    set_source_files_properties(src/cpu_kernels_avx2.cpp
+        PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+else()
+    set_source_files_properties(src/cpu_kernels_avx2.cpp
+        PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+endif()
 
 # ============================================================================
 # Executable Target

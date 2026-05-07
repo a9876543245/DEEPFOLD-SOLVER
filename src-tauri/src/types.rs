@@ -70,6 +70,15 @@ pub struct SolverRequest {
     /// stare at "estimated 5 hours" and walk away.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_budget_seconds: Option<u32>,
+    /// v1.4.0 Phase 2: CPU SIMD policy override. None / "auto" = CPUID picks.
+    /// "scalar" forces scalar kernels (parity test / debugging).
+    /// "avx2" requires AVX2 CPU (engine aborts on detection failure).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_simd: Option<String>,
+    /// v1.4.0 Phase 2: CPU CFR thread count. None / 0 = auto. 1 = serial
+    /// traversers, 2 = OOP||IP via OMP. Higher values become useful in v1.5+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_threads: Option<u32>,
 }
 
 /// Sprint 3 (resource policy guide): resolved memory budget tuple after
@@ -235,6 +244,11 @@ pub struct SolveResources {
     pub backend_for_estimate: String,
     #[serde(default)]
     pub estimated_solve_seconds: f64,
+    // v1.4.0 Phase 2: CPU mode diagnostics. Empty/0 on GPU solves.
+    #[serde(default)]
+    pub cpu_simd: String,
+    #[serde(default)]
+    pub cpu_threads_effective: u32,
 }
 
 /// v1.2.2: Lightweight pre-solve estimate response. Returned by the

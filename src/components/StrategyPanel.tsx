@@ -202,14 +202,47 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
           marginBottom: 8, gap: 8, flexWrap: 'wrap',
         }}>
           <span className="text-label">{t('panel.solverResult')}</span>
-          {/* v1.3.0: post-solve quality at-a-glance. Reads exploitability +
-              early_stop_reason — surfaces "stopped at budget, may be rough"
-              without making the user dig into resources fields. */}
-          <SolveQualityBadge
-            exploitability={result.exploitability_pct}
-            iterationsRun={result.iterations_run}
-            earlyStopReason={result.early_stop_reason}
-          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            {/* v1.4.0 Phase 2: tiny pill with the actual SIMD mode + thread
+                count the engine used. Renders only on CPU solves (the
+                resources fields are empty/0 on GPU runs). Lets users see
+                why their CPU solve was fast or slow (AVX2 vs scalar) and
+                whether the OOP/IP parallel sections kicked in. */}
+            {result.resources?.cpu_simd && result.resources.cpu_simd.length > 0 && (
+              <div
+                title={`CPU CFR kernels: ${result.resources.cpu_simd.toUpperCase()} ` +
+                       `· ${result.resources.cpu_threads_effective ?? 1} thread${(result.resources.cpu_threads_effective ?? 1) > 1 ? 's' : ''}`}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 4,
+                  padding: '3px 8px', borderRadius: 999,
+                  background: result.resources.cpu_simd === 'avx2'
+                    ? 'rgba(10, 132, 255, 0.12)'
+                    : 'rgba(245, 158, 11, 0.15)',
+                  border: `1px solid ${result.resources.cpu_simd === 'avx2'
+                    ? 'rgba(10, 132, 255, 0.35)'
+                    : 'rgba(245, 158, 11, 0.4)'}`,
+                  fontSize: 10, fontWeight: 700, letterSpacing: 0.3,
+                  color: result.resources.cpu_simd === 'avx2'
+                    ? 'var(--color-accent, #0A84FF)'
+                    : '#f59e0b',
+                  cursor: 'help',
+                }}
+              >
+                CPU · {result.resources.cpu_simd.toUpperCase()}
+                {(result.resources.cpu_threads_effective ?? 0) > 1 && (
+                  <span style={{ opacity: 0.85 }}>· {result.resources.cpu_threads_effective}T</span>
+                )}
+              </div>
+            )}
+            {/* v1.3.0: post-solve quality at-a-glance. Reads exploitability +
+                early_stop_reason — surfaces "stopped at budget, may be rough"
+                without making the user dig into resources fields. */}
+            <SolveQualityBadge
+              exploitability={result.exploitability_pct}
+              iterationsRun={result.iterations_run}
+              earlyStopReason={result.early_stop_reason}
+            />
+          </div>
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
           <div style={{ background: 'var(--color-bg-tertiary)', borderRadius: 'var(--radius-sm)', padding: '6px 10px' }}>
@@ -233,12 +266,41 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
               {(elapsed / 1000).toFixed(2)}s
             </div>
           </div>
-          <div style={{ background: 'var(--color-bg-tertiary)', borderRadius: 'var(--radius-sm)', padding: '6px 10px' }}>
-            <div style={{ fontSize: 10, color: 'var(--color-text-tertiary)' }}>{t('panel.status')}</div>
-            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-green)' }}>
-              {result.status === 'success' ? t('panel.converged') : result.status}
-            </div>
-          </div>
+          {/* v1.3.2: Status now reflects ACTUAL convergence quality, not just
+              "solver returned a value". Previous version showed 「已收斂」 even
+              when exploitability was 110% because early_stop_reason=time_budget
+              was treated as success. Tier matches SolveQualityBadge thresholds. */}
+          {(() => {
+            const exploit = result.exploitability_pct;
+            const stoppedAtBudget = result.early_stop_reason === 'time_budget';
+            let label: string;
+            let color: string;
+            if (result.status !== 'success') {
+              label = result.status;
+              color = 'var(--color-orange)';
+            } else if (!Number.isFinite(exploit) || exploit <= 0) {
+              label = t('panel.converged');
+              color = 'var(--color-green)';
+            } else if (exploit < 1.5) {
+              label = t('panel.converged');
+              color = 'var(--color-green)';
+            } else if (exploit < 5) {
+              label = t('panel.rough');
+              color = 'var(--color-orange)';
+            } else {
+              label = t('panel.notConverged');
+              color = 'var(--color-red, #ef4444)';
+            }
+            const suffix = stoppedAtBudget && exploit >= 1.5 ? ` (${t('panel.timeUp')})` : '';
+            return (
+              <div style={{ background: 'var(--color-bg-tertiary)', borderRadius: 'var(--radius-sm)', padding: '6px 10px' }}>
+                <div style={{ fontSize: 10, color: 'var(--color-text-tertiary)' }}>{t('panel.status')}</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color }}>
+                  {label}{suffix}
+                </div>
+              </div>
+            );
+          })()}
         </div>
 
         {/* Sprint 2 (resource policy guide): minimal resource badge.

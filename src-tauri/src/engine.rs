@@ -295,6 +295,20 @@ fn build_solver_args(request: &SolverRequest, backend_override: Option<&str>) ->
         }
     }
 
+    // v1.4.0 Phase 2: CPU SIMD policy + thread count. Backend ignores these
+    // when --backend gpu wins, but the engine still parses them so the UI
+    // can pre-flight `--estimate-only` with the right CPU rate.
+    if let Some(simd) = &request.cpu_simd {
+        if !simd.is_empty() {
+            args.push("--cpu-simd".to_string());
+            args.push(simd.clone());
+        }
+    }
+    if let Some(threads) = request.cpu_threads {
+        args.push("--cpu-threads".to_string());
+        args.push(threads.to_string());
+    }
+
     args
 }
 
