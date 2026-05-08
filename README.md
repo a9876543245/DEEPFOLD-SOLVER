@@ -7,10 +7,44 @@
 📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.3.1-green)
-![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
+![Version](https://img.shields.io/badge/version-1.7.1-green)
+![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU%20%28AVX2%2BMulti--core%29-orange)
 
-DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). It pairs a GPU-accelerated DCFR engine (with full CPU fallback) with **runout aggregation, per-combo blocker analysis, EV / aggression heatmaps, and a 2,500+ preflop chart browser** — all in a single Windows installer.
+DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). It pairs a GPU-accelerated DCFR engine — now matched by a multi-core CPU backend that scales linearly to every available core — with **runout aggregation, per-combo blocker analysis, EV / aggression heatmaps, and a 2,500+ preflop chart browser**, all in a single Windows installer.
+
+## What's new in v1.7.1 — Multi-core CPU is now the default
+
+Four releases of compounding CPU work since v1.3.1 have transformed CPU solving. The standard rainbow benchmark on a typical 8-thread laptop CPU now runs at ~140 iter/s — roughly **5× faster than the previous CPU backend** (which was the default through v1.7.0) on the same hardware, fully automatic, no flags or settings to flip. Users who never touch the GPU now get solve times that used to require one.
+
+### What you'll notice
+
+- **Solves are dramatically faster on CPU.** A new BFS-flat "levelized" CFR backend replaces the old recursive one and scales linearly across physical cores instead of capping at 2 threads. The standard rainbow benchmark goes from 28 to 137 iterations per second on the same hardware.
+- **The ETA banner is now accurate.** Before v1.7.1 the pre-solve estimator didn't know which CPU backend would actually run and quoted "5 minutes" for solves that finished in 1. The throughput model is now backend- and thread-aware, sitting within roughly 2× of measured throughput across the entire config space.
+- **Old hardware still loads.** Pre-Haswell CPUs (no AVX2) automatically fall back to scalar kernels via runtime CPUID dispatch at startup — single binary, no separate build, no startup crashes.
+- **`--cpu-threads N` is honored.** The flag was reported but ignored before; the levelized backend now applies it as `num_threads(…)` on every parallel-for, so you can cap thread usage on shared machines.
+
+### Calibration
+
+Measured against `--benchmark standard` (AsKd7c rainbow flop, 100 iter, 8 logical / 4 physical cores):
+
+| Backend                 | 1T   | 2T   | 4T   | 8T    | 1T → 8T |
+|-------------------------|------|------|------|-------|---------|
+| reference (v1.5.x)      | 25.3 | 28.2 | 27.8 | 28.5  | 1.13× *(parallel-sections cap)* |
+| **levelized (v1.7.1)**  | 25.0 | 49.1 | 91.0 | **137.6** | **5.46×** |
+
+Both backends emit the same numerical strategy; a per-commit parity gate (reference vs levelized, scalar vs AVX2, single- vs multi-thread) prevents the implementations from drifting.
+
+### Why this took four releases
+
+- **v1.4.0 — AVX2/scalar runtime dispatch.** Per-source `/arch:AVX2` confines AVX2 opcodes to a single translation unit; CPUID + OS-state checks at startup pick the kernel table. Pre-Haswell CPUs never enter the AVX2 path. A scratch-arena bump allocator on the recursive backend eliminated 60k+ `vector<float>` allocations per iteration.
+- **v1.4.1 — Real engine progress events.** The iter counter no longer fakes via `setInterval`; the engine emits structured progress events on stderr that Tauri forwards to the UI. Matchup precompute also parallelized over the outer combo dimension.
+- **v1.5.0 — Levelized CPU backend.** BFS-flat traversal with per-level `parallel for` replaces the recursive arena's serial bump pointer. This is the change that unlocks scaling past 2 threads.
+- **v1.5.1 — Google OAuth login fix.** A build-pipeline gap had shipped four releases with an empty `client_secret`; closed by sourcing `.env.local` from `prepare-release.ps1` and adding a `cargo:rerun-if-env-changed` hint so the secret can't get cached as empty.
+- **v1.6.0 — CPU correctness gates.** Restored test-target linking after the AVX2 dispatch refactor, added the parity test suite, and made `--cpu-threads N` actually clamp the OMP team size.
+- **v1.7.0 — GUI flips to levelized.** The frontend now requests the levelized backend for every solve. The host-memory budget gate accounts for the levelized backend's extra reach/value buffers so tight RAM limits reject before allocation rather than after.
+- **v1.7.1 — ETA throughput model rebuilt.** Per-backend × per-thread rates calibrated against the standard benchmark, fixing the "5 minutes estimated, 1 minute actual" wait-cliff inversion.
+
+The previous recursive backend remains selectable via `--cpu-backend reference` (CLI only) for parity testing and debugging — it is no longer a user-facing toggle in the GUI.
 
 ## What's new in v1.3.1 (time-budget honored on slow CPUs)
 
@@ -224,12 +258,12 @@ After install, the app self-updates: a banner appears in the top-left when a new
 | | Minimum | Recommended |
 |---|---|---|
 | OS | Windows 10 64-bit | Windows 11 64-bit |
-| CPU | Dual-core | Quad-core or better |
+| CPU | x86-64, dual-core (any year) | 4+ physical cores, AVX2 (Haswell 2013 / Excavator 2015 or newer) |
 | RAM | 4 GB | 8 GB+ |
-| GPU | — (CPU fallback works) | NVIDIA RTX 2000 series or newer, 4 GB+ VRAM |
+| GPU | — *(CPU backend is fully featured)* | NVIDIA RTX 2000 series or newer, 4 GB+ VRAM |
 | Disk | 200 MB | 200 MB |
 
-GPU detection is automatic. The status pill in the top-right shows **CUDA** / **CPU** at a glance.
+GPU and SIMD detection are both automatic. The status pill in the top-right shows **CUDA** / **CPU** at a glance, and the CPU backend prints an `AVX2` or `scalar` tag based on what your hardware supports — pre-Haswell CPUs run the scalar kernels and never see an AVX2 opcode.
 
 ## Getting started
 

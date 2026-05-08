@@ -7,10 +7,44 @@
 📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.3.1-green)
-![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
+![Version](https://img.shields.io/badge/version-1.7.1-green)
+![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU%20%28AVX2%2BMulti--core%29-orange)
 
-DEEPFOLD-SOLVER は [DEEPFOLD](https://deepfold.co) のデスクトップ GTO ソルバーです。GPU アクセラレーション DCFR エンジン（CPU フォールバック完備）に **runout 集計、コンボ別ブロッカー解析、EV/アグレ度ヒートマップ、2,500+ プリフロップ チャート** を加え、Windows 用ワンクリックインストーラーに同梱しています。
+DEEPFOLD-SOLVER は [DEEPFOLD](https://deepfold.co) のデスクトップ GTO ソルバーです。GPU アクセラレーション DCFR エンジンに、**全ての CPU コアを線形にスケールさせる新しいマルチコア後端**を組み合わせ、**runout 集計、コンボ別ブロッカー解析、EV/アグレ度ヒートマップ、2,500+ プリフロップ チャート** とともに Windows ワンクリックインストーラーに同梱しています。
+
+## v1.7.1 のハイライト — マルチコア CPU がデフォルトに
+
+v1.3.1 以降、4 リリース分の CPU 最適化が積み重なりました。標準 rainbow ベンチマークは、典型的な 8 スレッドのノート PC で約 ~140 iter/s に到達 — 同一ハードウェアで **以前の CPU 後端（v1.7.0 までのデフォルト）の約 5 倍**、完全自動でフラグや設定変更は不要です。GPU を持たないユーザーが、これまで GPU 必須だった速度で解けるようになりました。
+
+### ユーザーが感じる変化
+
+- **CPU 解算が劇的に高速化**：新しい BFS-flat「levelized」CFR 後端が従来の再帰版を置き換え、2 スレッド上限ではなく物理コア数まで線形にスケールします。標準 rainbow ベンチマーク：同じハードウェアで 28 → 137 iter/s。
+- **ETA バナーが正確に**：v1.7.1 以前は事前推定器がどの CPU 後端で実行されるか知らず、1 分で終わる solve に対して「5 分」と表示していました。新しいスループットモデルは後端 × スレッド数を考慮し、設定空間全体で実測値の ~2× 以内に収まります。
+- **古いハードウェアもそのまま動作**：Pre-Haswell CPU（AVX2 非対応）は起動時の CPUID ディスパッチで自動的に scalar kernels にフォールバック — 単一バイナリ、別ビルド不要、起動時クラッシュなし。
+- **`--cpu-threads N` が有効化**：以前は表示されるだけで実際は無視されていました。levelized 後端は今や全ての parallel-for に `num_threads(…)` として適用するので、共用マシンでスレッド数を制限できます。
+
+### 実測データ
+
+`--benchmark standard`（AsKd7c rainbow flop、100 iter、8 論理 / 4 物理コア）：
+
+| 後端                 | 1T   | 2T   | 4T   | 8T    | 1T → 8T |
+|----------------------|------|------|------|-------|---------|
+| reference（v1.5.x）  | 25.3 | 28.2 | 27.8 | 28.5  | 1.13×（parallel-sections の上限） |
+| **levelized（v1.7.1）** | 25.0 | 49.1 | 91.0 | **137.6** | **5.46×** |
+
+両後端は同じ数値戦略を出力します。コミット毎の parity gate（reference vs levelized、scalar vs AVX2、シングル vs マルチスレッド）が実装の乖離を防いでいます。
+
+### 4 リリースかかった理由
+
+- **v1.4.0 — AVX2/scalar ランタイムディスパッチ**。`/arch:AVX2` を 1 つの translation unit に限定し、起動時の CPUID + OS 状態チェックで kernel テーブルを選択。Pre-Haswell CPU は AVX2 opcode に到達しません。再帰後端の scratch-arena bump allocator により、iter あたり 60k 以上の `vector<float>` 確保を排除。
+- **v1.4.1 — 実際のエンジン進捗イベント**。Iter カウンタは `setInterval` での偽動作ではなく、エンジンが stderr に構造化進捗イベントを出力し Tauri が UI に転送。Matchup precompute も outer combo 次元で並列化。
+- **v1.5.0 — Levelized CPU 後端**。BFS-flat 走査と各レベルの `parallel for` で再帰 arena の逐次 bump pointer を置換。これが 2 スレッド超のスケーリングを解禁する核心の変更。
+- **v1.5.1 — Google OAuth ログイン修正**。ビルドパイプラインのギャップで 4 リリース連続で空の `client_secret` を出荷していました。`prepare-release.ps1` から `.env.local` を自動読込し、`cargo:rerun-if-env-changed` ヒントで secret が空のままキャッシュされないように。
+- **v1.6.0 — CPU 正確性ガード**。AVX2 dispatch リファクタリング後のテストターゲットリンクを修復、parity test スイート追加、`--cpu-threads N` が実際に OMP team サイズを制限。
+- **v1.7.0 — GUI が levelized へ切替**。フロントエンドが全 solve で levelized 後端を要求。Host メモリ予算 gate が levelized の追加 reach/value バッファを計上、タイトな RAM 制限が確保前に拒否。
+- **v1.7.1 — ETA スループットモデル再構築**。標準ベンチマークで後端 × スレッド毎のレートを測定校正、「予想 5 分・実際 1 分」の逆転待機現象を解決。
+
+旧再帰後端は `--cpu-backend reference`（CLI 限定）で parity テスト / デバッグ用に選択可能です — GUI からは見えない選択肢になりました。
 
 ## v1.3.1 のハイライト（遅い CPU でも時間予算が正しく発火）
 
@@ -194,12 +228,12 @@ CPU レートも 3× 引き上げ。以前 11 分と推定された spot が 12 
 | | 最小 | 推奨 |
 |---|---|---|
 | OS | Windows 10 64-bit | Windows 11 64-bit |
-| CPU | デュアルコア | クアッドコア以上 |
+| CPU | x86-64 デュアルコア（年代不問） | 4 物理コア以上、AVX2 対応（Haswell 2013 / Excavator 2015 以降） |
 | RAM | 4 GB | 8 GB+ |
-| GPU | — (CPU フォールバック可) | NVIDIA RTX 2000 シリーズ以上、4 GB+ VRAM |
+| GPU | — *(CPU 後端のみで完全機能)* | NVIDIA RTX 2000 シリーズ以上、4 GB+ VRAM |
 | ディスク | 200 MB | 200 MB |
 
-GPU は自動検出。右上のステータスピルで **CUDA** / **CPU** が一目瞭然。
+GPU と SIMD はどちらも自動検出。右上のステータスピルで **CUDA** / **CPU** が一目瞭然、CPU 後端はハードウェアの対応状況に応じて `AVX2` または `scalar` を表示します — Pre-Haswell CPU は scalar kernels で動作し、AVX2 opcode に触れることはありません。
 
 ## 始め方
 

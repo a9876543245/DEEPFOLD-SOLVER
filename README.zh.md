@@ -7,10 +7,44 @@
 📘 **[使用說明 (中文)](USER_GUIDE.zh.md)** · **[User Guide (English)](USER_GUIDE.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.3.1-green)
-![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU-orange)
+![Version](https://img.shields.io/badge/version-1.7.1-green)
+![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU%20%28AVX2%2BMulti--core%29-orange)
 
-DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GPU 加速的 DCFR 引擎（含 CPU fallback）+ **runout 聚合報告、per-combo blocker 分析、EV / 激進度熱力圖、2,500+ preflop 圖庫**，單一 Windows 安裝檔搞定。
+DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GPU 加速 DCFR 引擎搭配**真正會吃滿所有 CPU 核心**的 multi-core 後端，加上 **runout 聚合報告、per-combo blocker 分析、EV / 激進度熱力圖、2,500+ preflop 圖庫**，單一 Windows 安裝檔搞定。
+
+## v1.7.1 新功能 — 多核 CPU 預設啟用
+
+從 v1.3.1 之後一連四個版本的 CPU 優化終於累積到位。Standard rainbow benchmark 在一台 8 執行緒筆電上現在跑到 ~140 iter/s — 同一台機器上**比舊 CPU 後端快約 5×**（舊後端在 v1.7.0 之前都是預設），完全自動、沒有任何選項要打開。沒 GPU 的使用者現在拿到的解算速度，過去要靠顯卡才有。
+
+### 你會直接感受到的變化
+
+- **CPU 解算速度大躍進**：新的 BFS-flat「levelized」CFR 後端取代原本的遞迴版本，能線性 scale 到所有實體核心，不再卡在 2 執行緒上限。Standard rainbow benchmark 從每秒 28 iter 跳到 137 iter（同一台機器）。
+- **ETA banner 終於準了**：v1.7.1 之前的 pre-solve 預估器不知道實際會跑哪個 CPU 後端，所以對只要 1 分鐘解完的 spot 顯示「預估 5 分鐘」。新 throughput 模型會根據 backend 種類 + 執行緒數調整，整個 config space 內預估誤差控制在 ~2× 以內。
+- **舊 CPU 仍然能跑**：Pre-Haswell CPU（沒 AVX2）啟動時會自動 fallback 到 scalar kernels，靠 runtime CPUID dispatch — 單一安裝檔、不需要另外編譯、不會啟動就 crash。
+- **`--cpu-threads N` 終於有效**：以前這個 flag 顯示有但其實沒生效；現在 levelized 後端會把它套到每個 parallel-for 的 `num_threads(…)`，需要在共用機器上限制執行緒就直接設。
+
+### 實測數據
+
+`--benchmark standard`（AsKd7c rainbow flop、100 iter、8 邏輯 / 4 實體核心）：
+
+| 後端                  | 1T   | 2T   | 4T   | 8T    | 1T → 8T |
+|-----------------------|------|------|------|-------|---------|
+| reference（v1.5.x）   | 25.3 | 28.2 | 27.8 | 28.5  | 1.13×（卡 parallel-sections 上限） |
+| **levelized（v1.7.1）** | 25.0 | 49.1 | 91.0 | **137.6** | **5.46×** |
+
+兩個後端輸出的策略**逐位相同**；每次 commit 都跑一個 parity gate（reference vs levelized、scalar vs AVX2、單執行緒 vs 多執行緒）防止實作漂移。
+
+### 為什麼花了四個版本
+
+- **v1.4.0 — AVX2/scalar 動態分派**。把 `/arch:AVX2` 限縮到單一 translation unit，CPUID + OS 狀態檢查在啟動時挑選 kernel 表。Pre-Haswell CPU 永遠不會碰到 AVX2 opcode。Scratch-arena bump allocator 也消除了遞迴後端裡每個 iter 的 60k+ 個 `vector<float>` 配置。
+- **v1.4.1 — 真實的引擎進度事件**。Iter 計數不再靠 `setInterval` 假動畫，而是引擎用 stderr 發結構化進度事件、Tauri 轉發到前端。Matchup precompute 也平行化了 outer combo 維度。
+- **v1.5.0 — Levelized CPU 後端**。BFS-flat 走訪 + 每層 `parallel for`，取代遞迴 arena 的序列 bump pointer。這就是讓多執行緒能 scale 的關鍵改動。
+- **v1.5.1 — Google OAuth 登入修復**。Build pipeline 漏掉 `.env.local`，連續四個版本都 ship 了空的 `client_secret`；改由 `prepare-release.ps1` 自動載入，並加上 `cargo:rerun-if-env-changed` 提示讓 secret 不會被 cache 成空字串。
+- **v1.6.0 — CPU 正確性護欄**。修復 AVX2 dispatch 重構後 test target 連結問題、加上 parity test suite、`--cpu-threads N` 真的會把 OMP team 數量限制住。
+- **v1.7.0 — GUI 切換到 levelized**。前端解算現在預設請求 levelized 後端。Host memory budget gate 會把 levelized 額外的 reach/value buffer 算進去，緊預算的機器會在配置前就拒絕，不再事後爆掉。
+- **v1.7.1 — ETA throughput 模型重做**。針對 standard benchmark 量測每個 backend × thread 數的實際速率，修掉「估 5 分鐘、實際 1 分鐘」這種反向等待懸崖。
+
+舊的遞迴後端仍可透過 `--cpu-backend reference` 選用（CLI 限定）做 parity 測試 / debug — 不再是 GUI 內的可見選項。
 
 ## v1.3.1 新功能（慢 CPU 上時間預算正確生效）
 
@@ -201,12 +235,12 @@ Pre-solve estimator 之前 GPU 端低估 50×（用 hand-wave 估的；現在用
 | | 最低 | 建議 |
 |---|---|---|
 | 作業系統 | Windows 10 64-bit | Windows 11 64-bit |
-| CPU | 雙核 | 四核以上 |
+| CPU | x86-64 雙核（任何年份） | 4 顆以上實體核心、AVX2（Haswell 2013 / Excavator 2015 之後） |
 | RAM | 4 GB | 8 GB+ |
-| GPU | — (CPU fallback 可用) | NVIDIA RTX 2000 系列以上、4 GB+ VRAM |
+| GPU | — *(沒 GPU 也完整可用 — CPU 後端功能對齊)* | NVIDIA RTX 2000 系列以上、4 GB+ VRAM |
 | 硬碟 | 200 MB | 200 MB |
 
-GPU 自動偵測。右上角的狀態指示燈一眼就能看出 **CUDA** / **CPU**。
+GPU 跟 SIMD 都自動偵測：右上角狀態指示燈一眼看出 **CUDA** / **CPU**，CPU 後端會根據硬體支援度標 `AVX2` 或 `scalar` — Pre-Haswell CPU 跑 scalar kernels，永遠不會碰到 AVX2 opcode。
 
 ## 開始使用
 
