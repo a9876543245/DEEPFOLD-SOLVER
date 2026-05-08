@@ -86,18 +86,31 @@ endif()
 # ============================================================================
 # Source Files
 # ============================================================================
-set(CORE_SOURCES
-    src/hand_evaluator.cpp
-    src/backend_factory.cpp
-    src/main.cpp
+
+# CPU SIMD kernels — required by every target that pulls in solver.h /
+# cpu_backend.h / cpu_backend_levelized.h (any of those reference
+# cpu_simd::kernels(), cpu_simd::active_mode(), cpu_simd::mode_label()).
+# Centralized here so test executables can reuse the exact same list and we
+# don't drift toward "solver test fails to link cpu_simd::*" again.
+set(CPU_KERNEL_SOURCES
     src/cpu_kernels_scalar.cpp
     src/cpu_kernels_avx2.cpp
     src/cpu_kernels_dispatch.cpp
 )
 
+set(CORE_SOURCES
+    src/hand_evaluator.cpp
+    src/backend_factory.cpp
+    src/main.cpp
+    ${CPU_KERNEL_SOURCES}
+)
+
 # Per-source AVX2 flag — confines the AVX2 opcodes to one .obj. The rest of
 # the binary stays at the platform's SSE2 baseline. CPUID dispatch at startup
 # decides whether to call into the AVX2 functions or the scalar ones.
+# Source-file properties are scoped to this directory, so all targets in this
+# CMakeLists.txt that compile cpu_kernels_avx2.cpp (deepsolver_core, test_solver,
+# test_gpu_postsolve, future parity tests) automatically pick up the flag.
 if(MSVC)
     set_source_files_properties(src/cpu_kernels_avx2.cpp
         PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
@@ -178,6 +191,7 @@ if(BUILD_TESTS)
         tests/test_solver.cpp
         src/hand_evaluator.cpp
         src/backend_factory.cpp
+        ${CPU_KERNEL_SOURCES}
     )
     target_include_directories(test_solver PRIVATE include)
     if(MSVC)
@@ -210,6 +224,27 @@ if(BUILD_TESTS)
         COMMAND test_solver --suite=all)
     set_tests_properties(SolverCorrectness PROPERTIES
         LABELS "stress" TIMEOUT 600)
+
+    # ----------------------------------------------------------------
+    # Cross-config parity (v1.6.0): reference vs levelized, scalar vs
+    # avx2, thread cap consistency. Each scenario runs 2 small solves
+    # (60 iter on AsKd2c) and asserts root strategy diverges < 2pp and
+    # AhKh EV diverges < 1 chip. Total runtime budget < 10s — fits the
+    # `smoke` label so every CI run gates on it.
+    # ----------------------------------------------------------------
+    add_executable(test_parity
+        tests/test_parity.cpp
+        src/hand_evaluator.cpp
+        src/backend_factory.cpp
+        ${CPU_KERNEL_SOURCES}
+    )
+    target_include_directories(test_parity PRIVATE include)
+    if(MSVC)
+        target_compile_options(test_parity PRIVATE /W4 /O2 /EHsc)
+        target_link_options(test_parity PRIVATE "/STACK:16777216")
+    endif()
+    add_test(NAME CpuParity COMMAND test_parity)
+    set_tests_properties(CpuParity PROPERTIES LABELS "smoke" TIMEOUT 60)
 
     # ----------------------------------------------------------------
     # Smoke-via-CLI: tiny solves that exercise the new memory-budget
@@ -274,13 +309,16 @@ if(BUILD_TESTS)
 
     # AUTO fallback: insufficient VRAM should downgrade to CPU and
     # populate fallback_reason in the resources block.
+    # v1.4.0+: backend label may be "CPU-DCFR", "CPU-DCFR-AVX2", or
+    # "CPU-Levelized-AVX2" depending on runtime SIMD dispatch and the
+    # selected cpu_backend_kind. The "CPU-" prefix is the stable invariant.
     add_test(NAME CliGpuAutoFallback
         COMMAND deepsolver_core
             --pot 100 --stack 500 --board AsKd7c
             --iterations 5 --backend auto --gpu-memory-mb 1)
     set_tests_properties(CliGpuAutoFallback PROPERTIES
         LABELS "smoke;memory;gpu" TIMEOUT 60
-        PASS_REGULAR_EXPRESSION "\"backend\": \"CPU-DCFR\"")
+        PASS_REGULAR_EXPRESSION "\"backend\": \"CPU-")
 
     # P1-1 (v1.2.1): VISIBLE EV cache must respect strategy_tree_max_nodes.
     # With cap=3 the estimated_strategy_tree_bytes should land in the tens
@@ -331,6 +369,7 @@ if(BUILD_TESTS)
             tests/test_gpu_postsolve.cpp
             src/hand_evaluator.cpp
             src/backend_factory.cpp
+            ${CPU_KERNEL_SOURCES}
             cuda/cfr_kernel.cu
             cuda/eval_kernel.cu
             cuda/gpu_backend.cu

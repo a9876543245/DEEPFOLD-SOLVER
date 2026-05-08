@@ -521,6 +521,14 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         gate_est.matchup_tables_bytes   = bytes_for_matchup_tables(
             matchup_ev_per_runout_.size(), nc);
         gate_est.cpu_state_bytes        = bytes_for_cpu_state(gate_player_nodes, MAX_ACTIONS, nc);
+        // v1.7.0: levelized backend pre-allocates 3 × total_nodes × nc floats
+        // (reach_oop_, reach_ip_, value_) on top of the reference state.
+        // Only count it when the user actually selected levelized — otherwise
+        // GPU and reference solves would be told they need more host RAM
+        // than they really do.
+        if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
+            gate_est.cpu_state_bytes   += bytes_for_levelized_cpu_extra(total_n, nc);
+        }
         gate_est.gpu_state_bytes        = bytes_for_gpu_state(total_n, MAX_ACTIONS, nc);
 
         // P1-1: EV cache estimate must use the SAME cap as build_strategy_tree
@@ -930,29 +938,35 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         }
         const int cc = (selected_backend == BackendType::GPU)
                        ? cuda_compute_capability() : 0;
+
+        // v1.7.1: resolve cpu_threads_effective BEFORE the ETA estimate so
+        // the throughput model can take it into account. Without this,
+        // estimate_solve_seconds() defaults to hardware_concurrency() and
+        // mis-estimates --cpu-threads N solves.
+        uint32_t cpu_eff = 0u;
+        if (selected_backend != BackendType::GPU) {
+            cpu_eff = (backend_ != nullptr) ? backend_->cpu_threads_effective() : 0u;
+            if (cpu_eff == 0u) {
+                uint32_t hw = 1u;
+#ifdef _OPENMP
+                hw = static_cast<uint32_t>(omp_get_max_threads());
+#endif
+                cpu_eff = resolve_cpu_threads(config_.cpu_threads, hw);
+            }
+        }
+
         r.estimated_solve_seconds = estimate_solve_seconds(
             player_nodes, MAX_ACTIONS, iso_.num_canonical,
-            config_.max_iterations, backend_label_lc, cc);
+            config_.max_iterations, backend_label_lc, cc, cpu_eff);
 
         // v1.4.0 Phase 2: CPU mode diagnostics. Empty / 0 on GPU solves so
         // the UI can suppress the CPU-only label there.
         if (selected_backend != BackendType::GPU) {
             r.cpu_simd = cpu_simd::mode_label();
-            // v1.5.0 Phase 4: levelized backend uses all CPU cores via OMP,
-            // not a fixed pair like the reference backend's parallel sections.
-            // For diagnostics we report the OMP team size when known, else
-            // fall back to the cpu_threads config (capped at 2 for reference).
-            if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
-#ifdef _OPENMP
-                r.cpu_threads_effective = static_cast<uint32_t>(omp_get_max_threads());
-#else
-                r.cpu_threads_effective = 1u;
-#endif
-                r.cpu_backend_kind = "levelized";
-            } else {
-                r.cpu_threads_effective = (config_.cpu_threads == 1) ? 1u : 2u;
-                r.cpu_backend_kind = "reference";
-            }
+            r.cpu_backend_kind =
+                (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED)
+                ? "levelized" : "reference";
+            r.cpu_threads_effective = cpu_eff;
         }
 
         result.resources = std::move(r);
@@ -1015,6 +1029,12 @@ inline SolveResources Solver::estimate_only() {
 
     r.estimated_matchup_bytes        = bytes_for_matchup_tables(matchup_count_est, nc);
     r.estimated_cpu_state_bytes      = bytes_for_cpu_state(player_nodes, MAX_ACTIONS, nc);
+    // v1.7.0: include the levelized backend's extra reach/value buffers in
+    // the pre-solve estimate too, so the UI's ETA banner doesn't say "this
+    // fits in 4 GB" right before the host gate rejects on the real solve.
+    if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
+        r.estimated_cpu_state_bytes += bytes_for_levelized_cpu_extra(total_n, nc);
+    }
     r.estimated_gpu_state_bytes      = bytes_for_gpu_state(total_n, MAX_ACTIONS, nc);
 
     const uint64_t ev_cache_cap = config_.memory_budget.strategy_tree_max_nodes > 0
@@ -1041,12 +1061,21 @@ inline SolveResources Solver::estimate_only() {
     }
 
     // Backend label without actually allocating the backend — synthesize.
+    // v1.7.1: the synthesized CPU label must mirror what the real backend's
+    // name() will return (e.g. "CPU-Levelized-AVX2") so the throughput model
+    // in memory_budget.h can pick the right rate. The pre-v1.7.1 code
+    // hardcoded "CPU-DCFR" here, which made estimate-only always price as
+    // reference scalar regardless of the user's --cpu-backend choice.
     std::string backend_label;
     if (predicted_backend == BackendType::GPU) {
         std::string desc = describe_cuda_gpu();
         backend_label = std::string("CUDA (") + (desc.empty() ? "no device" : desc) + ")";
     } else {
-        backend_label = "CPU-DCFR";
+        backend_label =
+            (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED)
+                ? "CPU-Levelized" : "CPU-DCFR";
+        backend_label += (cpu_simd::active_mode() == cpu_simd::SimdMode::Avx2)
+                ? "-AVX2" : "-scalar";
     }
     r.backend_for_estimate = backend_label;
     std::string lc = backend_label;
@@ -1055,24 +1084,31 @@ inline SolveResources Solver::estimate_only() {
     }
     const int cc = (predicted_backend == BackendType::GPU) ? cuda_compute_capability() : 0;
 
+    // Resolve threads BEFORE the estimate so the rate model can use it.
+    uint32_t cpu_eff = 0u;
+    if (predicted_backend != BackendType::GPU) {
+        if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
+            uint32_t hw = 1u;
+#ifdef _OPENMP
+            hw = static_cast<uint32_t>(omp_get_max_threads());
+#endif
+            cpu_eff = resolve_cpu_threads(config_.cpu_threads, hw);
+        } else {
+            cpu_eff = (config_.cpu_threads == 1) ? 1u : 2u;
+        }
+    }
+
     r.ops_per_iteration = ops_per_solve_iteration(player_nodes, MAX_ACTIONS, nc);
     r.estimated_solve_seconds = estimate_solve_seconds(
-        player_nodes, MAX_ACTIONS, nc, config_.max_iterations, lc, cc);
+        player_nodes, MAX_ACTIONS, nc, config_.max_iterations, lc, cc, cpu_eff);
 
     // v1.4.0 Phase 2: same CPU mode diagnostics on the estimate-only path.
     if (predicted_backend != BackendType::GPU) {
         r.cpu_simd = cpu_simd::mode_label();
-        if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
-#ifdef _OPENMP
-            r.cpu_threads_effective = static_cast<uint32_t>(omp_get_max_threads());
-#else
-            r.cpu_threads_effective = 1u;
-#endif
-            r.cpu_backend_kind = "levelized";
-        } else {
-            r.cpu_threads_effective = (config_.cpu_threads == 1) ? 1u : 2u;
-            r.cpu_backend_kind = "reference";
-        }
+        r.cpu_threads_effective = cpu_eff;
+        r.cpu_backend_kind =
+            (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED)
+                ? "levelized" : "reference";
     }
 
     // Lightweight budget-decision label so the UI can flag "this will fail

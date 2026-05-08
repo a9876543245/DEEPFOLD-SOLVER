@@ -103,6 +103,15 @@ public:
             ? "CPU-DCFR-AVX2"
             : "CPU-DCFR-scalar";
     }
+    /// Reference backend's only intra-iter parallelism is the OOP||IP
+    /// `parallel sections` block, which fans out to at most 2 OMP threads
+    /// regardless of `omp_get_max_threads()`. So the effective worker count
+    /// here is 1 (when user explicitly asked for serial) or 2 otherwise.
+    uint32_t cpu_threads_effective() const override {
+        const uint32_t requested =
+            (ctx_.config != nullptr) ? ctx_.config->cpu_threads : 0u;
+        return (requested == 1u) ? 1u : 2u;
+    }
 
 private:
     SolverContext ctx_{};

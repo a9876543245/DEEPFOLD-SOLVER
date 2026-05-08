@@ -90,6 +90,23 @@ inline bool dcfr_decay_and_add(const SolverConfig& config) {
  * All pointers are borrowed: the Solver orchestrator owns the underlying data
  * and guarantees it stays alive for the backend's lifetime.
  */
+/// Shared CPU-thread resolution. Returns the effective worker count for a
+/// `config.cpu_threads` request:
+///   0 → auto: hardware concurrency (typically every core/HT)
+///   1 → serial: forced single thread
+///   N → clamp to [1, hw_concurrency]
+///
+/// Used both by the levelized backend's prepare() (to pin its OMP team
+/// size) and by Solver::estimate_only() (so the pre-solve resource preview
+/// reports the same number the backend will actually use). Keeping it in
+/// one place avoids "estimate said 4, backend ran with 8" drift.
+inline uint32_t resolve_cpu_threads(uint32_t requested, uint32_t hw_concurrency) {
+    if (hw_concurrency == 0u) hw_concurrency = 1u;
+    if (requested == 0u) return hw_concurrency;
+    if (requested == 1u) return 1u;
+    return (requested < hw_concurrency) ? requested : hw_concurrency;
+}
+
 struct SolverContext {
     const FlatGameTree*          tree          = nullptr;
     const IsomorphismMapping*    iso           = nullptr;
@@ -152,6 +169,15 @@ public:
     /// Human-readable backend name, e.g. "CPU-DCFR", "CUDA (RTX 4060, 8GB)".
     /// Shown in UI as the active backend indicator.
     virtual const char* name() const = 0;
+
+    /// Effective worker count for diagnostics. CPU backends should resolve
+    /// `config.cpu_threads` (0=auto, 1=serial, N=clamped) inside prepare()
+    /// and return that here. Reported in `SolveResources.cpu_threads_effective`
+    /// — important so users can verify their `--cpu-threads` cap actually
+    /// took effect rather than silently falling back to `omp_get_max_threads()`.
+    /// Default 0 means "unknown / use env"; the orchestrator falls back to
+    /// the legacy heuristic in that case (e.g. for GPU backends).
+    virtual uint32_t cpu_threads_effective() const { return 0; }
 
     // ------------------------------------------------------------------------
     // Optional GPU postsolve hooks

@@ -245,6 +245,14 @@ function App() {
       // the user types a custom value into Advanced settings; otherwise
       // we use the mode preset.
       time_budget_seconds: SOLVE_MODE_PRESETS[solveMode].time_budget_seconds,
+      // v1.7.0: GUI defaults to the levelized CPU backend (4-5x faster than
+      // reference on a typical 8-thread laptop CPU). cpu_simd='auto' lets
+      // CPUID pick AVX2 vs scalar at startup, cpu_threads=0 means "use
+      // every available core". Reference is still selectable via the CLI
+      // for parity-test / debugging; the GUI doesn't expose a toggle yet.
+      cpu_backend: 'levelized',
+      cpu_simd: 'auto',
+      cpu_threads: 0,
     };
   }, [pot, stack, iterations, selectedMatchup, getHeroRange, customIpRange, customOopRange, nodeLocks, sizingKey, memoryProfile, solveMode]);
 

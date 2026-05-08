@@ -146,6 +146,24 @@ inline uint64_t bytes_for_cpu_state(uint64_t player_nodes, uint64_t max_actions,
          * sizeof(float);
 }
 
+/// v1.7.0: extra heap held by the levelized CPU backend on top of the
+/// reference state. LevelizedCpuBackend allocates three flat [N × nc] float
+/// buffers — `reach_oop_`, `reach_ip_`, and `value_` — that the recursive
+/// reference backend doesn't need (it carries reach on the call stack).
+///
+///   total = 3 × total_nodes × nc × sizeof(float)
+///
+/// On a 200k-node tree with nc=1326 that lands at ~3.2 GB, easily enough to
+/// blow a tight host-RAM budget. Add this to `cpu_state_bytes` whenever the
+/// solve will run on the levelized backend so the host gate can reject
+/// before LevelizedCpuBackend::prepare() heap-allocates.
+///
+/// `total_nodes` is `tree.total_nodes` (every node, not just player nodes —
+/// reach is propagated through chance nodes too). `nc` is iso.num_canonical.
+inline uint64_t bytes_for_levelized_cpu_extra(uint64_t total_nodes, uint64_t nc) {
+    return total_nodes * nc * 3ULL * sizeof(float);
+}
+
 /// Bytes for the GPU CFR state. Lives in VRAM. Includes:
 ///   - regrets, strategy_sum, current_strategy, action_values: each N×A×nc floats
 ///   - reach_scratch_oop, reach_scratch_ip: each N×nc floats
@@ -209,10 +227,14 @@ inline uint64_t ops_per_solve_iteration(uint64_t player_nodes,
 
 /// Returns rough ops/second throughput for the named backend.
 ///   - backend_label_lc is the lowercased backend name as it appears in the
-///     SolverResult.backend field, e.g. "cpu-dcfr" or "cuda (...)" with the
-///     parenthesised device name still attached.
+///     SolverResult.backend field, e.g. "cpu-dcfr-avx2", "cpu-levelized-avx2",
+///     "cpu-dcfr-scalar", or "cuda (...)" with the device name attached.
 ///   - cuda_compute_capability is the device CC×10 (so 89 = Ada, 61 = Pascal,
 ///     90 = Hopper). 0 means "unknown — use a conservative middle value".
+///   - cpu_threads_effective is the resolved OMP team size for CPU backends
+///     (output of `resolve_cpu_threads()`). Ignored on GPU. Pass 0 to fall
+///     back to `hardware_concurrency()` — historically callers did this and
+///     we want the helper to keep working when wired into older code.
 ///
 /// v1.3.0: rates **recalibrated** against actual benchmarks. The pre-1.3.0
 /// table was 50× pessimistic on the GPU side (calibrated against a
@@ -221,8 +243,19 @@ inline uint64_t ops_per_solve_iteration(uint64_t player_nodes,
 /// CC-12 entry of 10 Gops/s would have estimated 11 minutes for a spot
 /// that actually ran in ~12 seconds. CPU rates also bumped (unmeasured
 /// but parallel logic — atomicAdd is faster than I assumed).
+///
+/// v1.7.1: CPU model split by backend variant (reference vs levelized) and
+/// threads. The pre-v1.7.1 model returned 1.5e8 × min(8, cores) regardless
+/// of which CPU backend ran, which made `--estimate-only` say "150 seconds"
+/// for a spot that levelized 8T finishes in 0.7s — 200× pessimistic, big
+/// enough that users were ignoring the banner. Calibrated against
+/// `--benchmark standard` (AsKd7c, 216 player nodes, 1176 nc, 1.79e9 ops/iter)
+/// across reference {1T, 2T} and levelized {1T, 2T, 4T, 8T}; the per-core
+/// avx2 base of 4.0e10 ops/s comes in ~12% pessimistic on this calibration
+/// machine, which is the safer side for an ETA banner.
 inline double estimated_throughput_ops_per_sec(const std::string& backend_label_lc,
-                                                int cuda_compute_capability)
+                                                int cuda_compute_capability,
+                                                uint32_t cpu_threads_effective = 0u)
 {
     if (backend_label_lc.rfind("cuda", 0) == 0) {  // starts with "cuda"
         switch (cuda_compute_capability / 10) {
@@ -234,14 +267,50 @@ inline double estimated_throughput_ops_per_sec(const std::string& backend_label_
             default: return 5.0e10;  // unknown CC: middle modern-GPU estimate
         }
     }
-    // CPU rate: per-core ~1.5e8 ops/s for fp32 + atomicAdd CFR workload
-    // (bumped from 5e7). Modern x86 cores do ~1-3 Gflop/s effective on
-    // memory-bound kernels; we're closer to the bottom of that range
-    // because of the matchup-table pointer chasing. Cap effective parallelism
-    // at 8 cores (memory bandwidth bound past that).
-    const unsigned cores = std::max(1u,
-        std::min(8u, std::thread::hardware_concurrency()));
-    return 1.5e8 * static_cast<double>(cores);
+
+    // ---- CPU model (v1.7.1) ----
+    //
+    // Per-core base rate at 1 thread:
+    //   AVX2 + FMA path: ~4.0e10 ops/s on a typical modern x86 core.
+    //     (measured ~4.5e10 on the calibration machine; we shave 12% to
+    //     stay slightly pessimistic for safer ETAs on slower CPUs.)
+    //   Scalar fallback: ~1.6e10 ops/s. AVX2 wins are dominated by
+    //     vec_pos_normalize / vec_regret_update which SIMD cleanly.
+    //
+    // Multi-thread scaling depends on the CFR backend variant:
+    //   reference (CpuBackend): only intra-iter parallelism is the
+    //     OOP||IP `parallel sections` block — caps at 2 OMP threads, and
+    //     the second thread only buys ~10% over single-thread (both
+    //     traversers share the matchup table and saturate L2).
+    //   levelized (LevelizedCpuBackend): per-level `parallel for` over
+    //     all nodes, scales linearly up to the physical core count, then
+    //     ~40% per logical thread past that (HT diminishing).
+    //
+    // Calibration constants chosen to match `--benchmark standard` within
+    // ~10% across both backends and 1/2/4/8 threads. Real GUI solves on
+    // turn/river spots have larger trees, so the per-core rate is a
+    // moderate over-estimate there — but still 5-10× more accurate than
+    // the pre-v1.7.1 single-rate model.
+    const bool is_avx2     = backend_label_lc.find("avx2") != std::string::npos;
+    const bool is_levelized = backend_label_lc.find("levelized") != std::string::npos;
+    const double per_core   = is_avx2 ? 4.0e10 : 1.6e10;
+
+    uint32_t threads = cpu_threads_effective;
+    if (threads == 0u) {
+        threads = std::max(1u, std::thread::hardware_concurrency());
+    }
+
+    if (is_levelized) {
+        // Linear up to 4 cores, then 40% per additional logical thread.
+        // Tuned against an 8-logical / 4-physical Intel laptop CPU; rough
+        // but better than ignoring threads entirely.
+        const double t = static_cast<double>(threads);
+        const double eff = (t <= 4.0) ? t : 4.0 + (t - 4.0) * 0.4;
+        return per_core * eff;
+    }
+
+    // Reference backend: cap at 2-thread parallel sections, +10% from 2nd thread.
+    return per_core * (threads >= 2u ? 1.1 : 1.0);
 }
 
 inline double estimate_solve_seconds(uint64_t player_nodes,
@@ -249,11 +318,13 @@ inline double estimate_solve_seconds(uint64_t player_nodes,
                                      uint64_t canonical_combos,
                                      int max_iterations,
                                      const std::string& backend_label_lc,
-                                     int cuda_compute_capability)
+                                     int cuda_compute_capability,
+                                     uint32_t cpu_threads_effective = 0u)
 {
     if (max_iterations <= 0 || player_nodes == 0 || canonical_combos == 0) return 0.0;
     const uint64_t ops = ops_per_solve_iteration(player_nodes, max_actions, canonical_combos);
-    const double rate = estimated_throughput_ops_per_sec(backend_label_lc, cuda_compute_capability);
+    const double rate = estimated_throughput_ops_per_sec(
+        backend_label_lc, cuda_compute_capability, cpu_threads_effective);
     if (rate <= 0.0) return 0.0;
     // Add a fixed 0.5s for backend prepare + final postsolve so very small
     // spots don't show "0.01s" — too good to be true.

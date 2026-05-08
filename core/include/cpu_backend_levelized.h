@@ -72,9 +72,20 @@ public:
             ? "CPU-Levelized-AVX2"
             : "CPU-Levelized-scalar";
     }
+    uint32_t cpu_threads_effective() const override { return cpu_threads_effective_; }
 
 private:
     SolverContext ctx_{};
+
+    // Resolved in prepare() from config.cpu_threads:
+    //   0 → auto: omp_get_max_threads() (env-controlled, typically all cores)
+    //   1 → serial: one OMP team thread, no parallel-for fan-out
+    //   N → clamp to [1, hardware_concurrency()]
+    // Used as `num_threads(cpu_threads_effective_)` on every parallel-for in
+    // forward_pass / backward_pass. Avoids global omp_set_num_threads() so we
+    // don't leak a thread cap into postsolve / estimate-only / GPU paths
+    // sharing this process.
+    uint32_t cpu_threads_effective_ = 0;
 
     // Per-iteration DCFR state — same shape as the reference backend so
     // node locks / dcfr_schedule tests carry over unchanged.
@@ -194,6 +205,17 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     ctx_ = ctx;
     const uint16_t nc = ctx.iso->num_canonical;
     const uint32_t N = ctx.tree->total_nodes;
+
+    // Resolve effective thread count via the shared helper so estimate_only()
+    // and the live backend agree on what `--cpu-threads N` means.
+    {
+        const uint32_t requested = (ctx.config != nullptr) ? ctx.config->cpu_threads : 0u;
+        uint32_t hw = 1u;
+#ifdef _OPENMP
+        hw = static_cast<uint32_t>(omp_get_max_threads());
+#endif
+        cpu_threads_effective_ = resolve_cpu_threads(requested, hw);
+    }
 
     regrets_.assign(N, {});
     strategy_sum_.assign(N, {});
@@ -441,7 +463,7 @@ inline void LevelizedCpuBackend::forward_pass(int iteration) {
         const uint32_t hi = level_offsets_[L + 1];
 
         #if defined(_OPENMP)
-        #pragma omp parallel for schedule(dynamic, 8)
+        #pragma omp parallel for schedule(dynamic, 8) num_threads(static_cast<int>(cpu_threads_effective_))
         #endif
         for (int64_t idx = static_cast<int64_t>(lo);
              idx < static_cast<int64_t>(hi); ++idx)
@@ -542,7 +564,7 @@ inline void LevelizedCpuBackend::backward_pass(int traverser) {
         const uint32_t hi = level_offsets_[L + 1];
 
         #if defined(_OPENMP)
-        #pragma omp parallel for schedule(dynamic, 8)
+        #pragma omp parallel for schedule(dynamic, 8) num_threads(static_cast<int>(cpu_threads_effective_))
         #endif
         for (int64_t idx = static_cast<int64_t>(lo);
              idx < static_cast<int64_t>(hi); ++idx)
