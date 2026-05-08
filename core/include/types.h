@@ -286,16 +286,33 @@ struct SolverConfig {
     uint32_t cpu_threads = 0;
 
     /// v1.5.0 Phase 4: which CPU CFR backend to use.
-    ///   REFERENCE = recursive scratch-arena CpuBackend (the parity oracle).
-    ///   LEVELIZED = BFS-flat traversal LevelizedCpuBackend, scales past
-    ///               the 2-thread cap of the reference backend.
-    /// Surfaced as `--cpu-backend reference|levelized`. Default REFERENCE
-    /// until the levelized backend's parity tests stabilize.
+    ///   REFERENCE = recursive scratch-arena CpuBackend. Kept as the parity
+    ///               oracle and `--cpu-backend reference` debug escape hatch.
+    ///               Caps at 2 threads (parallel-sections OOP||IP).
+    ///   LEVELIZED = BFS-flat traversal LevelizedCpuBackend. Production CPU
+    ///               path — scales linearly to all available cores.
+    /// Surfaced as `--cpu-backend reference|levelized`.
+    /// v1.8.0 Sprint 1.1: LEVELIZED is now the default. Reference backend
+    /// is selectable via the CLI flag for parity testing / debugging only.
+    /// The flip is gated by the parity suite (test_parity, test_cpu_kernels)
+    /// which proves the two backends produce bit-identical results on
+    /// AsKd2c flop / AsKd7c2h5d river / limited-sizing flop fixtures.
     enum class CpuBackendKind {
         REFERENCE = 0,
         LEVELIZED = 1,
     };
-    CpuBackendKind cpu_backend_kind = CpuBackendKind::REFERENCE;
+    CpuBackendKind cpu_backend_kind = CpuBackendKind::LEVELIZED;
+
+    /// v1.8.0 Sprint 3 (no-precision-loss guide): opt-in persistent OpenMP
+    /// team for the levelized backend's forward / backward passes. Default
+    /// off — the existing per-level `parallel for` path stays the safe
+    /// baseline. When set, each pass runs inside a single `#pragma omp
+    /// parallel` region with `#pragma omp for` on each level loop;
+    /// implicit barriers keep the level-by-level dependency intact while
+    /// avoiding the K parallel-region creations per iteration.
+    /// Surfaced as `--cpu-persistent-omp 0|1`. Reverted to default if
+    /// paired-benchmark measurement doesn't show a clean win.
+    bool cpu_persistent_omp = false;
 
     /// Sprint 1 (market-beating plan): the host RAM / GPU VRAM / JSON /
     /// strategy-tree budget that gates every large allocation in the solve

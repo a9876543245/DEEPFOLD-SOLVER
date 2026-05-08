@@ -259,6 +259,179 @@ static void test_parity_levelized_thread_cap() {
 }
 
 // ----------------------------------------------------------------------------
+// v1.8.0 Sprint 0.3: tightened deterministic fixtures.
+//
+// The original AsKd2c flop fixture above runs the full default bet-sizing
+// menu, so the tree branches widely; combined with 60 iter (not converged)
+// the tolerances had to stay loose at ±2.0pp / ±1.0 chip. To catch finer
+// drift we add two tighter fixtures:
+//
+//   1. river_no_chance — 5-card board, no further dealing, smaller tree,
+//      130 iter. Tightest reproducibility because there's zero chance
+//      enumeration.
+//   2. flop_limited_sizing — same AsKd2c flop but with a single bet size
+//      (Bet_75 only). Smaller branching factor → faster convergence →
+//      tighter tolerances at fewer iter.
+//
+// Tolerance budget for these:
+//   AhKh EV: 0.05 chip (vs 1.0 chip on the loose fixture)
+//   global_strategy: 0.5pp (vs 2.0pp on the loose fixture)
+//
+// Why both backends should be bit-equal on these: levelized and reference
+// implement the same DCFR update; differences come from FP ordering
+// (forward/backward pass aggregation order). With small nc, fewer
+// reductions, and no chance integration, those ordering differences are
+// vanishing.
+// ----------------------------------------------------------------------------
+
+static void test_parity_river_no_chance() {
+    auto& eval = get_evaluator();
+    eval.initialize();
+    cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+
+    auto make_river = []() {
+        SolverConfig sc;
+        sc.pot = 100.0f;
+        sc.effective_stack = 200.0f;   // shorter SPR → faster convergence
+        sc.board_size = 5;
+        auto board = parse_board("AsKd7c2h5d");
+        for (size_t i = 0; i < 5; ++i) sc.board[i] = board[i];
+        sc.max_iterations = 130;
+        sc.target_exploitability = 0.0f;
+        sc.exploitability_check_interval = 1000;
+        return sc;
+    };
+
+    auto cfg_ref = make_river();
+    cfg_ref.cpu_backend_kind = SolverConfig::CpuBackendKind::REFERENCE;
+    Solver s_ref(cfg_ref);
+    auto r_ref = s_ref.solve();
+    auto akh_ref = s_ref.analyze_combo("AhKh");
+
+    auto cfg_lvl = make_river();
+    cfg_lvl.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
+    Solver s_lvl(cfg_lvl);
+    auto r_lvl = s_lvl.solve();
+    auto akh_lvl = s_lvl.analyze_combo("AhKh");
+
+    std::cout << "  river ref  exploit=" << r_ref.exploitability_pct
+              << "%  AhKh ev=" << akh_ref.ev << "\n";
+    std::cout << "  river lvl  exploit=" << r_lvl.exploitability_pct
+              << "%  AhKh ev=" << akh_lvl.ev << "\n";
+
+    assert_near(akh_ref.ev, akh_lvl.ev, 0.05f,
+                "river: AhKh EV must match within 0.05 chip");
+
+    auto m_ref = strategy_map(r_ref.global_strategy);
+    auto m_lvl = strategy_map(r_lvl.global_strategy);
+    assert_strategy_close(m_ref, m_lvl, 0.5f, "river ref vs levelized");
+}
+
+static void test_parity_flop_limited_sizing() {
+    auto& eval = get_evaluator();
+    eval.initialize();
+    cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+
+    auto make_flop = []() {
+        SolverConfig sc;
+        sc.pot = 100.0f;
+        sc.effective_stack = 200.0f;
+        sc.board_size = 3;
+        auto board = parse_board("AsKd2c");
+        for (size_t i = 0; i < 3; ++i) sc.board[i] = board[i];
+        sc.max_iterations = 100;
+        sc.target_exploitability = 0.0f;
+        sc.exploitability_check_interval = 1000;
+        // Constrain to a single sizing on flop (skip turn/river — board is
+        // 3-card so they're not in the tree anyway). Smaller branching →
+        // strategy converges faster, tolerance can tighten.
+        sc.bet_sizing.flop_sizes = {0.75f};
+        return sc;
+    };
+
+    auto cfg_ref = make_flop();
+    cfg_ref.cpu_backend_kind = SolverConfig::CpuBackendKind::REFERENCE;
+    Solver s_ref(cfg_ref);
+    auto r_ref = s_ref.solve();
+    auto akh_ref = s_ref.analyze_combo("AhKh");
+
+    auto cfg_lvl = make_flop();
+    cfg_lvl.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
+    Solver s_lvl(cfg_lvl);
+    auto r_lvl = s_lvl.solve();
+    auto akh_lvl = s_lvl.analyze_combo("AhKh");
+
+    std::cout << "  flop ltd ref  exploit=" << r_ref.exploitability_pct
+              << "%  AhKh ev=" << akh_ref.ev << "\n";
+    std::cout << "  flop ltd lvl  exploit=" << r_lvl.exploitability_pct
+              << "%  AhKh ev=" << akh_lvl.ev << "\n";
+
+    assert_near(akh_ref.ev, akh_lvl.ev, 0.05f,
+                "flop limited: AhKh EV must match within 0.05 chip");
+
+    auto m_ref = strategy_map(r_ref.global_strategy);
+    auto m_lvl = strategy_map(r_lvl.global_strategy);
+    assert_strategy_close(m_ref, m_lvl, 0.5f, "flop limited ref vs levelized");
+}
+
+// ----------------------------------------------------------------------------
+// v1.8.0 Sprint 3: persistent OMP team flag parity.
+//
+// `cpu_persistent_omp` toggles between (a) one OMP parallel-region per
+// level (the v1.5.0 baseline) and (b) one OMP parallel-region per pass
+// with `omp for` distributing each level (the candidate). Same node
+// processing order, same SIMD kernels, same level dependency via
+// implicit barriers — must produce bit-identical results.
+//
+// This test is what gates Sprint 3 from drifting parity-wise. If the
+// candidate ever diverges from the baseline on these fixtures, the most
+// likely cause is a missed barrier or a per-thread state leak between
+// levels.
+// ----------------------------------------------------------------------------
+
+static void test_parity_persistent_omp_toggle() {
+    auto& eval = get_evaluator();
+    eval.initialize();
+    cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+
+    auto make_cfg = [](bool persistent) {
+        SolverConfig sc;
+        sc.pot = 100.0f;
+        sc.effective_stack = 500.0f;
+        sc.board_size = 3;
+        auto board = parse_board("AsKd2c");
+        for (size_t i = 0; i < 3; ++i) sc.board[i] = board[i];
+        sc.max_iterations = 60;
+        sc.target_exploitability = 0.0f;
+        sc.exploitability_check_interval = 1000;
+        sc.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
+        sc.cpu_threads = 4;        // multi-thread to actually exercise the diff
+        sc.cpu_persistent_omp = persistent;
+        return sc;
+    };
+
+    Solver s_off(make_cfg(false));
+    auto r_off = s_off.solve();
+    auto akh_off = s_off.analyze_combo("AhKh");
+
+    Solver s_on(make_cfg(true));
+    auto r_on = s_on.solve();
+    auto akh_on = s_on.analyze_combo("AhKh");
+
+    std::cout << "  persistent=off  exploit=" << r_off.exploitability_pct
+              << "%  AhKh ev=" << akh_off.ev << "\n";
+    std::cout << "  persistent=on   exploit=" << r_on.exploitability_pct
+              << "%  AhKh ev=" << akh_on.ev << "\n";
+
+    assert_near(akh_off.ev, akh_on.ev, 0.05f,
+                "persistent_omp toggle: AhKh EV must match within 0.05 chip");
+
+    auto m_off = strategy_map(r_off.global_strategy);
+    auto m_on  = strategy_map(r_on.global_strategy);
+    assert_strategy_close(m_off, m_on, 0.5f, "persistent_omp 0 vs 1");
+}
+
+// ----------------------------------------------------------------------------
 // Main
 // ----------------------------------------------------------------------------
 
@@ -268,6 +441,9 @@ int main(int /*argc*/, char* /*argv*/[]) {
     RUN_TEST(test_parity_reference_vs_levelized);
     RUN_TEST(test_parity_scalar_vs_avx2);
     RUN_TEST(test_parity_levelized_thread_cap);
+    RUN_TEST(test_parity_river_no_chance);
+    RUN_TEST(test_parity_flop_limited_sizing);
+    RUN_TEST(test_parity_persistent_omp_toggle);
 
     std::cout << "=== " << g_tests_passed << " / " << g_tests_run
               << " tests passed ===\n";

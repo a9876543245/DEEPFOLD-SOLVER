@@ -122,6 +122,23 @@ private:
     std::vector<float> inv_pos_sum_scratch_;
     std::vector<float> uniform_or_zero_scratch_;
 
+    // v1.8.0 P2-5: per-thread scratch for evaluate_terminal()'s `opp_reach × weight`
+    // pre-computation. Layout: [thread_id × nc, thread_id × nc + nc).
+    // Sized to cpu_threads_effective_ × nc in prepare() so the OMP parallel-for
+    // inside backward_pass() can call evaluate_terminal() without each call
+    // heap-allocating a fresh nc-wide vector. On a 549-node tree there are
+    // ~270 terminals × 2 traversers = ~540 mallocs/iter under the old code;
+    // this lifts that into a single prepare()-time allocation.
+    std::vector<float> terminal_opp_reach_w_;
+    inline float* terminal_scratch_for_thread(int tid) {
+        const uint32_t cap = cpu_threads_effective_;
+        const uint32_t safe_tid =
+            (tid < 0 || static_cast<uint32_t>(tid) >= cap) ? 0u
+                                                           : static_cast<uint32_t>(tid);
+        return terminal_opp_reach_w_.data()
+             + static_cast<std::size_t>(safe_tid) * ctx_.iso->num_canonical;
+    }
+
     // ---- Internal methods ----
     void compute_strategy();
     void apply_dcfr_discount(int iteration);
@@ -248,6 +265,13 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     inv_pos_sum_scratch_.assign(nc, 0.0f);
     uniform_or_zero_scratch_.assign(nc, 0.0f);
 
+    // v1.8.0 P2-5: pre-allocate the terminal scratch so the inner OMP loop
+    // doesn't heap-allocate per terminal visit. cpu_threads_effective_ is
+    // already resolved earlier in prepare(). Total = threads × nc floats —
+    // tiny next to reach_oop_/reach_ip_/value_ which are N × nc each.
+    terminal_opp_reach_w_.assign(
+        static_cast<std::size_t>(cpu_threads_effective_) * nc, 0.0f);
+
     build_level_schedule();
 }
 
@@ -256,6 +280,16 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
 // re-implemented here so the two backends are independent.
 // ============================================================================
 
+// Note (v1.8.0 Sprint 2): the no-precision-loss guide proposed
+// parallelizing this function across player nodes via per-thread scratch.
+// Implemented + measured + reverted because both the parallel and serial
+// variants of the new structure regressed standard-benchmark 8T
+// throughput by ~10-15%, past the doc's >5% stop condition. Theory: 216
+// player nodes × ~6µs serial work = ~1.3ms / call; OMP team setup on
+// MSVC is comparable, and the bigger per-thread scratch (8nc × 3 buffers
+// = 113KB) appears to perturb heap layout enough that even the serial
+// path slows. Sprint 3's persistent-team refactor is the right
+// structural fix; revisit parallelization here once that lands.
 inline void LevelizedCpuBackend::compute_strategy() {
     const uint16_t nc = ctx_.iso->num_canonical;
     const auto& resolved_locks = *ctx_.resolved_locks;
@@ -360,8 +394,16 @@ inline void LevelizedCpuBackend::evaluate_terminal(
     const float* matchup_ev    = matchup_ev_table.data();
     const float* matchup_valid = matchup_valid_table.data();
 
-    // opp_reach × canonical_weight, computed once.
-    std::vector<float> opp_reach_w(nc);
+    // opp_reach × canonical_weight, computed once into thread-local scratch.
+    // The pre-v1.8.0 code allocated a fresh `std::vector<float>(nc)` here on
+    // every terminal visit — under OMP that's hundreds of mallocs per iter
+    // contending on the heap allocator. Now we slot into a fixed buffer
+    // sized to cpu_threads_effective_ × nc in prepare().
+    int tid = 0;
+#ifdef _OPENMP
+    tid = omp_get_thread_num();
+#endif
+    float* opp_reach_w = terminal_scratch_for_thread(tid);
     const float* opp_reach = (traverser == 0)
         ? &reach_ip_[row_off(node_idx)]
         : &reach_oop_[row_off(node_idx)];
@@ -370,25 +412,17 @@ inline void LevelizedCpuBackend::evaluate_terminal(
     }
 
     if (tt == TerminalType::SHOWDOWN) {
+        // v1.8.0 P3-8 spike: full-matrix kernels fold the per-c outer loop
+        // into the kernel itself, hoisting SIMD constants out of the hot
+        // path and saving nc dispatch-table lookups per terminal call.
         if (traverser == 0) {
-            for (uint16_t c = 0; c < nc; ++c) {
-                const float* ev_row    = matchup_ev    + static_cast<std::size_t>(c) * nc;
-                const float* valid_row = matchup_valid + static_cast<std::size_t>(c) * nc;
-                out[c] = cpu_simd::showdown_oop_inner(
-                    ev_row, valid_row, opp_reach_w.data(),
-                    win_payoff, lose_payoff, tie_payoff, nc);
-            }
+            cpu_simd::showdown_oop_full(
+                matchup_ev, matchup_valid, opp_reach_w, out, nc,
+                win_payoff, lose_payoff, tie_payoff);
         } else {
-            cpu_simd::vec_set_zero(out, nc);
-            for (uint16_t ci = 0; ci < nc; ++ci) {
-                float rw_ci = opp_reach_w[ci];
-                if (rw_ci == 0.0f) continue;
-                const float* ev_row    = matchup_ev    + static_cast<std::size_t>(ci) * nc;
-                const float* valid_row = matchup_valid + static_cast<std::size_t>(ci) * nc;
-                cpu_simd::showdown_ip_step(
-                    out, ev_row, valid_row, rw_ci,
-                    win_payoff, lose_payoff, tie_payoff, nc);
-            }
+            cpu_simd::showdown_ip_full(
+                matchup_ev, matchup_valid, opp_reach_w, out, nc,
+                win_payoff, lose_payoff, tie_payoff);
         }
     } else {
         // Fold terminal — asymmetric pot fix from CpuBackend.
@@ -412,7 +446,7 @@ inline void LevelizedCpuBackend::evaluate_terminal(
                 const float* valid_row =
                     matchup_valid + static_cast<std::size_t>(c) * nc;
                 float opp_total =
-                    cpu_simd::dot_valid_reach(valid_row, opp_reach_w.data(), nc);
+                    cpu_simd::dot_valid_reach(valid_row, opp_reach_w, nc);
                 out[c] = self_payoff * opp_total;
             }
         } else {
@@ -455,9 +489,119 @@ inline void LevelizedCpuBackend::forward_pass(int iteration) {
     const bool decay_and_add = (ctx_.config->dcfr_schedule ==
                                 SolverConfig::DcfrSchedule::POSTFLOP_STYLE);
 
-    // Walk levels from root down to the level just above terminals (level 1).
-    // Level 0 contains terminals — no reach propagation from there.
+    // Level 0 contains terminals — no reach propagation from there. Walk
+    // levels root → leaves (decreasing depth, level 1 inclusive).
     if (num_levels_ <= 1) return;
+
+    // Per-node body, shared by both OMP variants. Captures by reference so
+    // the inner SIMD-kernel calls can stay on hot paths; MSVC inlines this
+    // through the lambda for both call sites in measurement.
+    auto process_node = [&](uint32_t n) {
+        auto nt = static_cast<NodeType>(tree.node_types[n]);
+        if (nt == NodeType::TERMINAL) return;
+
+        const float* parent_oop = &reach_oop_[row_off(n)];
+        const float* parent_ip  = &reach_ip_[row_off(n)];
+
+        if (nt == NodeType::CHANCE) {
+            // Reach passes through chance unchanged; EV averaging happens
+            // on the backward pass.
+            uint8_t nch = tree.num_children[n];
+            uint32_t off = tree.children_offset[n];
+            for (uint8_t k = 0; k < nch; ++k) {
+                uint32_t child = tree.children[off + k];
+                std::memcpy(&reach_oop_[row_off(child)], parent_oop, sizeof(float) * nc);
+                std::memcpy(&reach_ip_[row_off(child)],  parent_ip,  sizeof(float) * nc);
+            }
+            return;
+        }
+
+        // PLAYER_OOP / PLAYER_IP
+        int acting = tree.active_player[n];
+        uint8_t na = tree.num_children[n];
+        if (na == 0) return;
+        const auto& strat = current_strategy_[n];
+
+        // Strategy_sum update at this node — uses reach of the ACTING
+        // player. Reference backend does this only at acting==traverser
+        // nodes, but since we run a backward pass per traverser and
+        // strategy_sum entries are disjoint per acting player, doing it
+        // once during the shared forward pass is equivalent and saves a
+        // pass.
+        const float* acting_reach = (acting == 0) ? parent_oop : parent_ip;
+        if (decay_and_add) {
+            for (uint8_t a = 0; a < na; ++a) {
+                cpu_simd::vec_decay_add(
+                    strategy_sum_[n].data() + static_cast<std::size_t>(a) * nc,
+                    sw,
+                    strat.data() + static_cast<std::size_t>(a) * nc,
+                    nc);
+            }
+        } else {
+            for (uint8_t a = 0; a < na; ++a) {
+                cpu_simd::vec_reach_weighted_strat_sum(
+                    strategy_sum_[n].data() + static_cast<std::size_t>(a) * nc,
+                    sw,
+                    acting_reach,
+                    strat.data() + static_cast<std::size_t>(a) * nc,
+                    nc);
+            }
+        }
+
+        // Reach propagation to children.
+        //   Child's acting-player-reach = parent's acting reach × strat[a]
+        //   Child's other reach         = parent's other reach (unchanged)
+        uint32_t off = tree.children_offset[n];
+        for (uint8_t a = 0; a < na; ++a) {
+            uint32_t child = tree.children[off + a];
+            float* child_oop = &reach_oop_[row_off(child)];
+            float* child_ip  = &reach_ip_[row_off(child)];
+            if (acting == 0) {
+                for (uint16_t c = 0; c < nc; ++c) {
+                    child_oop[c] = parent_oop[c] *
+                        strat[static_cast<std::size_t>(a) * nc + c];
+                }
+                std::memcpy(child_ip, parent_ip, sizeof(float) * nc);
+            } else {
+                for (uint16_t c = 0; c < nc; ++c) {
+                    child_ip[c] = parent_ip[c] *
+                        strat[static_cast<std::size_t>(a) * nc + c];
+                }
+                std::memcpy(child_oop, parent_oop, sizeof(float) * nc);
+            }
+        }
+    };
+
+#if defined(_OPENMP)
+    // v1.8.0 Sprint 3 (gated): persistent OMP team variant. Single fork
+    // wraps the level loop; `omp for` distributes nodes within each
+    // level. Implicit barrier at end of each `omp for` keeps the
+    // parent-before-child invariant intact (no `nowait`). Saves K-1
+    // team creations per pass (K = num_levels) on big trees where the
+    // per-level fork overhead measurably hurts scaling.
+    if (ctx_.config != nullptr && ctx_.config->cpu_persistent_omp
+        && cpu_threads_effective_ > 1) {
+        #pragma omp parallel num_threads(static_cast<int>(cpu_threads_effective_))
+        {
+            for (int64_t L = static_cast<int64_t>(num_levels_) - 1; L >= 1; --L) {
+                const uint32_t lo = level_offsets_[L];
+                const uint32_t hi = level_offsets_[L + 1];
+                #pragma omp for schedule(dynamic, 8)
+                for (int64_t idx = static_cast<int64_t>(lo);
+                     idx < static_cast<int64_t>(hi); ++idx)
+                {
+                    process_node(node_order_[static_cast<std::size_t>(idx)]);
+                }
+                // implicit barrier here is required for level dependency
+            }
+        }
+        return;
+    }
+#endif
+
+    // Default: per-level parallel-for fork. Same shape as v1.5.0 — kept
+    // as the safe baseline until persistent-team variant has clean
+    // paired-benchmark evidence.
     for (int64_t L = static_cast<int64_t>(num_levels_) - 1; L >= 1; --L) {
         const uint32_t lo = level_offsets_[L];
         const uint32_t hi = level_offsets_[L + 1];
@@ -468,83 +612,7 @@ inline void LevelizedCpuBackend::forward_pass(int iteration) {
         for (int64_t idx = static_cast<int64_t>(lo);
              idx < static_cast<int64_t>(hi); ++idx)
         {
-            uint32_t n = node_order_[static_cast<std::size_t>(idx)];
-            auto nt = static_cast<NodeType>(tree.node_types[n]);
-            if (nt == NodeType::TERMINAL) continue;
-
-            const float* parent_oop = &reach_oop_[row_off(n)];
-            const float* parent_ip  = &reach_ip_[row_off(n)];
-
-            if (nt == NodeType::CHANCE) {
-                // Reach passes through chance nodes unchanged. The expected
-                // value over chance is handled at the BACKWARD pass via
-                // weighted child averaging.
-                uint8_t nch = tree.num_children[n];
-                uint32_t off = tree.children_offset[n];
-                for (uint8_t k = 0; k < nch; ++k) {
-                    uint32_t child = tree.children[off + k];
-                    std::memcpy(&reach_oop_[row_off(child)], parent_oop, sizeof(float) * nc);
-                    std::memcpy(&reach_ip_[row_off(child)],  parent_ip,  sizeof(float) * nc);
-                }
-                continue;
-            }
-
-            // PLAYER_OOP / PLAYER_IP
-            int acting = tree.active_player[n];
-            uint8_t na = tree.num_children[n];
-            if (na == 0) continue;
-            const auto& strat = current_strategy_[n];
-
-            // Strategy_sum update at this node — uses reach of the ACTING
-            // player. Reference backend does this only at acting==traverser
-            // nodes, but since we run a backward pass per traverser and
-            // strategy_sum entries are disjoint per acting player, doing it
-            // once during the shared forward pass is equivalent and saves a
-            // pass.
-            const float* acting_reach = (acting == 0) ? parent_oop : parent_ip;
-            if (decay_and_add) {
-                for (uint8_t a = 0; a < na; ++a) {
-                    cpu_simd::vec_decay_add(
-                        strategy_sum_[n].data() + static_cast<std::size_t>(a) * nc,
-                        sw,
-                        strat.data() + static_cast<std::size_t>(a) * nc,
-                        nc);
-                }
-            } else {
-                for (uint8_t a = 0; a < na; ++a) {
-                    cpu_simd::vec_reach_weighted_strat_sum(
-                        strategy_sum_[n].data() + static_cast<std::size_t>(a) * nc,
-                        sw,
-                        acting_reach,
-                        strat.data() + static_cast<std::size_t>(a) * nc,
-                        nc);
-                }
-            }
-
-            // Reach propagation to children.
-            //   Child's acting-player-reach = parent's acting reach × strat[a]
-            //   Child's other reach         = parent's other reach (unchanged)
-            uint32_t off = tree.children_offset[n];
-            for (uint8_t a = 0; a < na; ++a) {
-                uint32_t child = tree.children[off + a];
-                float* child_oop = &reach_oop_[row_off(child)];
-                float* child_ip  = &reach_ip_[row_off(child)];
-                if (acting == 0) {
-                    // Acting OOP: scale OOP by strat[a], copy IP straight.
-                    for (uint16_t c = 0; c < nc; ++c) {
-                        child_oop[c] = parent_oop[c] *
-                            strat[static_cast<std::size_t>(a) * nc + c];
-                    }
-                    std::memcpy(child_ip, parent_ip, sizeof(float) * nc);
-                } else {
-                    // Acting IP.
-                    for (uint16_t c = 0; c < nc; ++c) {
-                        child_ip[c] = parent_ip[c] *
-                            strat[static_cast<std::size_t>(a) * nc + c];
-                    }
-                    std::memcpy(child_oop, parent_oop, sizeof(float) * nc);
-                }
-            }
+            process_node(node_order_[static_cast<std::size_t>(idx)]);
         }
     }
 }
@@ -559,6 +627,113 @@ inline void LevelizedCpuBackend::backward_pass(int traverser) {
     const uint32_t N = tree.total_nodes;
     if (N == 0) return;
 
+    // Per-node body, shared by both OMP variants. See forward_pass for
+    // why this lambda pattern preserves both correctness (read-only
+    // captures + per-node disjoint writes) and codegen (MSVC inlines).
+    auto process_node = [&](uint32_t n) {
+        auto nt = static_cast<NodeType>(tree.node_types[n]);
+        float* out = &value_[row_off(n)];
+
+        if (nt == NodeType::TERMINAL) {
+            evaluate_terminal(n, traverser, out);
+            return;
+        }
+
+        if (nt == NodeType::CHANCE) {
+            uint8_t nch = tree.num_children[n];
+            if (nch == 0) {
+                cpu_simd::vec_set_zero(out, nc);
+                return;
+            }
+            cpu_simd::vec_set_zero(out, nc);
+            uint32_t total_weight = 0;
+            uint32_t off = tree.children_offset[n];
+            for (uint8_t k = 0; k < nch; ++k) {
+                uint32_t child = tree.children[off + k];
+                uint32_t weight = (child < tree.runout_weight.size())
+                                    ? tree.runout_weight[child] : 1;
+                if (weight == 0) weight = 1;
+                cpu_simd::vec_axpy(
+                    out, static_cast<float>(weight),
+                    &value_[row_off(child)], nc);
+                total_weight += weight;
+            }
+            if (total_weight > 0) {
+                cpu_simd::vec_scale_in_place(
+                    out, 1.0f / static_cast<float>(total_weight), nc);
+            }
+            return;
+        }
+
+        // Player decision node.
+        int acting = tree.active_player[n];
+        uint8_t na = tree.num_children[n];
+        if (na == 0) {
+            cpu_simd::vec_set_zero(out, nc);
+            return;
+        }
+        const auto& strat = current_strategy_[n];
+        uint32_t off = tree.children_offset[n];
+
+        if (acting == traverser) {
+            // node_val = Σ_a strat[a] · child_val[a]
+            cpu_simd::vec_set_zero(out, nc);
+            for (uint8_t a = 0; a < na; ++a) {
+                uint32_t child = tree.children[off + a];
+                cpu_simd::vec_fmadd(
+                    out,
+                    strat.data() + static_cast<std::size_t>(a) * nc,
+                    &value_[row_off(child)],
+                    nc);
+            }
+            // regret[a, c] += child_val[a, c] − node_val[c]
+            for (uint8_t a = 0; a < na; ++a) {
+                uint32_t child = tree.children[off + a];
+                cpu_simd::vec_regret_update(
+                    regrets_[n].data() + static_cast<std::size_t>(a) * nc,
+                    &value_[row_off(child)],
+                    out,
+                    nc);
+            }
+        } else {
+            // Opp node: opp's strat is already baked into reach by the
+            // forward pass, so just sum the children's values.
+            cpu_simd::vec_set_zero(out, nc);
+            for (uint8_t a = 0; a < na; ++a) {
+                uint32_t child = tree.children[off + a];
+                cpu_simd::vec_add_in_place(
+                    out, &value_[row_off(child)], nc);
+            }
+        }
+    };
+
+#if defined(_OPENMP)
+    // v1.8.0 Sprint 3 (gated): persistent OMP team variant. Same
+    // structural argument as forward_pass — single fork wraps the
+    // level loop, implicit barrier between `omp for` iterations
+    // preserves the child-before-parent dependency that the backward
+    // pass relies on (parent reads child `value_[row_off(child)]`).
+    if (ctx_.config != nullptr && ctx_.config->cpu_persistent_omp
+        && cpu_threads_effective_ > 1) {
+        #pragma omp parallel num_threads(static_cast<int>(cpu_threads_effective_))
+        {
+            for (uint32_t L = 0; L < num_levels_; ++L) {
+                const uint32_t lo = level_offsets_[L];
+                const uint32_t hi = level_offsets_[L + 1];
+                #pragma omp for schedule(dynamic, 8)
+                for (int64_t idx = static_cast<int64_t>(lo);
+                     idx < static_cast<int64_t>(hi); ++idx)
+                {
+                    process_node(node_order_[static_cast<std::size_t>(idx)]);
+                }
+                // implicit barrier here is required for level dependency
+            }
+        }
+        return;
+    }
+#endif
+
+    // Default: per-level parallel-for fork.
     for (uint32_t L = 0; L < num_levels_; ++L) {
         const uint32_t lo = level_offsets_[L];
         const uint32_t hi = level_offsets_[L + 1];
@@ -569,81 +744,7 @@ inline void LevelizedCpuBackend::backward_pass(int traverser) {
         for (int64_t idx = static_cast<int64_t>(lo);
              idx < static_cast<int64_t>(hi); ++idx)
         {
-            uint32_t n = node_order_[static_cast<std::size_t>(idx)];
-            auto nt = static_cast<NodeType>(tree.node_types[n]);
-            float* out = &value_[row_off(n)];
-
-            if (nt == NodeType::TERMINAL) {
-                evaluate_terminal(n, traverser, out);
-                continue;
-            }
-
-            if (nt == NodeType::CHANCE) {
-                uint8_t nch = tree.num_children[n];
-                if (nch == 0) {
-                    cpu_simd::vec_set_zero(out, nc);
-                    continue;
-                }
-                cpu_simd::vec_set_zero(out, nc);
-                uint32_t total_weight = 0;
-                uint32_t off = tree.children_offset[n];
-                for (uint8_t k = 0; k < nch; ++k) {
-                    uint32_t child = tree.children[off + k];
-                    uint32_t weight = (child < tree.runout_weight.size())
-                                        ? tree.runout_weight[child] : 1;
-                    if (weight == 0) weight = 1;
-                    cpu_simd::vec_axpy(
-                        out, static_cast<float>(weight),
-                        &value_[row_off(child)], nc);
-                    total_weight += weight;
-                }
-                if (total_weight > 0) {
-                    cpu_simd::vec_scale_in_place(
-                        out, 1.0f / static_cast<float>(total_weight), nc);
-                }
-                continue;
-            }
-
-            // Player decision node.
-            int acting = tree.active_player[n];
-            uint8_t na = tree.num_children[n];
-            if (na == 0) {
-                cpu_simd::vec_set_zero(out, nc);
-                continue;
-            }
-            const auto& strat = current_strategy_[n];
-            uint32_t off = tree.children_offset[n];
-
-            if (acting == traverser) {
-                // node_val = Σ_a strat[a] · child_val[a]
-                cpu_simd::vec_set_zero(out, nc);
-                for (uint8_t a = 0; a < na; ++a) {
-                    uint32_t child = tree.children[off + a];
-                    cpu_simd::vec_fmadd(
-                        out,
-                        strat.data() + static_cast<std::size_t>(a) * nc,
-                        &value_[row_off(child)],
-                        nc);
-                }
-                // regret[a, c] += child_val[a, c] − node_val[c]
-                for (uint8_t a = 0; a < na; ++a) {
-                    uint32_t child = tree.children[off + a];
-                    cpu_simd::vec_regret_update(
-                        regrets_[n].data() + static_cast<std::size_t>(a) * nc,
-                        &value_[row_off(child)],
-                        out,
-                        nc);
-                }
-            } else {
-                // Opp node: opp's strat is already baked into reach by the
-                // forward pass, so just sum the children's values.
-                cpu_simd::vec_set_zero(out, nc);
-                for (uint8_t a = 0; a < na; ++a) {
-                    uint32_t child = tree.children[off + a];
-                    cpu_simd::vec_add_in_place(
-                        out, &value_[row_off(child)], nc);
-                }
-            }
+            process_node(node_order_[static_cast<std::size_t>(idx)]);
         }
     }
 }

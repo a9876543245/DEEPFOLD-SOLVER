@@ -92,17 +92,25 @@ struct CLIArgs {
     float rake_rate = 0.0f;
     float rake_cap  = 0.0f;
 
-    // v1.4.0 Phase 2: CPU SIMD policy + thread count overrides.
+    // CPU SIMD policy + thread count overrides.
     //   --cpu-simd auto|scalar|avx2  default auto (CPUID picks)
-    //   --cpu-threads N              default 0 (auto, capped at 2 for now until
-    //                                levelized backend lands in Phase 4)
+    //   --cpu-threads N              default 0 (auto = hardware concurrency for
+    //                                levelized backend; reference still caps at 2)
     std::string cpu_simd = "auto";
     uint32_t cpu_threads = 0;
 
     // v1.5.0 Phase 4: CPU CFR backend variant.
-    //   reference (default) — recursive scratch-arena CpuBackend
-    //   levelized           — BFS-flat traversal, scales past 2 threads
-    std::string cpu_backend_kind = "reference";
+    //   levelized (default, v1.8.0+) — BFS-flat traversal, scales past 2 threads
+    //   reference                    — recursive scratch-arena CpuBackend
+    //                                  kept as parity oracle / debug escape hatch
+    std::string cpu_backend_kind = "levelized";
+
+    // v1.8.0 Sprint 3 (gated): opt-in persistent OpenMP team for the
+    // levelized backend's forward / backward passes. Default 0 = the safe
+    // per-level parallel-region path. Flip to 1 to use a single team per
+    // pass with `omp for` distributing each level. Wired via SolverConfig
+    // so paired benchmark mode can A/B it cleanly.
+    int cpu_persistent_omp = 0;
 
     // Sprint 1 (market-beating plan): per-solve memory budget overrides.
     // Default 0 = use the SolverConfig defaults (6 GB host, 100 MB JSON,
@@ -116,6 +124,19 @@ struct CLIArgs {
     // Tree construction flags (expose SolverConfig defaults)
     int  oop_has_initiative = 1;     // 0/1 (default 1: OOP can bet at root)
     int  allow_donk_bet     = 0;     // 0/1 (adds an extra small donk size when OOP has no initiative)
+
+    // v1.8.0 paired benchmark mode (`--benchmark paired`):
+    //   --benchmark-case standard | monotone   (which fixture)
+    //   --runs N                                (paired N-of-each, BCBC...)
+    //   --benchmark-threads N                   (cpu_threads override; 0=auto)
+    std::string benchmark_case = "standard";
+    int benchmark_runs = 3;
+    int benchmark_threads_override = -1;   // -1 = use args.cpu_threads / 0=auto
+
+    // v1.8.0 P3-9 — `--benchmark matrix --include-scalar` adds scalar-SIMD
+    // rows (otherwise we only emit the AVX2 ones since shipping binaries
+    // pick AVX2 by default).
+    int  include_scalar = 0;
 };
 
 CLIArgs parse_args(int argc, char* argv[]) {
@@ -237,6 +258,17 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.cpu_threads = static_cast<uint32_t>(std::max(0, v));
         } else if (arg == "--cpu-backend" && i + 1 < argc) {
             args.cpu_backend_kind = argv[++i];
+        } else if (arg == "--cpu-persistent-omp" && i + 1 < argc) {
+            std::string v = argv[++i];
+            args.cpu_persistent_omp = (v == "1" || v == "true" || v == "True") ? 1 : 0;
+        } else if (arg == "--include-scalar") {
+            args.include_scalar = 1;
+        } else if (arg == "--benchmark-case" && i + 1 < argc) {
+            args.benchmark_case = argv[++i];
+        } else if (arg == "--runs" && i + 1 < argc) {
+            args.benchmark_runs = std::max(1, std::stoi(argv[++i]));
+        } else if (arg == "--benchmark-threads" && i + 1 < argc) {
+            args.benchmark_threads_override = std::max(0, std::stoi(argv[++i]));
         }
     }
 
@@ -274,7 +306,11 @@ Arguments:
   --no-strategy-tree-evs   Keep strategy tree but omit per-node EV cache
   --gpu-info               Print detected GPU info and exit
   --benchmark <preset>     Run a fixed scenario for perf tracking, emit benchmark JSON.
-                           Presets: standard (AsKd7c rainbow, full ranges, 100 iter)
+                           Presets:
+                             standard — AsKd7c rainbow, full ranges, 100 iter
+                             matrix   — sweep (scenario × backend × threads),
+                                        emits aggregated JSON. Add --include-scalar
+                                        to also benchmark scalar-SIMD variants.
   --estimate-only          Build tree + estimate solve time/memory, emit JSON, exit.
                            Skips precompute_matchups + iterations. Sub-second on most
                            spots — used by the UI to show ETA before committing.
@@ -284,13 +320,21 @@ Arguments:
   --cpu-simd <mode>        SIMD mode for CPU CFR kernels: auto | scalar | avx2.
                            auto (default) picks AVX2 when CPUID + OS support it,
                            else scalar. Use "scalar" for parity tests / debugging.
-  --cpu-threads <int>      CPU CFR thread count. 0 = auto. Currently capped at 2
-                           (the OOP/IP traverser parallelism). Use 1 to force
-                           serial traversal. Higher values become useful in v1.5+.
-  --cpu-backend <kind>     CPU CFR variant: reference | levelized.
-                           reference (default): recursive scratch-arena.
-                           levelized: BFS-flat traversal, scales to all cores
-                           via per-level OMP. Pick this when you have 4+ cores.
+  --cpu-threads <int>      CPU CFR thread count. 0 = auto (hardware concurrency
+                           for levelized; capped at 2 for reference, the only
+                           limit the recursive backend can use). Use 1 to force
+                           serial. Larger values are honored on levelized via
+                           num_threads(...) on each parallel-for.
+  --cpu-backend <kind>     CPU CFR variant: levelized | reference.
+                           levelized (default, v1.8.0+): BFS-flat traversal,
+                             scales linearly to physical cores; production CPU.
+                           reference: recursive scratch-arena; kept as parity
+                             oracle and CLI-only debug escape hatch.
+  --cpu-persistent-omp <0|1>
+                           Levelized only. Wraps forward_pass / backward_pass in
+                           a single `omp parallel` region per pass instead of
+                           one per level. Default 0; opt in for big trees where
+                           per-level team-creation overhead is significant.
   --help, -h               Show this help message
 
 Output:
@@ -713,6 +757,350 @@ std::string result_to_json(
 }
 
 // ============================================================================
+// v1.8.0 P3-9: --benchmark matrix
+//
+// Sweeps a fixed cross-product of (scenario × backend × simd × threads) and
+// emits one consolidated JSON document with throughput/timing metrics per
+// row. Goal is regression detection — "v1.8 was 137 iter/s on AsKd7c
+// levelized 8T, v1.9 is 142, that's a 4% gain we can ship" — without
+// repeatedly re-running the single-solve binary by hand.
+//
+// Design choices:
+//   * Single binary, single process: a Python wrapper that calls
+//     deepsolver_core 60 times pays ~50ms × 60 = 3s of process overhead and
+//     re-builds the tree every time. Doing it in-process amortizes the
+//     setup cost when iter counts are small.
+//   * Skip turn / river by default: those scenarios add 30-60s each and
+//     mostly characterize the same kernels as flop spots. Add a flag if the
+//     caller wants them.
+//   * Force CPU backend only: GPU benchmarks are a separate question (need
+//     to enumerate the device, handle missing CUDA gracefully).
+//   * Fresh Solver per row: Solver doesn't expose a `reset()` and resetting
+//     SIMD policy mid-process is supported by cpu_simd::set_policy. Tree
+//     build is fast (<10ms on flop, <100ms on monotone iso-engaged).
+// ============================================================================
+
+namespace {
+
+struct MatrixScenario {
+    const char* name;
+    const char* board;
+    int iterations;     // small enough to keep the whole matrix under ~3 min
+};
+
+struct MatrixConfig {
+    const char* backend;   // "reference" or "levelized"
+    const char* simd;      // "scalar" or "avx2"
+    uint32_t threads;
+};
+
+void run_benchmark_matrix(std::ostream& out, bool include_scalar) {
+    // (deepsolver:: is already brought in by the file-level `using namespace
+    // deepsolver` at the top of this TU.)
+
+    // Scenarios chosen to cover the dominant code paths:
+    //   rainbow_flop: hits the no-iso fast path (matchup table per runout = 1)
+    //   two_tone_flop: 2 chance-suit symmetries collapse → smaller iso
+    //   monotone_flop: most aggressive iso — heavy precompute, tiny trees
+    static const MatrixScenario kScenarios[] = {
+        { "rainbow_flop",  "AsKd7c", 100 },
+        { "two_tone_flop", "AsKs7c",  60 },
+        { "monotone_flop", "AsKsQs",  20 },  // huge tree, fewer iters
+    };
+
+    // Configs cover the (backend × thread) cross-product. SIMD is "avx2" by
+    // default; --include-scalar adds scalar variants to validate the dispatch
+    // table on the same machine. Reference backend tops out at 2 threads
+    // (parallel-sections cap), so we don't bother running it at 4/8 — they
+    // produce the same throughput.
+    std::vector<MatrixConfig> configs = {
+        { "reference", "avx2", 1 },
+        { "reference", "avx2", 2 },
+        { "levelized", "avx2", 1 },
+        { "levelized", "avx2", 2 },
+        { "levelized", "avx2", 4 },
+        { "levelized", "avx2", 8 },
+    };
+    if (include_scalar) {
+        configs.push_back({ "reference", "scalar", 1 });
+        configs.push_back({ "reference", "scalar", 2 });
+        configs.push_back({ "levelized", "scalar", 1 });
+        configs.push_back({ "levelized", "scalar", 8 });
+    }
+
+    out << "{\n";
+    out << "  \"benchmark\": \"matrix\",\n";
+    out << "  \"hardware_concurrency\": "
+        << std::thread::hardware_concurrency() << ",\n";
+    out << "  \"results\": [\n";
+
+    bool first_row = true;
+    for (const auto& scen : kScenarios) {
+        for (const auto& cfg : configs) {
+            // Apply SIMD policy. Skip silently if the host can't service
+            // ForceAvx2 — the parity test already covers that case, and
+            // adding scalar fallback rows here would muddy the JSON.
+            if (std::string(cfg.simd) == "avx2") {
+                if (!cpu_simd::cpuid_supports_avx2_fma_os()) continue;
+                cpu_simd::set_policy(cpu_simd::SimdPolicy::ForceAvx2);
+            } else {
+                cpu_simd::set_policy(cpu_simd::SimdPolicy::ForceScalar);
+            }
+
+            // Build config for this row.
+            SolverConfig sc;
+            auto board = parse_board(scen.board);
+            sc.board_size = static_cast<uint8_t>(board.size());
+            for (size_t i = 0; i < board.size() && i < MAX_BOARD_CARDS; ++i) {
+                sc.board[i] = board[i];
+            }
+            sc.pot = 100.0f;
+            sc.effective_stack = 500.0f;
+            sc.max_iterations = scen.iterations;
+            sc.target_exploitability = 0.0f;        // run all iters
+            sc.exploitability_check_interval = 100000;  // disable interim checks
+            sc.cpu_threads = cfg.threads;
+            sc.cpu_backend_kind = (std::string(cfg.backend) == "levelized")
+                ? SolverConfig::CpuBackendKind::LEVELIZED
+                : SolverConfig::CpuBackendKind::REFERENCE;
+            // Skip strategy_tree + postsolve to isolate solve throughput.
+            sc.compute_combo_evs = false;
+            sc.compute_exploitability = false;
+            sc.parallel_postsolve = false;
+
+            Solver solver(sc, BackendType::CPU);
+            SolverResult res;
+            try {
+                res = solver.solve();
+            } catch (const std::exception& e) {
+                std::cerr << "matrix row failed: " << scen.name << " "
+                          << cfg.backend << " " << cfg.simd << " " << cfg.threads
+                          << ": " << e.what() << "\n";
+                continue;
+            }
+
+            const double iter_ms = res.timing.iterations_ms;
+            const double iter_per_sec = (iter_ms > 0.0)
+                ? (static_cast<double>(res.iterations_run) * 1000.0 / iter_ms)
+                : 0.0;
+            const double nodes_per_sec = iter_per_sec
+                * static_cast<double>(solver.tree_node_count());
+
+            if (!first_row) out << ",\n";
+            first_row = false;
+            out << std::fixed << std::setprecision(3);
+            out << "    {\n";
+            out << "      \"scenario\": \""           << scen.name  << "\",\n";
+            out << "      \"board\": \""              << scen.board << "\",\n";
+            out << "      \"backend\": \""            << cfg.backend << "\",\n";
+            out << "      \"simd\": \""               << cfg.simd << "\",\n";
+            out << "      \"threads_requested\": "    << cfg.threads << ",\n";
+            out << "      \"threads_effective\": "
+                << res.resources.cpu_threads_effective << ",\n";
+            out << "      \"iterations\": "           << res.iterations_run << ",\n";
+            out << "      \"tree_nodes\": "           << solver.tree_node_count() << ",\n";
+            out << "      \"matchup_tables\": "       << res.timing.matchup_tables << ",\n";
+            out << "      \"timing_ms\": {\n";
+            out << "        \"tree_build\": "         << res.timing.tree_build_ms << ",\n";
+            out << "        \"precompute_matchups\": " << res.timing.precompute_matchups_ms << ",\n";
+            out << "        \"backend_prepare\": "    << res.timing.backend_prepare_ms << ",\n";
+            out << "        \"iterations\": "         << res.timing.iterations_ms << ",\n";
+            out << "        \"total\": "              << res.timing.total_ms << "\n";
+            out << "      },\n";
+            out << "      \"iterations_per_sec\": "   << iter_per_sec << ",\n";
+            out << "      \"nodes_per_sec\": "        << nodes_per_sec << ",\n";
+            out << "      \"memory_estimate_mb\": "
+                << (res.resources.estimated_cpu_state_bytes / (1024.0 * 1024.0)) << "\n";
+            out << "    }";
+        }
+    }
+
+    out << "\n  ]\n";
+    out << "}\n";
+
+    // Reset policy for any subsequent code paths.
+    cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+}
+
+}  // anonymous namespace (matrix)
+
+// ============================================================================
+// v1.8.0 paired benchmark
+//
+// Runs `baseline` and `candidate` solves in alternating order so thermal
+// drift hits both labels equally instead of stacking on whichever gets
+// run last. Reports best/median per label and the candidate/baseline
+// ratio. Designed for comparing one boolean knob at a time (currently
+// `cpu_persistent_omp` 0 vs 1) on the same fixture × thread count.
+//
+// Why alternation matters on a laptop:
+//   The matrix benchmark runs 18 configs sequentially over 2-3 minutes
+//   on a thermally-constrained laptop. CPU base clock can drop 15-20%
+//   over that window, so the LAST config measured has lower
+//   throughput regardless of code quality. A fixed-order baseline-then-
+//   candidate run hands the candidate a "hot CPU" handicap that swamps
+//   any 5% real difference. Alternating BCBC... interleaves them so
+//   any monotonic thermal trend cancels in the ratio.
+// ============================================================================
+
+namespace {
+
+struct PairedScenario {
+    const char* name;
+    const char* board;
+    int iterations;
+};
+
+static const PairedScenario* lookup_paired_case(const std::string& name) {
+    static const PairedScenario kStandard = { "standard", "AsKd7c", 100 };
+    static const PairedScenario kMonotone = { "monotone", "AsKsQs",  20 };
+    if (name == "standard") return &kStandard;
+    if (name == "monotone") return &kMonotone;
+    return nullptr;
+}
+
+// Run one solve with the requested config, return iter/s.
+struct PairedRun {
+    double iter_per_sec;
+    double iterations_ms;
+    double total_ms;
+    int iterations_run;
+};
+static PairedRun run_one_paired(const PairedScenario& scen,
+                                  uint32_t threads,
+                                  bool persistent_omp)
+{
+    using namespace deepsolver;
+    SolverConfig sc;
+    auto board = parse_board(scen.board);
+    sc.board_size = static_cast<uint8_t>(board.size());
+    for (size_t i = 0; i < board.size() && i < MAX_BOARD_CARDS; ++i) {
+        sc.board[i] = board[i];
+    }
+    sc.pot = 100.0f;
+    sc.effective_stack = 500.0f;
+    sc.max_iterations = scen.iterations;
+    sc.target_exploitability = 0.0f;
+    sc.exploitability_check_interval = 100000;
+    sc.cpu_threads = threads;
+    sc.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
+    sc.cpu_persistent_omp = persistent_omp;
+    sc.compute_combo_evs = false;
+    sc.compute_exploitability = false;
+    sc.parallel_postsolve = false;
+
+    Solver solver(sc, BackendType::CPU);
+    auto result = solver.solve();
+    PairedRun out{};
+    out.iterations_run = result.iterations_run;
+    out.iterations_ms = result.timing.iterations_ms;
+    out.total_ms      = result.timing.total_ms;
+    out.iter_per_sec  = (out.iterations_ms > 0.0)
+        ? static_cast<double>(out.iterations_run) * 1000.0 / out.iterations_ms
+        : 0.0;
+    return out;
+}
+
+void run_benchmark_paired(std::ostream& out,
+                           const std::string& case_name,
+                           int runs_per_label,
+                           int threads_override)
+{
+    using namespace deepsolver;
+    const PairedScenario* scen = lookup_paired_case(case_name);
+    if (!scen) {
+        std::cerr << "{\"status\":\"error\",\"message\":\"unknown --benchmark-case: "
+                  << case_name << " (valid: standard | monotone)\"}\n";
+        return;
+    }
+    const uint32_t threads = (threads_override >= 0)
+        ? static_cast<uint32_t>(threads_override)
+        : 0u;   // 0 = backend auto
+
+    cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+
+    // Warmup — paid once before measurement so the first measured run
+    // doesn't get the OS-page-fault / first-touch tax.
+    (void)run_one_paired(*scen, threads, /*persistent_omp=*/false);
+
+    // Alternating BCBC... order. With runs_per_label=3 we do 6 total runs:
+    // B C B C B C. Stops thermal drift from hitting only one label.
+    std::vector<PairedRun> baseline_runs, candidate_runs;
+    baseline_runs.reserve(runs_per_label);
+    candidate_runs.reserve(runs_per_label);
+    for (int k = 0; k < runs_per_label; ++k) {
+        baseline_runs.push_back(run_one_paired(*scen, threads, false));
+        candidate_runs.push_back(run_one_paired(*scen, threads, true));
+    }
+
+    auto best = [](const std::vector<PairedRun>& v) {
+        double m = 0.0;
+        for (auto& r : v) if (r.iter_per_sec > m) m = r.iter_per_sec;
+        return m;
+    };
+    auto worst = [](const std::vector<PairedRun>& v) {
+        double m = 1e18;
+        for (auto& r : v) if (r.iter_per_sec < m) m = r.iter_per_sec;
+        return m;
+    };
+    auto median = [](std::vector<PairedRun> v) {
+        if (v.empty()) return 0.0;
+        std::sort(v.begin(), v.end(),
+                  [](const PairedRun& a, const PairedRun& b){
+                      return a.iter_per_sec < b.iter_per_sec;
+                  });
+        const std::size_t mid = v.size() / 2;
+        return (v.size() % 2 == 1)
+            ? v[mid].iter_per_sec
+            : (v[mid - 1].iter_per_sec + v[mid].iter_per_sec) * 0.5;
+    };
+
+    const double base_best = best(baseline_runs);
+    const double cand_best = best(candidate_runs);
+    const double base_med  = median(baseline_runs);
+    const double cand_med  = median(candidate_runs);
+    const double ratio_best = (base_best > 0.0) ? (cand_best / base_best) : 0.0;
+    const double ratio_med  = (base_med  > 0.0) ? (cand_med  / base_med ) : 0.0;
+
+    out << std::fixed << std::setprecision(4);
+    out << "{\n";
+    out << "  \"benchmark\": \"paired\",\n";
+    out << "  \"case\": \""               << scen->name  << "\",\n";
+    out << "  \"board\": \""              << scen->board << "\",\n";
+    out << "  \"iterations\": "           << scen->iterations << ",\n";
+    out << "  \"runs_per_label\": "       << runs_per_label << ",\n";
+    out << "  \"order\": \"alternating BCBC\",\n";
+    out << "  \"threads_requested\": "    << threads << ",\n";
+    out << "  \"hardware_concurrency\": " << std::thread::hardware_concurrency() << ",\n";
+
+    auto emit_label = [&](const char* label, const std::vector<PairedRun>& v,
+                           bool persistent) {
+        out << "  \"" << label << "\": {\n";
+        out << "    \"cpu_persistent_omp\": " << (persistent ? "true" : "false") << ",\n";
+        out << "    \"runs_iter_per_sec\": [";
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            if (i) out << ", ";
+            out << v[i].iter_per_sec;
+        }
+        out << "],\n";
+        out << "    \"best\": "   << best(v)   << ",\n";
+        out << "    \"median\": " << median(v) << ",\n";
+        out << "    \"min\": "    << worst(v)  << "\n";
+        out << "  },\n";
+    };
+    emit_label("baseline",  baseline_runs,  false);
+    emit_label("candidate", candidate_runs, true);
+
+    out << "  \"ratio_best\": "   << ratio_best << ",\n";
+    out << "  \"ratio_median\": " << ratio_med  << "\n";
+    out << "}\n";
+
+    cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+}
+
+}  // anonymous namespace
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -721,6 +1109,27 @@ int main(int argc, char* argv[]) {
 
     if (args.help) {
         print_help();
+        return 0;
+    }
+
+    // v1.8.0 P3-9: --benchmark matrix runs an independent multi-row sweep and
+    // exits before the single-solve path takes over. Handled before "standard"
+    // because matrix mode emits its own JSON and doesn't share state with the
+    // post-solve writer.
+    if (args.benchmark == "matrix") {
+        run_benchmark_matrix(std::cout, args.include_scalar != 0);
+        return 0;
+    }
+
+    // v1.8.0: --benchmark paired runs alternating baseline-vs-candidate
+    // iterations on a single fixture × thread count, reporting best / median
+    // / ratio. Use this for A/B comparing one knob (currently
+    // cpu_persistent_omp) without thermal drift contaminating the result.
+    if (args.benchmark == "paired") {
+        run_benchmark_paired(std::cout,
+                              args.benchmark_case,
+                              args.benchmark_runs,
+                              args.benchmark_threads_override);
         return 0;
     }
 
@@ -805,6 +1214,11 @@ int main(int argc, char* argv[]) {
                 config.cpu_backend_kind = SolverConfig::CpuBackendKind::REFERENCE;
             }
         }
+
+        // v1.8.0 Sprint 3 gated rollout: forward the persistent-OMP request
+        // to the backend. Field stays default-false in SolverConfig — only
+        // explicit --cpu-persistent-omp 1 enables it.
+        config.cpu_persistent_omp = (args.cpu_persistent_omp != 0);
 
         // v1.4.0 Phase 2: apply --cpu-simd policy. set_policy() is idempotent
         // and re-resolves the kernel table on next call to kernels(). Done

@@ -283,6 +283,104 @@ static void fold_ip_step(
     for (; i < n; ++i) out_vals[i] += rw_ci * valid_row[i];
 }
 
+// v1.8.0 P3-8 spike: full-row showdown kernels. The per-call versions above
+// rebuild vwin/vlose/vtie/v05/vn05 on every entry — for nc≈1200 calls per
+// terminal that's 6000 wasted broadcast instructions. Hoisting them out of
+// the c loop is the only structural change here; the inner loop body is
+// byte-identical to showdown_oop_inner / showdown_ip_step.
+static void showdown_oop_full(
+    const float* ev_matrix, const float* valid_matrix,
+    const float* opp_reach_w, float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p)
+{
+    __m256 vwin  = _mm256_set1_ps(win_p);
+    __m256 vlose = _mm256_set1_ps(lose_p);
+    __m256 vtie  = _mm256_set1_ps(tie_p);
+    __m256 v05   = _mm256_set1_ps(0.5f);
+    __m256 vn05  = _mm256_set1_ps(-0.5f);
+
+    for (std::size_t c = 0; c < n; ++c) {
+        const float* ev_row    = ev_matrix    + c * n;
+        const float* valid_row = valid_matrix + c * n;
+        __m256 acc = _mm256_setzero_ps();
+        std::size_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            __m256 ev    = _mm256_loadu_ps(ev_row + i);
+            __m256 valid = _mm256_loadu_ps(valid_row + i);
+            __m256 reach = _mm256_loadu_ps(opp_reach_w + i);
+            __m256 m_win  = _mm256_cmp_ps(ev, v05,  _CMP_GT_OS);
+            __m256 m_lose = _mm256_cmp_ps(ev, vn05, _CMP_LT_OS);
+            __m256 payoff = _mm256_blendv_ps(vtie, vwin, m_win);
+            payoff        = _mm256_blendv_ps(payoff, vlose, m_lose);
+            __m256 rv     = _mm256_mul_ps(reach, valid);
+            acc           = _mm256_fmadd_ps(rv, payoff, acc);
+        }
+        float sum = hsum256(acc);
+        for (; i < n; ++i) {
+            float ev = ev_row[i];
+            float valid = valid_row[i];
+            if (valid <= 0.0f) continue;
+            float p;
+            if (ev >  0.5f) p = win_p;
+            else if (ev < -0.5f) p = lose_p;
+            else                 p = tie_p;
+            sum += opp_reach_w[i] * valid * p;
+        }
+        out[c] = sum;
+    }
+}
+
+static void showdown_ip_full(
+    const float* ev_matrix, const float* valid_matrix,
+    const float* opp_reach_w, float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p)
+{
+    __m256 vwin  = _mm256_set1_ps(win_p);
+    __m256 vlose = _mm256_set1_ps(lose_p);
+    __m256 vtie  = _mm256_set1_ps(tie_p);
+    __m256 v05   = _mm256_set1_ps(0.5f);
+    __m256 vn05  = _mm256_set1_ps(-0.5f);
+
+    // Initialize output (matches vec_set_zero on the per-call path).
+    {
+        std::size_t i = 0;
+        __m256 z = _mm256_setzero_ps();
+        for (; i + 8 <= n; i += 8) _mm256_storeu_ps(out + i, z);
+        for (; i < n; ++i) out[i] = 0.0f;
+    }
+
+    for (std::size_t ci = 0; ci < n; ++ci) {
+        float rw_ci = opp_reach_w[ci];
+        if (rw_ci == 0.0f) continue;
+        __m256 vrw = _mm256_set1_ps(rw_ci);
+        const float* ev_row    = ev_matrix    + ci * n;
+        const float* valid_row = valid_matrix + ci * n;
+        std::size_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            __m256 ev    = _mm256_loadu_ps(ev_row + i);
+            __m256 valid = _mm256_loadu_ps(valid_row + i);
+            __m256 m_win  = _mm256_cmp_ps(ev, v05,  _CMP_GT_OS);
+            __m256 m_lose = _mm256_cmp_ps(ev, vn05, _CMP_LT_OS);
+            __m256 payoff = _mm256_blendv_ps(vtie, vlose, m_win);
+            payoff        = _mm256_blendv_ps(payoff, vwin, m_lose);
+            __m256 contrib = _mm256_mul_ps(valid, payoff);
+            contrib        = _mm256_mul_ps(contrib, vrw);
+            __m256 ov      = _mm256_loadu_ps(out + i);
+            _mm256_storeu_ps(out + i, _mm256_add_ps(ov, contrib));
+        }
+        for (; i < n; ++i) {
+            float ev = ev_row[i];
+            float valid = valid_row[i];
+            if (valid <= 0.0f) continue;
+            float p;
+            if (ev >  0.5f) p = lose_p;
+            else if (ev < -0.5f) p = win_p;
+            else                 p = tie_p;
+            out[i] += rw_ci * valid * p;
+        }
+    }
+}
+
 }  // namespace deepsolver::cpu_simd::avx2_impl
 
 namespace deepsolver::cpu_simd {
@@ -303,6 +401,8 @@ const Kernels avx2_kernels = {
     &avx2_impl::showdown_ip_step,
     &avx2_impl::dot_valid_reach,
     &avx2_impl::fold_ip_step,
+    &avx2_impl::showdown_oop_full,
+    &avx2_impl::showdown_ip_full,
 };
 
 }  // namespace deepsolver::cpu_simd

@@ -79,6 +79,28 @@ struct Kernels {
                              std::size_t n);
     void  (*fold_ip_step)(float* out_vals, const float* valid_row,
                           float rw_ci, std::size_t n);
+
+    // v1.8.0 P3-8 spike: full-row variants that fuse the per-c outer loop
+    // into the kernel itself. The per-call versions above made
+    // evaluate_terminal() pay (a) one dispatch-table lookup, (b) one set of
+    // SIMD-constant materializations (vwin/vlose/vtie/v05/vn05), and (c)
+    // one function-call prologue/epilogue per c row — that's nc=~1200 of
+    // each per terminal × 2 traversers × thousands of terminals.
+    //
+    // The _full variants take the full ev/valid matrices and write into the
+    // entire `out` array in one call. SIMD constants are hoisted out of
+    // the c loop. Same numeric output as calling the per-c kernels in
+    // sequence — the parity test gates this.
+    //
+    // Layout: ev/valid_matrix is row-major [c × n + j]. out is n floats.
+    void  (*showdown_oop_full)(const float* ev_matrix, const float* valid_matrix,
+                               const float* opp_reach_w,
+                               float* out, std::size_t n,
+                               float win_p, float lose_p, float tie_p);
+    void  (*showdown_ip_full)(const float* ev_matrix, const float* valid_matrix,
+                              const float* opp_reach_w,
+                              float* out, std::size_t n,
+                              float win_p, float lose_p, float tie_p);
 };
 
 // Defined in cpu_kernels_scalar.cpp / cpu_kernels_avx2.cpp.
@@ -176,6 +198,23 @@ inline void fold_ip_step(
     float* out_vals, const float* valid_row, float rw_ci, std::size_t n)
 {
     kernels().fold_ip_step(out_vals, valid_row, rw_ci, n);
+}
+
+inline void showdown_oop_full(
+    const float* ev_matrix, const float* valid_matrix,
+    const float* opp_reach_w, float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p)
+{
+    kernels().showdown_oop_full(ev_matrix, valid_matrix, opp_reach_w, out, n,
+                                 win_p, lose_p, tie_p);
+}
+inline void showdown_ip_full(
+    const float* ev_matrix, const float* valid_matrix,
+    const float* opp_reach_w, float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p)
+{
+    kernels().showdown_ip_full(ev_matrix, valid_matrix, opp_reach_w, out, n,
+                                win_p, lose_p, tie_p);
 }
 
 }  // namespace deepsolver::cpu_simd

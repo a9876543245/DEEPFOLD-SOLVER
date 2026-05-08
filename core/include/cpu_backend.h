@@ -356,30 +356,18 @@ inline void CpuBackend::cfr_traverse(
         }
 
         if (tt == TerminalType::SHOWDOWN) {
+            // v1.8.0 P3-8 spike: full-matrix kernels — see cpu_simd.h for
+            // why. Same numeric output as the per-c loop (parity test
+            // gates this); just hoists SIMD-constant setup out of the c
+            // loop so we don't rebuild vwin/vlose/vtie nc times per call.
             if (traverser == 0) {
-                // For OOP: matchup row indexed by [c * nc + cj] — inner cj
-                // is contiguous, SIMD-friendly.
-                for (uint16_t c = 0; c < nc; ++c) {
-                    const float* ev_row    = matchup_ev    + static_cast<std::size_t>(c) * nc;
-                    const float* valid_row = matchup_valid + static_cast<std::size_t>(c) * nc;
-                    out_vals[c] = cpu_simd::showdown_oop_inner(
-                        ev_row, valid_row, opp_reach_w,
-                        win_payoff, lose_payoff, tie_payoff, nc);
-                }
+                cpu_simd::showdown_oop_full(
+                    matchup_ev, matchup_valid, opp_reach_w, out_vals, nc,
+                    win_payoff, lose_payoff, tie_payoff);
             } else {
-                // For IP: natural form is [ci * nc + c] which would stride
-                // through ev/valid by nc floats per c. Loop-swap to ci-outer
-                // / c-inner — same sum, contiguous reads, SIMD-friendly.
-                cpu_simd::vec_set_zero(out_vals, nc);
-                for (uint16_t ci = 0; ci < nc; ++ci) {
-                    float rw_ci = opp_reach_w[ci];
-                    if (rw_ci == 0.0f) continue;
-                    const float* ev_row    = matchup_ev    + static_cast<std::size_t>(ci) * nc;
-                    const float* valid_row = matchup_valid + static_cast<std::size_t>(ci) * nc;
-                    cpu_simd::showdown_ip_step(
-                        out_vals, ev_row, valid_row, rw_ci,
-                        win_payoff, lose_payoff, tie_payoff, nc);
-                }
+                cpu_simd::showdown_ip_full(
+                    matchup_ev, matchup_valid, opp_reach_w, out_vals, nc,
+                    win_payoff, lose_payoff, tie_payoff);
             }
         } else {
             // Fold terminal — asymmetric pot. Winner only gets the matched

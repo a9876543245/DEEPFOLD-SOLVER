@@ -122,6 +122,59 @@ static void fold_ip_step(
     for (std::size_t i = 0; i < n; ++i) out_vals[i] += rw_ci * valid_row[i];
 }
 
+// v1.8.0 P3-8 spike: full-row showdown kernels — see cpu_simd.h for the why.
+// Logic is identical to calling showdown_oop_inner / showdown_ip_step n times
+// in sequence; just hoists the per-call setup work out of the loop.
+static void showdown_oop_full(
+    const float* ev_matrix, const float* valid_matrix,
+    const float* opp_reach_w, float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p)
+{
+    for (std::size_t c = 0; c < n; ++c) {
+        const float* ev_row    = ev_matrix    + c * n;
+        const float* valid_row = valid_matrix + c * n;
+        float sum = 0.0f;
+        for (std::size_t i = 0; i < n; ++i) {
+            float ev = ev_row[i];
+            float valid = valid_row[i];
+            if (valid <= 0.0f) continue;
+            float p;
+            if (ev >  0.5f) p = win_p;
+            else if (ev < -0.5f) p = lose_p;
+            else                 p = tie_p;
+            sum += opp_reach_w[i] * valid * p;
+        }
+        out[c] = sum;
+    }
+}
+
+static void showdown_ip_full(
+    const float* ev_matrix, const float* valid_matrix,
+    const float* opp_reach_w, float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p)
+{
+    // Initialize output, then accumulate. This matches the order of the
+    // per-call version (vec_set_zero followed by per-ci showdown_ip_step
+    // calls, with rw_ci=0 ones skipped).
+    for (std::size_t i = 0; i < n; ++i) out[i] = 0.0f;
+    for (std::size_t ci = 0; ci < n; ++ci) {
+        float rw_ci = opp_reach_w[ci];
+        if (rw_ci == 0.0f) continue;
+        const float* ev_row    = ev_matrix    + ci * n;
+        const float* valid_row = valid_matrix + ci * n;
+        for (std::size_t i = 0; i < n; ++i) {
+            float ev = ev_row[i];
+            float valid = valid_row[i];
+            if (valid <= 0.0f) continue;
+            float p;
+            if (ev >  0.5f) p = lose_p;
+            else if (ev < -0.5f) p = win_p;
+            else                 p = tie_p;
+            out[i] += rw_ci * valid * p;
+        }
+    }
+}
+
 }  // namespace deepsolver::cpu_simd::scalar_impl
 
 namespace deepsolver::cpu_simd {
@@ -142,6 +195,8 @@ const Kernels scalar_kernels = {
     &scalar_impl::showdown_ip_step,
     &scalar_impl::dot_valid_reach,
     &scalar_impl::fold_ip_step,
+    &scalar_impl::showdown_oop_full,
+    &scalar_impl::showdown_ip_full,
 };
 
 }  // namespace deepsolver::cpu_simd

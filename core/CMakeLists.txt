@@ -244,7 +244,25 @@ if(BUILD_TESTS)
         target_link_options(test_parity PRIVATE "/STACK:16777216")
     endif()
     add_test(NAME CpuParity COMMAND test_parity)
-    set_tests_properties(CpuParity PROPERTIES LABELS "smoke" TIMEOUT 60)
+    set_tests_properties(CpuParity PROPERTIES LABELS "smoke;parity" TIMEOUT 60)
+
+    # ----------------------------------------------------------------
+    # Per-kernel scalar vs AVX2 parity (v1.8.0 Sprint 0.2). Loops every
+    # entry in `cpu_simd::Kernels` across representative lengths to
+    # localize any future divergence between the scalar and AVX2 TUs
+    # before it shows up as a backend-level symptom.
+    # ----------------------------------------------------------------
+    add_executable(test_cpu_kernels
+        tests/test_cpu_kernels.cpp
+        ${CPU_KERNEL_SOURCES}
+    )
+    target_include_directories(test_cpu_kernels PRIVATE include)
+    if(MSVC)
+        target_compile_options(test_cpu_kernels PRIVATE /W4 /O2 /EHsc)
+    endif()
+    add_test(NAME CpuKernelParity COMMAND test_cpu_kernels)
+    set_tests_properties(CpuKernelParity PROPERTIES
+        LABELS "smoke;parity" TIMEOUT 30)
 
     # ----------------------------------------------------------------
     # Smoke-via-CLI: tiny solves that exercise the new memory-budget
