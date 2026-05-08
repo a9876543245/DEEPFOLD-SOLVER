@@ -28,6 +28,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 
 namespace deepsolver::cpu_simd {
@@ -93,8 +94,23 @@ struct Kernels {
     // sequence — the parity test gates this.
     //
     // Layout: ev/valid_matrix is row-major [c × n + j]. out is n floats.
+    //
+    // v1.8.1+ optional sparse-OOP skip: when `skip_mask` is non-null, rows
+    // where skip_mask[c] != 0 set out[c]=0 and skip the inner reduction.
+    // The caller is responsible for guaranteeing that skipping is safe —
+    // i.e. that out[c] either won't propagate or will only be multiplied
+    // by 0 at every ancestor. Safe usage: combos that are 0-reach from
+    // root (out-of-range), which propagate as 0 everywhere. UNSAFE: combos
+    // with 0-reach at THIS terminal but >0 reach at some ancestor — the
+    // ancestor's regret update consumes value[c] and changing it to 0
+    // distorts CFR convergence.
+    //
+    // Pass nullptr for the skip_mask to disable (dense path), preserving
+    // the original v1.8.0 behavior for any caller that doesn't have a
+    // pre-validated mask.
     void  (*showdown_oop_full)(const float* ev_matrix, const float* valid_matrix,
                                const float* opp_reach_w,
+                               const uint8_t* skip_mask,
                                float* out, std::size_t n,
                                float win_p, float lose_p, float tie_p);
     void  (*showdown_ip_full)(const float* ev_matrix, const float* valid_matrix,
@@ -202,11 +218,12 @@ inline void fold_ip_step(
 
 inline void showdown_oop_full(
     const float* ev_matrix, const float* valid_matrix,
-    const float* opp_reach_w, float* out, std::size_t n,
+    const float* opp_reach_w, const uint8_t* skip_mask,
+    float* out, std::size_t n,
     float win_p, float lose_p, float tie_p)
 {
-    kernels().showdown_oop_full(ev_matrix, valid_matrix, opp_reach_w, out, n,
-                                 win_p, lose_p, tie_p);
+    kernels().showdown_oop_full(ev_matrix, valid_matrix, opp_reach_w, skip_mask,
+                                 out, n, win_p, lose_p, tie_p);
 }
 inline void showdown_ip_full(
     const float* ev_matrix, const float* valid_matrix,

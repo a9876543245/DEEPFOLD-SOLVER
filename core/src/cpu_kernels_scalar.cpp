@@ -125,12 +125,21 @@ static void fold_ip_step(
 // v1.8.0 P3-8 spike: full-row showdown kernels — see cpu_simd.h for the why.
 // Logic is identical to calling showdown_oop_inner / showdown_ip_step n times
 // in sequence; just hoists the per-call setup work out of the loop.
+//
+// v1.8.1+ optional skip_mask: rows where skip_mask[c] != 0 set out[c]=0 and
+// skip the inner reduction. Caller must ensure skipping is safe (out[c] won't
+// be consumed by ancestor regret updates) — see cpu_simd.h header doc.
 static void showdown_oop_full(
     const float* ev_matrix, const float* valid_matrix,
-    const float* opp_reach_w, float* out, std::size_t n,
+    const float* opp_reach_w, const uint8_t* skip_mask,
+    float* out, std::size_t n,
     float win_p, float lose_p, float tie_p)
 {
     for (std::size_t c = 0; c < n; ++c) {
+        if (skip_mask && skip_mask[c]) {
+            out[c] = 0.0f;
+            continue;
+        }
         const float* ev_row    = ev_matrix    + c * n;
         const float* valid_row = valid_matrix + c * n;
         float sum = 0.0f;

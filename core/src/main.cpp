@@ -541,6 +541,16 @@ std::string result_to_json(
     json << "    \"node_locks_ms\": " << result.timing.node_locks_ms << ",\n";
     json << "    \"backend_prepare_ms\": " << result.timing.backend_prepare_ms << ",\n";
     json << "    \"iterations_ms\": " << result.timing.iterations_ms << ",\n";
+    json << "    \"phase_compute_strategy_ms\": "
+         << result.timing.phase_compute_strategy_ms << ",\n";
+    json << "    \"phase_apply_discount_ms\": "
+         << result.timing.phase_apply_discount_ms << ",\n";
+    json << "    \"phase_forward_pass_ms\": "
+         << result.timing.phase_forward_pass_ms << ",\n";
+    json << "    \"phase_backward_pass_oop_ms\": "
+         << result.timing.phase_backward_pass_oop_ms << ",\n";
+    json << "    \"phase_backward_pass_ip_ms\": "
+         << result.timing.phase_backward_pass_ip_ms << ",\n";
     json << "    \"finalize_ms\": " << result.timing.finalize_ms << ",\n";
     json << "    \"combo_evs_ms\": " << result.timing.combo_evs_ms << ",\n";
     json << "    \"exploitability_ms\": " << result.timing.exploitability_ms << ",\n";
@@ -905,6 +915,16 @@ void run_benchmark_matrix(std::ostream& out, bool include_scalar) {
             out << "        \"precompute_matchups\": " << res.timing.precompute_matchups_ms << ",\n";
             out << "        \"backend_prepare\": "    << res.timing.backend_prepare_ms << ",\n";
             out << "        \"iterations\": "         << res.timing.iterations_ms << ",\n";
+            out << "        \"phase_compute_strategy\": "
+                << res.timing.phase_compute_strategy_ms << ",\n";
+            out << "        \"phase_apply_discount\": "
+                << res.timing.phase_apply_discount_ms << ",\n";
+            out << "        \"phase_forward_pass\": "
+                << res.timing.phase_forward_pass_ms << ",\n";
+            out << "        \"phase_backward_pass_oop\": "
+                << res.timing.phase_backward_pass_oop_ms << ",\n";
+            out << "        \"phase_backward_pass_ip\": "
+                << res.timing.phase_backward_pass_ip_ms << ",\n";
             out << "        \"total\": "              << res.timing.total_ms << "\n";
             out << "      },\n";
             out << "      \"iterations_per_sec\": "   << iter_per_sec << ",\n";

@@ -179,6 +179,16 @@ public:
     /// the legacy heuristic in that case (e.g. for GPU backends).
     virtual uint32_t cpu_threads_effective() const { return 0; }
 
+    // v1.8.1+ per-iteration-phase timing in ms (cumulative across the
+    // whole solve). Default 0.0 — only the levelized CPU backend
+    // currently instruments these. Solver pulls them into SolverTiming
+    // after iterate() loop completes.
+    virtual double phase_compute_strategy_ms()  const { return 0.0; }
+    virtual double phase_apply_discount_ms()    const { return 0.0; }
+    virtual double phase_forward_pass_ms()      const { return 0.0; }
+    virtual double phase_backward_pass_oop_ms() const { return 0.0; }
+    virtual double phase_backward_pass_ip_ms()  const { return 0.0; }
+
     // ------------------------------------------------------------------------
     // Optional GPU postsolve hooks
     // ------------------------------------------------------------------------

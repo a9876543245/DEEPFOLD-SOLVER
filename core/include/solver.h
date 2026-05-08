@@ -809,6 +809,21 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     stage_end = Clock::now();
     timing.iterations_ms = elapsed_since(stage_start, stage_end);
 
+    // v1.8.1+: pull per-phase timing from the backend (defaults to 0.0
+    // on backends that don't instrument). Useful for "where does the
+    // time go inside iterate()" analysis without re-running with a
+    // profiler attached.
+    timing.phase_compute_strategy_ms    =
+        static_cast<float>(backend_->phase_compute_strategy_ms());
+    timing.phase_apply_discount_ms      =
+        static_cast<float>(backend_->phase_apply_discount_ms());
+    timing.phase_forward_pass_ms        =
+        static_cast<float>(backend_->phase_forward_pass_ms());
+    timing.phase_backward_pass_oop_ms   =
+        static_cast<float>(backend_->phase_backward_pass_oop_ms());
+    timing.phase_backward_pass_ip_ms    =
+        static_cast<float>(backend_->phase_backward_pass_ip_ms());
+
     // Step 6: finalize (normalize strategy_sum → strategy)
     stage_start = Clock::now();
     backend_->finalize();

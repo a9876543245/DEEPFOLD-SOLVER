@@ -151,6 +151,11 @@ private:
     std::vector<float> inv_pos_sum_;
     std::vector<float> uniform_or_zero_;
 
+    // v1.8.1+ out-of-range skip masks (same semantics as in
+    // LevelizedCpuBackend — see that file for the correctness note).
+    std::vector<uint8_t> oop_out_of_range_mask_;
+    std::vector<uint8_t> ip_out_of_range_mask_;
+
     // ---- Internal methods ----
     void compute_strategy();
     void apply_dcfr_discount(int iteration);
@@ -205,6 +210,20 @@ inline void CpuBackend::prepare(const SolverContext& ctx) {
     pos_sum_.assign(nc, 0.0f);
     inv_pos_sum_.assign(nc, 0.0f);
     uniform_or_zero_.assign(nc, 0.0f);
+
+    // v1.8.1+ out-of-range skip masks built from root reach.
+    oop_out_of_range_mask_.assign(nc, 0);
+    ip_out_of_range_mask_.assign(nc, 0);
+    if (ctx.oop_reach != nullptr) {
+        for (uint16_t c = 0; c < nc; ++c) {
+            if ((*ctx.oop_reach)[c] == 0.0f) oop_out_of_range_mask_[c] = 1;
+        }
+    }
+    if (ctx.ip_reach != nullptr) {
+        for (uint16_t c = 0; c < nc; ++c) {
+            if ((*ctx.ip_reach)[c] == 0.0f) ip_out_of_range_mask_[c] = 1;
+        }
+    }
 
     // Reserve scratch arena capacity. Worst case per recursion frame at a
     // player decision node is (max_actions * nc) for action_vals + (nc) for
@@ -355,6 +374,12 @@ inline void CpuBackend::cfr_traverse(
             opp_reach_w[k] = opp_reach[k] * canonical_weights_f_[k];
         }
 
+        // v1.8.1+ out-of-range skip mask — see cpu_backend_levelized.h for
+        // the correctness note.
+        const uint8_t* skip_mask = (traverser == 0)
+            ? oop_out_of_range_mask_.data()
+            : ip_out_of_range_mask_.data();
+
         if (tt == TerminalType::SHOWDOWN) {
             // v1.8.0 P3-8 spike: full-matrix kernels — see cpu_simd.h for
             // why. Same numeric output as the per-c loop (parity test
@@ -362,7 +387,7 @@ inline void CpuBackend::cfr_traverse(
             // loop so we don't rebuild vwin/vlose/vtie nc times per call.
             if (traverser == 0) {
                 cpu_simd::showdown_oop_full(
-                    matchup_ev, matchup_valid, opp_reach_w, out_vals, nc,
+                    matchup_ev, matchup_valid, opp_reach_w, skip_mask, out_vals, nc,
                     win_payoff, lose_payoff, tie_payoff);
             } else {
                 cpu_simd::showdown_ip_full(
@@ -391,7 +416,12 @@ inline void CpuBackend::cfr_traverse(
             if (traverser == 0) {
                 // For OOP: out_vals[c] = self_payoff * Σ_cj (reach_w[cj] * valid[c, cj])
                 // Inner cj is contiguous — single SIMD dot product per c.
+                // v1.8.1+ out-of-range skip.
                 for (uint16_t c = 0; c < nc; ++c) {
+                    if (skip_mask[c]) {
+                        out_vals[c] = 0.0f;
+                        continue;
+                    }
                     const float* valid_row =
                         matchup_valid + static_cast<std::size_t>(c) * nc;
                     float opp_total =

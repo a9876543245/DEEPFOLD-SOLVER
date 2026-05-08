@@ -74,6 +74,18 @@ public:
     }
     uint32_t cpu_threads_effective() const override { return cpu_threads_effective_; }
 
+    // v1.8.1+ phase-timing accessors. Each call returns the cumulative
+    // wall-clock time (in ms) spent in that iteration phase across the
+    // whole solve. Solver pulls these into SolverTiming after the iter
+    // loop completes. Always-on instrumentation; the per-phase
+    // omp_get_wtime() calls add ~5 × ~50ns per iter on Windows — well
+    // below 0.1% of typical iter time.
+    double phase_compute_strategy_ms()  const { return phase_compute_strategy_ms_;  }
+    double phase_apply_discount_ms()    const { return phase_apply_discount_ms_;    }
+    double phase_forward_pass_ms()      const { return phase_forward_pass_ms_;      }
+    double phase_backward_pass_oop_ms() const { return phase_backward_pass_oop_ms_; }
+    double phase_backward_pass_ip_ms()  const { return phase_backward_pass_ip_ms_;  }
+
 private:
     SolverContext ctx_{};
 
@@ -138,6 +150,28 @@ private:
         return terminal_opp_reach_w_.data()
              + static_cast<std::size_t>(safe_tid) * ctx_.iso->num_canonical;
     }
+
+    // v1.8.1+ phase timing accumulators (cumulative across whole solve, ms).
+    // Reset to 0 in prepare(); accumulated in iterate(). Solver reads them
+    // after the iter loop and stores into SolverTiming.
+    double phase_compute_strategy_ms_  = 0.0;
+    double phase_apply_discount_ms_    = 0.0;
+    double phase_forward_pass_ms_      = 0.0;
+    double phase_backward_pass_oop_ms_ = 0.0;
+    double phase_backward_pass_ip_ms_  = 0.0;
+
+    // v1.8.1+ out-of-range skip masks. Built once in prepare() from the
+    // root reach vectors. mask[c] = 1 means "this combo is 0-reach from
+    // root" — the user's range excludes it, so out[c] for this combo at
+    // any terminal can be set to 0 without affecting CFR convergence
+    // (it propagates as 0 everywhere). UNSAFE to derive a per-node
+    // "skip when local reach is 0" because that breaks regret updates
+    // at ancestors with non-zero reach (a CFR signal we need).
+    //
+    // 70-75% of canonical combos are out-of-range on standard preflop
+    // ranges → ~3× speedup on OOP showdown / fold paths.
+    std::vector<uint8_t> oop_out_of_range_mask_;
+    std::vector<uint8_t> ip_out_of_range_mask_;
 
     // ---- Internal methods ----
     void compute_strategy();
@@ -271,6 +305,30 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     // tiny next to reach_oop_/reach_ip_/value_ which are N × nc each.
     terminal_opp_reach_w_.assign(
         static_cast<std::size_t>(cpu_threads_effective_) * nc, 0.0f);
+
+    // v1.8.1+ reset phase timers for this solve.
+    phase_compute_strategy_ms_  = 0.0;
+    phase_apply_discount_ms_    = 0.0;
+    phase_forward_pass_ms_      = 0.0;
+    phase_backward_pass_oop_ms_ = 0.0;
+    phase_backward_pass_ip_ms_  = 0.0;
+
+    // v1.8.1+ build the out-of-range skip masks from root reach.
+    // mask[c] = 1 iff that combo has 0-reach at root (i.e. excluded
+    // from the user's range, so propagates as 0 throughout the tree
+    // and out[c]=0 at any terminal is mathematically safe).
+    oop_out_of_range_mask_.assign(nc, 0);
+    ip_out_of_range_mask_.assign(nc, 0);
+    if (ctx.oop_reach != nullptr) {
+        for (uint16_t c = 0; c < nc; ++c) {
+            if ((*ctx.oop_reach)[c] == 0.0f) oop_out_of_range_mask_[c] = 1;
+        }
+    }
+    if (ctx.ip_reach != nullptr) {
+        for (uint16_t c = 0; c < nc; ++c) {
+            if ((*ctx.ip_reach)[c] == 0.0f) ip_out_of_range_mask_[c] = 1;
+        }
+    }
 
     build_level_schedule();
 }
@@ -411,13 +469,23 @@ inline void LevelizedCpuBackend::evaluate_terminal(
         opp_reach_w[k] = opp_reach[k] * canonical_weights_f_[k];
     }
 
+    // v1.8.1+ out-of-range skip: skip rows for combos that have 0 reach
+    // at root (user's range excludes them). These combos propagate as 0
+    // throughout the tree, so out[c]=0 at any terminal is provably safe.
+    // We do NOT skip combos with 0 reach at THIS terminal but >0 reach
+    // at some ancestor — that would break regret updates at the ancestor.
+    // The mask is built once in prepare() from root reach.
+    const uint8_t* skip_mask = (traverser == 0)
+        ? oop_out_of_range_mask_.data()
+        : ip_out_of_range_mask_.data();
+
     if (tt == TerminalType::SHOWDOWN) {
         // v1.8.0 P3-8 spike: full-matrix kernels fold the per-c outer loop
         // into the kernel itself, hoisting SIMD constants out of the hot
         // path and saving nc dispatch-table lookups per terminal call.
         if (traverser == 0) {
             cpu_simd::showdown_oop_full(
-                matchup_ev, matchup_valid, opp_reach_w, out, nc,
+                matchup_ev, matchup_valid, opp_reach_w, skip_mask, out, nc,
                 win_payoff, lose_payoff, tie_payoff);
         } else {
             cpu_simd::showdown_ip_full(
@@ -442,7 +510,12 @@ inline void LevelizedCpuBackend::evaluate_terminal(
         }
 
         if (traverser == 0) {
+            // v1.8.1+ out-of-range skip — same skip_mask as showdown.
             for (uint16_t c = 0; c < nc; ++c) {
+                if (skip_mask[c]) {
+                    out[c] = 0.0f;
+                    continue;
+                }
                 const float* valid_row =
                     matchup_valid + static_cast<std::size_t>(c) * nc;
                 float opp_total =
@@ -754,11 +827,27 @@ inline void LevelizedCpuBackend::backward_pass(int traverser) {
 // ============================================================================
 
 inline void LevelizedCpuBackend::iterate(int iteration) {
+    // v1.8.1+ phase timing. omp_get_wtime resolution is ~µs on Windows /
+    // sub-µs on Linux; per-iter cost is negligible. The if-guards on
+    // _OPENMP keep the build clean if anyone disables OMP (then phase
+    // timers stay at 0 — caller treats that as "unavailable").
+    auto now = []() -> double {
+        #if defined(_OPENMP)
+        return omp_get_wtime();
+        #else
+        return 0.0;
+        #endif
+    };
+
+    const double t0 = now();
     compute_strategy();
+    const double t1 = now();
     apply_dcfr_discount(iteration);
+    const double t2 = now();
 
     // Single forward pass updates reach + strategy_sum for both traversers.
     forward_pass(iteration);
+    const double t3 = now();
 
     // Backward passes — one per traverser. They write to disjoint slices
     // of regrets_ (acting==traverser nodes are different sets), so they
@@ -766,7 +855,15 @@ inline void LevelizedCpuBackend::iterate(int iteration) {
     // is already heavily multi-threaded inside via the per-level OMP. We
     // keep them serial to avoid oversubscribing the thread pool.
     backward_pass(0);
+    const double t4 = now();
     backward_pass(1);
+    const double t5 = now();
+
+    phase_compute_strategy_ms_  += (t1 - t0) * 1000.0;
+    phase_apply_discount_ms_    += (t2 - t1) * 1000.0;
+    phase_forward_pass_ms_      += (t3 - t2) * 1000.0;
+    phase_backward_pass_oop_ms_ += (t4 - t3) * 1000.0;
+    phase_backward_pass_ip_ms_  += (t5 - t4) * 1000.0;
 }
 
 // ============================================================================

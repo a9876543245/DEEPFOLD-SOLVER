@@ -359,6 +359,19 @@ struct SolverTiming {
     float postsolve_ms = 0.0f;
     float total_ms = 0.0f;
 
+    /// v1.8.1+ iteration-phase breakdown for the levelized CPU backend.
+    /// Sums across the whole iteration loop; expressed in ms.
+    /// Reference backend leaves these at 0 (it doesn't have the phases
+    /// in the same shape). Used to pick where the next optimization pass
+    /// actually pays off — Sprint 5 (flat aligned pools) only matters if
+    /// player-node phases dominate; Sprint 5 is wasted effort if 80% of
+    /// time is in terminal evaluation.
+    float phase_compute_strategy_ms    = 0.0f;
+    float phase_apply_discount_ms      = 0.0f;
+    float phase_forward_pass_ms        = 0.0f;
+    float phase_backward_pass_oop_ms   = 0.0f;
+    float phase_backward_pass_ip_ms    = 0.0f;
+
     uint32_t tree_nodes = 0;
     uint32_t tree_edges = 0;
     uint32_t matchup_tables = 0;

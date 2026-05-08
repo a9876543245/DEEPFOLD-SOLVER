@@ -375,6 +375,78 @@ static void test_parity_flop_limited_sizing() {
 }
 
 // ----------------------------------------------------------------------------
+// v1.8.1+ out-of-range skip parity. The new optimization skips terminal
+// evaluation for combos that are 0-reach from root (excluded from the
+// user's range). Mathematically safe because those combos propagate as 0
+// throughout the tree. This fixture uses a narrow range (~6% of combos
+// in range) where the optimization fires hard, and asserts the result
+// matches the dense path (reference backend with full range disabled
+// for the OOP combos would naturally produce 0-reach behavior, but we
+// just need ref vs lvl agreement to gate against drift).
+// ----------------------------------------------------------------------------
+
+static void test_parity_narrow_range_skip() {
+    auto& eval = get_evaluator();
+    eval.initialize();
+    cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+
+    auto make_cfg = []() {
+        SolverConfig sc;
+        sc.pot = 100.0f;
+        sc.effective_stack = 500.0f;
+        sc.board_size = 3;
+        auto board = parse_board("AsKd7c");
+        for (size_t i = 0; i < 3; ++i) sc.board[i] = board[i];
+        sc.max_iterations = 60;
+        sc.target_exploitability = 0.0f;
+        sc.exploitability_check_interval = 1000;
+
+        // Narrow ranges — set most combos to 0 weight so the skip mask
+        // fires on the bulk of the canonical-combo space.
+        sc.has_custom_ranges = true;
+        sc.oop_range_weights.fill(0.0f);
+        sc.ip_range_weights.fill(0.0f);
+        const auto& combo_table = get_combo_table();
+        auto in = [&](const std::string& label) {
+            for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+                if (combo_to_grid_label(combo_table[i]) == label) {
+                    sc.oop_range_weights[i] = 1.0f;
+                    sc.ip_range_weights[i]  = 1.0f;
+                }
+            }
+        };
+        for (auto& l : { std::string("AA"), std::string("KK"), std::string("QQ"),
+                         std::string("JJ"), std::string("TT"), std::string("AKs"),
+                         std::string("AKo") }) in(l);
+        return sc;
+    };
+
+    auto cfg_ref = make_cfg();
+    cfg_ref.cpu_backend_kind = SolverConfig::CpuBackendKind::REFERENCE;
+    Solver s_ref(cfg_ref);
+    auto r_ref = s_ref.solve();
+    auto akh_ref = s_ref.analyze_combo("AhKh");
+
+    auto cfg_lvl = make_cfg();
+    cfg_lvl.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
+    Solver s_lvl(cfg_lvl);
+    auto r_lvl = s_lvl.solve();
+    auto akh_lvl = s_lvl.analyze_combo("AhKh");
+
+    std::cout << "  narrow ref  exploit=" << r_ref.exploitability_pct
+              << "%  AhKh ev=" << akh_ref.ev << "\n";
+    std::cout << "  narrow lvl  exploit=" << r_lvl.exploitability_pct
+              << "%  AhKh ev=" << akh_lvl.ev << "\n";
+
+    assert_near(akh_ref.ev, akh_lvl.ev, 0.05f,
+                "narrow range: AhKh EV must match within 0.05 chip");
+
+    auto m_ref = strategy_map(r_ref.global_strategy);
+    auto m_lvl = strategy_map(r_lvl.global_strategy);
+    assert_strategy_close(m_ref, m_lvl, 0.5f, "narrow range ref vs levelized");
+}
+
+// ----------------------------------------------------------------------------
 // v1.8.0 Sprint 3: persistent OMP team flag parity.
 //
 // `cpu_persistent_omp` toggles between (a) one OMP parallel-region per
@@ -444,6 +516,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
     RUN_TEST(test_parity_river_no_chance);
     RUN_TEST(test_parity_flop_limited_sizing);
     RUN_TEST(test_parity_persistent_omp_toggle);
+    RUN_TEST(test_parity_narrow_range_skip);
 
     std::cout << "=== " << g_tests_passed << " / " << g_tests_run
               << " tests passed ===\n";

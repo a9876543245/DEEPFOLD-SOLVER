@@ -288,9 +288,12 @@ static void fold_ip_step(
 // terminal that's 6000 wasted broadcast instructions. Hoisting them out of
 // the c loop is the only structural change here; the inner loop body is
 // byte-identical to showdown_oop_inner / showdown_ip_step.
+//
+// v1.8.1+ optional skip_mask — see cpu_simd.h for safety constraints.
 static void showdown_oop_full(
     const float* ev_matrix, const float* valid_matrix,
-    const float* opp_reach_w, float* out, std::size_t n,
+    const float* opp_reach_w, const uint8_t* skip_mask,
+    float* out, std::size_t n,
     float win_p, float lose_p, float tie_p)
 {
     __m256 vwin  = _mm256_set1_ps(win_p);
@@ -300,6 +303,10 @@ static void showdown_oop_full(
     __m256 vn05  = _mm256_set1_ps(-0.5f);
 
     for (std::size_t c = 0; c < n; ++c) {
+        if (skip_mask && skip_mask[c]) {
+            out[c] = 0.0f;
+            continue;
+        }
         const float* ev_row    = ev_matrix    + c * n;
         const float* valid_row = valid_matrix + c * n;
         __m256 acc = _mm256_setzero_ps();

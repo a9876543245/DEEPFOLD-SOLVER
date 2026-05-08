@@ -395,16 +395,35 @@ static void test_showdown_oop_full() {
             std::copy(v_row.begin(), v_row.end(), valid.begin() + c * n);
             std::copy(e_row.begin(), e_row.end(), ev.begin()    + c * n);
         }
-        auto reach = mixed_floats(n, 0.0f, 1.0f);
+        auto reach = range_floats(n, 0.0f, 1.0f);
+        // v1.8.1+ kernel takes optional skip_mask. Test both the no-mask
+        // (dense) path and the with-mask path with ~30% skipped rows.
+        std::vector<uint8_t> skip(n, 0);
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        for (std::size_t c = 0; c < n; ++c) {
+            if (dist(rng()) < 0.3f) skip[c] = 1;
+        }
         std::vector<float> sa(n, 0.0f), aa(n, 0.0f);
+        // No-mask path:
         scalar_kernels.showdown_oop_full(
-            ev.data(), valid.data(), reach.data(), sa.data(), n,
-            50.0f, -50.0f, 0.0f);
+            ev.data(), valid.data(), reach.data(), nullptr,
+            sa.data(), n, 50.0f, -50.0f, 0.0f);
         avx2_kernels.showdown_oop_full(
-            ev.data(), valid.data(), reach.data(), aa.data(), n,
-            50.0f, -50.0f, 0.0f);
+            ev.data(), valid.data(), reach.data(), nullptr,
+            aa.data(), n, 50.0f, -50.0f, 0.0f);
         assert_arrays_close(sa, aa, kTolAccumulate.abs_, kTolAccumulate.rel_,
-                            "showdown_oop_full");
+                            "showdown_oop_full (no-mask)");
+        // With-mask path:
+        std::fill(sa.begin(), sa.end(), 0.0f);
+        std::fill(aa.begin(), aa.end(), 0.0f);
+        scalar_kernels.showdown_oop_full(
+            ev.data(), valid.data(), reach.data(), skip.data(),
+            sa.data(), n, 50.0f, -50.0f, 0.0f);
+        avx2_kernels.showdown_oop_full(
+            ev.data(), valid.data(), reach.data(), skip.data(),
+            aa.data(), n, 50.0f, -50.0f, 0.0f);
+        assert_arrays_close(sa, aa, kTolAccumulate.abs_, kTolAccumulate.rel_,
+                            "showdown_oop_full (mask)");
     }
 }
 
