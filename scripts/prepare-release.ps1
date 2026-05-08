@@ -116,6 +116,62 @@ if (-not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
 }
 Write-Host "Signing key: $keyPath" -ForegroundColor DarkGray
 
+# ----- 2.5 Load build-time secrets from .env.local --------------------------
+#
+# The OAuth client_secret needed for Google Desktop sign-in (post-2024
+# clients require it even though Desktop secrets are not "true" secrets per
+# Google's own docs) is read at compile time via `option_env!` in
+# src-tauri/src/oauth.rs. If `DEEPFOLD_GOOGLE_CLIENT_SECRET` isn't set when
+# `cargo build` runs, the constant compiles to "" and every released install
+# fails sign-in with "Token exchange failed: Google Token endpoint returned
+# 400 bad request".
+#
+# v1.4.0 / v1.4.1 / v1.5.0 all shipped with an empty secret because this
+# loader didn't exist — the file lived at D:\DEEPFOLD-SOLVER\.env.local and
+# the operator was supposed to source it manually before running this
+# script. Easy to forget. Doing it inline here removes the foot-gun.
+#
+# Format expected: KEY=value (one per line), comments with `#`, blank lines
+# allowed. Values may be quoted with single or double quotes (stripped).
+# $repoRoot is computed later for releaseDir staging; do it eagerly here.
+if (-not $repoRoot) { $repoRoot = Split-Path $PSScriptRoot -Parent }
+$envFiles = @(
+    Join-Path $repoRoot ".env.local"
+    Join-Path (Split-Path -Parent $repoRoot) "DEEPFOLD-SOLVER\.env.local"
+)
+$loadedSecret = $false
+foreach ($envFile in $envFiles) {
+    if (-not (Test-Path $envFile)) { continue }
+    Write-Host "Loading build-time env from $envFile" -ForegroundColor DarkGray
+    Get-Content $envFile | ForEach-Object {
+        $line = $_.Trim()
+        if (-not $line -or $line.StartsWith('#')) { return }
+        $eq = $line.IndexOf('=')
+        if ($eq -lt 1) { return }
+        $key = $line.Substring(0, $eq).Trim()
+        $val = $line.Substring($eq + 1).Trim()
+        if ($val.StartsWith('"') -and $val.EndsWith('"')) {
+            $val = $val.Substring(1, $val.Length - 2)
+        } elseif ($val.StartsWith("'") -and $val.EndsWith("'")) {
+            $val = $val.Substring(1, $val.Length - 2)
+        }
+        Set-Item -Path "Env:$key" -Value $val
+        if ($key -eq "DEEPFOLD_GOOGLE_CLIENT_SECRET") {
+            $script:loadedSecret = $true
+        }
+    }
+    break
+}
+if (-not $env:DEEPFOLD_GOOGLE_CLIENT_SECRET) {
+    Write-Host "  [!] DEEPFOLD_GOOGLE_CLIENT_SECRET is not set. The build" `
+               "will compile but Google sign-in will fail at runtime with" `
+               "'Token exchange failed: 400 bad request'. Add it to" `
+               ".env.local in the repo root or as a shell env var." `
+               -ForegroundColor Yellow
+} else {
+    Write-Host "  DEEPFOLD_GOOGLE_CLIENT_SECRET is set (length: $($env:DEEPFOLD_GOOGLE_CLIENT_SECRET.Length))" -ForegroundColor DarkGray
+}
+
 # ----- 3. Build (unless skipped) --------------------------------------------
 #
 # We DISABLE Tauri's in-build minisign signing here (`--config` override) and
@@ -186,6 +242,21 @@ $nsisExeForSigning = Get-ChildItem "$bundleDir\nsis\*$Version*setup.exe" -File |
 if (-not $nsisExeForSigning) { throw "NSIS installer not found in $bundleDir\nsis\ — build must have failed" }
 
 $existingSig = Get-ChildItem "$bundleDir\nsis\*$Version*setup.exe.sig" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+# v1.5.1: re-sign when the .exe has been rebuilt since the last .sig was
+# produced, even at the same version number. Previous logic reused a stale
+# .sig from an older build and shipped it alongside a fresh .exe — the
+# signature wouldn't verify, so the auto-updater would refuse to apply the
+# update. Compare timestamps; only skip when both files exist AND the .sig
+# is at least as new as the .exe.
+$sigIsStale = $false
+if ($existingSig) {
+    $sigIsStale = ($nsisExeForSigning.LastWriteTimeUtc -gt $existingSig.LastWriteTimeUtc)
+    if ($sigIsStale) {
+        Write-Host "Existing .sig is older than .exe — re-signing." -ForegroundColor Yellow
+        Remove-Item -LiteralPath $existingSig.FullName -Force
+        $existingSig = $null
+    }
+}
 if (-not $existingSig -or $SkipBuild) {
     Write-Host ""
     Write-Host "Signing $($nsisExeForSigning.Name) (manual, --password CLI flag)..." -ForegroundColor Cyan
