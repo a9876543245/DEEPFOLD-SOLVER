@@ -154,11 +154,19 @@ export const SOLVE_MODE_PRESETS: Record<SolveMode, {
   /** Short user-facing description for tooltips. */
   description: string;
 }> = {
-  quick:    { iterations:  100, time_budget_seconds:  60, exploitability: 1.5,
+  // v1.8.3+ iter caps were 100 / 300 / 1000 — set when narrow ranges hit
+  // 0.5% exploit at iter 300. With wide SRP ranges the same iter cap stops
+  // at ~5-13% exploit (didn't reach the target). Bumping caps lets fast
+  // hardware (GPU / multi-core CPU) keep going past the old cap when the
+  // exploit target hasn't been reached, while time_budget remains the
+  // safety net for slow hardware (engine takes min(iter, time, exploit)).
+  // Net effect: fast machines deliver tighter strategies in roughly the
+  // same wall time; slow machines unchanged because time_budget binds first.
+  quick:    { iterations:   500, time_budget_seconds:  60, exploitability: 1.5,
               description: 'Sanity check — up to 1 min' },
-  standard: { iterations:  300, time_budget_seconds: 300, exploitability: 0.5,
+  standard: { iterations:  3000, time_budget_seconds: 300, exploitability: 0.5,
               description: 'Pro-grade quality — up to 5 min' },
-  deep:     { iterations: 1000, time_budget_seconds: 900, exploitability: 0.2,
+  deep:     { iterations: 10000, time_budget_seconds: 900, exploitability: 0.2,
               description: 'Research-grade — up to 15 min' },
 };
 

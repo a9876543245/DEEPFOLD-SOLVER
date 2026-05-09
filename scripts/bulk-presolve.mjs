@@ -60,7 +60,16 @@ function parseArgs(argv) {
     stacksBb: ['default'],   // 'default' = use the matchup's defaultStack
     limit: 0,
     backend: 'auto',         // 'cuda' | 'cpu' | 'auto'
-    iterations: 1000,
+    // v1.8.3+ tiered iter caps. SRP wide ranges need more iter to converge
+    // (1000 iter only reaches ~5-7% exploit; need 3000+ for ~1.5%). Narrow
+    // 3-bet pots converge faster (1500 iter usually <1%). Lite sizing tree
+    // is small so 1000 iter is enough. `--iterations N` overrides all tiers
+    // with a single value (back-compat).
+    iterations: 0,            // 0 = use tiered defaults below
+    iterSrpStandard: 3000,    // SRP × Standard sizing — wide tree, needs the most
+    iterThreeBetStandard: 1500,  // 3-bet × Standard — narrower range, faster convergence
+    iterAnyLite: 1000,        // Any × Lite sizing — small tree, fast
+    iterDefault: 1000,        // safety fallback for any tuple we didn't classify
     exploitability: 0.2,
     maxTreeNodes: 2000,
   };
@@ -78,6 +87,18 @@ function parseArgs(argv) {
     else throw new Error(`unknown arg: ${a}`);
   }
   return out;
+}
+
+/** Pick iter cap based on (potType, sizingKey) — see parseArgs comments for
+ *  the rationale. `--iterations N` overrides via args.iterations. */
+function iterFor(spot) {
+  if (args.iterations > 0) return args.iterations;
+  const isLite = spot.sizingKey === 'lite';
+  const isSrp  = spot.meta.pot_type === 'SRP';
+  if (isLite)             return args.iterAnyLite;
+  if (isSrp)              return args.iterSrpStandard;
+  if (spot.meta.pot_type === '3BET') return args.iterThreeBetStandard;
+  return args.iterDefault;
 }
 
 // ============================================================================
@@ -197,7 +218,7 @@ function solveOne(exe, spot) {
       '--pot',           String(spot.pot),
       '--stack',         String(spot.stack),
       '--board',         spot.board,
-      '--iterations',    String(args.iterations),
+      '--iterations',    String(iterFor(spot)),
       '--exploitability', String(args.exploitability),
       '--ip-range',      spot.ipRange,
       '--oop-range',     spot.oopRange,
@@ -244,7 +265,15 @@ async function main() {
   console.log(`Solver:  ${exe}`);
   console.log(`Output:  ${OUT_RAW_DIR}`);
   console.log(`Backend: ${args.backend}`);
-  console.log(`Plan:    ${args.iterations} iter × ${args.exploitability}% exploit target`);
+  if (args.iterations > 0) {
+    console.log(`Plan:    ${args.iterations} iter (override) × ${args.exploitability}% exploit target`);
+  } else {
+    console.log(`Plan (tiered):`);
+    console.log(`  SRP × Standard sizing  → ${args.iterSrpStandard} iter`);
+    console.log(`  3BET × Standard sizing → ${args.iterThreeBetStandard} iter`);
+    console.log(`  Any × Lite sizing      → ${args.iterAnyLite} iter`);
+    console.log(`  exploit target          ${args.exploitability}%`);
+  }
 
   if (args.dryRun) {
     const plan = buildPlan();
