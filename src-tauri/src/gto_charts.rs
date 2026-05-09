@@ -227,6 +227,43 @@ pub async fn load_gto_chart(id: String) -> Result<GtoChart, String> {
 // frontend then JSON.parses + version-checks against its CURRENT_SOLVER_VERSION
 // constant — mismatches fall through to a live solve.
 
+/// Like `find_gto_root()` but additionally requires that the resolved
+/// `gto_output/` contains a `presolved/` subdirectory. Reason: in dev mode,
+/// Tauri may have ALREADY copied an older snapshot of `gto_output/` (without
+/// `presolved/`) into `target/debug/gto_output/`, while the source-of-truth
+/// `gto_output/presolved/` lives one level up. `find_gto_root()` would
+/// (correctly) return the exe-relative path because that's right for chart
+/// listing; but for presolve lookup we need the dir that ACTUALLY has the
+/// presolved bundles. This helper iterates the same candidate list but skips
+/// any candidate that lacks `presolved/`.
+fn find_presolve_dir() -> Option<PathBuf> {
+    let mut all_candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            all_candidates.push(parent.join("resources").join("gto_output"));
+            all_candidates.push(parent.join("resources").join("_up_").join("gto_output"));
+            all_candidates.push(parent.join("gto_output"));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut dir = cwd.as_path();
+        for _ in 0..6 {
+            all_candidates.push(dir.join("gto_output"));
+            match dir.parent() {
+                Some(p) => dir = p,
+                None => break,
+            }
+        }
+    }
+    for c in all_candidates.iter() {
+        let presolved = c.join("presolved");
+        if presolved.exists() && presolved.is_dir() {
+            return Some(c.clone());
+        }
+    }
+    None
+}
+
 #[tauri::command]
 pub async fn read_bundled_presolve(spot_key: String) -> Result<String, String> {
     use std::io::Read;
@@ -239,8 +276,11 @@ pub async fn read_bundled_presolve(spot_key: String) -> Result<String, String> {
         return Err(format!("spot_key must end with .json.gz, got: {}", spot_key));
     }
 
-    let root = find_gto_root()
-        .ok_or_else(|| "gto_output/ directory not found".to_string())?;
+    // Use the presolve-aware finder so dev mode doesn't pick a stale Tauri
+    // resource snapshot that happens to have `gto_output/` but not
+    // `gto_output/presolved/`.
+    let root = find_presolve_dir()
+        .ok_or_else(|| "gto_output/presolved/ directory not found".to_string())?;
     let path = root.join("presolved").join(&spot_key);
 
     if !path.exists() {

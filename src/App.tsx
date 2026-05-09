@@ -1096,6 +1096,22 @@ function App() {
             setCurrentNode(rootNode);
             setShowSpotLibrary(false);
 
+            // v1.8.3+ Phase 3: if the SpotLibrary already upgraded this spot
+            // to a bundled, pre-solved version (source: 'bundled'), skip the
+            // live solve entirely and render the cached strategy directly.
+            // The bundle has both global_strategy + combo_strategies AND the
+            // navigable strategy_tree, so runout drilling stays instant too.
+            if (spot.source === 'bundled') {
+              setResult({
+                status: 'success',
+                iterations_run: spot.iterationsRun ?? 0,
+                exploitability_pct: spot.exploitabilityPct ?? 0,
+                global_strategy: spot.globalStrategy,
+                combo_strategies: spot.comboStrategies,
+              });
+              return;
+            }
+
             if (isRealSolverAvailable()) {
               // Tauri mode: trigger a REAL solve with this spot's config.
               // User sees the normal solving progress indicator.

@@ -309,17 +309,23 @@ function bundledSpotKey(
  *
  * On null, the caller should fall through to a live solve.
  */
-async function tryLoadBundled(
+export async function tryLoadBundled(
   matchupIdx: number,
   boardIdx: number,
   sizingKey: string = 'standard',
   stackLabel: string = 'default',
 ): Promise<PresolvedSpot | null> {
-  if (!isTauri()) return null;
+  if (!isTauri()) {
+    console.log(`[presolvedSpots] tryLoadBundled(${matchupIdx},${boardIdx}): not in Tauri (browser mode), skipping`);
+    return null;
+  }
 
   const matchup = MATCHUPS[matchupIdx];
   const template = BOARD_TEMPLATES[boardIdx];
-  if (!matchup || !template) return null;
+  if (!matchup || !template) {
+    console.log(`[presolvedSpots] tryLoadBundled(${matchupIdx},${boardIdx}): bad matchup/template indices`);
+    return null;
+  }
 
   const spotKey = bundledSpotKey(matchupIdx, boardIdx, sizingKey, stackLabel);
   let json: string;
@@ -329,10 +335,13 @@ async function tryLoadBundled(
   } catch (e: unknown) {
     // The Rust command returns "NOT_FOUND:<key>" for missing bundles —
     // that's the common case, not an error. Anything else is logged so we
-    // notice real issues.
+    // notice real issues. v1.8.3+: log NOT_FOUND too as console.log (was
+    // console.debug, hidden by default Chrome DevTools filter level).
     const msg = String(e);
-    if (!msg.includes('NOT_FOUND:')) {
-      console.warn('[presolvedSpots] read_bundled_presolve failed:', msg);
+    if (msg.includes('NOT_FOUND:')) {
+      console.log(`[presolvedSpots] no bundle for ${spotKey} (live solve will run on click)`);
+    } else {
+      console.warn(`[presolvedSpots] read_bundled_presolve('${spotKey}') failed:`, msg);
     }
     return null;
   }
@@ -341,21 +350,23 @@ async function tryLoadBundled(
   try {
     bundled = JSON.parse(json);
   } catch (e) {
-    console.warn('[presolvedSpots] bundled JSON parse failed:', e);
+    console.warn(`[presolvedSpots] JSON.parse failed for ${spotKey}:`, e);
     return null;
   }
 
   // Schema invalidation. Mismatch → fall through to live solve.
   if (bundled.v !== EXPECTED_SCHEMA_VERSION) {
     console.warn(
-      `[presolvedSpots] bundled schema v${bundled.v} != expected v${EXPECTED_SCHEMA_VERSION}, falling through`);
+      `[presolvedSpots] ${spotKey} schema v${bundled.v} != expected v${EXPECTED_SCHEMA_VERSION}, falling through`);
     return null;
   }
   if (bundled.solver_version !== APP_VERSION) {
     console.info(
-      `[presolvedSpots] bundled solver_version ${bundled.solver_version} != current ${APP_VERSION}, falling through`);
+      `[presolvedSpots] ${spotKey} solver_version "${bundled.solver_version}" != current "${APP_VERSION}", falling through`);
     return null;
   }
+  console.info(
+    `[presolvedSpots] HIT bundled ${spotKey} (iter=${bundled.iterations_run}, exploit=${bundled.exploitability_pct}%)`);
 
   return {
     id: buildSpotId(matchupIdx, boardIdx),
@@ -427,6 +438,43 @@ async function solveSpotReal(
 // ============================================================================
 // Public API
 // ============================================================================
+
+/**
+ * v1.8.3+ — bundled-or-demo lookup. Used by SpotLibrary's preview grid to
+ * upgrade spots from heuristic to real-bundled strategies when a pre-solved
+ * file exists, WITHOUT firing a live solve on cache miss. Promise always
+ * resolves; never throws. Result is also written to the in-memory cache so
+ * the synchronous `getPresolvedSpot()` returns the upgraded version on
+ * subsequent calls.
+ *
+ * - Tauri + bundle exists  → PresolvedSpot with source: 'bundled'
+ * - Tauri + no bundle      → heuristic spot (source: 'demo' implicitly)
+ * - Browser mode           → heuristic spot (no Tauri command)
+ */
+export async function getBundledOrDemo(
+  matchupIdx: number,
+  boardIdx: number,
+  sizingKey: string = 'standard',
+  stackLabel: string = 'default',
+): Promise<PresolvedSpot> {
+  const id = buildSpotId(matchupIdx, boardIdx);
+  const cached = cache.get(id);
+  // Already upgraded to bundled or live — no need to re-fetch.
+  if (cached && !cached.spot.isDemo) return cached.spot;
+
+  if (isTauri()) {
+    const bundled = await tryLoadBundled(matchupIdx, boardIdx, sizingKey, stackLabel);
+    if (bundled) {
+      cache.set(id, { spot: bundled });
+      return bundled;
+    }
+  }
+  // No bundle — return heuristic. Don't trigger a live solve here; that's the
+  // caller's decision (e.g. App.tsx onSelectSpot).
+  const fallback = cached?.spot ?? buildHeuristicSpot(matchupIdx, boardIdx);
+  cache.set(id, { spot: fallback });
+  return fallback;
+}
 
 /**
  * Get a spot synchronously — returns heuristic preview unless a real solve

@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { X, Info, AlertTriangle } from 'lucide-react';
 import { useT } from '../lib/i18n';
 import { parseBoardCards, SUIT_SYMBOLS, SUIT_COLORS, getActionColor } from '../lib/poker';
@@ -9,6 +9,7 @@ import {
   BOARD_TEMPLATES,
   getSpotsByMatchup,
   isRealSolverAvailable,
+  getBundledOrDemo,
 } from '../lib/presolvedSpots';
 import type { PresolvedSpot } from '../lib/presolvedSpots';
 
@@ -131,10 +132,35 @@ export function SpotLibrary({ onSelectSpot, onClose }: Props) {
   }, [filteredOptions, selectedMatchupIdx]);
 
   // Generate spots for the active matchup
-  const spots = useMemo(
-    () => getSpotsByMatchup(activeMatchupIdx),
-    [activeMatchupIdx],
+  // Initial render: synchronous heuristic preview (instant). On mount of
+  // each new matchup, kick off async parallel `getBundledOrDemo()` calls so
+  // any spot with a bundled .json.gz on disk gets upgraded in-place. Cache
+  // hits are O(disk read + gunzip) and complete within ~50ms each; the React
+  // re-render swaps the heuristic for the bundled strategy + adds the
+  // ● PRE-SOLVED badge. Spots without bundles stay heuristic until the user
+  // explicitly clicks Solve.
+  const [spots, setSpots] = useState<PresolvedSpot[]>(
+    () => getSpotsByMatchup(activeMatchupIdx)
   );
+  useEffect(() => {
+    let cancelled = false;
+    // 1. Snapshot the heuristic versions immediately so the grid renders.
+    setSpots(getSpotsByMatchup(activeMatchupIdx));
+    // 2. Kick off bundled lookups in parallel; update once each resolves.
+    if (!isRealSolverAvailable()) return;  // browser mode: skip
+    Promise.all(
+      BOARD_TEMPLATES.map((_, b) =>
+        getBundledOrDemo(activeMatchupIdx, b).catch(() => null)
+      )
+    ).then((results) => {
+      if (cancelled) return;
+      // Re-fetch via getSpotsByMatchup since it now returns the cached upgraded
+      // spots (getBundledOrDemo writes to the shared cache).
+      void results;  // marked-unused; the cache side-effect is what matters
+      setSpots(getSpotsByMatchup(activeMatchupIdx));
+    });
+    return () => { cancelled = true; };
+  }, [activeMatchupIdx]);
 
   return (
     <div
