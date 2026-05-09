@@ -108,15 +108,59 @@ struct Kernels {
     // Pass nullptr for the skip_mask to disable (dense path), preserving
     // the original v1.8.0 behavior for any caller that doesn't have a
     // pre-validated mask.
-    void  (*showdown_oop_full)(const float* ev_matrix, const float* valid_matrix,
+    //
+    // v1.8.2 A2 encoding: category_matrix is a per-cell uint8_t in
+    // {0=invalid, 1=win, 2=lose, 3=tie}, pre-thresholded at precompute time
+    // from the continuous ev. valid_matrix stays as f32 (exact validity
+    // weight). 5 bytes/cell vs the prior 8 bytes/cell — bench shows ~1.97x
+    // throughput on cold-cache workloads and bit-identical results.
+    void  (*showdown_oop_full)(const uint8_t* category_matrix,
+                               const float* valid_matrix,
                                const float* opp_reach_w,
                                const uint8_t* skip_mask,
                                float* out, std::size_t n,
                                float win_p, float lose_p, float tie_p);
-    void  (*showdown_ip_full)(const float* ev_matrix, const float* valid_matrix,
+    void  (*showdown_ip_full)(const uint8_t* category_matrix,
+                              const float* valid_matrix,
                               const float* opp_reach_w,
                               float* out, std::size_t n,
                               float win_p, float lose_p, float tie_p);
+
+    // POST_OPTIMIZATION_REVIEW Sec 4.3 Phase 2 (kernel-level batching):
+    // process M terminal-OOP showdowns that all share the same matchup
+    // table, in a single kernel invocation. Each (cat_row, valid_row) is
+    // streamed exactly once per c (outer) and reused across all M terminals
+    // — the per-call kernel re-streams the matrix M times. On monotone with
+    // ~245 terminals per group, the theoretical matrix-bandwidth saving is
+    // ~245x; in practice the real saving is bounded by L3 reuse the natural
+    // BFS order already gives.
+    //
+    // Layout / contract:
+    //   cat_matrix, valid_matrix : shared [n × n] row-major
+    //   skip_mask                : optional [n], applied to ALL terminals
+    //                              (root-out-of-range is matchup-invariant)
+    //   opp_reach_w_array[t]     : terminal t's opp_reach × canonical_weight
+    //                              vector, length n
+    //   out_array[t]             : terminal t's output, length n
+    //   c_lo, c_hi               : c-range to process (allows the caller to
+    //                              parallelize the outer loop across threads
+    //                              without each thread re-streaming the same
+    //                              matrix rows)
+    //
+    // Numerically equivalent to calling showdown_oop_full(...) M times with
+    // each terminal's (opp_reach_w, win_p, lose_p, tie_p, out) — verified by
+    // the per-kernel parity test.
+    void (*showdown_oop_full_batch)(
+        const uint8_t* category_matrix, const float* valid_matrix,
+        std::size_t n,
+        std::size_t num_terminals,
+        const float* const* opp_reach_w_array,
+        const uint8_t* skip_mask,
+        float* const* out_array,
+        const float* win_p_array,
+        const float* lose_p_array,
+        const float* tie_p_array,
+        std::size_t c_lo, std::size_t c_hi);
 };
 
 // Defined in cpu_kernels_scalar.cpp / cpu_kernels_avx2.cpp.
@@ -217,21 +261,38 @@ inline void fold_ip_step(
 }
 
 inline void showdown_oop_full(
-    const float* ev_matrix, const float* valid_matrix,
+    const uint8_t* category_matrix, const float* valid_matrix,
     const float* opp_reach_w, const uint8_t* skip_mask,
     float* out, std::size_t n,
     float win_p, float lose_p, float tie_p)
 {
-    kernels().showdown_oop_full(ev_matrix, valid_matrix, opp_reach_w, skip_mask,
-                                 out, n, win_p, lose_p, tie_p);
+    kernels().showdown_oop_full(category_matrix, valid_matrix, opp_reach_w,
+                                 skip_mask, out, n, win_p, lose_p, tie_p);
 }
 inline void showdown_ip_full(
-    const float* ev_matrix, const float* valid_matrix,
+    const uint8_t* category_matrix, const float* valid_matrix,
     const float* opp_reach_w, float* out, std::size_t n,
     float win_p, float lose_p, float tie_p)
 {
-    kernels().showdown_ip_full(ev_matrix, valid_matrix, opp_reach_w, out, n,
-                                win_p, lose_p, tie_p);
+    kernels().showdown_ip_full(category_matrix, valid_matrix, opp_reach_w, out,
+                                n, win_p, lose_p, tie_p);
+}
+inline void showdown_oop_full_batch(
+    const uint8_t* category_matrix, const float* valid_matrix,
+    std::size_t n,
+    std::size_t num_terminals,
+    const float* const* opp_reach_w_array,
+    const uint8_t* skip_mask,
+    float* const* out_array,
+    const float* win_p_array,
+    const float* lose_p_array,
+    const float* tie_p_array,
+    std::size_t c_lo, std::size_t c_hi)
+{
+    kernels().showdown_oop_full_batch(
+        category_matrix, valid_matrix, n, num_terminals,
+        opp_reach_w_array, skip_mask, out_array,
+        win_p_array, lose_p_array, tie_p_array, c_lo, c_hi);
 }
 
 }  // namespace deepsolver::cpu_simd

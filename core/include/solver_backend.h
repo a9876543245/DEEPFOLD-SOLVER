@@ -117,11 +117,20 @@ struct SolverContext {
     /// node is in the tree (e.g. solving a river spot).
     const std::vector<float>*    matchup_ev    = nullptr;
     const std::vector<float>*    matchup_valid = nullptr;
+    /// v1.8.2 A2 encoding (POST_OPTIMIZATION_REVIEW Sec 4.3): pre-thresholded
+    /// per-cell category in {0=invalid, 1=win, 2=lose, 3=tie}. Built once at
+    /// precompute time so the showdown hot-loop reads 1 byte/cell instead of
+    /// re-thresholding ev_f32 (4 bytes/cell). Bench: ~1.97x on cold-cache
+    /// regimes (monotone-shape workloads), neutral on hot.
+    /// `matchup_ev`/`matchup_valid` are still kept around for postsolve
+    /// (combo_evs / exploitability), which uses the full continuous ev.
+    const std::vector<uint8_t>*  matchup_category = nullptr;
     /// Phase 1 chance enumeration: per-runout matchup tables. The terminal
     /// handler should pick the table by tree.matchup_idx[node_idx].
     /// matchup_ev_per_runout[k] is the matchup-ev table for runout k.
     const std::vector<std::vector<float>>* matchup_ev_per_runout    = nullptr;
     const std::vector<std::vector<float>>* matchup_valid_per_runout = nullptr;
+    const std::vector<std::vector<uint8_t>>* matchup_category_per_runout = nullptr;
 
     /// Per-canonical-combo reach probabilities derived from range weights.
     const std::vector<float>*    ip_reach      = nullptr;
@@ -188,6 +197,11 @@ public:
     virtual double phase_forward_pass_ms()      const { return 0.0; }
     virtual double phase_backward_pass_oop_ms() const { return 0.0; }
     virtual double phase_backward_pass_ip_ms()  const { return 0.0; }
+    // CPU-seconds (sum across threads) inside terminal evaluation, split by
+    // terminal type. Diagnostic only — used to decide whether to attack
+    // showdown matrix kernels or fold accumulation next.
+    virtual double phase_backward_showdown_ms() const { return 0.0; }
+    virtual double phase_backward_fold_ms()     const { return 0.0; }
 
     // ------------------------------------------------------------------------
     // Optional GPU postsolve hooks

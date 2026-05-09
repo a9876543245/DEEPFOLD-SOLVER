@@ -5,7 +5,7 @@ import {
   type MemoryProfile, type SolveMode,
 } from '../lib/poker';
 
-export type BetSizingKey = 'standard' | 'polar' | 'small_ball';
+export type BetSizingKey = 'lite' | 'standard' | 'polar' | 'small_ball';
 
 interface Props {
   pot: number;
@@ -48,9 +48,10 @@ export function SolverControls({
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const betPresets: Array<{ key: BetSizingKey; label: string; flop: string; turn: string; river: string }> = [
-    { key: 'standard',   label: t('config.standard'),  flop: '33/75',  turn: '33/75', river: '33/75' },
+    { key: 'lite',       label: t('config.lite'),      flop: '50',     turn: '50',     river: '50' },
+    { key: 'standard',   label: t('config.standard'),  flop: '33/75',  turn: '33/75',  river: '33/75' },
     { key: 'polar',      label: t('config.polar'),     flop: '75/150', turn: '75/150', river: '75/150' },
-    { key: 'small_ball', label: t('config.smallBall'), flop: '25/33',  turn: '25/33', river: '33/50' },
+    { key: 'small_ball', label: t('config.smallBall'), flop: '25/33',  turn: '25/33',  river: '33/50' },
   ];
   const activePreset = Math.max(0, betPresets.findIndex(p => p.key === sizingKey));
 

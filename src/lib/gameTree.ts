@@ -72,6 +72,22 @@ export interface BetSizing {
 }
 
 export const BET_SIZINGS: Record<string, BetSizing> = {
+  // v1.8.2 "Lite" profile (POST_OPTIMIZATION_REVIEW Idea 1):
+  // single 50%-pot bet per street + single 3× raise. The minimum sensible
+  // betting menu — every decision node has at most one bet branch instead
+  // of two, which roughly halves the tree's branching factor at each
+  // depth. Solve runs ~30-40% faster than Standard with a small (<1bb in
+  // most spots) EV gap. Combine with the "Quick" solve mode for fastest
+  // possible solve when you just need a directional read.
+  lite: {
+    label: 'Lite',
+    flopBetSizes: [0.5],
+    flopRaiseSizes: [3],
+    turnBetSizes: [0.5],
+    turnRaiseSizes: [3],
+    riverBetSizes: [0.5],
+    riverRaiseSizes: [3],
+  },
   standard: {
     label: 'Standard',
     flopBetSizes: [0.33, 0.75],

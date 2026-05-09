@@ -116,6 +116,7 @@ const dict: Dict = {
   'config.potSize': { en: 'Pot Size', zh: '底池大小', ja: 'ポットサイズ' },
   'config.effStack': { en: 'Effective Stack', zh: '有效籌碼', ja: '有効スタック' },
   'config.betSizing': { en: 'Bet Sizing', zh: '下注尺寸', ja: 'ベットサイジング' },
+  'config.lite': { en: 'Lite', zh: '輕量', ja: 'ライト' },
   'config.standard': { en: 'Standard', zh: '標準', ja: 'スタンダード' },
   'config.polar': { en: 'Polar', zh: '極化', ja: 'ポーラー' },
   'config.smallBall': { en: 'Small Ball', zh: '小球', ja: 'スモールボール' },

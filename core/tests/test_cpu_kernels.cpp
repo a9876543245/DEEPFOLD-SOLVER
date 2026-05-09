@@ -88,6 +88,13 @@ static void assert_arrays_close(const std::vector<float>& sa,
         assert_close(sa[i], aa[i], abs_tol, rel_tol, sa.size(), kernel, i);
     }
 }
+static void assert_arrays_close(const std::vector<float>& sa,
+                                 const std::vector<float>& aa,
+                                 float abs_tol, float rel_tol,
+                                 const std::string& kernel)
+{
+    assert_arrays_close(sa, aa, abs_tol, rel_tol, kernel.c_str());
+}
 
 // ----------------------------------------------------------------------------
 // Shared input fixtures. The lengths span (a) sub-SIMD trivial cases, (b)
@@ -384,6 +391,28 @@ static void test_fold_ip_step() {
 // sizes to exercise the inner-loop tail path.
 // ----------------------------------------------------------------------------
 
+// v1.8.2 A2: helper to compute the pre-thresholded category byte from an
+// (ev, valid) pair, mirroring precompute_matchups()'s bucketing rules:
+//   valid == 0           → 0 (invalid)
+//   ev > 0.5             → 1 (win)
+//   ev < -0.5            → 2 (lose)
+//   else                 → 3 (tie)
+static inline uint8_t cat_byte(float ev, float valid) {
+    if (valid <= 0.0f)   return 0;
+    if (ev    >  0.5f)   return 1;
+    if (ev    < -0.5f)   return 2;
+    return 3;
+}
+static std::vector<uint8_t> derive_categories(
+    const std::vector<float>& ev, const std::vector<float>& valid)
+{
+    std::vector<uint8_t> cat(ev.size(), 0);
+    for (std::size_t i = 0; i < ev.size(); ++i) {
+        cat[i] = cat_byte(ev[i], valid[i]);
+    }
+    return cat;
+}
+
 static void test_showdown_oop_full() {
     // n² rapidly dwarfs the full sweep; pick a few representative sizes.
     static const std::vector<std::size_t> kFullLengths = {1, 7, 8, 16, 32, 200, 1176};
@@ -395,6 +424,7 @@ static void test_showdown_oop_full() {
             std::copy(v_row.begin(), v_row.end(), valid.begin() + c * n);
             std::copy(e_row.begin(), e_row.end(), ev.begin()    + c * n);
         }
+        auto category = derive_categories(ev, valid);
         auto reach = range_floats(n, 0.0f, 1.0f);
         // v1.8.1+ kernel takes optional skip_mask. Test both the no-mask
         // (dense) path and the with-mask path with ~30% skipped rows.
@@ -406,10 +436,10 @@ static void test_showdown_oop_full() {
         std::vector<float> sa(n, 0.0f), aa(n, 0.0f);
         // No-mask path:
         scalar_kernels.showdown_oop_full(
-            ev.data(), valid.data(), reach.data(), nullptr,
+            category.data(), valid.data(), reach.data(), nullptr,
             sa.data(), n, 50.0f, -50.0f, 0.0f);
         avx2_kernels.showdown_oop_full(
-            ev.data(), valid.data(), reach.data(), nullptr,
+            category.data(), valid.data(), reach.data(), nullptr,
             aa.data(), n, 50.0f, -50.0f, 0.0f);
         assert_arrays_close(sa, aa, kTolAccumulate.abs_, kTolAccumulate.rel_,
                             "showdown_oop_full (no-mask)");
@@ -417,13 +447,137 @@ static void test_showdown_oop_full() {
         std::fill(sa.begin(), sa.end(), 0.0f);
         std::fill(aa.begin(), aa.end(), 0.0f);
         scalar_kernels.showdown_oop_full(
-            ev.data(), valid.data(), reach.data(), skip.data(),
+            category.data(), valid.data(), reach.data(), skip.data(),
             sa.data(), n, 50.0f, -50.0f, 0.0f);
         avx2_kernels.showdown_oop_full(
-            ev.data(), valid.data(), reach.data(), skip.data(),
+            category.data(), valid.data(), reach.data(), skip.data(),
             aa.data(), n, 50.0f, -50.0f, 0.0f);
         assert_arrays_close(sa, aa, kTolAccumulate.abs_, kTolAccumulate.rel_,
                             "showdown_oop_full (mask)");
+    }
+}
+
+// v1.8.2 Phase 2 parity: showdown_oop_full_batch must produce numerically
+// equivalent output to running showdown_oop_full once per terminal. Tests
+// both scalar-vs-AVX2 within batch, AND batch-vs-per-call within scalar
+// (so a bug in either impl gets caught).
+static void test_showdown_oop_full_batch() {
+    static const std::vector<std::size_t> kFullLengths = {7, 8, 16, 32, 200, 1176, 1326};
+    static const std::vector<std::size_t> kBatchSizes  = {1, 2, 8, 32, 128, 320};
+    for (auto n : kFullLengths) {
+        // Build a shared category + valid matrix (matches what the production
+        // precompute would emit).
+        std::vector<float>   ev_mat(n * n, 0.0f);
+        std::vector<float>   valid_mat(n * n, 0.0f);
+        std::vector<uint8_t> cat_mat(n * n, 0);
+        for (std::size_t c = 0; c < n; ++c) {
+            auto v_row = valid_mask(n);
+            auto e_row = ev_row(n, v_row);
+            std::copy(v_row.begin(), v_row.end(), valid_mat.begin() + c * n);
+            std::copy(e_row.begin(), e_row.end(), ev_mat.begin()    + c * n);
+        }
+        // Re-derive category from (ev, valid) mirroring precompute_matchups.
+        for (std::size_t k = 0; k < n * n; ++k) {
+            cat_mat[k] = cat_byte(ev_mat[k], valid_mat[k]);
+        }
+
+        // skip_mask: ~30% of c slots randomly skipped.
+        std::vector<uint8_t> skip(n, 0);
+        std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
+        for (std::size_t c = 0; c < n; ++c) {
+            if (dist01(rng()) < 0.3f) skip[c] = 1;
+        }
+
+        for (auto M : kBatchSizes) {
+            // Build M independent terminals (each with its own opp_reach_w
+            // and payoff coefficients).
+            std::vector<std::vector<float>> reaches(M);
+            std::vector<std::vector<float>> outs_per_call(M);
+            std::vector<std::vector<float>> outs_batch_scalar(M);
+            std::vector<std::vector<float>> outs_batch_avx2(M);
+            std::vector<float> win_p(M), lose_p(M), tie_p(M);
+            std::vector<const float*> reach_ptrs(M);
+            std::vector<float*>       out_ptrs_scalar(M);
+            std::vector<float*>       out_ptrs_avx2(M);
+            std::uniform_real_distribution<float> dpay(-100.0f, 100.0f);
+            for (std::size_t t = 0; t < M; ++t) {
+                // Use range_floats (not mixed_floats) — showdown is a reduction
+                // and 1e6 spikes from mixed_floats blow up FP-non-associativity
+                // gaps between batch's row-major outer-c order and per-call's
+                // c-major order well past the per-cell tolerance, even though
+                // the result is mathematically equivalent.
+                reaches[t]            = range_floats(n, 0.0f, 1.0f);
+                outs_per_call[t]      = std::vector<float>(n, 0.0f);
+                outs_batch_scalar[t]  = std::vector<float>(n, 0.0f);
+                outs_batch_avx2[t]    = std::vector<float>(n, 0.0f);
+                win_p[t]  = dpay(rng());
+                lose_p[t] = dpay(rng());
+                tie_p[t]  = dpay(rng());
+                reach_ptrs[t]      = reaches[t].data();
+                out_ptrs_scalar[t] = outs_batch_scalar[t].data();
+                out_ptrs_avx2[t]   = outs_batch_avx2[t].data();
+            }
+
+            // Reference: per-terminal calls via the existing scalar kernel.
+            for (std::size_t t = 0; t < M; ++t) {
+                scalar_kernels.showdown_oop_full(
+                    cat_mat.data(), valid_mat.data(), reaches[t].data(),
+                    skip.data(), outs_per_call[t].data(), n,
+                    win_p[t], lose_p[t], tie_p[t]);
+            }
+
+            // Batch scalar.
+            scalar_kernels.showdown_oop_full_batch(
+                cat_mat.data(), valid_mat.data(), n, M,
+                reach_ptrs.data(), skip.data(), out_ptrs_scalar.data(),
+                win_p.data(), lose_p.data(), tie_p.data(),
+                /*c_lo=*/0, /*c_hi=*/n);
+
+            // Batch AVX2.
+            avx2_kernels.showdown_oop_full_batch(
+                cat_mat.data(), valid_mat.data(), n, M,
+                reach_ptrs.data(), skip.data(), out_ptrs_avx2.data(),
+                win_p.data(), lose_p.data(), tie_p.data(),
+                /*c_lo=*/0, /*c_hi=*/n);
+
+            // Compare both batch impls against the per-call reference.
+            for (std::size_t t = 0; t < M; ++t) {
+                const std::string ctx_lbl = " (n=" + std::to_string(n)
+                                          + " M=" + std::to_string(M)
+                                          + " t=" + std::to_string(t) + ")";
+                assert_arrays_close(outs_batch_scalar[t], outs_per_call[t],
+                                     kTolAccumulate.abs_, kTolAccumulate.rel_,
+                                     "showdown_oop_full_batch (scalar vs per-call)" + ctx_lbl);
+                assert_arrays_close(outs_batch_avx2[t], outs_per_call[t],
+                                     kTolAccumulate.abs_, kTolAccumulate.rel_,
+                                     "showdown_oop_full_batch (avx2 vs per-call)" + ctx_lbl);
+            }
+
+            // Also exercise the c-range slicing — split [0, n) into halves
+            // and verify the union matches the full-range call.
+            std::vector<std::vector<float>> outs_split(M);
+            std::vector<float*> split_ptrs(M);
+            for (std::size_t t = 0; t < M; ++t) {
+                outs_split[t]  = std::vector<float>(n, 0.0f);
+                split_ptrs[t]  = outs_split[t].data();
+            }
+            const std::size_t mid = n / 2;
+            avx2_kernels.showdown_oop_full_batch(
+                cat_mat.data(), valid_mat.data(), n, M,
+                reach_ptrs.data(), skip.data(), split_ptrs.data(),
+                win_p.data(), lose_p.data(), tie_p.data(),
+                /*c_lo=*/0, /*c_hi=*/mid);
+            avx2_kernels.showdown_oop_full_batch(
+                cat_mat.data(), valid_mat.data(), n, M,
+                reach_ptrs.data(), skip.data(), split_ptrs.data(),
+                win_p.data(), lose_p.data(), tie_p.data(),
+                /*c_lo=*/mid, /*c_hi=*/n);
+            for (std::size_t t = 0; t < M; ++t) {
+                assert_arrays_close(outs_split[t], outs_per_call[t],
+                                     kTolAccumulate.abs_, kTolAccumulate.rel_,
+                                     "showdown_oop_full_batch (split c-range)");
+            }
+        }
     }
 }
 
@@ -437,13 +591,14 @@ static void test_showdown_ip_full() {
             std::copy(v_row.begin(), v_row.end(), valid.begin() + c * n);
             std::copy(e_row.begin(), e_row.end(), ev.begin()    + c * n);
         }
+        auto category = derive_categories(ev, valid);
         auto reach = mixed_floats(n, 0.0f, 1.0f);
         std::vector<float> sa(n, 0.0f), aa(n, 0.0f);
         scalar_kernels.showdown_ip_full(
-            ev.data(), valid.data(), reach.data(), sa.data(), n,
+            category.data(), valid.data(), reach.data(), sa.data(), n,
             50.0f, -50.0f, 0.0f);
         avx2_kernels.showdown_ip_full(
-            ev.data(), valid.data(), reach.data(), aa.data(), n,
+            category.data(), valid.data(), reach.data(), aa.data(), n,
             50.0f, -50.0f, 0.0f);
         assert_arrays_close(sa, aa, kTolAccumulate.abs_, kTolAccumulate.rel_,
                             "showdown_ip_full");
@@ -513,6 +668,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
     RUN_TEST(test_fold_ip_step);
     RUN_TEST(test_showdown_oop_full);
     RUN_TEST(test_showdown_ip_full);
+    RUN_TEST(test_showdown_oop_full_batch);
     RUN_TEST(test_edge_case_zero_input);
     RUN_TEST(test_edge_case_all_invalid_showdown);
 

@@ -85,6 +85,16 @@ public:
     double phase_forward_pass_ms()      const { return phase_forward_pass_ms_;      }
     double phase_backward_pass_oop_ms() const { return phase_backward_pass_oop_ms_; }
     double phase_backward_pass_ip_ms()  const { return phase_backward_pass_ip_ms_;  }
+    double phase_backward_showdown_ms() const {
+        double s = 0.0;
+        for (double v : showdown_acc_per_thread_) s += v;
+        return s * 1000.0;
+    }
+    double phase_backward_fold_ms() const {
+        double s = 0.0;
+        for (double v : fold_acc_per_thread_) s += v;
+        return s * 1000.0;
+    }
 
 private:
     SolverContext ctx_{};
@@ -119,6 +129,34 @@ private:
     std::vector<uint32_t> level_offsets_;
     uint32_t max_depth_  = 0;
     uint32_t num_levels_ = 0;
+
+    // POST_OPTIMIZATION_REVIEW Sec 4.3 Phase 2: level-0 terminals grouped
+    // by matchup_idx. Matrix benchmark on monotone shows ~245 terminals share
+    // each of the 446 matchup tables. Built once at prepare() from level-0
+    // nodes. Used by backward_pass to feed showdown_oop_full_batch with all
+    // SHOWDOWN terminals from one table per call — the matrix rows stream
+    // from cache once for the whole group instead of once per terminal call.
+    std::vector<std::vector<uint32_t>> terminals_by_table_;
+
+    // SHOWDOWN-only subset of terminals_by_table_ (split out so the batch
+    // kernel doesn't have to filter inside its hot path). FOLD terminals at
+    // level 0 keep the per-call path because the FOLD kernel's structure
+    // (nested OOP/IP loops with rw_ci skips) doesn't benefit from batching
+    // and refactoring it just for FOLD risks regressing the dominant
+    // SHOWDOWN path's win.
+    std::vector<std::vector<uint32_t>> showdowns_by_table_;
+    std::vector<uint32_t> non_showdown_l0_;     // FOLD + any other types
+
+    // Per-thread scratch for the batch kernel call. Grouped here so we
+    // don't re-allocate per group (or per iter). Sized to the largest group
+    // × per-terminal scratch needs in prepare().
+    std::vector<float>             batch_opp_reach_w_;     // [max_group × nc]
+    std::vector<float*>            batch_out_ptrs_;        // [max_group]
+    std::vector<const float*>      batch_reach_ptrs_;      // [max_group]
+    std::vector<float>             batch_win_payoff_;      // [max_group]
+    std::vector<float>             batch_lose_payoff_;     // [max_group]
+    std::vector<float>             batch_tie_payoff_;      // [max_group]
+    std::size_t                    max_showdown_group_size_ = 0;
 
     // ---- Per-node persistent buffers ----
     // Flat [N × nc] in row-major (node, combo). Allocated once in
@@ -160,6 +198,14 @@ private:
     double phase_backward_pass_oop_ms_ = 0.0;
     double phase_backward_pass_ip_ms_  = 0.0;
 
+    // POST_OPTIMIZATION_REVIEW Sec 4.2: showdown vs fold split inside
+    // evaluate_terminal(). Per-thread accumulators sized in prepare() so
+    // OMP threads add into their own slot without a synchronization point
+    // on the inner-most hot path. Held in seconds; phase_backward_*_ms()
+    // converts to ms × thread-sum (= CPU-seconds across all workers).
+    std::vector<double> showdown_acc_per_thread_;
+    std::vector<double> fold_acc_per_thread_;
+
     // v1.8.1+ out-of-range skip masks. Built once in prepare() from the
     // root reach vectors. mask[c] = 1 means "this combo is 0-reach from
     // root" — the user's range excludes it, so out[c] for this combo at
@@ -175,6 +221,15 @@ private:
 
     // ---- Internal methods ----
     void compute_strategy();
+
+    // v1.8.2 Phase 2: process all SHOWDOWN terminals in `group` (which all
+    // share the same matchup_idx) for the OOP traverser via the fused
+    // batch kernel. The matrix table (cat + valid for this mi) streams
+    // from cache once per c-row across all M terminals' accumulators.
+    // Gather is single-threaded (1.3 MB written per group, ~50µs at DRAM
+    // bandwidth); the kernel call is parallelized across c-slices via
+    // OMP so 8 threads share the matrix-row reads.
+    void process_showdown_group_oop(const std::vector<uint32_t>& group);
     void apply_dcfr_discount(int iteration);
     void build_level_schedule();
 
@@ -313,6 +368,12 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     phase_backward_pass_oop_ms_ = 0.0;
     phase_backward_pass_ip_ms_  = 0.0;
 
+    // POST_OPTIMIZATION_REVIEW Sec 4.2: per-thread showdown/fold accumulators.
+    // Sized to cpu_threads_effective_ so evaluate_terminal() can index by
+    // omp_get_thread_num() without bounds checks. Reset to 0 each prepare().
+    showdown_acc_per_thread_.assign(cpu_threads_effective_, 0.0);
+    fold_acc_per_thread_.assign(cpu_threads_effective_, 0.0);
+
     // v1.8.1+ build the out-of-range skip masks from root reach.
     // mask[c] = 1 iff that combo has 0-reach at root (i.e. excluded
     // from the user's range, so propagates as 0 throughout the tree
@@ -331,6 +392,64 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     }
 
     build_level_schedule();
+
+    // Phase 2: bucket level-0 terminals by their matchup_idx so backward_pass
+    // can iterate groups serially (parallel within group) and amortize the
+    // per-table DRAM streaming across all terminals that share that table.
+    // Reuse stats on monotone: 446 tables × ~245 terminals each.
+    terminals_by_table_.clear();
+    showdowns_by_table_.clear();
+    non_showdown_l0_.clear();
+    max_showdown_group_size_ = 0;
+    if (num_levels_ > 0) {
+        const uint32_t lo = level_offsets_[0];
+        const uint32_t hi = level_offsets_[1];
+        int32_t max_mi = -1;
+        for (uint32_t k = lo; k < hi; ++k) {
+            uint32_t n = node_order_[k];
+            if (n < ctx.tree->matchup_idx.size()) {
+                int32_t mi = ctx.tree->matchup_idx[n];
+                if (mi > max_mi) max_mi = mi;
+            }
+        }
+        if (max_mi >= 0) {
+            terminals_by_table_.resize(static_cast<std::size_t>(max_mi) + 1);
+            showdowns_by_table_.resize(static_cast<std::size_t>(max_mi) + 1);
+            for (uint32_t k = lo; k < hi; ++k) {
+                uint32_t n = node_order_[k];
+                int32_t mi = (n < ctx.tree->matchup_idx.size())
+                    ? ctx.tree->matchup_idx[n] : -1;
+                if (mi >= 0) {
+                    const std::size_t bin = static_cast<std::size_t>(mi);
+                    terminals_by_table_[bin].push_back(n);
+                    auto tt = static_cast<TerminalType>(ctx.tree->terminal_types[n]);
+                    if (tt == TerminalType::SHOWDOWN) {
+                        showdowns_by_table_[bin].push_back(n);
+                    } else {
+                        non_showdown_l0_.push_back(n);
+                    }
+                } else {
+                    non_showdown_l0_.push_back(n);
+                }
+            }
+            for (const auto& g : showdowns_by_table_) {
+                if (g.size() > max_showdown_group_size_) {
+                    max_showdown_group_size_ = g.size();
+                }
+            }
+        }
+    }
+    // Pre-size batch scratch to the largest group so the hot path never
+    // resizes. opp_reach_w buffer is [max_group × nc] flat.
+    if (max_showdown_group_size_ > 0) {
+        batch_opp_reach_w_.assign(
+            max_showdown_group_size_ * static_cast<std::size_t>(nc), 0.0f);
+        batch_out_ptrs_.assign(max_showdown_group_size_, nullptr);
+        batch_reach_ptrs_.assign(max_showdown_group_size_, nullptr);
+        batch_win_payoff_.assign(max_showdown_group_size_, 0.0f);
+        batch_lose_payoff_.assign(max_showdown_group_size_, 0.0f);
+        batch_tie_payoff_.assign(max_showdown_group_size_, 0.0f);
+    }
 }
 
 // ============================================================================
@@ -439,18 +558,22 @@ inline void LevelizedCpuBackend::evaluate_terminal(
     float tie_payoff  = -0.5f * rake;
 
     int32_t mi = (node_idx < tree.matchup_idx.size()) ? tree.matchup_idx[node_idx] : 0;
-    const auto& matchup_ev_table =
-        (ctx_.matchup_ev_per_runout && mi >= 0 &&
-         static_cast<std::size_t>(mi) < ctx_.matchup_ev_per_runout->size())
-            ? (*ctx_.matchup_ev_per_runout)[mi]
-            : *ctx_.matchup_ev;
     const auto& matchup_valid_table =
         (ctx_.matchup_valid_per_runout && mi >= 0 &&
          static_cast<std::size_t>(mi) < ctx_.matchup_valid_per_runout->size())
             ? (*ctx_.matchup_valid_per_runout)[mi]
             : *ctx_.matchup_valid;
-    const float* matchup_ev    = matchup_ev_table.data();
-    const float* matchup_valid = matchup_valid_table.data();
+    // v1.8.2 A2 encoding: showdown reads pre-thresholded category bytes
+    // instead of the continuous ev. Falls back to the root-board single
+    // category table when this terminal sits on the root board (no chance
+    // enumeration in the tree).
+    const auto& matchup_category_table =
+        (ctx_.matchup_category_per_runout && mi >= 0 &&
+         static_cast<std::size_t>(mi) < ctx_.matchup_category_per_runout->size())
+            ? (*ctx_.matchup_category_per_runout)[mi]
+            : *ctx_.matchup_category;
+    const float*   matchup_valid    = matchup_valid_table.data();
+    const uint8_t* matchup_category = matchup_category_table.data();
 
     // opp_reach × canonical_weight, computed once into thread-local scratch.
     // The pre-v1.8.0 code allocated a fresh `std::vector<float>(nc)` here on
@@ -479,17 +602,27 @@ inline void LevelizedCpuBackend::evaluate_terminal(
         ? oop_out_of_range_mask_.data()
         : ip_out_of_range_mask_.data();
 
+    // POST_OPTIMIZATION_REVIEW Sec 4.2: time showdown vs fold separately.
+    // omp_get_wtime() resolution on Windows is ~1µs which is > the call cost
+    // for tiny terminals — but called once per terminal, the noise averages
+    // out across the iter loop and the per-call overhead is well under 1%.
+#ifdef _OPENMP
+    const double _et_t0 = omp_get_wtime();
+#endif
+
     if (tt == TerminalType::SHOWDOWN) {
         // v1.8.0 P3-8 spike: full-matrix kernels fold the per-c outer loop
         // into the kernel itself, hoisting SIMD constants out of the hot
         // path and saving nc dispatch-table lookups per terminal call.
+        // v1.8.2 A2: kernels now read category bytes (1 B/cell) instead of
+        // ev floats (4 B/cell) — see SolverContext::matchup_category.
         if (traverser == 0) {
             cpu_simd::showdown_oop_full(
-                matchup_ev, matchup_valid, opp_reach_w, skip_mask, out, nc,
+                matchup_category, matchup_valid, opp_reach_w, skip_mask, out, nc,
                 win_payoff, lose_payoff, tie_payoff);
         } else {
             cpu_simd::showdown_ip_full(
-                matchup_ev, matchup_valid, opp_reach_w, out, nc,
+                matchup_category, matchup_valid, opp_reach_w, out, nc,
                 win_payoff, lose_payoff, tie_payoff);
         }
     } else {
@@ -534,6 +667,174 @@ inline void LevelizedCpuBackend::evaluate_terminal(
             cpu_simd::vec_scale_in_place(out, self_payoff, nc);
         }
     }
+
+#ifdef _OPENMP
+    {
+        const double _et_dt = omp_get_wtime() - _et_t0;
+        const int _et_tid = omp_get_thread_num();
+        const uint32_t _et_safe = (_et_tid < 0
+            || static_cast<uint32_t>(_et_tid) >= cpu_threads_effective_)
+                ? 0u : static_cast<uint32_t>(_et_tid);
+        if (tt == TerminalType::SHOWDOWN) {
+            showdown_acc_per_thread_[_et_safe] += _et_dt;
+        } else {
+            fold_acc_per_thread_[_et_safe] += _et_dt;
+        }
+    }
+#endif
+}
+
+// ============================================================================
+// v1.8.2 Phase 2: fused-kernel showdown for an OOP-traverser group.
+// Bypasses the per-call evaluate_terminal path and feeds the batch kernel
+// with M terminals' opp_reach_w + payoff coefficients gathered into the
+// pre-sized scratch buffers from prepare(). The matrix (cat + valid for
+// the group's shared matchup_idx) then streams from L1/L2 once per
+// c-row instead of once per terminal call.
+// ============================================================================
+inline void LevelizedCpuBackend::process_showdown_group_oop(
+    const std::vector<uint32_t>& group)
+{
+    if (group.empty()) return;
+    const auto& tree = *ctx_.tree;
+    const uint16_t nc = ctx_.iso->num_canonical;
+    const std::size_t M = group.size();
+
+    // All members share the same matchup_idx by construction.
+    const int32_t mi = (group[0] < tree.matchup_idx.size())
+        ? tree.matchup_idx[group[0]] : 0;
+
+    // Resolve matchup tables for this mi. Same fallback rule as
+    // evaluate_terminal — the per-runout vectors are populated when chance
+    // enumeration is engaged; otherwise we fall through to the root-board
+    // single-table path.
+    const auto& matchup_valid_table =
+        (ctx_.matchup_valid_per_runout && mi >= 0 &&
+         static_cast<std::size_t>(mi) < ctx_.matchup_valid_per_runout->size())
+            ? (*ctx_.matchup_valid_per_runout)[mi]
+            : *ctx_.matchup_valid;
+    const auto& matchup_category_table =
+        (ctx_.matchup_category_per_runout && mi >= 0 &&
+         static_cast<std::size_t>(mi) < ctx_.matchup_category_per_runout->size())
+            ? (*ctx_.matchup_category_per_runout)[mi]
+            : *ctx_.matchup_category;
+    const float*   valid_ptr = matchup_valid_table.data();
+    const uint8_t* cat_ptr   = matchup_category_table.data();
+
+    // Pre-resolve per-terminal pointers (cheap: M scalar copies).
+    for (std::size_t t = 0; t < M; ++t) {
+        const uint32_t n = group[t];
+        batch_reach_ptrs_[t] = batch_opp_reach_w_.data()
+                             + t * static_cast<std::size_t>(nc);
+        batch_out_ptrs_[t]   = &value_[row_off(n)];
+    }
+
+    const uint8_t* skip_mask = oop_out_of_range_mask_.data();
+
+    // Charge the entire group's wall time to the showdown phase counter
+    // (best-effort — finer per-thread breakdown isn't needed for the
+    // diagnostic and would require timing inside each c-slice).
+#ifdef _OPENMP
+    const double _bg_t0 = omp_get_wtime();
+#endif
+
+    // Single OMP region per group: each thread (a) gathers a slice of
+    // terminals' opp_reach_w + payoff coefficients, (b) hits a barrier so
+    // every gather is visible, then (c) processes a c-slice of the fused
+    // showdown kernel. Both phases parallelize at the same time without
+    // paying two separate fork/joins. With 446 monotone groups, that
+    // halves the OMP overhead vs the naive "gather then parallel kernel"
+    // version and recovers the 1.3 MB-per-group gather cost (was
+    // serializing into a ~1s/iter cliff).
+#if defined(_OPENMP)
+    if (cpu_threads_effective_ > 1) {
+        #pragma omp parallel num_threads(static_cast<int>(cpu_threads_effective_))
+        {
+            const int tid   = omp_get_thread_num();
+            const int nthr  = omp_get_num_threads();
+
+            // Phase A: gather. Each thread covers a slice of terminals.
+            const std::size_t t_lo = (M * tid) / nthr;
+            const std::size_t t_hi = (M * (tid + 1)) / nthr;
+            for (std::size_t t = t_lo; t < t_hi; ++t) {
+                const uint32_t n = group[t];
+                const float pot_total = tree.pots[n];
+                float rake = std::min(pot_total * ctx_.config->rake_rate,
+                                      ctx_.config->rake_cap);
+                if (rake < 0.0f) rake = 0.0f;
+                const float half_pot = pot_total * 0.5f;
+                batch_win_payoff_[t]  = half_pot - rake;
+                batch_lose_payoff_[t] = -half_pot;
+                batch_tie_payoff_[t]  = -0.5f * rake;
+
+                float* opp_w_buf = batch_opp_reach_w_.data()
+                                 + t * static_cast<std::size_t>(nc);
+                const float* opp_reach = &reach_ip_[row_off(n)];
+                for (uint16_t k = 0; k < nc; ++k) {
+                    opp_w_buf[k] = opp_reach[k] * canonical_weights_f_[k];
+                }
+            }
+
+            #pragma omp barrier
+
+            // Phase B: kernel. Each thread processes a slice of the c outer.
+            const std::size_t c_lo =
+                (static_cast<std::size_t>(nc) * tid) / nthr;
+            const std::size_t c_hi =
+                (static_cast<std::size_t>(nc) * (tid + 1)) / nthr;
+            cpu_simd::showdown_oop_full_batch(
+                cat_ptr, valid_ptr,
+                static_cast<std::size_t>(nc), M,
+                batch_reach_ptrs_.data(), skip_mask, batch_out_ptrs_.data(),
+                batch_win_payoff_.data(),  batch_lose_payoff_.data(),
+                batch_tie_payoff_.data(),
+                c_lo, c_hi);
+        }
+    } else
+#endif
+    {
+        // Single-thread fallback: gather then call.
+        for (std::size_t t = 0; t < M; ++t) {
+            const uint32_t n = group[t];
+            const float pot_total = tree.pots[n];
+            float rake = std::min(pot_total * ctx_.config->rake_rate,
+                                  ctx_.config->rake_cap);
+            if (rake < 0.0f) rake = 0.0f;
+            const float half_pot = pot_total * 0.5f;
+            batch_win_payoff_[t]  = half_pot - rake;
+            batch_lose_payoff_[t] = -half_pot;
+            batch_tie_payoff_[t]  = -0.5f * rake;
+
+            float* opp_w_buf = batch_opp_reach_w_.data()
+                             + t * static_cast<std::size_t>(nc);
+            const float* opp_reach = &reach_ip_[row_off(n)];
+            for (uint16_t k = 0; k < nc; ++k) {
+                opp_w_buf[k] = opp_reach[k] * canonical_weights_f_[k];
+            }
+        }
+        cpu_simd::showdown_oop_full_batch(
+            cat_ptr, valid_ptr,
+            static_cast<std::size_t>(nc), M,
+            batch_reach_ptrs_.data(), skip_mask, batch_out_ptrs_.data(),
+            batch_win_payoff_.data(),  batch_lose_payoff_.data(),
+            batch_tie_payoff_.data(),
+            0, static_cast<std::size_t>(nc));
+    }
+
+#ifdef _OPENMP
+    {
+        const double _bg_dt = omp_get_wtime() - _bg_t0;
+        // Charge against thread 0 — the OMP region above stays inside the
+        // batch kernel call so we can't easily attribute per-thread cost
+        // without instrumenting the kernel internals.
+        if (!showdown_acc_per_thread_.empty()) {
+            // Multiply by num threads to keep the CPU-seconds semantic
+            // consistent with the per-call path's per-thread accumulator.
+            showdown_acc_per_thread_[0] += _bg_dt
+                * static_cast<double>(cpu_threads_effective_);
+        }
+    }
+#endif
 }
 
 // ============================================================================
@@ -806,7 +1107,15 @@ inline void LevelizedCpuBackend::backward_pass(int traverser) {
     }
 #endif
 
-    // Default: per-level parallel-for fork.
+    // v1.8.2 Phase 2 experiment: kernel-level batching (process_showdown_group_oop)
+    // was implemented but disabled — measured regression on monotone (-13%
+    // 8T) outweighed the standard win (+4% noise). Root cause: each per-t
+    // inner-loop iteration reintroduces memory traffic via acc_buf
+    // load/store, which cancels the matrix-row-reuse savings the batch
+    // shape was supposed to capture. Natural BFS terminal order already
+    // covers most of the available cache locality. The kernel + parity
+    // test stay so a future revisit (different CPU / workload / acc-in-
+    // register variant) can re-enable with one line.
     for (uint32_t L = 0; L < num_levels_; ++L) {
         const uint32_t lo = level_offsets_[L];
         const uint32_t hi = level_offsets_[L + 1];

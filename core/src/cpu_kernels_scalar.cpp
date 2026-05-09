@@ -122,15 +122,15 @@ static void fold_ip_step(
     for (std::size_t i = 0; i < n; ++i) out_vals[i] += rw_ci * valid_row[i];
 }
 
-// v1.8.0 P3-8 spike: full-row showdown kernels — see cpu_simd.h for the why.
-// Logic is identical to calling showdown_oop_inner / showdown_ip_step n times
-// in sequence; just hoists the per-call setup work out of the loop.
+// v1.8.2 A2 encoding: takes a pre-thresholded category byte per cell rather
+// than re-bucketing the continuous ev. See cpu_simd.h header + cpu_kernels_avx2.cpp
+// for details. Categories: 0=invalid, 1=win, 2=lose, 3=tie.
 //
 // v1.8.1+ optional skip_mask: rows where skip_mask[c] != 0 set out[c]=0 and
 // skip the inner reduction. Caller must ensure skipping is safe (out[c] won't
 // be consumed by ancestor regret updates) — see cpu_simd.h header doc.
 static void showdown_oop_full(
-    const float* ev_matrix, const float* valid_matrix,
+    const uint8_t* category_matrix, const float* valid_matrix,
     const float* opp_reach_w, const uint8_t* skip_mask,
     float* out, std::size_t n,
     float win_p, float lose_p, float tie_p)
@@ -140,25 +140,24 @@ static void showdown_oop_full(
             out[c] = 0.0f;
             continue;
         }
-        const float* ev_row    = ev_matrix    + c * n;
-        const float* valid_row = valid_matrix + c * n;
+        const uint8_t* cat_row   = category_matrix + c * n;
+        const float*   valid_row = valid_matrix    + c * n;
         float sum = 0.0f;
         for (std::size_t i = 0; i < n; ++i) {
-            float ev = ev_row[i];
-            float valid = valid_row[i];
-            if (valid <= 0.0f) continue;
+            uint8_t cat = cat_row[i];
+            if (cat == 0) continue;
             float p;
-            if (ev >  0.5f) p = win_p;
-            else if (ev < -0.5f) p = lose_p;
-            else                 p = tie_p;
-            sum += opp_reach_w[i] * valid * p;
+            if      (cat == 1) p = win_p;
+            else if (cat == 2) p = lose_p;
+            else               p = tie_p;
+            sum += opp_reach_w[i] * valid_row[i] * p;
         }
         out[c] = sum;
     }
 }
 
 static void showdown_ip_full(
-    const float* ev_matrix, const float* valid_matrix,
+    const uint8_t* category_matrix, const float* valid_matrix,
     const float* opp_reach_w, float* out, std::size_t n,
     float win_p, float lose_p, float tie_p)
 {
@@ -169,17 +168,59 @@ static void showdown_ip_full(
     for (std::size_t ci = 0; ci < n; ++ci) {
         float rw_ci = opp_reach_w[ci];
         if (rw_ci == 0.0f) continue;
-        const float* ev_row    = ev_matrix    + ci * n;
-        const float* valid_row = valid_matrix + ci * n;
+        const uint8_t* cat_row   = category_matrix + ci * n;
+        const float*   valid_row = valid_matrix    + ci * n;
         for (std::size_t i = 0; i < n; ++i) {
-            float ev = ev_row[i];
-            float valid = valid_row[i];
-            if (valid <= 0.0f) continue;
+            uint8_t cat = cat_row[i];
+            if (cat == 0) continue;
             float p;
-            if (ev >  0.5f) p = lose_p;
-            else if (ev < -0.5f) p = win_p;
-            else                 p = tie_p;
-            out[i] += rw_ci * valid * p;
+            if      (cat == 1) p = lose_p;   // ev > 0.5 → IP loses
+            else if (cat == 2) p = win_p;    // ev < -0.5 → IP wins
+            else               p = tie_p;
+            out[i] += rw_ci * valid_row[i] * p;
+        }
+    }
+}
+
+// v1.8.2 Phase 2 (kernel-level batching): scalar reference. Numerically
+// equivalent to calling showdown_oop_full(...) for each terminal in turn —
+// the AVX2 version achieves matrix-bandwidth amortization via the fused
+// outer-c loop, but parity-wise both implementations must produce the same
+// result.
+static void showdown_oop_full_batch(
+    const uint8_t* category_matrix, const float* valid_matrix,
+    std::size_t n,
+    std::size_t num_terminals,
+    const float* const* opp_reach_w_array,
+    const uint8_t* skip_mask,
+    float* const* out_array,
+    const float* win_p_array,
+    const float* lose_p_array,
+    const float* tie_p_array,
+    std::size_t c_lo, std::size_t c_hi)
+{
+    for (std::size_t c = c_lo; c < c_hi; ++c) {
+        if (skip_mask && skip_mask[c]) {
+            for (std::size_t t = 0; t < num_terminals; ++t) {
+                out_array[t][c] = 0.0f;
+            }
+            continue;
+        }
+        const uint8_t* cat_row   = category_matrix + c * n;
+        const float*   valid_row = valid_matrix    + c * n;
+        for (std::size_t t = 0; t < num_terminals; ++t) {
+            const float* reach = opp_reach_w_array[t];
+            float sum = 0.0f;
+            for (std::size_t i = 0; i < n; ++i) {
+                uint8_t cat = cat_row[i];
+                if (cat == 0) continue;
+                float p;
+                if      (cat == 1) p = win_p_array[t];
+                else if (cat == 2) p = lose_p_array[t];
+                else               p = tie_p_array[t];
+                sum += reach[i] * valid_row[i] * p;
+            }
+            out_array[t][c] = sum;
         }
     }
 }
@@ -206,6 +247,7 @@ const Kernels scalar_kernels = {
     &scalar_impl::fold_ip_step,
     &scalar_impl::showdown_oop_full,
     &scalar_impl::showdown_ip_full,
+    &scalar_impl::showdown_oop_full_batch,
 };
 
 }  // namespace deepsolver::cpu_simd

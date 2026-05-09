@@ -7,238 +7,52 @@
 📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.7.1-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU%20%28AVX2%2BMulti--core%29-orange)
 
-DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). It pairs a GPU-accelerated DCFR engine — now matched by a multi-core CPU backend that scales linearly to every available core — with **runout aggregation, per-combo blocker analysis, EV / aggression heatmaps, and a 2,500+ preflop chart browser**, all in a single Windows installer.
+DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). It pairs a GPU-accelerated DCFR engine with a multi-core CPU backend that scales linearly across every available core, surrounded by **runout aggregation, per-combo blocker analysis, EV / aggression heatmaps, and a 2,500+ preflop chart browser** — all in a single Windows installer.
 
-## What's new in v1.7.1 — Multi-core CPU is now the default
+## What sets DEEPFOLD-SOLVER apart
 
-Four releases of compounding CPU work since v1.3.1 have transformed CPU solving. The standard rainbow benchmark on a typical 8-thread laptop CPU now runs at ~140 iter/s — roughly **5× faster than the previous CPU backend** (which was the default through v1.7.0) on the same hardware, fully automatic, no flags or settings to flip. Users who never touch the GPU now get solve times that used to require one.
+### Engine that uses every core you have
 
-### What you'll notice
+- **Dual-backend DCFR** — GPU when you have one, CPU when you don't, identical numerical strategy either way. The GPU path ships native CUDA SASS for Turing / Ampere / Ada / Hopper, with PTX-JIT forward-compat for Blackwell. The CPU path is a BFS-flat "levelized" CFR backend that scales linearly across physical cores instead of capping at two threads.
+- **Runtime CPUID dispatch** — AVX2 kernels on Haswell-and-newer, scalar fallback on older silicon. One binary, no separate build, no startup crashes on pre-2013 CPUs.
+- **Per-commit parity gate** — every build re-verifies that `reference vs levelized`, `scalar vs AVX2`, and `1-thread vs N-thread` paths emit bit-identical strategies. The fast path can never silently drift from the correctness oracle.
 
-- **Solves are dramatically faster on CPU.** A new BFS-flat "levelized" CFR backend replaces the old recursive one and scales linearly across physical cores instead of capping at 2 threads. The standard rainbow benchmark goes from 28 to 137 iterations per second on the same hardware.
-- **The ETA banner is now accurate.** Before v1.7.1 the pre-solve estimator didn't know which CPU backend would actually run and quoted "5 minutes" for solves that finished in 1. The throughput model is now backend- and thread-aware, sitting within roughly 2× of measured throughput across the entire config space.
-- **Old hardware still loads.** Pre-Haswell CPUs (no AVX2) automatically fall back to scalar kernels via runtime CPUID dispatch at startup — single binary, no separate build, no startup crashes.
-- **`--cpu-threads N` is honored.** The flag was reported but ignored before; the levelized backend now applies it as `num_threads(…)` on every parallel-for, so you can cap thread usage on shared machines.
+### Solve-mode presets that actually stop on time
 
-### Calibration
+- **Quick / Standard / Deep** preset pills bundle iteration cap + time budget + exploitability target into one click. The solver stops at whichever fires first — and because CFR is anytime, the running average at any iteration *is* the strategy, so a budget-stopped solve is a usable strategy, not a half-baked one.
+- **Pre-solve ETA banner** — clicking Solve fires a sub-second `--estimate-only` engine call that shows wall-clock time before iterations begin, calibrated against the standard benchmark. Surfaces AUTO fallback reasons (e.g. "Pascal needs CUDA-12.x build") right next to the estimate.
+- **Stop button + Quality badge** — pure abort with no partial result preserved (use the time budget for "stop with what we have"). Result panel shows 🟢 high / 🟡 good / 🟠 rough / 🔴 low confidence based on final exploitability%.
+- **`--time-budget-seconds`** is checked **every iter**, so even slow per-iter spots stop precisely at budget instead of overshooting.
 
-Measured against `--benchmark standard` (AsKd7c rainbow flop, 100 iter, 8 logical / 4 physical cores):
+### Post-solve insight tools other solvers don't have
 
-| Backend                 | 1T   | 2T   | 4T   | 8T    | 1T → 8T |
-|-------------------------|------|------|------|-------|---------|
-| reference (v1.5.x)      | 25.3 | 28.2 | 27.8 | 28.5  | 1.13× *(parallel-sections cap)* |
-| **levelized (v1.7.1)**  | 25.0 | 49.1 | 91.0 | **137.6** | **5.46×** |
+- **Runout Report** — one click after a solve fans out every canonical turn card into a 13×4 grid colored by dominant action. Switch to **By Class** view and the 23+ turns get grouped into **Pair / Flush / Straight / Overcard / Brick** texture buckets with weighted strategy + EV per bucket. Sort by Best EV / Worst EV / Most aggressive. CSV export.
+- **1326 Combo Drill** — click any 169-class label to expand the 4 / 6 / 12 specific combos in that class with **per-combo blocker analysis**: how much of the opponent's range each specific hand removes, plus the top-5 most-blocked opponent classes. The standard tie-breaker for mixed strategies, finally first-class in the UI.
+- **Strategy grid view modes** — toolbar above the 169 grid switches between Strategy Mix (default multi-action gradient), **EV** (per-class heatmap, red→grey→green normalized to in-range EV span), **Aggression** (Bet/Raise/All-in frequency cool→hot), and single-action Heatmap. EV mode surfaces "which combos are profit centres vs which are losing" at a glance.
 
-Both backends emit the same numerical strategy; a per-commit parity gate (reference vs levelized, scalar vs AVX2, single- vs multi-thread) prevents the implementations from drifting.
+### Memory you can trust
 
-### Why this took four releases
+- **Memory Profile presets** — `safe / balanced / performance` pick host-RAM, JSON, and strategy-tree-node budgets up front, with a live preview of each. The solver respects the budget end-to-end — pre-backend gates evaluate CPU host / GPU VRAM / AUTO fallback **before** allocation, so OOM scenarios become structured errors with a UI badge instead of crashes.
+- **Common host budget gate** applies on GPU backend too — matchup tables, strategy-tree EV cache, and JSON response all live on host RAM regardless of backend, and all are checked. The diagnostic clarifies that switching to GPU won't fix common-host overflows.
+- **Chunked GPU matchup upload** eliminates host-side `flat_ev` / `flat_valid` duplication; upload happens per-runout via `cudaMemset + cudaMemcpy`, lowering peak host RAM during GPU prep.
 
-- **v1.4.0 — AVX2/scalar runtime dispatch.** Per-source `/arch:AVX2` confines AVX2 opcodes to a single translation unit; CPUID + OS-state checks at startup pick the kernel table. Pre-Haswell CPUs never enter the AVX2 path. A scratch-arena bump allocator on the recursive backend eliminated 60k+ `vector<float>` allocations per iteration.
-- **v1.4.1 — Real engine progress events.** The iter counter no longer fakes via `setInterval`; the engine emits structured progress events on stderr that Tauri forwards to the UI. Matchup precompute also parallelized over the outer combo dimension.
-- **v1.5.0 — Levelized CPU backend.** BFS-flat traversal with per-level `parallel for` replaces the recursive arena's serial bump pointer. This is the change that unlocks scaling past 2 threads.
-- **v1.5.1 — Google OAuth login fix.** A build-pipeline gap had shipped four releases with an empty `client_secret`; closed by sourcing `.env.local` from `prepare-release.ps1` and adding a `cargo:rerun-if-env-changed` hint so the secret can't get cached as empty.
-- **v1.6.0 — CPU correctness gates.** Restored test-target linking after the AVX2 dispatch refactor, added the parity test suite, and made `--cpu-threads N` actually clamp the OMP team size.
-- **v1.7.0 — GUI flips to levelized.** The frontend now requests the levelized backend for every solve. The host-memory budget gate accounts for the levelized backend's extra reach/value buffers so tight RAM limits reject before allocation rather than after.
-- **v1.7.1 — ETA throughput model rebuilt.** Per-backend × per-thread rates calibrated against the standard benchmark, fixing the "5 minutes estimated, 1 minute actual" wait-cliff inversion.
+### Built-in content
 
-The previous recursive backend remains selectable via `--cpu-backend reference` (CLI only) for parity testing and debugging — it is no longer a user-facing toggle in the GUI.
+- **2,550+ preflop scenarios** browsable in-app. One click applies as IP / OOP range.
+- **120+ pre-solved flop spots** in a one-click library.
+- **Bet sizing presets** — Standard / Polar / Small Ball — flow through to both the solver tree and the UI buttons.
+- **Range editor + node locking** — override any combo frequency and re-solve.
+- **Training mode** — 10-question drills that score your answers against the equilibrium.
 
-## What's new in v1.3.1 (time-budget honored on slow CPUs)
+### Operational polish
 
-Field bug from v1.3.0: a user with a GTX 1070 Max-Q laptop hit Tauri's
-outer subprocess timeout (720s for 300 iter) before the engine's
-internal time_budget (300s) could fire. Root cause: a single CFR
-iteration on a 9k-node turn solve took longer than 720s on that laptop's
-CPU, so the loop never got to its between-iter budget check.
-
-Tauri's outer timeout now scales with the user-set time_budget:
-\`min(budget × 3 + 90s, 1800s)\`. That gives the in-flight iter room to
-finish so the engine's budget check can fire. Bigger spots on slower
-hardware now correctly stop at the budget instead of dying with a
-"Engine timed out" error.
-
-The error message also got smarter — when the timeout fires WITH a
-budget set, we now say "your spot is too large for the X-second budget
-on this hardware" rather than the generic "try reducing iterations".
-
-## What's new in v1.3.0 (time-budgeted solves + Stop button)
-
-The wait-cliff fix. Triggered by user feedback on v1.2.2: "if you're going to
-stop at 5 minutes anyway, showing me a 3-hour ETA is useless."
-
-### Solve mode presets
-
-Three pills above the Solve button bundle iteration cap + time budget +
-exploitability target into one click:
-
-| Mode | Iter cap | Time budget | Exploit target | Use when |
-|---|---|---|---|---|
-| **Quick**    | 100  | 60s   | 1.5%   | Sanity check, exploration |
-| **Standard** | 300  | 5 min | 0.5%   | **Default** — pro-grade play |
-| **Deep**     | 1000 | 15 min | 0.2%  | Research, nuanced spots |
-
-The solver stops at whichever fires first. CFR is anytime — at any iteration
-*N* the running average is the strategy, so stopping at the budget gives a
-usable result, not a half-baked one.
-
-### Stop button + Quality badge
-
-- **Stop button** (replaces Solve while loading) — pure abort; no partial
-  result preserved. Time budget is the path for "stop with what we have"
-  (auto-fires when budget hits).
-- **Quality badge** in the result panel: 🟢 high / 🟡 good / 🟠 rough /
-  🔴 low confidence based on final exploitability%. Surfaces "stopped at
-  budget — try Deep mode" when relevant.
-
-### ETA banner reworked
-
-Headline is now `min(estimate, time_budget)` instead of an unbounded
-estimate. No more "Estimated 5 hours on CPU" for spots the user will only
-wait 5 minutes for. Side note shows the unbounded estimate so users
-understand the budget is fire-the-stop, not "we'll converge in time".
-
-### Throughput recalibration
-
-The pre-solve estimator was 50× pessimistic on GPU (calibrated against a
-hand-wave; now calibrated against actual `--benchmark standard` numbers
-on a real RTX 5090: 568 Gops/s sustained). CPU rate also bumped 3×. Same
-spot that previously estimated "11 minutes" on a top-end GPU now
-estimates ~12 seconds — matching reality.
-
-### Engine
-
-- New `--time-budget-seconds <s>` CLI flag, checked **every iter** so slow
-  per-iter spots stop precisely at the budget (not 5 minutes late).
-- New `early_stop_reason` field in result JSON: `iter_cap` / `time_budget`.
-- New `cancel_solve` Tauri command (terminate via taskkill).
-
-## What's new in v1.2.2 (pre-solve ETA + multi-arch CUDA)
-
-User-visible:
-
-- **Pre-solve ETA banner** — clicking *Solve* now fires a sub-second
-  `--estimate-only` engine call that returns "Estimated 12 minutes on CPU"
-  before the iterations even start. Spots that would have made you wait
-  five minutes wondering if anything was happening now show their wall-clock
-  upfront, with an amber warning past 60s and a red one past 30 minutes.
-  Also surfaces the `fallback_reason` if AUTO downgraded to CPU (e.g.
-  "Pascal needs CUDA-12.x build").
-- **Multi-arch CUDA build** — installer now ships native SASS for Turing
-  (RTX 20-series), Ampere (RTX 30-series), Ada (RTX 40-series), and Hopper
-  (H100), with PTX-JIT forward-compat for Blackwell (RTX 5090). Previously
-  only Ada was native — every other supported card paid a one-time JIT
-  penalty on first kernel launch.
-- **AUTO fallback diagnostics** — when AUTO routes to CPU because the GPU
-  was rejected, the resources block now carries the actual reason. Pascal
-  (GTX 10-series) and Volta (Titan V) hardware get a specific note that
-  the current build uses CUDA 13.x which dropped those archs; CUDA-12.x
-  Pascal-friendly build planned for v1.3.0.
-
-Engine internals:
-
-- `SolveResources` got `ops_per_iteration`, `backend_for_estimate`,
-  `estimated_solve_seconds` so the post-solve calibration matches the
-  pre-solve estimate (useful for benchmark CLI / regression tracking).
-- New `Solver::estimate_only()` method — runs iso + tree build only, no
-  precompute_matchups or iterations. Sub-second on most spots.
-- New `--estimate-only` CLI flag and Tauri `estimate_solve` command.
-
-## What's new in v1.2.1 (memory-control hardening)
-
-Patch release plugging two memory-budget holes flagged by an external review:
-
-- **VISIBLE EV cache now respects `strategy_tree_max_nodes`** — the pre-walk
-  that builds the EV cache for emitted nodes was unbounded, so on big trees
-  with tight node caps the EV cache RAM (two `std::map<uint32_t,
-  std::vector<float>>`) could dwarf the eventual JSON payload by orders of
-  magnitude. Now capped at the same threshold as the JSON walk.
-  `resources.estimated_strategy_tree_bytes` correctly scales with the cap.
-- **Common host budget gate now applies on GPU backend too** — the previous
-  host budget check ran only when `selected_backend == CPU`, so GPU solves
-  silently bypassed the host RAM ceiling on matchup tables, strategy_tree
-  EV cache, and JSON response (all of which live on host regardless of
-  backend). Split into a common-host gate (always checked) plus a
-  CPU-specific add (cpu_state). Diagnostic message clarifies that switching
-  to GPU won't fix common-host overflows.
-- New ctest regression guards: `CliEvCacheRespectsCap`,
-  `CliGpuCommonHostBudgetReject`.
-
-## What's new in v1.2.0
-
-> v1.2.0 adds two new strategy-grid view modes, a memory-profile selector,
-> and several solver-side reliability improvements.
-
-### Grid view modes
-
-The 169 strategy grid now switches between four views via a toolbar:
-
-- **Strategy Mix** (default) — multi-action gradient per cell
-- **EV** *(new)* — per-class EV heatmap, red→grey→green normalized to the in-range EV span. Surfaces "which combos are profit centres vs which are losing" at a glance.
-- **Aggression** *(new)* — sum of Bet/Raise/All-in frequencies, cool→hot. Answers "how often does this class take an aggressive line vs passive?"
-- **Heatmap** — single-action intensity (e.g. "show only Bet 75% freq")
-
-### Solve controls
-
-- **Memory Profile selector** — `safe / balanced / performance` pills in advanced settings, with live preview of the host RAM / JSON / strategy-tree-node budgets each profile applies. Default `balanced` matches the engine and Rust resolver.
-
-### Engine
-
-- **JSON cap as action** — when the estimated JSON response would exceed the configured budget, the solver now auto-reduces `strategy_tree_max_nodes` to fit *before* the budget gate runs. The previous behavior was to fail the gate; users now get a usable (smaller) navigation cache plus a `resources.diagnostic` note explaining what got reduced and why.
-- **`--benchmark standard` CLI flag** — reproducible perf-tracking preset (AsKd7c rainbow, full ranges, 100 iter). Emits a compact JSON with `iterations_per_sec`, `nodes_per_sec`, `memory_estimate_mb`, plus full timing breakdown. Greppable for CI regression tracking.
-
-### Reliability
-
-- **Tauri timeout integration test** (`src-tauri/tests/timeout_kill.rs`) — regression guard for the Phase 5 engine-cleanup fix. Spawns the engine, lets the timeout fire, asserts the child is killed cleanly (no zombie process holding GPU memory).
-- **Release script reliability** — `scripts/prepare-release.ps1` now bypasses Tauri's in-build minisign signer (which hangs on stdin password prompts in PowerShell 5.1 + npm.cmd setups) and signs explicitly post-build via the `--password` CLI flag. Same end-user verification path, no more half-built releases.
-
-## What's new in v1.1.0
-
-> v1.1.0 is a feature drop focused on **post-solve insight tools** that other
-> solvers don't have. The engine itself also got a serious resource-safety pass.
-
-### Three flagship features
-
-- **Runout Report** — One click after a solve fans out every canonical turn
-  card into a single 13×4 grid colored by dominant action. Switch to **By
-  Class** view and the 23+ turns are grouped into **Pair / Flush / Straight /
-  Overcard / Brick** texture buckets with weighted strategy + EV per bucket.
-  Sort by Best EV / Worst EV / Most aggressive. Export to CSV.
-- **1326 Combo Drill** — Click any 169-class label to expand the 4/6/12
-  specific combos in that class with **per-combo blocker analysis**. See
-  exactly how much of the opponent's range each specific hand removes,
-  with the top-5 most-blocked opponent classes called out. The standard
-  poker tie-breaker for mixed strategies, finally first-class in the UI.
-- **Memory Profile presets** — `safe / balanced / performance` profiles
-  pick host-RAM, JSON, and strategy-tree-node budgets up front. The
-  solver respects the budget end-to-end — no more silent OOM kills.
-
-### Engine resource safety
-
-- **Pre-backend budget gate** — CPU host / GPU VRAM / AUTO fallback all
-  evaluated *before* allocation. OOM scenarios become structured errors
-  with a UI badge, not crashes.
-- **CUDA exception-based error handling** — `CUDA_CHECK` throws
-  `CudaError` instead of `exit()`. Partial allocations roll back cleanly
-  on failure.
-- **Chunked GPU matchup upload** — host-side `flat_ev` / `flat_valid`
-  duplication eliminated. Upload happens per-runout via `cudaMemset +
-  cudaMemcpy`. Lower peak host RAM during GPU prep.
-- **Strategy tree EV emission modes** — `none | visible | full` lets you
-  trim the JSON output for narrow workflows (e.g. headless benchmarks).
-- **Test layering** — ctest now has labeled suites: `smoke` (~13s),
-  `correctness` (~106s), `stress` (nightly), plus dedicated `gpu` and
-  `memory` labels.
-
-### Carried forward from v1.0.4–1.0.11
-
-- Phase 2 suit isomorphism (3–7× speedup on monotone / three-of-suit boards)
-- GPU per-runout matchup tables (6–10× over CPU on iso-engaged trees)
-- Route A navigation cache (O(1) action switching, no re-solve)
-- Path B runout selector (PioSolver-style chance-aware navigation)
-- GameContextSelector — Cash 6max/8max + MTT + stack picker
+- **Trilingual UI** — English / 中文 / 日本語, switchable at any time.
+- **Auto-update** — banner-driven one-click installer refresh, signed releases, install-mode `passive`.
+- **Suit isomorphism** delivers 3–7× speedup on monotone / three-of-suit boards automatically; per-runout matchup tables on GPU give 6–10× over CPU on iso-engaged trees.
+- **Route A navigation cache** — O(1) action switching, no re-solve. **Path B runout selector** for PioSolver-style chance-aware navigation.
+- **Reproducible benchmarks** — `deepsolver_core --benchmark standard` runs an AsKd7c rainbow / 100-iter scenario and emits compact perf-tracking JSON (`iterations_per_sec`, `nodes_per_sec`, `memory_estimate_mb`, full timing breakdown). Greppable for CI regression tracking.
 
 ## Download
 
@@ -273,19 +87,19 @@ GPU and SIMD detection are both automatic. The status pill in the top-right show
 
 Not a member yet? Upgrade at [deepfold.co](https://deepfold.co).
 
-## What's inside
+## Feature reference
 
 | Feature | Description |
 |---|---|
-| **GTO Solver** | Discounted CFR with vectorized GPU kernels. Sub-percent exploitability in seconds for typical turn spots. |
+| **GTO Solver** | Discounted CFR with vectorized GPU kernels and a multi-core CPU backend. Sub-percent exploitability in seconds for typical turn spots. |
 | **Per-combo strategy grid** | 13×13 grid colored by action mix at the current decision node. Hover for suited-variant breakdown. |
 | **Acting ↔ Opponent view** | Toggle between your strategy and the opponent's reach-weighted range at the same node. |
-| **🆕 Grid view modes (v1.2.0)** | Toolbar above the 169 grid switches between Strategy Mix / **EV** / **Aggression** / single-action heatmap. EV mode normalizes red→grey→green across in-range cells so profit centres jump out. |
-| **🆕 Memory Profile selector (v1.2.0)** | UI pills for `safe / balanced / performance` in advanced settings with live budget preview. Threads through to the engine via `--memory-profile`. |
-| **🆕 Benchmark CLI (v1.2.0)** | `deepsolver_core --benchmark standard` runs a reproducible AsKd7c+100iter scenario and emits compact perf-tracking JSON. |
-| **Runout Report (v1.1.0)** | After any solve, fan out all enumerated turn cards into a 13×4 grid + texture-bucket view + 4 sort modes + CSV export. See the [User Guide](USER_GUIDE.md#2-runout-report--see-every-turn-at-once). |
-| **1326 Combo Drill (v1.1.0)** | Expand any 169-class into its 4/6/12 specific combos with per-combo blocker analysis vs the opponent's range. See the [User Guide](USER_GUIDE.md#3-combo-drill--break-169-classes-into-specific-combos). |
-| **Memory Profile (v1.1.0)** | `safe / balanced / performance` presets to bound host-RAM, JSON, and strategy-tree-node budgets. No more silent OOM kills. |
+| **Grid view modes** | Toolbar above the 169 grid switches between Strategy Mix / **EV** / **Aggression** / single-action heatmap. EV mode normalizes red→grey→green across in-range cells so profit centres jump out. |
+| **Memory Profile selector** | UI pills for `safe / balanced / performance` in advanced settings with live budget preview. Threads through to the engine via `--memory-profile`. |
+| **Benchmark CLI** | `deepsolver_core --benchmark standard` runs a reproducible AsKd7c+100iter scenario and emits compact perf-tracking JSON. |
+| **Runout Report** | After any solve, fan out all enumerated turn cards into a 13×4 grid + texture-bucket view + 4 sort modes + CSV export. See the [User Guide](USER_GUIDE.md#2-runout-report--see-every-turn-at-once). |
+| **1326 Combo Drill** | Expand any 169-class into its 4/6/12 specific combos with per-combo blocker analysis vs the opponent's range. See the [User Guide](USER_GUIDE.md#3-combo-drill--break-169-classes-into-specific-combos). |
+| **Memory Profile** | `safe / balanced / performance` presets to bound host-RAM, JSON, and strategy-tree-node budgets. No more silent OOM kills. |
 | **Runout picker** | When iso enumeration is engaged, click any canonical river card to switch subtrees. |
 | **GTO chart library** | 2,550+ bundled preflop scenarios browsable in-app. One click applies as IP / OOP range. |
 | **Bet sizing presets** | Standard / Polar / Small Ball — flows through to the solver tree AND the UI buttons. |
@@ -361,7 +175,7 @@ When filing a bug, please include:
 Yes. Auto-detects and falls back to CPU. Slower but produces identical strategies.
 
 **macOS / Linux support?**
-Not in v1.0.x. On the roadmap.
+Not currently. On the roadmap.
 
 **Are solver strategies uploaded anywhere?**
 No. Everything runs locally. The only network call is the OAuth sign-in check against deepfold.co.

@@ -551,6 +551,10 @@ std::string result_to_json(
          << result.timing.phase_backward_pass_oop_ms << ",\n";
     json << "    \"phase_backward_pass_ip_ms\": "
          << result.timing.phase_backward_pass_ip_ms << ",\n";
+    json << "    \"phase_backward_showdown_ms\": "
+         << result.timing.phase_backward_showdown_ms << ",\n";
+    json << "    \"phase_backward_fold_ms\": "
+         << result.timing.phase_backward_fold_ms << ",\n";
     json << "    \"finalize_ms\": " << result.timing.finalize_ms << ",\n";
     json << "    \"combo_evs_ms\": " << result.timing.combo_evs_ms << ",\n";
     json << "    \"exploitability_ms\": " << result.timing.exploitability_ms << ",\n";
@@ -804,6 +808,49 @@ struct MatrixConfig {
     uint32_t threads;
 };
 
+// POST_OPTIMIZATION_REVIEW Sec 4.3 Phase 2: collect terminal-by-matchup_idx
+// reuse statistics. The Phase 2 ROI question is: when many terminals share
+// the same matchup table, can we batch their showdown calls so the table
+// streams from DRAM once per group instead of once per call? This function
+// just measures the reuse pattern; it does not change any solver behavior.
+struct TerminalReuseStats {
+    std::uint64_t total_terminals    = 0;
+    std::uint64_t distinct_tables    = 0;
+    std::uint64_t max_per_table      = 0;
+    double        mean_per_table     = 0.0;
+    std::uint64_t p50_per_table      = 0;
+    std::uint64_t p95_per_table      = 0;
+};
+
+static TerminalReuseStats compute_terminal_reuse(const deepsolver::FlatGameTree& tree) {
+    TerminalReuseStats s;
+    std::map<std::int32_t, std::uint64_t> counts;
+    for (std::uint32_t n = 0; n < tree.total_nodes; ++n) {
+        if (static_cast<deepsolver::NodeType>(tree.node_types[n])
+                != deepsolver::NodeType::TERMINAL) continue;
+        ++s.total_terminals;
+        std::int32_t mi = (n < tree.matchup_idx.size()) ? tree.matchup_idx[n] : 0;
+        counts[mi]++;
+    }
+    s.distinct_tables = counts.size();
+    if (counts.empty()) return s;
+    std::vector<std::uint64_t> per_table;
+    per_table.reserve(counts.size());
+    for (auto& kv : counts) per_table.push_back(kv.second);
+    std::sort(per_table.begin(), per_table.end());
+    s.max_per_table = per_table.back();
+    s.mean_per_table = static_cast<double>(s.total_terminals)
+                     / static_cast<double>(s.distinct_tables);
+    auto pct = [&](double p) {
+        const std::size_t idx = std::min(per_table.size() - 1,
+            static_cast<std::size_t>(p * per_table.size()));
+        return per_table[idx];
+    };
+    s.p50_per_table = pct(0.50);
+    s.p95_per_table = pct(0.95);
+    return s;
+}
+
 void run_benchmark_matrix(std::ostream& out, bool include_scalar) {
     // (deepsolver:: is already brought in by the file-level `using namespace
     // deepsolver` at the top of this TU.)
@@ -910,6 +957,21 @@ void run_benchmark_matrix(std::ostream& out, bool include_scalar) {
             out << "      \"iterations\": "           << res.iterations_run << ",\n";
             out << "      \"tree_nodes\": "           << solver.tree_node_count() << ",\n";
             out << "      \"matchup_tables\": "       << res.timing.matchup_tables << ",\n";
+            // Phase 2 ROI signal: how often does each matchup table get reused
+            // across distinct terminal nodes? High mean/p50 means a batching
+            // pass (group terminals by matchup_idx) could amortize matrix
+            // streaming across many calls.
+            {
+                const auto rs = compute_terminal_reuse(solver.tree());
+                out << "      \"reuse_stats\": {\n";
+                out << "        \"total_terminals\": "    << rs.total_terminals << ",\n";
+                out << "        \"distinct_tables\": "    << rs.distinct_tables << ",\n";
+                out << "        \"max_per_table\": "      << rs.max_per_table << ",\n";
+                out << "        \"mean_per_table\": "     << rs.mean_per_table << ",\n";
+                out << "        \"p50_per_table\": "      << rs.p50_per_table << ",\n";
+                out << "        \"p95_per_table\": "      << rs.p95_per_table << "\n";
+                out << "      },\n";
+            }
             out << "      \"timing_ms\": {\n";
             out << "        \"tree_build\": "         << res.timing.tree_build_ms << ",\n";
             out << "        \"precompute_matchups\": " << res.timing.precompute_matchups_ms << ",\n";
@@ -925,6 +987,10 @@ void run_benchmark_matrix(std::ostream& out, bool include_scalar) {
                 << res.timing.phase_backward_pass_oop_ms << ",\n";
             out << "        \"phase_backward_pass_ip\": "
                 << res.timing.phase_backward_pass_ip_ms << ",\n";
+            out << "        \"phase_backward_showdown\": "
+                << res.timing.phase_backward_showdown_ms << ",\n";
+            out << "        \"phase_backward_fold\": "
+                << res.timing.phase_backward_fold_ms << ",\n";
             out << "        \"total\": "              << res.timing.total_ms << "\n";
             out << "      },\n";
             out << "      \"iterations_per_sec\": "   << iter_per_sec << ",\n";
@@ -1021,7 +1087,10 @@ static PairedRun run_one_paired(const PairedScenario& scen,
     return out;
 }
 
-void run_benchmark_paired(std::ostream& out,
+// Returns false on invalid input so main() can surface a non-zero exit code
+// (POST_OPTIMIZATION_REVIEW Finding 4: invalid --benchmark-case used to print
+// an error and return success, hiding bad invocations from automation).
+bool run_benchmark_paired(std::ostream& out,
                            const std::string& case_name,
                            int runs_per_label,
                            int threads_override)
@@ -1031,7 +1100,7 @@ void run_benchmark_paired(std::ostream& out,
     if (!scen) {
         std::cerr << "{\"status\":\"error\",\"message\":\"unknown --benchmark-case: "
                   << case_name << " (valid: standard | monotone)\"}\n";
-        return;
+        return false;
     }
     const uint32_t threads = (threads_override >= 0)
         ? static_cast<uint32_t>(threads_override)
@@ -1039,9 +1108,13 @@ void run_benchmark_paired(std::ostream& out,
 
     cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
 
-    // Warmup — paid once before measurement so the first measured run
-    // doesn't get the OS-page-fault / first-touch tax.
+    // Warmup — paid once per label before measurement so neither run's first
+    // measured iteration eats the OS-page-fault / first-touch tax. Both
+    // baseline AND candidate get warmed so the candidate's first measured run
+    // doesn't carry persistent-OMP team-spawn cost (POST_OPTIMIZATION_REVIEW
+    // Finding 3: previously only baseline was warmed).
     (void)run_one_paired(*scen, threads, /*persistent_omp=*/false);
+    (void)run_one_paired(*scen, threads, /*persistent_omp=*/true);
 
     // Alternating BCBC... order. With runs_per_label=3 we do 6 total runs:
     // B C B C B C. Stops thermal drift from hitting only one label.
@@ -1116,6 +1189,7 @@ void run_benchmark_paired(std::ostream& out,
     out << "}\n";
 
     cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+    return true;
 }
 
 }  // anonymous namespace
@@ -1146,11 +1220,11 @@ int main(int argc, char* argv[]) {
     // / ratio. Use this for A/B comparing one knob (currently
     // cpu_persistent_omp) without thermal drift contaminating the result.
     if (args.benchmark == "paired") {
-        run_benchmark_paired(std::cout,
-                              args.benchmark_case,
-                              args.benchmark_runs,
-                              args.benchmark_threads_override);
-        return 0;
+        const bool ok = run_benchmark_paired(std::cout,
+                                              args.benchmark_case,
+                                              args.benchmark_runs,
+                                              args.benchmark_threads_override);
+        return ok ? 0 : 1;
     }
 
     // Polish #2: --benchmark <preset> overrides scenario inputs with a known
@@ -1373,7 +1447,11 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
-        SolverResult result = solver.solve(progress);
+        // In --benchmark mode, suppress the per-iter stderr progress callback —
+        // it sits inside the timed iteration loop and otherwise contaminates the
+        // throughput measurement with logging overhead (POST_OPTIMIZATION_REVIEW
+        // Finding 1: standard benchmark collapsed to ~60 iter/s vs ~110+ silent).
+        SolverResult result = solver.solve(benchmark_mode ? ProgressCallback{} : progress);
         std::string backend_name = solver.backend_name();
 
         // Process history navigation
@@ -1478,6 +1556,20 @@ int main(int argc, char* argv[]) {
                       << "    \"tree_build_ms\": " << result.timing.tree_build_ms << ",\n"
                       << "    \"backend_prepare_ms\": " << result.timing.backend_prepare_ms << ",\n"
                       << "    \"iterations_ms\": " << result.timing.iterations_ms << ",\n"
+                      << "    \"phase_compute_strategy_ms\": "
+                      << result.timing.phase_compute_strategy_ms << ",\n"
+                      << "    \"phase_apply_discount_ms\": "
+                      << result.timing.phase_apply_discount_ms << ",\n"
+                      << "    \"phase_forward_pass_ms\": "
+                      << result.timing.phase_forward_pass_ms << ",\n"
+                      << "    \"phase_backward_pass_oop_ms\": "
+                      << result.timing.phase_backward_pass_oop_ms << ",\n"
+                      << "    \"phase_backward_pass_ip_ms\": "
+                      << result.timing.phase_backward_pass_ip_ms << ",\n"
+                      << "    \"phase_backward_showdown_ms\": "
+                      << result.timing.phase_backward_showdown_ms << ",\n"
+                      << "    \"phase_backward_fold_ms\": "
+                      << result.timing.phase_backward_fold_ms << ",\n"
                       << "    \"finalize_ms\": " << result.timing.finalize_ms << ",\n"
                       << "    \"postsolve_ms\": " << result.timing.postsolve_ms << "\n"
                       << "  }\n"

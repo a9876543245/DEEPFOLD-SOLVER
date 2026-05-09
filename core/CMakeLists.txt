@@ -226,11 +226,17 @@ if(BUILD_TESTS)
         LABELS "stress" TIMEOUT 600)
 
     # ----------------------------------------------------------------
-    # Cross-config parity (v1.6.0): reference vs levelized, scalar vs
-    # avx2, thread cap consistency. Each scenario runs 2 small solves
-    # (60 iter on AsKd2c) and asserts root strategy diverges < 2pp and
-    # AhKh EV diverges < 1 chip. Total runtime budget < 10s — fits the
-    # `smoke` label so every CI run gates on it.
+    # Cross-config parity (v1.6.0+): reference vs levelized, scalar vs
+    # avx2, thread cap consistency, persistent-OMP toggle, plus tighter
+    # extended fixtures (river / limited sizing / narrow range).
+    #
+    # Split into two ctest entries (POST_OPTIMIZATION_REVIEW Finding 2):
+    #   CpuParityFast      — fast subset (<10s) on smoke label so every
+    #                        CI run gates on it.
+    #   CpuParityExtended  — slower tight-tolerance fixtures on the
+    #                        correctness label; kept off smoke so the
+    #                        smoke loop returns to <10s wall-clock.
+    # Both run the same binary with --suite=fast|extended.
     # ----------------------------------------------------------------
     add_executable(test_parity
         tests/test_parity.cpp
@@ -243,8 +249,13 @@ if(BUILD_TESTS)
         target_compile_options(test_parity PRIVATE /W4 /O2 /EHsc)
         target_link_options(test_parity PRIVATE "/STACK:16777216")
     endif()
-    add_test(NAME CpuParity COMMAND test_parity)
-    set_tests_properties(CpuParity PROPERTIES LABELS "smoke;parity" TIMEOUT 60)
+    add_test(NAME CpuParityFast COMMAND test_parity --suite=fast)
+    set_tests_properties(CpuParityFast PROPERTIES
+        LABELS "smoke;parity" TIMEOUT 30)
+
+    add_test(NAME CpuParityExtended COMMAND test_parity --suite=extended)
+    set_tests_properties(CpuParityExtended PROPERTIES
+        LABELS "parity;correctness" TIMEOUT 90)
 
     # ----------------------------------------------------------------
     # Per-kernel scalar vs AVX2 parity (v1.8.0 Sprint 0.2). Loops every
@@ -263,6 +274,20 @@ if(BUILD_TESTS)
     add_test(NAME CpuKernelParity COMMAND test_cpu_kernels)
     set_tests_properties(CpuKernelParity PROPERTIES
         LABELS "smoke;parity" TIMEOUT 30)
+
+    # ----------------------------------------------------------------
+    # Showdown encoding micro-benchmark (developer tool, NOT a ctest).
+    # Run manually before doing matrix-format surgery — picks between
+    # baseline f32+f32 and A2 u8+f32 encodings using realistic synthetic
+    # data, with hot/cold cache regimes and 1T/8T thread sweeps.
+    # ----------------------------------------------------------------
+    add_executable(bench_showdown_encoding
+        tests/bench_showdown_encoding.cpp)
+    target_include_directories(bench_showdown_encoding PRIVATE include)
+    if(MSVC)
+        target_compile_options(bench_showdown_encoding PRIVATE
+            /W4 /O2 /EHsc /arch:AVX2)
+    endif()
 
     # ----------------------------------------------------------------
     # Smoke-via-CLI: tiny solves that exercise the new memory-budget

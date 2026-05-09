@@ -27,6 +27,7 @@
 #include "hand_evaluator.h"
 #include "cpu_simd.h"
 
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <map>
@@ -48,12 +49,20 @@ static int g_tests_passed = 0;
     do {                                                                       \
         ++g_tests_run;                                                         \
         std::cout << "[RUN ] " #name << "\n";                                  \
+        const auto _t0 = std::chrono::steady_clock::now();                     \
         try {                                                                  \
             name();                                                            \
             ++g_tests_passed;                                                  \
-            std::cout << "[PASS] " #name << "\n\n";                            \
+            const auto _t1 = std::chrono::steady_clock::now();                 \
+            const double _ms = std::chrono::duration<double, std::milli>(      \
+                                   _t1 - _t0).count();                         \
+            std::cout << "[PASS] " #name << " (" << _ms << " ms)\n\n";         \
         } catch (const std::exception& e) {                                    \
-            std::cout << "[FAIL] " #name ": " << e.what() << "\n\n";           \
+            const auto _t1 = std::chrono::steady_clock::now();                 \
+            const double _ms = std::chrono::duration<double, std::milli>(      \
+                                   _t1 - _t0).count();                         \
+            std::cout << "[FAIL] " #name ": " << e.what() << " (" << _ms       \
+                      << " ms)\n\n";                                           \
         } catch (...) {                                                        \
             std::cout << "[FAIL] " #name ": unknown exception\n\n";            \
         }                                                                      \
@@ -505,18 +514,50 @@ static void test_parity_persistent_omp_toggle() {
 
 // ----------------------------------------------------------------------------
 // Main
+//
+// Supports --suite=fast|extended|all (default all). Split is data-driven from
+// measured per-test wall time — the slowest fixtures (forced-scalar SIMD,
+// thread-cap sweep, limited-sizing tight tolerance) live in extended so the
+// smoke loop stays under ~10s while still gating on the core algorithmic /
+// persistent-OMP / narrow-range correctness paths.
+//
+//   fast      — ref-vs-lvl, persistent-OMP toggle, river_no_chance,
+//               narrow_range_skip. ~5–6s wall time.
+//   extended  — scalar_vs_avx2 (slow scalar path), levelized_thread_cap,
+//               flop_limited_sizing. ~17s wall time.
+//   all       — both subsets back-to-back.
 // ----------------------------------------------------------------------------
 
-int main(int /*argc*/, char* /*argv*/[]) {
-    std::cout << "=== DeepSolver CPU parity test suite ===\n\n";
+int main(int argc, char* argv[]) {
+    std::string suite = "all";
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a.rfind("--suite=", 0) == 0) {
+            suite = a.substr(8);
+        } else if (a == "--suite" && i + 1 < argc) {
+            suite = argv[++i];
+        }
+    }
+    if (suite != "fast" && suite != "extended" && suite != "all") {
+        std::cerr << "unknown --suite=" << suite
+                  << " (valid: fast | extended | all)\n";
+        return 2;
+    }
 
-    RUN_TEST(test_parity_reference_vs_levelized);
-    RUN_TEST(test_parity_scalar_vs_avx2);
-    RUN_TEST(test_parity_levelized_thread_cap);
-    RUN_TEST(test_parity_river_no_chance);
-    RUN_TEST(test_parity_flop_limited_sizing);
-    RUN_TEST(test_parity_persistent_omp_toggle);
-    RUN_TEST(test_parity_narrow_range_skip);
+    std::cout << "=== DeepSolver CPU parity test suite (suite=" << suite
+              << ") ===\n\n";
+
+    if (suite == "fast" || suite == "all") {
+        RUN_TEST(test_parity_reference_vs_levelized);
+        RUN_TEST(test_parity_persistent_omp_toggle);
+        RUN_TEST(test_parity_river_no_chance);
+        RUN_TEST(test_parity_narrow_range_skip);
+    }
+    if (suite == "extended" || suite == "all") {
+        RUN_TEST(test_parity_scalar_vs_avx2);
+        RUN_TEST(test_parity_levelized_thread_cap);
+        RUN_TEST(test_parity_flop_limited_sizing);
+    }
 
     std::cout << "=== " << g_tests_passed << " / " << g_tests_run
               << " tests passed ===\n";

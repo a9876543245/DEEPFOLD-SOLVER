@@ -121,7 +121,7 @@ function App() {
   // solver tree (passed via SolverRequest.flop_sizes/turn_sizes/river_sizes).
   // These MUST stay consistent or history navigation silently falls through
   // to the nearest backend node and shows misleading strategy.
-  const [sizingKey, setSizingKey] = useState<'standard' | 'polar' | 'small_ball'>('standard');
+  const [sizingKey, setSizingKey] = useState<'lite' | 'standard' | 'polar' | 'small_ball'>('standard');
 
   // Memory profile preset for the next solve (Polish #1). Default 'balanced'
   // matches the engine's `--memory-profile` default and the Rust resolver in

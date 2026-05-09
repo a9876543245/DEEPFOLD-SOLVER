@@ -7,216 +7,60 @@
 📘 **[User Guide (English)](USER_GUIDE.md)** · **[使用說明 (中文)](USER_GUIDE.zh.md)**
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/version-1.7.1-green)
 ![Backend](https://img.shields.io/badge/backend-CUDA%20%2B%20CPU%20%28AVX2%2BMulti--core%29-orange)
 
-DEEPFOLD-SOLVER は [DEEPFOLD](https://deepfold.co) のデスクトップ GTO ソルバーです。GPU アクセラレーション DCFR エンジンに、**全ての CPU コアを線形にスケールさせる新しいマルチコア後端**を組み合わせ、**runout 集計、コンボ別ブロッカー解析、EV/アグレ度ヒートマップ、2,500+ プリフロップ チャート** とともに Windows ワンクリックインストーラーに同梱しています。
+DEEPFOLD-SOLVER は [DEEPFOLD](https://deepfold.co) のデスクトップ GTO ソルバーです。GPU アクセラレーション DCFR エンジンに、**全ての CPU コアを線形にスケールさせるマルチコア後端**を組み合わせ、**runout 集計、コンボ別ブロッカー解析、EV/アグレ度ヒートマップ、2,500+ プリフロップ チャート** とともに Windows ワンクリックインストーラーに同梱しています。
 
-## v1.7.1 のハイライト — マルチコア CPU がデフォルトに
+## DEEPFOLD-SOLVER の核心となる特徴
 
-v1.3.1 以降、4 リリース分の CPU 最適化が積み重なりました。標準 rainbow ベンチマークは、典型的な 8 スレッドのノート PC で約 ~140 iter/s に到達 — 同一ハードウェアで **以前の CPU 後端（v1.7.0 までのデフォルト）の約 5 倍**、完全自動でフラグや設定変更は不要です。GPU を持たないユーザーが、これまで GPU 必須だった速度で解けるようになりました。
+### 全ての CPU コアを使い切るエンジン
 
-### ユーザーが感じる変化
+- **デュアル後端 DCFR** — GPU があれば GPU、なければ CPU、どちらでも数値戦略は完全一致。GPU パスは Turing / Ampere / Ada / Hopper のネイティブ CUDA SASS を同梱、Blackwell は PTX-JIT 前方互換。CPU パスは BFS-flat「levelized」CFR 後端で、2 スレッドで頭打ちするのではなく物理コア数まで線形にスケール。
+- **ランタイム CPUID ディスパッチ** — Haswell 以降は AVX2 カーネル、それより古い CPU は scalar に自動フォールバック。単一バイナリ、別ビルド不要、2013 年以前の CPU でも起動時クラッシュなし。
+- **コミット毎の parity gate** — `reference vs levelized`、`scalar vs AVX2`、`1 スレッド vs N スレッド` の全パスがビット単位で同一の戦略を出力することを毎ビルド検証。高速パスが正確性 oracle から無音で乖離することはありません。
 
-- **CPU 解算が劇的に高速化**：新しい BFS-flat「levelized」CFR 後端が従来の再帰版を置き換え、2 スレッド上限ではなく物理コア数まで線形にスケールします。標準 rainbow ベンチマーク：同じハードウェアで 28 → 137 iter/s。
-- **ETA バナーが正確に**：v1.7.1 以前は事前推定器がどの CPU 後端で実行されるか知らず、1 分で終わる solve に対して「5 分」と表示していました。新しいスループットモデルは後端 × スレッド数を考慮し、設定空間全体で実測値の ~2× 以内に収まります。
-- **古いハードウェアもそのまま動作**：Pre-Haswell CPU（AVX2 非対応）は起動時の CPUID ディスパッチで自動的に scalar kernels にフォールバック — 単一バイナリ、別ビルド不要、起動時クラッシュなし。
-- **`--cpu-threads N` が有効化**：以前は表示されるだけで実際は無視されていました。levelized 後端は今や全ての parallel-for に `num_threads(…)` として適用するので、共用マシンでスレッド数を制限できます。
+### 時間予算を本当に守る Solve mode プリセット
 
-### 実測データ
+- **Quick / Standard / Deep** ピルが iter 上限 + 時間予算 + exploitability 目標を一括設定。最初に達した条件で停止 — CFR は anytime アルゴリズムで、iter N の running average が**そのまま**戦略なので、予算で停止しても使える戦略であって半端な結果ではありません。
+- **解算前 ETA バナー** — Solve クリックで sub-second の `--estimate-only` エンジン呼び出しが走り、イテレーション開始前に標準ベンチマーク校正済みの wall-clock 予測を表示。AUTO が GPU 除外でフォールバックした場合の理由(例:「Pascal は CUDA-12.x build が必要」)も予測の隣に表示。
+- **Stop ボタン + Quality バッジ** — 完全 abort、部分結果は保存しない(「今あるものを返せ」は時間予算経由)。結果パネルは最終 exploitability に応じて 🟢 高 / 🟡 良 / 🟠 粗 / 🔴 低信頼度 のバッジ表示。
+- **`--time-budget-seconds` は iter 毎に確認**、遅い per-iter スポットでも予算を 5 分超過することなく正確に停止。
 
-`--benchmark standard`（AsKd7c rainbow flop、100 iter、8 論理 / 4 物理コア）：
+### 他のソルバーにない解析後インサイトツール
 
-| 後端                 | 1T   | 2T   | 4T   | 8T    | 1T → 8T |
-|----------------------|------|------|------|-------|---------|
-| reference（v1.5.x）  | 25.3 | 28.2 | 27.8 | 28.5  | 1.13×（parallel-sections の上限） |
-| **levelized（v1.7.1）** | 25.0 | 49.1 | 91.0 | **137.6** | **5.46×** |
+- **Runout Report** — ソルブ後ワンクリックで全ての正準 turn カードを 13×4 グリッドに展開、dominant action で色分け。**By Class** ビューに切り替えると 23+ 枚の turn が **Pair / Flush / Straight / Overcard / Brick** の 5 つのテクスチャバケットに自動分類され、加重ストラテジー + EV を表示。Best EV / Worst EV / Most aggressive でソート可能、CSV エクスポート対応。
+- **1326 Combo Drill** — 任意の 169-class ラベルをクリックすると、4 / 6 / 12 specific combo を **per-combo ブロッカー解析** 付きで展開。各ハンドが相手レンジをどれだけブロックしているか + 最もブロックされる相手クラスの Top-5 を表示。ポーカーで mixed strategy を選ぶ際の標準的なタイブレーカーが、ついに一級 UI として実装。
+- **戦略グリッド表示モード** — 169 グリッド上部のツールバーで Strategy Mix(既定のマルチアクション勾配)、**EV**(per-class ヒートマップ、in-range セルの EV 範囲で normalize、赤→グレー→緑)、**Aggression**(Bet/Raise/All-in 頻度の合計、クール→ホット)、単一アクション Heatmap を切替。EV モードは「どのコンボが利益源か、どれが負けているか」が一目瞭然。
 
-両後端は同じ数値戦略を出力します。コミット毎の parity gate（reference vs levelized、scalar vs AVX2、シングル vs マルチスレッド）が実装の乖離を防いでいます。
+### 信頼できるメモリ制御
 
-### 4 リリースかかった理由
+- **Memory Profile プリセット** — `safe / balanced / performance` で host RAM、JSON、strategy-tree-node の予算を事前にライブプレビュー付きで決定。ソルバーは予算を全工程で遵守 — pre-backend ゲートが CPU host / GPU VRAM / AUTO fallback をアロケーション**前**に評価、OOM は構造化エラー + UI バッジになり、クラッシュしません。
+- **共通ホストバジェットゲートは GPU バックエンドにも適用** — matchup tables、strategy-tree EV cache、JSON response はバックエンドに関わらず host RAM 常駐、全て検査されます。診断メッセージは「GPU に切り替えても common-host のオーバーフローは解決しない」と明示。
+- **Chunked GPU マッチアップ アップロード** が host 側の `flat_ev` / `flat_valid` 重複を排除、runout 単位の `cudaMemset + cudaMemcpy` に変更し、GPU prep 時のピーク host RAM を低減。
 
-- **v1.4.0 — AVX2/scalar ランタイムディスパッチ**。`/arch:AVX2` を 1 つの translation unit に限定し、起動時の CPUID + OS 状態チェックで kernel テーブルを選択。Pre-Haswell CPU は AVX2 opcode に到達しません。再帰後端の scratch-arena bump allocator により、iter あたり 60k 以上の `vector<float>` 確保を排除。
-- **v1.4.1 — 実際のエンジン進捗イベント**。Iter カウンタは `setInterval` での偽動作ではなく、エンジンが stderr に構造化進捗イベントを出力し Tauri が UI に転送。Matchup precompute も outer combo 次元で並列化。
-- **v1.5.0 — Levelized CPU 後端**。BFS-flat 走査と各レベルの `parallel for` で再帰 arena の逐次 bump pointer を置換。これが 2 スレッド超のスケーリングを解禁する核心の変更。
-- **v1.5.1 — Google OAuth ログイン修正**。ビルドパイプラインのギャップで 4 リリース連続で空の `client_secret` を出荷していました。`prepare-release.ps1` から `.env.local` を自動読込し、`cargo:rerun-if-env-changed` ヒントで secret が空のままキャッシュされないように。
-- **v1.6.0 — CPU 正確性ガード**。AVX2 dispatch リファクタリング後のテストターゲットリンクを修復、parity test スイート追加、`--cpu-threads N` が実際に OMP team サイズを制限。
-- **v1.7.0 — GUI が levelized へ切替**。フロントエンドが全 solve で levelized 後端を要求。Host メモリ予算 gate が levelized の追加 reach/value バッファを計上、タイトな RAM 制限が確保前に拒否。
-- **v1.7.1 — ETA スループットモデル再構築**。標準ベンチマークで後端 × スレッド毎のレートを測定校正、「予想 5 分・実際 1 分」の逆転待機現象を解決。
+### 同梱コンテンツ
 
-旧再帰後端は `--cpu-backend reference`（CLI 限定）で parity テスト / デバッグ用に選択可能です — GUI からは見えない選択肢になりました。
+- **2,550+ プリフロップ シナリオ** をアプリ内ブラウズ。ワンクリックで IP / OOP レンジに適用。
+- **120+ 解析済み flop スポット** をワンクリックで読込。
+- **ベットサイジング プリセット** — Standard / Polar / Small Ball — ソルバーツリーと UI ボタンの両方に反映。
+- **レンジエディタ + ノードロック** — 任意のコンボの頻度を上書きして再ソルブ。
+- **トレーニングモード** — 10 問のドリルが均衡解と比較して回答を採点。
 
-## v1.3.1 のハイライト（遅い CPU でも時間予算が正しく発火）
+### 運用上の磨き
 
-v1.3.0 で発覚したバグ：GTX 1070 Max-Q laptop でエンジン内部の time_budget
-(300s) が発火する前に Tauri 外側のサブプロセス timeout (720s) が先に
-キル。原因：遅い CPU で 9k ノードの turn solve は単一 iter が 720s を
-超え、loop が次の budget チェック点に到達できない。
-
-Tauri 外側 timeout を time_budget に連動：`min(budget × 3 + 90s, 1800s)`。
-進行中の iter に余裕を与え、エンジン自身の budget チェックが発火できる
-ように。
-
-## v1.3.0 のハイライト（時間予算 + Stop ボタン）
-
-待ち時間崖の解決。v1.2.2 のユーザーフィードバック「5 分で停止するのに 3 時間
-ETA を見せるのは無意味」が発端。
-
-### Solve mode プリセット
-
-Solve ボタン上に 3 つのピル — iter 上限 + 時間予算 + 達成目標を一括設定：
-
-| モード | iter 上限 | 時間予算 | exploit 目標 | 用途 |
-|---|---|---|---|---|
-| **Quick**    | 100  | 60 秒    | 1.5%  | 大方向確認 |
-| **Standard** | 300  | 5 分    | 0.5%   | **デフォルト** — Pro グレード |
-| **Deep**     | 1000 | 15 分   | 0.2%   | 詳細研究 |
-
-いずれか先に達した時点で停止。CFR は anytime アルゴリズム — iter N の running
-average が戦略なので、予算で停めても使える結果。
-
-### Stop ボタン + Quality バッジ
-
-- **Stop ボタン** — 完全 abort、部分結果は保存しない。「今あるものを返せ」は
-  時間予算経由（自動）。
-- **Quality バッジ**：🟢/🟡/🟠/🔴 で exploitability 別品質ラベル。
-
-### ETA バナー再設計
-
-ヘッドラインは `min(estimate, time_budget)`。「Estimated 5 hours on CPU」と
-出して 5 分で停めるのではなく、実際の待ち時間を表示。
-
-### スループット再キャリブレーション
-
-GPU 推定が 50× 悲観的だった（実測 568 Gops/s on RTX 5090 で再キャリブレーション）。
-CPU レートも 3× 引き上げ。以前 11 分と推定された spot が 12 秒に。
-
-### エンジン
-
-- 新 `--time-budget-seconds <s>` CLI フラグ
-- 新 `early_stop_reason` JSON フィールド
-- 新 `cancel_solve` Tauri コマンド
-
-## v1.2.2 のハイライト（解算前 ETA + マルチアーキ CUDA）
-
-ユーザー向け：
-
-- **解算前 ETA バナー** — *Solve* クリック時に sub-second の
-  `--estimate-only` エンジン呼び出しが走り、イテレーション開始前に
-  「Estimated 12 minutes on CPU」のような予測を表示。5 分待っても結果が
-  出ない、何が起きているか分からないという問題を解消。60s 超で琥珀警告、
-  30 分超で赤警告。AUTO が GPU 除外（Pascal カードは CUDA 12.x build が必要、
-  等）で CPU にフォールバックした場合の理由もバナーに表示。
-- **マルチアーキ CUDA build** — インストーラに Turing (RTX 20 シリーズ)、
-  Ampere (RTX 30)、Ada (RTX 40)、Hopper (H100) のネイティブ SASS を同梱、
-  Blackwell (RTX 5090) は PTX-JIT 前方互換。これまで Ada のみネイティブで、
-  他のカードは初回起動時に JIT コスト発生。
-- **AUTO フォールバック診断** — AUTO が GPU 除外で CPU に降格した場合、
-  実際の理由を resources ブロックに載せる。Pascal (GTX 10 シリーズ) と
-  Volta (Titan V) のカードは「現行 build は CUDA 13.x で Pascal/Volta が
-  drop された」旨が表示され、Pascal 対応の CUDA-12.x build は v1.3.0 予定。
-
-エンジン内部：
-
-- `SolveResources` に `ops_per_iteration` / `backend_for_estimate` /
-  `estimated_solve_seconds` を追加。
-- 新 `Solver::estimate_only()` メソッド — iso + tree build のみ実行。
-- 新 `--estimate-only` CLI フラグと Tauri `estimate_solve` コマンド。
-
-## v1.2.1 のハイライト（メモリ制御の堅牢化）
-
-外部レビューで指摘された 2 つのメモリバジェットの穴を塞いだパッチ：
-
-- **VISIBLE EV キャッシュが `strategy_tree_max_nodes` を遵守**：EV キャッシュの
-  プリウォークがキャップされておらず、巨大ツリー＋小ノードキャップ時に EV
-  キャッシュ RAM が JSON ペイロードを桁違いに上回る可能性があった。今は JSON
-  ウォークと同じ閾値でキャップ。
-- **共通ホストバジェットゲートが GPU バックエンドにも適用**：ホストゲートが
-  `selected_backend == CPU` のみで実行されていたため、GPU ソルブ時にホスト
-  RAM 上限が静かに無視されていた（matchup / strategy_tree EV / JSON はバックエンドに
-  関係なくホスト常駐）。共通ホストゲート（常時）+ CPU 専用追加（cpu_state）に分割。
-- 新 ctest regression: `CliEvCacheRespectsCap`、`CliGpuCommonHostBudgetReject`。
-
-## v1.2.0 のハイライト
-
-> v1.2.0 は新しい戦略グリッド表示モード 2 種、メモリプロファイル選択器、
-> およびソルバー側の信頼性向上を追加しました。
-
-### グリッド表示モード
-
-169 グリッド上部にツールバーを追加、4 つの表示モードを切替：
-
-- **Strategy Mix**（既定）— セルごとのマルチアクション勾配
-- **EV**（新）— per-class EV ヒートマップ。in-range セルの EV 範囲で normalize、赤→グレー→緑。「どのコンボが利益源か、どれが負けているか」が一目瞭然
-- **Aggression**（新）— Bet/Raise/All-in 頻度の合計、クール→ホット
-- **Heatmap** — 単一アクションの強度
-
-### ソルブ制御
-
-- **Memory Profile セレクタ** — Advanced 設定に `safe / balanced / performance` のピル UI を追加。各プロファイルの host RAM / JSON / strategy-tree-node 予算をリアルタイムでプレビュー。
-
-### エンジン
-
-- **JSON cap as action** — 推定 JSON 応答が予算を超える場合、ソルバーはバジェットゲート前に `strategy_tree_max_nodes` を**自動縮小**して収まるようにします。これまではゲートで失敗していましたが、現在は使用可能な小さなナビキャッシュと、`resources.diagnostic` での縮小理由の説明が得られます。
-- **`--benchmark standard` CLI flag** — 再現可能なパフォーマンス追跡プリセット（AsKd7c rainbow、フルレンジ、100 iter）。`iterations_per_sec` / `nodes_per_sec` / `memory_estimate_mb` + 完全な timing 内訳の JSON を出力。
-
-### 信頼性
-
-- **Tauri timeout integration test**（`src-tauri/tests/timeout_kill.rs`）— Phase 5 エンジンクリーンアップ修正のリグレッションガード。
-- **リリーススクリプトの信頼性** — `scripts/prepare-release.ps1` は Tauri のビルド内 minisign 署名（PowerShell 5.1 + npm.cmd 環境で stdin 入力でハングする）を回避し、ビルド後に `--password` CLI フラグで明示的に署名。
-
-## v1.1.0 のハイライト
-
-> v1.1.0 は **市販ソルバーにない解析後インサイトツール** に焦点を当てた
-> 機能リリースです。エンジン本体もリソース安全性を本格的に強化しました。
-
-### 旗艦機能 3 つ
-
-- **Runout Report** — ソルブ後ワンクリックで、列挙された全ての正準 turn
-  カードを 13×4 グリッドに展開。dominant action で色分け。**By Class**
-  ビューに切り替えると 23+ 枚の turn が **Pair / Flush / Straight /
-  Overcard / Brick** の 5 つのテクスチャバケットに自動分類され、加重
-  ストラテジー + EV を表示。Best EV / Worst EV / Most aggressive で
-  ソート可能。CSV エクスポート対応。
-- **1326 Combo Drill** — 任意の 169-class ラベルをクリックすると、その
-  クラスの 4/6/12 specific combo を **per-combo ブロッカー解析** 付きで
-  展開。各ハンドが相手レンジをどれだけブロックしているか + 最もブロック
-  される相手クラスの Top-5 を表示。ポーカーで mixed strategy を選ぶ際の
-  標準的なタイブレーカーが、ついに一級 UI として実装。
-- **Memory Profile** — `safe / balanced / performance` プロファイルで
-  host RAM / JSON / strategy-tree-node の予算をソルブ前に決定。ソルバー
-  全体が予算を守る — もうサイレント OOM はありません。
-
-### エンジンのリソース安全性
-
-- **Pre-backend budget gate** — CPU host / GPU VRAM / AUTO fallback を
-  アロケーション**前**に評価。OOM シナリオは構造化エラー + UI バッジに
-  なり、クラッシュしません。
-- **CUDA 例外ベースのエラー処理** — `CUDA_CHECK` が `exit()` でなく
-  `CudaError` を throw。失敗時は partial allocation がきれいに rollback。
-- **Chunked GPU マッチアップ アップロード** — host 側の `flat_ev` /
-  `flat_valid` 重複を排除。runout 単位の `cudaMemset + cudaMemcpy` に変更。
-  GPU prep 時のピーク host RAM を低減。
-- **Strategy tree EV emission モード** — `none | visible | full` で JSON
-  出力をトリム可能（headless ベンチマーク用途等）。
-- **テスト階層化** — ctest にラベル付きスイート: `smoke`（~13s）、
-  `correctness`（~106s）、`stress`（nightly）、`gpu` / `memory`。
-
-### v1.0.4–1.0.11 から継続
-
-- Phase 2 スート同型（モノトーン・3-of-suit ボードで 3〜7 倍高速化）
-- GPU per-runout マッチアップテーブル（iso 有効時 CPU 比 6〜10 倍）
-- Route A ナビゲーションキャッシュ（O(1) アクション切替、再ソルブ不要）
-- Path B runout セレクタ（PioSolver スタイル chance-aware ナビゲーション）
-- GameContextSelector — Cash 6max/8max + MTT + スタックピッカー
+- **三言語 UI** — English / 中文 / 日本語、いつでも切替可能。
+- **自動更新** — バナーからのワンクリックインストール、署名付きリリース、install mode `passive`。
+- **スート同型** がモノトーン / 3-of-suit ボードで自動的に 3〜7 倍高速化、GPU per-runout マッチアップテーブルが iso 有効時に CPU 比 6〜10 倍。
+- **Route A ナビゲーションキャッシュ** — O(1) アクション切替、再ソルブ不要。**Path B runout セレクタ** で PioSolver 風の chance-aware ナビゲーション。
+- **再現可能なベンチマーク** — `deepsolver_core --benchmark standard` が AsKd7c rainbow / 100 iter シナリオを実行、コンパクトな perf JSON(`iterations_per_sec` / `nodes_per_sec` / `memory_estimate_mb` + 完全な timing 内訳)を出力。CI regression 追跡で grep 可能。
 
 ## ダウンロード
 
 **Windows 10 / 11 (x64)** — [最新インストーラー](https://github.com/a9876543245/DEEPFOLD-SOLVER/releases/latest)
 
-インストール後、アプリは自動更新されます。新バージョンが利用可能になると左上にバナーが表示され、ワンクリックでインストール＆再起動。
+インストール後、アプリは自動更新されます。新バージョンが利用可能になると左上にバナーが表示され、ワンクリックでインストール&再起動。
 
-> ⚠️ **初回インストール時に Windows の警告が表示されます**：インストーラーを
+> ⚠️ **初回インストール時に Windows の警告が表示されます**:インストーラーを
 > 起動すると Windows が「**WindowsによってPCが保護されました**」(SmartScreen)
 > 警告を表示します。これは想定内です — DEEPFOLD-SOLVER はまだ EV コード署名
 > 証明書を取得していないため、Windows が発行元を認識しません。
@@ -228,7 +72,7 @@ CPU レートも 3× 引き上げ。以前 11 分と推定された spot が 12 
 | | 最小 | 推奨 |
 |---|---|---|
 | OS | Windows 10 64-bit | Windows 11 64-bit |
-| CPU | x86-64 デュアルコア（年代不問） | 4 物理コア以上、AVX2 対応（Haswell 2013 / Excavator 2015 以降） |
+| CPU | x86-64 デュアルコア(年代不問) | 4 物理コア以上、AVX2 対応(Haswell 2013 / Excavator 2015 以降) |
 | RAM | 4 GB | 8 GB+ |
 | GPU | — *(CPU 後端のみで完全機能)* | NVIDIA RTX 2000 シリーズ以上、4 GB+ VRAM |
 | ディスク | 200 MB | 200 MB |
@@ -247,15 +91,15 @@ GPU と SIMD はどちらも自動検出。右上のステータスピルで **C
 
 | 機能 | 説明 |
 |---|---|
-| **GTO ソルバー** | ベクトル化 GPU カーネル付き Discounted CFR。一般的な turn スポットを数秒で sub-percent exploitability まで収束 |
+| **GTO ソルバー** | ベクトル化 GPU カーネルとマルチコア CPU 後端を備えた Discounted CFR。一般的な turn スポットを数秒で sub-percent exploitability まで収束 |
 | **コンボ別戦略グリッド** | 13×13 グリッドが現在の決定ノードでアクションミックスごとに色分け。ホバーでスーテッド変種の内訳 |
 | **アクション側 ↔ 相手視点切替** | 同じノードで自分の戦略 vs 相手の reach 加重レンジを切替 |
-| **🆕 グリッド表示モード (v1.2.0)** | 169 グリッド上部のツールバーで Strategy Mix / **EV** / **Aggression** / 単一アクションヒートマップを切替 |
-| **🆕 Memory Profile セレクタ (v1.2.0)** | Advanced 設定に `safe / balanced / performance` ピル + 予算ライブプレビュー |
-| **🆕 Benchmark CLI (v1.2.0)** | `deepsolver_core --benchmark standard` で再現可能な AsKd7c+100iter シナリオを実行、コンパクトなパフォーマンス JSON を出力 |
-| **Runout Report (v1.1.0)** | ソルブ後ワンクリックで全 turn を 13×4 グリッド + テクスチャバケットビュー + 4 ソートモード + CSV エクスポート。詳細は [User Guide](USER_GUIDE.md#2-runout-report--see-every-turn-at-once) |
-| **1326 Combo Drill (v1.1.0)** | 任意の 169-class を 4/6/12 specific combo に展開、相手レンジ vs per-combo ブロッカー解析付き。詳細は [User Guide](USER_GUIDE.md#3-combo-drill--break-169-classes-into-specific-combos) |
-| **Memory Profile (v1.1.0)** | `safe / balanced / performance` プリセットで host RAM / JSON / strategy-tree-node 予算を境界決定。サイレント OOM なし |
+| **グリッド表示モード** | 169 グリッド上部のツールバーで Strategy Mix / **EV** / **Aggression** / 単一アクションヒートマップを切替 |
+| **Memory Profile セレクタ** | Advanced 設定の `safe / balanced / performance` ピル + 予算ライブプレビュー |
+| **Benchmark CLI** | `deepsolver_core --benchmark standard` で再現可能な AsKd7c+100iter シナリオを実行、コンパクトなパフォーマンス JSON を出力 |
+| **Runout Report** | ソルブ後ワンクリックで全 turn を 13×4 グリッド + テクスチャバケットビュー + 4 ソートモード + CSV エクスポート。詳細は [User Guide](USER_GUIDE.md#2-runout-report--see-every-turn-at-once) |
+| **1326 Combo Drill** | 任意の 169-class を 4/6/12 specific combo に展開、相手レンジ vs per-combo ブロッカー解析付き。詳細は [User Guide](USER_GUIDE.md#3-combo-drill--break-169-classes-into-specific-combos) |
+| **Memory Profile** | `safe / balanced / performance` プリセットで host RAM / JSON / strategy-tree-node 予算を境界決定。サイレント OOM なし |
 | **Runout ピッカー** | iso 列挙有効時、任意の正準 river カードをクリックして枝切替 |
 | **GTO チャートライブラリ** | 2,550 件以上のプリフロップシナリオをアプリ内ブラウズ。ワンクリックで IP / OOP レンジに適用 |
 | **ベットサイジング プリセット** | Standard / Polar / Small Ball — ソルバーツリーと UI ボタンの両方に反映 |
@@ -280,15 +124,15 @@ GPU と SIMD はどちらも自動検出。右上のステータスピルで **C
 └─────────────────────────────────────────────┘
 ```
 
-エンジンは独立した CLI（`deepsolver_core.exe`）で、Tauri サイドカーとして同梱されます。Tauri はソルブごとにプロセスを起動し JSON 結果をパース。クライアント側ナビゲーション用の完全な戦略ツリーを含みます。
+エンジンは独立した CLI(`deepsolver_core.exe`)で、Tauri サイドカーとして同梱されます。Tauri はソルブごとにプロセスを起動し JSON 結果をパース。クライアント側ナビゲーション用の完全な戦略ツリーを含みます。
 
 ## ソースからビルド
 
-必要なもの：
+必要なもの:
 - **Node.js 20+** + **npm**
-- **Rust 1.78+**（`rustup`）
-- **CMake 3.20+** + **MSVC 2022**（Windows）
-- **CUDA Toolkit 12.x**（オプション — CPU ビルドは不要）
+- **Rust 1.78+**(`rustup`)
+- **CMake 3.20+** + **MSVC 2022**(Windows)
+- **CUDA Toolkit 12.x**(オプション — CPU ビルドは不要)
 
 ```sh
 git clone https://github.com/a9876543245/DEEPFOLD-SOLVER.git
@@ -301,42 +145,42 @@ cmake .. -DBUILD_TESTS=ON
 cmake --build . --config Release
 ctest
 
-# 開発モード（../core/build/Release/ のエンジンバイナリを自動検出）
+# 開発モード(../core/build/Release/ のエンジンバイナリを自動検出)
 cd ../..
 npm run tauri dev
 ```
 
-> **注意**：同梱の GTO プリフロップチャートデータ（`gto_output/`、約31MB）と
-> プリビルド済みエンジンサイドカー（`src-tauri/binaries/`）は **このリポジトリ
+> **注意**:同梱の GTO プリフロップチャートデータ(`gto_output/`、約31MB)と
+> プリビルド済みエンジンサイドカー(`src-tauri/binaries/`)は **このリポジトリ
 > には含まれていません**。公式インストーラーにのみ同梱されています。ソースから
 > ビルドした版にはチャートデータが入らないため、必要なら同じ JSON スキーマで
 > `gto_output/` ディレクトリをリポジトリルートに自分で用意してください。サインインは
 > ビルド環境に `DEEPFOLD_GOOGLE_CLIENT_SECRET` の env var を設定する必要があります
-> （未設定の場合、OAuth は実行時に失敗します）。
+> (未設定の場合、OAuth は実行時に失敗します)。
 
 ## サポート
 
-- **バグ報告 / 機能リクエスト**：[Issue を開く](https://github.com/a9876543245/DEEPFOLD-SOLVER/issues)
-- **会員関連**：[contact@deepfold.co](mailto:contact@deepfold.co)
+- **バグ報告 / 機能リクエスト**:[Issue を開く](https://github.com/a9876543245/DEEPFOLD-SOLVER/issues)
+- **会員関連**:[contact@deepfold.co](mailto:contact@deepfold.co)
 
-バグ報告には以下を添えてください：
-- アプリのバージョン（ウィンドウ右上 / **About**）
-- そのときの backend ピル：**CUDA** / **CPU**
-- Windows のバージョン（設定 → 詳細情報）
+バグ報告には以下を添えてください:
+- アプリのバージョン(ウィンドウ右上 / **About**)
+- そのときの backend ピル:**CUDA** / **CPU**
+- Windows のバージョン(設定 → 詳細情報)
 - UI の問題の場合はスクリーンショットまたは画面録画
 
 ## よくある質問
 
-**GPU なしでも動きますか？**
+**GPU なしでも動きますか?**
 はい。自動検出して CPU にフォールバックします。遅くなりますが戦略は完全に同一。
 
-**macOS / Linux 対応は？**
-v1.0.x ではなし。ロードマップにあります。
+**macOS / Linux 対応は?**
+現在はなし。ロードマップにあります。
 
-**ソルバーの戦略はどこかにアップロードされますか？**
-いいえ。すべてローカルで実行されます。ネットワーク通信は deepfold.co への会員資格チェック（サインイン時）のみ。
+**ソルバーの戦略はどこかにアップロードされますか?**
+いいえ。すべてローカルで実行されます。ネットワーク通信は deepfold.co への会員資格チェック(サインイン時)のみ。
 
-**アップデートはどう動きますか？**
+**アップデートはどう動きますか?**
 起動時にアプリが GitHub の最新リリースをチェック。署名が有効で新しいものがあればバナーを表示、ワンクリックでインストール。
 
 ## ライセンス

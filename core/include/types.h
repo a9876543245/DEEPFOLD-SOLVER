@@ -372,6 +372,15 @@ struct SolverTiming {
     float phase_backward_pass_oop_ms   = 0.0f;
     float phase_backward_pass_ip_ms    = 0.0f;
 
+    /// POST_OPTIMIZATION_REVIEW Sec 4.2: split terminal evaluation into
+    /// showdown vs fold buckets so the next optimization pass knows which
+    /// branch dominates. CPU-seconds (sum across threads) so the absolute
+    /// number maps to total work, not wall time. Both buckets together cover
+    /// all of evaluate_terminal(); the levelized backward phases above include
+    /// player-node work plus terminal work, so showdown+fold < oop+ip.
+    float phase_backward_showdown_ms   = 0.0f;
+    float phase_backward_fold_ms       = 0.0f;
+
     uint32_t tree_nodes = 0;
     uint32_t tree_edges = 0;
     uint32_t matchup_tables = 0;

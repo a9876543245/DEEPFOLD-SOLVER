@@ -218,6 +218,9 @@ public:
     ComboAnalysis analyze_combo(const std::string& combo_str) const;
 
     uint32_t tree_node_count() const { return tree_.total_nodes; }
+    /// Read-only view of the built game tree. Exposed for diagnostic tools
+    /// that need terminal-by-matchup_idx histograms (Phase 2 batching ROI).
+    const FlatGameTree& tree() const { return tree_; }
     uint32_t navigate_to_node(const std::string& history) const;
     std::vector<std::pair<std::string, float>> extract_global_strategy_at(uint32_t node_idx) const;
     std::vector<std::string> get_action_labels_at(uint32_t node_idx) const;
@@ -361,10 +364,15 @@ private:
     /// (i.e. the root board). All other runouts live in matchup_ev_per_runout_.
     std::vector<float> matchup_ev_;
     std::vector<float> matchup_valid_;
+    /// v1.8.2 A2 encoding: pre-thresholded category matrix used by the CPU
+    /// showdown kernels. Built alongside ev/valid in precompute_matchups().
+    /// 1 byte/cell vs ev's 4. See SolverContext::matchup_category for rationale.
+    std::vector<uint8_t> matchup_category_;
     /// Phase 1 chance-enumeration: per-runout matchup tables. Indexed by
     /// FlatGameTree.matchup_idx[node]. Entry [0] mirrors matchup_ev_.
     std::vector<std::vector<float>> matchup_ev_per_runout_;
     std::vector<std::vector<float>> matchup_valid_per_runout_;
+    std::vector<std::vector<uint8_t>> matchup_category_per_runout_;
     std::map<std::pair<uint32_t, uint16_t>, std::vector<float>> resolved_locks_;
 
     // Backend (CPU or GPU) handles DCFR iteration
@@ -740,8 +748,10 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     ctx.config                     = &config_;
     ctx.matchup_ev                 = &matchup_ev_;
     ctx.matchup_valid              = &matchup_valid_;
+    ctx.matchup_category           = &matchup_category_;
     ctx.matchup_ev_per_runout      = &matchup_ev_per_runout_;
     ctx.matchup_valid_per_runout   = &matchup_valid_per_runout_;
+    ctx.matchup_category_per_runout = &matchup_category_per_runout_;
     ctx.ip_reach                   = &ip_reach_;
     ctx.oop_reach                  = &oop_reach_;
     ctx.resolved_locks             = &resolved_locks_;
@@ -823,6 +833,10 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         static_cast<float>(backend_->phase_backward_pass_oop_ms());
     timing.phase_backward_pass_ip_ms    =
         static_cast<float>(backend_->phase_backward_pass_ip_ms());
+    timing.phase_backward_showdown_ms   =
+        static_cast<float>(backend_->phase_backward_showdown_ms());
+    timing.phase_backward_fold_ms       =
+        static_cast<float>(backend_->phase_backward_fold_ms());
 
     // Step 6: finalize (normalize strategy_sum → strategy)
     stage_start = Clock::now();
@@ -1173,12 +1187,17 @@ inline void compute_matchup_for_board(
     uint8_t board_size,
     std::function<uint16_t(const Combo&)> eval_for_board,
     std::vector<float>& out_ev,
-    std::vector<float>& out_valid)
+    std::vector<float>& out_valid,
+    std::vector<uint8_t>& out_category)
 {
     (void)solver_unused;
     uint16_t nc = iso.num_canonical;
     out_ev.assign(static_cast<size_t>(nc) * nc, 0.0f);
     out_valid.assign(static_cast<size_t>(nc) * nc, 0.0f);
+    // v1.8.2 A2 encoding: pre-thresholded {0=invalid, 1=win, 2=lose, 3=tie}
+    // matrix used by the CPU showdown hot loop. Initialized to 0 (CAT_INVALID)
+    // so any cell we don't touch (no valid pair found) stays invalid.
+    out_category.assign(static_cast<size_t>(nc) * nc, 0u);
 
     const auto& combo_table = get_combo_table();
     CardMask board_mask = board_to_mask(board_cards, board_size);
@@ -1229,9 +1248,19 @@ inline void compute_matchup_for_board(
             }
             size_t idx = static_cast<size_t>(ci) * nc + cj;
             if (valid > 0) {
-                out_ev[idx] = static_cast<float>(oop_wins - ip_wins) / valid;
-                out_valid[idx] = static_cast<float>(valid)
+                const float ev_val = static_cast<float>(oop_wins - ip_wins) / valid;
+                const float valid_val = static_cast<float>(valid)
                     / std::max(1u, static_cast<unsigned>(originals_i.size() * originals_j.size()));
+                out_ev[idx]    = ev_val;
+                out_valid[idx] = valid_val;
+                // Match the showdown kernel's bucketing: ev > 0.5 → win,
+                // ev < -0.5 → lose, otherwise tie. Cells where valid == 0
+                // stay at the default CAT_INVALID = 0 from the initial assign.
+                uint8_t cat;
+                if      (ev_val >  0.5f) cat = 1;   // CAT_WIN
+                else if (ev_val < -0.5f) cat = 2;   // CAT_LOSE
+                else                     cat = 3;   // CAT_TIE
+                out_category[idx] = cat;
             }
         }
     }
@@ -1268,6 +1297,7 @@ inline void Solver::precompute_matchups() {
     // Board signature = sorted tuple of (config.board ∪ runout_cards).
     matchup_ev_per_runout_.clear();
     matchup_valid_per_runout_.clear();
+    matchup_category_per_runout_.clear();
     std::map<std::vector<uint8_t>, int32_t> sig_to_idx;
 
     std::vector<int32_t>& matchup_idx = tree_.matchup_idx;
@@ -1328,11 +1358,13 @@ inline void Solver::precompute_matchups() {
         sig_to_idx[sig] = new_idx;
         // Compute matchup table for this board signature.
         std::vector<float> ev, valid;
+        std::vector<uint8_t> category;
         uint8_t bs = static_cast<uint8_t>(sig.size());
         compute_matchup_for_board(*this, iso_, sig.data(), bs,
-            make_eval_for(sig.data(), bs), ev, valid);
+            make_eval_for(sig.data(), bs), ev, valid, category);
         matchup_ev_per_runout_.push_back(std::move(ev));
         matchup_valid_per_runout_.push_back(std::move(valid));
+        matchup_category_per_runout_.push_back(std::move(category));
         return new_idx;
     };
 
@@ -1362,11 +1394,13 @@ inline void Solver::precompute_matchups() {
     // Keep matchup_ev_/_valid_ pointing at the root board (idx 0) for
     // backward-compat with code paths that haven't been migrated yet.
     if (!matchup_ev_per_runout_.empty()) {
-        matchup_ev_    = matchup_ev_per_runout_[0];
-        matchup_valid_ = matchup_valid_per_runout_[0];
+        matchup_ev_       = matchup_ev_per_runout_[0];
+        matchup_valid_    = matchup_valid_per_runout_[0];
+        matchup_category_ = matchup_category_per_runout_[0];
     } else {
         matchup_ev_.assign(static_cast<size_t>(nc) * nc, 0.0f);
         matchup_valid_.assign(static_cast<size_t>(nc) * nc, 0.0f);
+        matchup_category_.assign(static_cast<size_t>(nc) * nc, 0u);
     }
 }
 

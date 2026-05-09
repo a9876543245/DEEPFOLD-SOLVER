@@ -352,18 +352,19 @@ inline void CpuBackend::cfr_traverse(
         float tie_payoff  = -0.5f * rake;
 
         int32_t mi = (node_idx < tree.matchup_idx.size()) ? tree.matchup_idx[node_idx] : 0;
-        const auto& matchup_ev_table =
-            (ctx_.matchup_ev_per_runout && mi >= 0 &&
-             static_cast<std::size_t>(mi) < ctx_.matchup_ev_per_runout->size())
-                ? (*ctx_.matchup_ev_per_runout)[mi]
-                : *ctx_.matchup_ev;
         const auto& matchup_valid_table =
             (ctx_.matchup_valid_per_runout && mi >= 0 &&
              static_cast<std::size_t>(mi) < ctx_.matchup_valid_per_runout->size())
                 ? (*ctx_.matchup_valid_per_runout)[mi]
                 : *ctx_.matchup_valid;
-        const auto* matchup_ev    = matchup_ev_table.data();
-        const auto* matchup_valid = matchup_valid_table.data();
+        // v1.8.2 A2 encoding — see cpu_backend_levelized.h for the why.
+        const auto& matchup_category_table =
+            (ctx_.matchup_category_per_runout && mi >= 0 &&
+             static_cast<std::size_t>(mi) < ctx_.matchup_category_per_runout->size())
+                ? (*ctx_.matchup_category_per_runout)[mi]
+                : *ctx_.matchup_category;
+        const auto* matchup_valid    = matchup_valid_table.data();
+        const auto* matchup_category = matchup_category_table.data();
 
         // Precompute opp_reach * canonical_weights once per terminal so
         // the inner SIMD loop only does reach_w * valid * payoff.
@@ -387,11 +388,11 @@ inline void CpuBackend::cfr_traverse(
             // loop so we don't rebuild vwin/vlose/vtie nc times per call.
             if (traverser == 0) {
                 cpu_simd::showdown_oop_full(
-                    matchup_ev, matchup_valid, opp_reach_w, skip_mask, out_vals, nc,
-                    win_payoff, lose_payoff, tie_payoff);
+                    matchup_category, matchup_valid, opp_reach_w, skip_mask,
+                    out_vals, nc, win_payoff, lose_payoff, tie_payoff);
             } else {
                 cpu_simd::showdown_ip_full(
-                    matchup_ev, matchup_valid, opp_reach_w, out_vals, nc,
+                    matchup_category, matchup_valid, opp_reach_w, out_vals, nc,
                     win_payoff, lose_payoff, tie_payoff);
             }
         } else {
