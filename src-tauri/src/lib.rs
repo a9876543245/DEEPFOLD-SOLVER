@@ -8,7 +8,7 @@ mod api_server;
 use commands::{
     solve, estimate_solve, cancel_solve, engine_status, save_solution, load_solution, get_gpu_info, start_google_oauth,
 };
-use gto_charts::{list_gto_scenarios, load_gto_chart};
+use gto_charts::{list_gto_scenarios, load_gto_chart, read_bundled_presolve};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -26,7 +26,8 @@ pub fn run() {
             get_gpu_info,
             start_google_oauth,
             list_gto_scenarios,
-            load_gto_chart
+            load_gto_chart,
+            read_bundled_presolve
         ])
         .setup(|_app| {
             // Optionally start headless API server

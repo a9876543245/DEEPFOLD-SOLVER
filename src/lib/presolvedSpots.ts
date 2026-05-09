@@ -38,7 +38,45 @@ export interface PresolvedSpot {
   isDemo: boolean;
   /** Unix ms when the real solver produced this; undefined for demo. */
   solvedAt?: number;
+  /** Where this strategy came from (v1.8.3+):
+   *   - 'bundled': pre-solved on the dev's GPU, shipped in the installer
+   *   - 'live':    live solve via the C++ engine on the user's machine
+   *   - 'demo':    heuristic placeholder (browser mode or pre-solve in flight)
+   *  Used by SpotLibrary UI for the "Pre-solved" / "Live-solved" badge.
+   */
+  source?: 'bundled' | 'live' | 'demo';
+  /** Iterations that produced this result (bundled spots are typically Deep). */
+  iterationsRun?: number;
+  /** Final exploitability % for badge display. */
+  exploitabilityPct?: number;
 }
+
+// ----------------------------------------------------------------------------
+// Bundled spot envelope (matches scripts/compact-presolved.mjs:buildBundledSpot
+// schema v1).
+// ----------------------------------------------------------------------------
+interface BundledSpot {
+  v: number;                    // schema version
+  solver_version: string;       // app version that produced this bundle
+  matchup_idx: number;
+  board_idx: number;
+  sizing_key: string;
+  stack_label: string;
+  iterations_run: number;
+  exploitability_pct: number | null;
+  early_stop_reason: string | null;
+  global_strategy: Record<string, string>;
+  combo_strategies: Record<string, ComboStrategy>;
+  acting_player: number | null;
+  opponent_side: string | null;
+  opponent_range: string[];
+  strategy_tree?: Record<string, unknown>;  // Tier B only
+}
+
+/** Schema version + app version the frontend expects. Mismatches → fall through
+ *  to live solve so the UI never serves stale strategies after a solver bump. */
+const EXPECTED_SCHEMA_VERSION = 1;
+import { APP_VERSION } from './appVersion';
 
 // ============================================================================
 // Board Templates: 12 representative flop textures
@@ -239,6 +277,102 @@ function buildHeuristicSpot(
 }
 
 // ============================================================================
+// Bundled spot lookup (Tauri only) — PRESOLVE_BUNDLE_PLAN Phase 3
+// ============================================================================
+
+/**
+ * Build the canonical spot key used by `scripts/bulk-presolve.mjs` and
+ * `scripts/compact-presolved.mjs`. Format:
+ *   `m<matchupIdx>_b<boardIdx>_<sizingKey>_<stackLabel>bb.json.gz`
+ *
+ * Default args mirror what `solveSpotReal` produces today (the live solve
+ * uses the matchup's defaultPot/defaultStack with whatever sizing the user
+ * has selected). For SpotLibrary's preview grid we always use 'standard'
+ * sizing + 'default' stack — that's what gets bundled by Phase 1.
+ */
+function bundledSpotKey(
+  matchupIdx: number,
+  boardIdx: number,
+  sizingKey: string = 'standard',
+  stackLabel: string = 'default',
+): string {
+  return `m${matchupIdx}_b${boardIdx}_${sizingKey}_${stackLabel}bb.json.gz`;
+}
+
+/**
+ * Try to load a bundled, pre-solved version of this spot. Returns null on:
+ *   - browser mode (no Tauri command available)
+ *   - bundle file missing for this (matchup, board, sizing, stack) tuple
+ *   - bundle solver_version doesn't match the current app version (stale)
+ *   - bundle schema version isn't recognized
+ *   - any IO / JSON / decompression error
+ *
+ * On null, the caller should fall through to a live solve.
+ */
+async function tryLoadBundled(
+  matchupIdx: number,
+  boardIdx: number,
+  sizingKey: string = 'standard',
+  stackLabel: string = 'default',
+): Promise<PresolvedSpot | null> {
+  if (!isTauri()) return null;
+
+  const matchup = MATCHUPS[matchupIdx];
+  const template = BOARD_TEMPLATES[boardIdx];
+  if (!matchup || !template) return null;
+
+  const spotKey = bundledSpotKey(matchupIdx, boardIdx, sizingKey, stackLabel);
+  let json: string;
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    json = await invoke<string>('read_bundled_presolve', { spotKey });
+  } catch (e: unknown) {
+    // The Rust command returns "NOT_FOUND:<key>" for missing bundles —
+    // that's the common case, not an error. Anything else is logged so we
+    // notice real issues.
+    const msg = String(e);
+    if (!msg.includes('NOT_FOUND:')) {
+      console.warn('[presolvedSpots] read_bundled_presolve failed:', msg);
+    }
+    return null;
+  }
+
+  let bundled: BundledSpot;
+  try {
+    bundled = JSON.parse(json);
+  } catch (e) {
+    console.warn('[presolvedSpots] bundled JSON parse failed:', e);
+    return null;
+  }
+
+  // Schema invalidation. Mismatch → fall through to live solve.
+  if (bundled.v !== EXPECTED_SCHEMA_VERSION) {
+    console.warn(
+      `[presolvedSpots] bundled schema v${bundled.v} != expected v${EXPECTED_SCHEMA_VERSION}, falling through`);
+    return null;
+  }
+  if (bundled.solver_version !== APP_VERSION) {
+    console.info(
+      `[presolvedSpots] bundled solver_version ${bundled.solver_version} != current ${APP_VERSION}, falling through`);
+    return null;
+  }
+
+  return {
+    id: buildSpotId(matchupIdx, boardIdx),
+    matchup,
+    board: template.board,
+    boardTexture: template.texture,
+    globalStrategy: bundled.global_strategy,
+    comboStrategies: bundled.combo_strategies,
+    isDemo: false,
+    solvedAt: Date.now(),
+    source: 'bundled',
+    iterationsRun: bundled.iterations_run,
+    exploitabilityPct: bundled.exploitability_pct ?? undefined,
+  };
+}
+
+// ============================================================================
 // Real solver invocation (Tauri only)
 // ============================================================================
 
@@ -249,6 +383,12 @@ async function solveSpotReal(
   if (!isTauri()) {
     throw new Error('Real solver not available in browser mode');
   }
+
+  // v1.8.3+ Phase 3: try the bundled, pre-solved version first. SpotLibrary's
+  // preview grid always wants the 'standard' sizing × 'default' stack
+  // (whatever sizing/stack the matchup defaults to), so that's the lookup key.
+  const bundled = await tryLoadBundled(matchupIdx, boardIdx);
+  if (bundled) return bundled;
 
   const matchup = MATCHUPS[matchupIdx];
   const template = BOARD_TEMPLATES[boardIdx];
@@ -280,6 +420,7 @@ async function solveSpotReal(
     comboStrategies,
     isDemo: false,
     solvedAt: Date.now(),
+    source: 'live',
   };
 }
 

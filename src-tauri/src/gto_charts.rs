@@ -210,3 +210,52 @@ pub async fn load_gto_chart(id: String) -> Result<GtoChart, String> {
         ranges: raw.strategy.upi_ranges,
     })
 }
+
+// ============================================================================
+// v1.8.3+ pre-solved spot bundle (PRESOLVE_BUNDLE_PLAN Phase 3)
+// ============================================================================
+//
+// The bulk-presolve pipeline (scripts/bulk-presolve.mjs +
+// scripts/compact-presolved.mjs) emits one `<spot_key>.json.gz` per bundled
+// spot under `gto_output/presolved/`. Filename scheme:
+//   m<matchupIdx>_b<boardIdx>_<sizingKey>_<stackLabel>bb.json.gz
+// e.g. `m0_b0_standard_defaultbb.json.gz`.
+//
+// The frontend's SpotLibrary calls `read_bundled_presolve(spot_key)`. We
+// locate the file under the same `gto_output/` resource root used by the
+// preflop charts above, gunzip it, and return the JSON string. The
+// frontend then JSON.parses + version-checks against its CURRENT_SOLVER_VERSION
+// constant — mismatches fall through to a live solve.
+
+#[tauri::command]
+pub async fn read_bundled_presolve(spot_key: String) -> Result<String, String> {
+    use std::io::Read;
+
+    // Defensive — never let a frontend pass `..` or absolute paths.
+    if spot_key.contains("..") || spot_key.contains('/') || spot_key.contains('\\') {
+        return Err(format!("Invalid spot_key (path traversal): {}", spot_key));
+    }
+    if !spot_key.ends_with(".json.gz") {
+        return Err(format!("spot_key must end with .json.gz, got: {}", spot_key));
+    }
+
+    let root = find_gto_root()
+        .ok_or_else(|| "gto_output/ directory not found".to_string())?;
+    let path = root.join("presolved").join(&spot_key);
+
+    if !path.exists() {
+        // NotFound is the common case — frontend treats it as "no bundle, fall
+        // through to live solve". Return a structured marker so the frontend
+        // can distinguish from real I/O errors.
+        return Err(format!("NOT_FOUND:{}", spot_key));
+    }
+
+    let bytes = std::fs::read(&path)
+        .map_err(|e| format!("Read failed for {}: {}", path.display(), e))?;
+    let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+    let mut json = String::new();
+    decoder
+        .read_to_string(&mut json)
+        .map_err(|e| format!("Gunzip failed for {}: {}", path.display(), e))?;
+    Ok(json)
+}

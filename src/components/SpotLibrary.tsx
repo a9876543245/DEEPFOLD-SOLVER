@@ -411,9 +411,12 @@ export function SpotLibrary({ onSelectSpot, onClose }: Props) {
                   {/* Board cards */}
                   <BoardCardDisplay board={spot.board} />
 
-                  {/* Texture label */}
+                  {/* Texture label + source badge (v1.8.3+) */}
                   <div
                     style={{
+                      display: 'flex',
+                      gap: 6,
+                      alignItems: 'center',
                       fontSize: 11,
                       fontWeight: 600,
                       color: 'var(--color-text-tertiary)',
@@ -421,7 +424,37 @@ export function SpotLibrary({ onSelectSpot, onClose }: Props) {
                       letterSpacing: 0.5,
                     }}
                   >
-                    {spot.boardTexture}
+                    <span>{spot.boardTexture}</span>
+                    {spot.source === 'bundled' && (
+                      <span
+                        title={`Pre-solved · ${spot.iterationsRun ?? '?'} iter · exploit ${spot.exploitabilityPct?.toFixed(2) ?? '?'}%`}
+                        style={{
+                          fontSize: 9,
+                          padding: '1px 5px',
+                          borderRadius: 3,
+                          background: 'rgba(34, 197, 94, 0.15)',
+                          color: 'rgb(74, 222, 128)',
+                          letterSpacing: 0.3,
+                        }}
+                      >
+                        ● PRE-SOLVED
+                      </span>
+                    )}
+                    {spot.source === 'live' && (
+                      <span
+                        title="Live-solved on your machine — cached for the session"
+                        style={{
+                          fontSize: 9,
+                          padding: '1px 5px',
+                          borderRadius: 3,
+                          background: 'rgba(251, 191, 36, 0.15)',
+                          color: 'rgb(251, 191, 36)',
+                          letterSpacing: 0.3,
+                        }}
+                      >
+                        ◐ LIVE
+                      </span>
+                    )}
                   </div>
 
                   {/* Mini strategy bars */}
