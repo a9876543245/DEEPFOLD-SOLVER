@@ -51,11 +51,44 @@ Budget agreed: **up to 500 MB installer size increase** (current installer is
 
 ## 3. Empirical sizing data (measured 2026-05-09)
 
-Single solve at 200 iter, AsKd7c flop, default config, `max_strategy_tree_nodes=2000`:
-- Raw JSON: **2.6 MB**
-- gzipped: **521 KB**
+### First measurement (narrow ranges, AsKd7c flop, 200 iter, max_tree=2000)
+- Raw JSON: 2.6 MB
+- gzipped: 521 KB
 
-So per-spot cost ≈ **500 KB compressed** for full Tier B (navigable strategy_tree).
+### Phase 1 actual measurement (2026-05-09 PM, after script written)
+
+Tested via `scripts/bulk-presolve.mjs --limit 2` on actual MATCHUPS data
+(UTG vs MP SRP, AsKd2c flop, 1000 iter @ 0.2% target on RTX 5090):
+
+| Sizing | Wall time | Exploit reached | Raw JSON | Gzipped |
+|--------|-----------|-----------------|----------|---------|
+| Standard | **53s** | 5.39% (didn't hit 0.2% target) | **6.9 MB** | **1.5 MB** |
+| Lite | **6.9s** | 3.87% | **1.2 MB** | **248 KB** |
+
+**Key finding**: strategy_tree is **99.7%** of raw bytes (8.0 MB out of 8.02 MB
+in the Standard sample). All other fields combined (timing, resources, global_strategy,
+combo_strategies, opponent_range) are ~28 KB. **Compaction by stripping fluff
+saves <1%.** Only effective lever: cap `--strategy-tree-max-nodes` lower.
+
+### Bundle size projection (revised)
+
+| Slice | Spots | Time on 5090 | Compressed bundle |
+|-------|-------|--------------|-------------------|
+| 312 × Standard × default stack | 312 | ~4.6 hours | **~470 MB** |
+| 312 × Lite × default stack | 312 | ~36 min | **~78 MB** |
+| Combined (default stack only) | 624 | **~5.2 hours** | **~548 MB** |
+
+**~50 MB over 500 MB target.** Mitigations (pick one):
+1. Drop `--strategy-tree-max-nodes` 2000 → 1500 ≈ 25% size cut → ~410 MB ✓
+2. Drop Lite's strategy_tree (Tier A for Lite, Tier B for Standard) → 312 × 1.5 MB + 312 × ~10 KB = ~471 MB ✓
+3. Skip the SRP wide-range matchups for Standard (worst offenders for tree size)
+4. Bundle Standard ONLY (drop Lite entirely) → 470 MB ✓
+
+**Recommended path**: Option 1 (lower max_tree_nodes to 1500). Loss in
+navigability is minor — most users won't hit the 1500-node ceiling on a
+flop spot, and the rare cases that would are exactly the spots that benefit
+most from re-solving on the user's machine anyway. Re-run bulk-presolve with
+`--max-tree-nodes 1500` after agreement.
 
 ---
 
@@ -104,9 +137,32 @@ User runs once overnight per release.
 
 ## 6. Implementation phases
 
-### Phase 1 — Bulk solve script (1 day)
+### Phase 1 — Bulk solve script (DONE, 2026-05-09)
 
-**Deliverable**: `scripts/bulk-presolve.ps1`
+**Status**: ✓ Implemented as `scripts/bulk-presolve.mjs` (Node ESM, not PowerShell — easier
+range-string passing, cross-platform). Smoke-tested on 2 spots end-to-end on the
+5090 (CC 12.0 / Blackwell). Output validated, sizes measured (see §3).
+
+**Auto-detects** the CUDA build at `D:/DEEPFOLD-SOLVER/core/build/Release/deepsolver_core.exe`
+(falls back to CPU build at `core/build_cpu/Release/` if missing). Reads MATCHUPS /
+BOARD_TEMPLATES / BET_SIZINGS via regex+`new Function()` from the actual TS sources
+so there's no manual sync.
+
+**Usage**:
+```
+node scripts/bulk-presolve.mjs --dry-run              # show plan
+node scripts/bulk-presolve.mjs --limit 5 --iterations 100  # smoke
+node scripts/bulk-presolve.mjs                        # full run (Deep, ~5-7 hours)
+node scripts/bulk-presolve.mjs --resume               # skip existing files
+node scripts/bulk-presolve.mjs --max-tree-nodes 1500  # smaller bundle
+```
+
+**Defaults**: `--iterations 1000 --exploitability 0.2 --max-tree-nodes 2000 --sizings standard,lite`.
+
+Output: `gto_output/presolved/raw/m<i>_b<j>_<sizing>_<stack>bb.json` (raw, NOT yet
+gzipped/compacted — that's Phase 2).
+
+**Original spec (kept for reference)**: `scripts/bulk-presolve.ps1`
 
 ```powershell
 # Inputs:
