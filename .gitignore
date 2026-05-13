@@ -25,5 +25,16 @@ logs/
 # Claude Code session state (per-developer)
 .claude/
 CLAUDE.md
-/gto_output/
+
+# gto_output/ structure:
+#   charts/        — bundled GTO preflop charts (NOT in repo, too large; user
+#                    downloads dataset separately, resolved at runtime)
+#   presolved/     — pre-solved spot bundles (.json.gz) SHIPPED IN INSTALLER;
+#                    committed to repo, used by SpotLibrary instant-load.
+#   presolved/raw/ — raw bulk-presolve output, regenerable from
+#                    scripts/bulk-presolve.mjs (~10 hr on a 5090) — not committed.
+/gto_output/*
+!/gto_output/presolved/
+/gto_output/presolved/raw/
+
 /src-tauri/gen/

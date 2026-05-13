@@ -291,12 +291,26 @@ async function mockSolve(
 // useSolver hook
 // ============================================================================
 
+// v1.8.3: GPU OOM detection for the engine's structured error string.
+//   "GpuBackend: solver state would require N MB but only M MB free on device"
+// is what the engine produces when a wide-range × monotone × 2-sizing tree
+// overflows the user's GPU memory. We retry once with single-sizing flop
+// to drop tree size by ~50% and fit common 24-32 GB GPUs.
+function isGpuOom(msg: string): boolean {
+  return /GpuBackend:.*solver state would require.*out of memory/i.test(msg)
+      || /needs.*MB.*free.*MB.*out of memory/i.test(msg);
+}
+
 export function useSolver() {
   const [result, setResultRaw] = useState<SolverResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [progress, setProgress] = useState<SolverProgress | null>(null);
+  // v1.8.3: surfaces "we retried with reduced sizing" to the UI so the user
+  // knows the strategy uses a simplified tree (monotone × wide range OOM
+  // fallback). Cleared on next solve() call.
+  const [oomFallback, setOomFallback] = useState<{ from: number[]; to: number[] } | null>(null);
   // v1.2.2: pre-solve ETA + memory preview from `--estimate-only`. Set by
   // `solve()` before the actual subprocess fires (sub-second cost) so the
   // UI can show "Estimated 12 minutes on CPU" before the user commits.
@@ -331,6 +345,7 @@ export function useSolver() {
     setError(null);
     setResult(null);  // ref kept in sync by wrapped setter
     setEstimate(null);  // clear stale estimate from previous solve
+    setOomFallback(null);  // clear stale OOM notice from previous solve
     setProgress({ iteration: 0, total: request.iterations ?? 300, elapsed: 0, phase: 'Starting...', pct: 0 });
     const start = Date.now();
 
@@ -420,7 +435,29 @@ export function useSolver() {
           request.node_locks = JSON.stringify(request.node_locks);
         }
 
-        response = await invoke<SolverResponse>('solve', { request });
+        try {
+          response = await invoke<SolverResponse>('solve', { request });
+        } catch (firstErr) {
+          // v1.8.3: GPU OOM auto-retry with reduced flop sizing. The wide-range
+          // × monotone Standard spots overflow 32 GB VRAM during tree build.
+          // Retrying with a single (largest) flop size drops tree nodes ~50%
+          // and reliably fits common consumer GPUs. The strategy is still
+          // valid GTO under the smaller action menu — just less granular.
+          const firstMsg = firstErr instanceof Error ? firstErr.message : String(firstErr);
+          const originalSizes = request.flop_sizes;
+          const canRetry = isGpuOom(firstMsg)
+            && Array.isArray(originalSizes)
+            && originalSizes.length > 1;
+          if (canRetry) {
+            const reduced = [originalSizes![originalSizes!.length - 1]];
+            console.warn(`[useSolver] GPU OOM on flop_sizes=${JSON.stringify(originalSizes)}, retrying with ${JSON.stringify(reduced)}`);
+            setOomFallback({ from: originalSizes!, to: reduced });
+            const retryReq = { ...request, flop_sizes: reduced };
+            response = await invoke<SolverResponse>('solve', { request: retryReq });
+          } else {
+            throw firstErr;
+          }
+        }
       } else {
         // Clear the generic timer — mock solver handles its own progress
         if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
@@ -432,7 +469,14 @@ export function useSolver() {
       setProgress({ iteration: response.iterations_run, total: request.iterations ?? 300, elapsed: Date.now() - start, phase: 'Done', pct: 100 });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      setError(msg);
+      // v1.8.3: prettier error for the unrecoverable OOM case (mono × wide
+      // range × already-single-sizing). User-actionable hint instead of raw
+      // engine error string.
+      if (isGpuOom(msg)) {
+        setError(`GPU memory exceeded on this spot's tree. Try switching to the "Lite" sizing preset (single 50% bet per street) — it's specifically designed for these wide-range monotone scenarios.`);
+      } else {
+        setError(msg);
+      }
       setProgress(null);
     } finally {
       if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
@@ -447,6 +491,7 @@ export function useSolver() {
     setElapsed(0);
     setProgress(null);
     setEstimate(null);
+    setOomFallback(null);
   }, [setResult]);
 
   /**
@@ -484,5 +529,5 @@ export function useSolver() {
     return true;
   }, [setResult]);
 
-  return { result, setResult, loading, error, elapsed, progress, estimate, solve, reset, navigate };
+  return { result, setResult, loading, error, elapsed, progress, estimate, solve, reset, navigate, oomFallback };
 }

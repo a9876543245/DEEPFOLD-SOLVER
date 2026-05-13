@@ -149,7 +149,7 @@ function App() {
     return b;
   }, [flopBoard, turnCard, riverCard]);
 
-  const { result, setResult, loading, error, elapsed, progress, estimate, solve, reset, navigate } = useSolver();
+  const { result, setResult, loading, error, elapsed, progress, estimate, solve, reset, navigate, oomFallback } = useSolver();
 
   // Off-range combo cache (#2 from roadmap). After a target_combo solve
   // completes (~10s), keep its analysis so a re-click on the same hand is
@@ -744,6 +744,22 @@ function App() {
           }}>
             <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-red)', marginBottom: 4 }}>{t('error')}</div>
             <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{error}</div>
+          </div>
+        )}
+        {/* v1.8.3: GPU OOM auto-retry notice. Surfaces when the wide-range
+            monotone Standard tree exceeded VRAM and the solver was rerun
+            with single-sizing flop. Strategy is still GTO but the action
+            menu drops "Bet 33%" — user should know. */}
+        {oomFallback && (
+          <div className="glass-panel animate-fade-in" style={{
+            padding: 12, borderColor: 'var(--color-amber)', background: 'var(--color-amber-dim, rgba(245, 158, 11, 0.08))',
+          }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-amber)', marginBottom: 4 }}>Simplified tree</div>
+            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>
+              Wide range + monotone flop exceeded GPU memory at {oomFallback.from.length}-bet sizing
+              ({oomFallback.from.map(s => `${(s*100)|0}%`).join(' / ')}). Solved with single sizing
+              ({oomFallback.to.map(s => `${(s*100)|0}%`).join(' / ')}) instead. Strategy is GTO under the smaller action menu.
+            </div>
           </div>
         )}
       </aside>
