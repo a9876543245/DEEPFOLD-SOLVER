@@ -1,6 +1,6 @@
 [package]
 name = "deepsolver-app"
-version = "1.8.3"
+version = "1.8.4"
 description = "DEEPFOLD-SOLVER - GPU-Accelerated GTO Poker Solver with Training Mode"
 authors = ["DEEPFOLD"]
 edition = "2021"
@@ -24,6 +24,11 @@ axum = "0.8"
 bincode = "2"
 flate2 = "1"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# native-tls (schannel on Windows) reads the Windows certificate store, so
+# antivirus / corporate-proxy MITM root CAs are trusted automatically. Switched
+# from rustls-tls in v1.8.4 after users reported "error sending request" on
+# https://oauth2.googleapis.com/token when behind HTTPS-scanning AV (Kaspersky,
+# Norton, etc.) — rustls's bundled webpki-roots couldn't see the AV's local CA.
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json"] }
 sha2 = "0.10"
 base64 = "0.22"

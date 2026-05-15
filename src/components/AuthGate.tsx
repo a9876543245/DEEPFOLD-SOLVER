@@ -188,7 +188,7 @@ export function AuthGate({ children, onAuth }: Props) {
               </div>
 
               <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
-                <a href="https://deepfold.co" target="_blank" rel="noopener" style={{
+                <a href="https://deepfold.co/en/pricing" target="_blank" rel="noopener" style={{
                   display: 'inline-flex', alignItems: 'center', gap: 6,
                   padding: '10px 24px', borderRadius: 10,
                   background: 'linear-gradient(135deg, #0A84FF, #BF5AF2)',
