@@ -1,0 +1,34 @@
+{
+  "context": {
+    "game_type": "Cash",
+    "scenario_type": "vs_3B",
+    "hero_position": "SB",
+    "villain_position": null,
+    "effective_bb": 100,
+    "description": "TexasSolverGPU 100bb 2.5x 500rake vs_3B: SB @ SB 3.0bb BB 9.0bb SB",
+    "source": "TexasSolverGPU ranges/qb_ranges/100bb 2.5x 500rake",
+    "source_path": "SB/vs_3bet/SB_3.0bb_BB_9.0bb_SB_22.0bb.txt; SB/vs_3bet/SB_3.0bb_BB_9.0bb_SB_Call.txt; SB/vs_3bet/SB_3.0bb_BB_9.0bb_SB_FOLD.txt",
+    "preflop_line": "SB 3.0bb BB 9.0bb SB"
+  },
+  "strategy": {
+    "actions": [
+      {
+        "name": "Raise 22.0bb",
+        "color_bucket": "Red"
+      },
+      {
+        "name": "Call",
+        "color_bucket": "Green"
+      },
+      {
+        "name": "Fold",
+        "color_bucket": "Blue"
+      }
+    ],
+    "upi_ranges": {
+      "Raise 22.0bb": "AA:1.000,A2s:0.346,A3s:0.212,A4s:0.208,A5s:0.214,A6s:0.198,A7s:0.010,ATs:0.056,ATo:0.556,AJo:0.676,AQs:1.000,AQo:0.620,AKs:1.000,AKo:1.000,44:0.030,55:0.106,65s:0.026,K5s:0.084,66:0.122,76s:0.066,K6s:0.166,77:0.084,K7s:0.072,88:0.080,98s:0.338,T8s:0.232,J8s:0.210,99:0.102,T9s:0.274,J9s:0.160,Q9s:0.128,K9s:0.054,TT:0.916,JTs:0.270,JTo:0.106,QTs:0.118,KTs:0.194,KTo:0.202,JJ:1.000,QJo:0.178,KJs:0.100,KJo:0.510,QQ:1.000,KQo:0.486,KK:1.000",
+      "Call": "A2s:0.654,A3s:0.788,A4s:0.792,A5s:0.786,A6s:0.802,A7s:0.990,A8s:1.000,A9s:1.000,ATs:0.944,ATo:0.444,AJs:1.000,AJo:0.324,AQo:0.380,22:0.606,33:0.796,44:0.970,54s:0.494,55:0.894,65s:0.472,K5s:0.292,66:0.878,76s:0.634,K6s:0.796,77:0.916,87s:0.460,97s:0.442,T7s:0.082,K7s:0.760,88:0.920,98s:0.662,T8s:0.768,J8s:0.628,Q8s:0.802,K8s:1.000,99:0.898,T9s:0.726,J9s:0.840,Q9s:0.872,K9s:0.946,TT:0.084,JTs:0.730,JTo:0.262,QTs:0.882,QTo:0.120,KTs:0.806,KTo:0.298,QJs:1.000,QJo:0.314,KJs:0.900,KJo:0.490,KQs:1.000,KQo:0.514",
+      "Fold": "A4o:0.896,A5o:1.000,A6o:1.000,A7o:1.000,A8o:1.000,A9o:1.000,22:0.394,Q2s:0.812,K2s:1.000,33:0.204,53s:0.098,Q3s:1.000,K3s:1.000,54s:0.506,64s:1.000,74s:0.028,J4s:0.840,Q4s:1.000,K4s:1.000,65s:0.502,75s:1.000,85s:1.000,J5s:1.000,Q5s:1.000,K5s:0.624,76s:0.300,86s:1.000,96s:1.000,T6s:1.000,J6s:1.000,Q6s:1.000,K6s:0.038,87s:0.540,87o:0.204,97s:0.558,T7s:0.918,J7s:1.000,Q7s:1.000,K7s:0.170,98o:0.636,T8o:0.558,J8s:0.162,J8o:0.144,Q8s:0.198,K8o:1.000,T9o:1.000,J9o:1.000,Q9o:1.000,K9o:1.000,JTo:0.632,QTo:0.880,KTo:0.500,QJo:0.506"
+    }
+  }
+}

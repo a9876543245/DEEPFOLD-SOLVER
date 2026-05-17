@@ -1,0 +1,29 @@
+{
+  "context": {
+    "game_type": "Cash",
+    "scenario_type": "vs_5B",
+    "hero_position": "SB",
+    "villain_position": null,
+    "effective_bb": 100,
+    "description": "TexasSolverGPU 100bb 2.5x 500rake vs_5B: SB @ CO 2.5bb SB 11.0bb BB 22.0bb CO AllIn SB",
+    "source": "TexasSolverGPU ranges/qb_ranges/100bb 2.5x 500rake",
+    "source_path": "SB/vs_5bet/CO_2.5bb_SB_11.0bb_BB_22.0bb_CO_AllIn_SB_Call.txt; SB/vs_5bet/CO_2.5bb_SB_11.0bb_BB_22.0bb_CO_AllIn_SB_FOLD.txt",
+    "preflop_line": "CO 2.5bb SB 11.0bb BB 22.0bb CO AllIn SB"
+  },
+  "strategy": {
+    "actions": [
+      {
+        "name": "Call",
+        "color_bucket": "Green"
+      },
+      {
+        "name": "Fold",
+        "color_bucket": "Blue"
+      }
+    ],
+    "upi_ranges": {
+      "Call": "AA:1.000,KK:1.000",
+      "Fold": "A3s:0.250,A4s:0.604,A5s:1.000,A8s:0.110,A9s:0.798,ATs:1.000,AJs:1.000,AJo:0.388,AQs:1.000,AQo:1.000,AKs:1.000,AKo:1.000,44:0.040,54s:0.136,55:0.090,65s:0.150,66:0.484,76s:0.258,77:0.604,87s:0.118,88:1.000,99:1.000,T9s:0.610,J9s:0.600,K9s:0.434,TT:1.000,JTs:1.000,QTs:1.000,KTs:1.000,JJ:1.000,QJs:1.000,KJs:1.000,KJo:0.162,QQ:1.000,KQs:1.000,KQo:0.646"
+    }
+  }
+}

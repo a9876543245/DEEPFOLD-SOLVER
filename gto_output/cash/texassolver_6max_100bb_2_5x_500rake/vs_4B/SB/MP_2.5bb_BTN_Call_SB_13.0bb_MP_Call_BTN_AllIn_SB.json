@@ -1,0 +1,29 @@
+{
+  "context": {
+    "game_type": "Cash",
+    "scenario_type": "vs_4B",
+    "hero_position": "SB",
+    "villain_position": null,
+    "effective_bb": 100,
+    "description": "TexasSolverGPU 100bb 2.5x 500rake vs_4B: SB @ MP 2.5bb BTN Call SB 13.0bb MP Call BTN AllIn SB",
+    "source": "TexasSolverGPU ranges/qb_ranges/100bb 2.5x 500rake",
+    "source_path": "SB/vs_4bet/MP_2.5bb_BTN_Call_SB_13.0bb_MP_Call_BTN_AllIn_SB_Call.txt; SB/vs_4bet/MP_2.5bb_BTN_Call_SB_13.0bb_MP_Call_BTN_AllIn_SB_FOLD.txt",
+    "preflop_line": "MP 2.5bb BTN Call SB 13.0bb MP Call BTN AllIn SB"
+  },
+  "strategy": {
+    "actions": [
+      {
+        "name": "Call",
+        "color_bucket": "Green"
+      },
+      {
+        "name": "Fold",
+        "color_bucket": "Blue"
+      }
+    ],
+    "upi_ranges": {
+      "Call": "AA:1.000,AKs:1.000,AKo:1.000,JJ:1.000,QQ:1.000,KK:1.000",
+      "Fold": "A4s:0.138,A5s:0.382,ATs:0.780,AJs:1.000,AQs:1.000,AQo:1.000,54s:0.306,65s:0.302,66:0.200,76s:0.148,77:0.244,88:0.496,99:1.000,T9s:0.096,J9s:0.024,TT:1.000,JTs:1.000,QTs:0.416,KTs:0.970,QJs:1.000,KJs:1.000,KQs:1.000,KQo:0.112"
+    }
+  }
+}

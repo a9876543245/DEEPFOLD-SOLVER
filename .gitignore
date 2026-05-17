@@ -27,13 +27,16 @@ logs/
 CLAUDE.md
 
 # gto_output/ structure:
-#   charts/        — bundled GTO preflop charts (NOT in repo, too large; user
-#                    downloads dataset separately, resolved at runtime)
+#   cash/          — GTO preflop charts (852 JSON files, ~3.7 MB) consumed by
+#                    GameContextSelector + GtoChartBrowser + useGtoAutoRange.
+#                    Committed to repo + bundled into installer (v1.8.5+).
 #   presolved/     — pre-solved spot bundles (.json.gz) SHIPPED IN INSTALLER;
 #                    committed to repo, used by SpotLibrary instant-load.
 #   presolved/raw/ — raw bulk-presolve output, regenerable from
 #                    scripts/bulk-presolve.mjs (~10 hr on a 5090) — not committed.
+#   progress_hybrid.json — bulk-presolve scratch file, not committed.
 /gto_output/*
+!/gto_output/cash/
 !/gto_output/presolved/
 /gto_output/presolved/raw/
 

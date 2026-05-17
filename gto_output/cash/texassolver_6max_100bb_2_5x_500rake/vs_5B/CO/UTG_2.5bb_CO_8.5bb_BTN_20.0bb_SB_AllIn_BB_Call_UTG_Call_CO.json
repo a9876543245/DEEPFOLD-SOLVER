@@ -1,0 +1,29 @@
+{
+  "context": {
+    "game_type": "Cash",
+    "scenario_type": "vs_5B",
+    "hero_position": "CO",
+    "villain_position": null,
+    "effective_bb": 100,
+    "description": "TexasSolverGPU 100bb 2.5x 500rake vs_5B: CO @ UTG 2.5bb CO 8.5bb BTN 20.0bb SB AllIn BB Call UTG Call CO",
+    "source": "TexasSolverGPU ranges/qb_ranges/100bb 2.5x 500rake",
+    "source_path": "CO/vs_5bet/UTG_2.5bb_CO_8.5bb_BTN_20.0bb_SB_AllIn_BB_Call_UTG_Call_CO_Call.txt; CO/vs_5bet/UTG_2.5bb_CO_8.5bb_BTN_20.0bb_SB_AllIn_BB_Call_UTG_Call_CO_FOLD.txt",
+    "preflop_line": "UTG 2.5bb CO 8.5bb BTN 20.0bb SB AllIn BB Call UTG Call CO"
+  },
+  "strategy": {
+    "actions": [
+      {
+        "name": "Call",
+        "color_bucket": "Green"
+      },
+      {
+        "name": "Fold",
+        "color_bucket": "Blue"
+      }
+    ],
+    "upi_ranges": {
+      "Call": "AA:1.000,A9s:0.208,ATs:0.410,AJs:0.168,AKs:0.072,44:0.012,54s:0.244,55:0.024,65s:0.224,77:0.050,87s:0.114,TT:0.548,JTs:0.022,QTs:0.064,KQs:0.696",
+      "Fold": "A3s:0.152,A4s:0.752,A5s:0.938,A8s:0.162,A9s:0.086,ATs:0.312,AJs:0.832,AQs:1.000,AQo:1.000,AKs:0.928,AKo:1.000,54s:0.056,55:0.030,65s:0.084,66:0.150,76s:0.214,77:0.084,88:0.236,99:0.318,T9s:0.014,K9s:0.108,TT:0.116,JTs:0.048,KTs:0.982,JJ:1.000,QJs:1.000,KJs:1.000,QQ:1.000,KQs:0.304,KQo:0.600,KK:1.000"
+    }
+  }
+}

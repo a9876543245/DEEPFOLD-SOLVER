@@ -1,0 +1,34 @@
+{
+  "context": {
+    "game_type": "Cash",
+    "scenario_type": "vs_3B",
+    "hero_position": "MP",
+    "villain_position": null,
+    "effective_bb": 100,
+    "description": "TexasSolverGPU 100bb 2.5x 500rake vs_3B: MP @ MP 2.5bb BTN Call SB 13.0bb MP",
+    "source": "TexasSolverGPU ranges/qb_ranges/100bb 2.5x 500rake",
+    "source_path": "MP/vs_3bet/MP_2.5bb_BTN_Call_SB_13.0bb_MP_25.0bb.txt; MP/vs_3bet/MP_2.5bb_BTN_Call_SB_13.0bb_MP_Call.txt; MP/vs_3bet/MP_2.5bb_BTN_Call_SB_13.0bb_MP_FOLD.txt",
+    "preflop_line": "MP 2.5bb BTN Call SB 13.0bb MP"
+  },
+  "strategy": {
+    "actions": [
+      {
+        "name": "Raise 25.0bb",
+        "color_bucket": "Red"
+      },
+      {
+        "name": "Call",
+        "color_bucket": "Green"
+      },
+      {
+        "name": "Fold",
+        "color_bucket": "Blue"
+      }
+    ],
+    "upi_ranges": {
+      "Raise 25.0bb": "AA:1.000,ATs:0.214,AJs:0.562,AQo:0.364,AKs:0.678,AKo:0.332,99:0.206,TT:0.266,KTs:0.214,JJ:0.318,KJs:0.354,QQ:0.212,KQs:0.436,KK:0.828",
+      "Call": "A3s:0.096,A4s:0.180,A5s:0.262,ATs:0.294,AJs:0.438,AQs:1.000,AQo:0.170,AKs:0.322,AKo:0.668,22:0.004,33:0.010,44:0.054,54s:0.302,55:0.032,65s:0.276,66:0.196,76s:0.164,77:0.230,87s:0.064,88:0.360,99:0.632,T9s:0.118,TT:0.734,JTs:0.424,QTs:0.144,KTs:0.410,JJ:0.682,QJs:0.556,KJs:0.646,QQ:0.788,KQs:0.564,KK:0.172",
+      "Fold": "A2s:1.000,A3s:0.904,A4s:0.820,A5s:0.738,A6s:1.000,A7s:1.000,A8s:1.000,A9s:1.000,A9o:0.374,ATs:0.492,ATo:1.000,AJo:1.000,AQo:0.468,22:0.124,33:0.110,44:0.160,55:0.668,65s:0.048,K5s:0.900,66:0.804,76s:0.112,86s:0.020,K6s:0.994,77:0.770,87s:0.330,K7s:1.000,88:0.640,98s:0.496,T8s:0.382,J8s:0.082,Q8s:0.572,K8s:1.000,99:0.162,T9s:0.882,J9s:1.000,Q9s:1.000,K9s:1.000,JTs:0.576,JTo:0.176,QTs:0.856,QTo:0.562,KTs:0.374,KTo:0.970,QJs:0.444,QJo:1.000,KJo:1.000,KQo:1.000"
+    }
+  }
+}

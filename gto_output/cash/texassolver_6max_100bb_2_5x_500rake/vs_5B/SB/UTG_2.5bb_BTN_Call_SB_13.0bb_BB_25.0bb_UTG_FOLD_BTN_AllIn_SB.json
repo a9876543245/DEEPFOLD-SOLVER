@@ -1,0 +1,29 @@
+{
+  "context": {
+    "game_type": "Cash",
+    "scenario_type": "vs_5B",
+    "hero_position": "SB",
+    "villain_position": null,
+    "effective_bb": 100,
+    "description": "TexasSolverGPU 100bb 2.5x 500rake vs_5B: SB @ UTG 2.5bb BTN Call SB 13.0bb BB 25.0bb UTG FOLD BTN AllIn SB",
+    "source": "TexasSolverGPU ranges/qb_ranges/100bb 2.5x 500rake",
+    "source_path": "SB/vs_5bet/UTG_2.5bb_BTN_Call_SB_13.0bb_BB_25.0bb_UTG_FOLD_BTN_AllIn_SB_Call.txt; SB/vs_5bet/UTG_2.5bb_BTN_Call_SB_13.0bb_BB_25.0bb_UTG_FOLD_BTN_AllIn_SB_FOLD.txt",
+    "preflop_line": "UTG 2.5bb BTN Call SB 13.0bb BB 25.0bb UTG FOLD BTN AllIn SB"
+  },
+  "strategy": {
+    "actions": [
+      {
+        "name": "Call",
+        "color_bucket": "Green"
+      },
+      {
+        "name": "Fold",
+        "color_bucket": "Blue"
+      }
+    ],
+    "upi_ranges": {
+      "Call": "AA:1.000,AKs:1.000,QQ:1.000,KK:1.000",
+      "Fold": "A4s:0.194,A5s:0.448,ATs:0.268,AJs:1.000,AQs:1.000,AQo:0.610,AKo:1.000,54s:0.340,65s:0.336,66:0.138,76s:0.262,77:0.216,88:0.338,99:0.594,TT:1.000,JTs:0.550,QTs:0.446,KTs:0.472,JJ:1.000,QJs:1.000,KJs:1.000,KQs:1.000,KQo:0.084"
+    }
+  }
+}
