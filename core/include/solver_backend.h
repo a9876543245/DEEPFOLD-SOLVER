@@ -117,6 +117,10 @@ struct SolverContext {
     /// node is in the tree (e.g. solving a river spot).
     const std::vector<float>*    matchup_ev    = nullptr;
     const std::vector<float>*    matchup_valid = nullptr;
+    /// Per-original-combo hand ranks for the root matchup board. Entries for
+    /// combos dead on the board are UINT16_MAX. Dense singleton showdown
+    /// shortcuts use this to avoid scanning the full category/valid matrix.
+    const std::vector<uint16_t>* matchup_original_ranks = nullptr;
     /// v1.8.2 A2 encoding (POST_OPTIMIZATION_REVIEW Sec 4.3): pre-thresholded
     /// per-cell category in {0=invalid, 1=win, 2=lose, 3=tie}. Built once at
     /// precompute time so the showdown hot-loop reads 1 byte/cell instead of
@@ -125,12 +129,30 @@ struct SolverContext {
     /// `matchup_ev`/`matchup_valid` are still kept around for postsolve
     /// (combo_evs / exploitability), which uses the full continuous ev.
     const std::vector<uint8_t>*  matchup_category = nullptr;
+    /// Zero-rake showdown coefficient matrix: +valid for OOP-win, -valid
+    /// for OOP-lose, 0 for tie/invalid. Present only for rake-free solves.
+    /// CPU showdown can use this to replace category decode + valid multiply
+    /// with a single signed dot product. Postsolve still uses matchup_ev.
+    const std::vector<float>*    matchup_showdown_coeff = nullptr;
+    /// Equivalent zero-rake coefficient encoded as signed valid pair counts.
+    /// For canonical buckets (i,j), signed_count = +/- valid_original_pairs.
+    /// During terminal evaluation the opponent canonical weight cancels one
+    /// denominator, so kernels multiply by the unweighted opponent reach and
+    /// the output row's inverse canonical weight.
+    const std::vector<int8_t>*    matchup_showdown_count = nullptr;
     /// Phase 1 chance enumeration: per-runout matchup tables. The terminal
     /// handler should pick the table by tree.matchup_idx[node_idx].
     /// matchup_ev_per_runout[k] is the matchup-ev table for runout k.
     const std::vector<std::vector<float>>* matchup_ev_per_runout    = nullptr;
     const std::vector<std::vector<float>>* matchup_valid_per_runout = nullptr;
     const std::vector<std::vector<uint8_t>>* matchup_category_per_runout = nullptr;
+    const std::vector<std::vector<float>>* matchup_showdown_coeff_per_runout = nullptr;
+    const std::vector<std::vector<int8_t>>* matchup_showdown_count_per_runout = nullptr;
+    const std::vector<std::vector<uint16_t>>* matchup_original_ranks_per_runout = nullptr;
+    /// Full-board mask for each matchup table. Fold terminal shortcuts use
+    /// this to apply turn/river dead-card filtering without reading the dense
+    /// matchup_valid matrix.
+    const std::vector<CardMask>* matchup_board_masks = nullptr;
 
     /// Per-canonical-combo reach probabilities derived from range weights.
     const std::vector<float>*    ip_reach      = nullptr;
@@ -202,6 +224,10 @@ public:
     // showdown matrix kernels or fold accumulation next.
     virtual double phase_backward_showdown_ms() const { return 0.0; }
     virtual double phase_backward_fold_ms()     const { return 0.0; }
+
+    // CPU-only sparse traversal / terminal gate diagnostics. GPU backends and
+    // backends that do not expose these choices return an unavailable block.
+    virtual CpuBackendDiagnostics cpu_diagnostics() const { return {}; }
 
     // ------------------------------------------------------------------------
     // Optional GPU postsolve hooks

@@ -26,6 +26,7 @@
 #include "solver_backend.h"
 #include "cpu_backend.h"
 #include "cpu_backend_levelized.h"
+#include "showdown_rank_blocker.h"
 
 #ifdef _OPENMP
 #  include <omp.h>
@@ -188,6 +189,24 @@ inline bool should_auto_select_gpu(
     if (tree.total_nodes < 128 && config.max_iterations < 25) return false;
 
     return true;
+}
+
+inline bool should_build_signed_showdown_coeff(
+    const SolverConfig& config,
+    const IsomorphismMapping& iso)
+{
+    return config.rake_rate == 0.0f
+        && config.rake_cap == 0.0f
+        && !showdown_rank_blocker::supports_singleton_iso(iso);
+}
+
+inline uint64_t matchup_bytes_per_cell(
+    const SolverConfig& config,
+    const IsomorphismMapping& iso)
+{
+    return should_build_signed_showdown_coeff(config, iso)
+        ? memory_budget::kSignedCountMatchupBytesPerCell
+        : memory_budget::kBaseMatchupBytesPerCell;
 }
 
 // ============================================================================
@@ -364,15 +383,27 @@ private:
     /// (i.e. the root board). All other runouts live in matchup_ev_per_runout_.
     std::vector<float> matchup_ev_;
     std::vector<float> matchup_valid_;
+    std::vector<uint16_t> matchup_original_ranks_;
     /// v1.8.2 A2 encoding: pre-thresholded category matrix used by the CPU
     /// showdown kernels. Built alongside ev/valid in precompute_matchups().
     /// 1 byte/cell vs ev's 4. See SolverContext::matchup_category for rationale.
     std::vector<uint8_t> matchup_category_;
+    /// Zero-rake CPU showdown fast path coefficient: +valid / -valid / 0
+    /// after category bucketing. Empty for raked solves.
+    std::vector<float> matchup_showdown_coeff_;
+    /// Signed valid-pair counts for the zero-rake showdown fast path. Flop+
+    /// suit-isomorphism buckets produce small counts, so int8 keeps the hot
+    /// terminal matrix at one byte/cell.
+    std::vector<int8_t> matchup_showdown_count_;
     /// Phase 1 chance-enumeration: per-runout matchup tables. Indexed by
     /// FlatGameTree.matchup_idx[node]. Entry [0] mirrors matchup_ev_.
     std::vector<std::vector<float>> matchup_ev_per_runout_;
     std::vector<std::vector<float>> matchup_valid_per_runout_;
     std::vector<std::vector<uint8_t>> matchup_category_per_runout_;
+    std::vector<std::vector<float>> matchup_showdown_coeff_per_runout_;
+    std::vector<std::vector<int8_t>> matchup_showdown_count_per_runout_;
+    std::vector<std::vector<uint16_t>> matchup_original_ranks_per_runout_;
+    std::vector<CardMask> matchup_board_masks_;
     std::map<std::pair<uint32_t, uint16_t>, std::vector<float>> resolved_locks_;
 
     // Backend (CPU or GPU) handles DCFR iteration
@@ -484,7 +515,10 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     // Step 1-2: tree (now with memory-budget-aware runout cap)
     stage_start = Clock::now();
     GameTreeBuilder builder(config_);
-    builder.set_memory_policy(iso_.num_canonical, config_.memory_budget);
+    builder.set_memory_policy(
+        iso_.num_canonical,
+        config_.memory_budget,
+        matchup_bytes_per_cell(config_, iso_));
     tree_ = builder.build();
     stage_end = Clock::now();
     timing.tree_build_ms = elapsed_since(stage_start, stage_end);
@@ -527,7 +561,9 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) ++gate_player_nodes;
         }
         gate_est.matchup_tables_bytes   = bytes_for_matchup_tables(
-            matchup_ev_per_runout_.size(), nc);
+            matchup_ev_per_runout_.size(),
+            nc,
+            matchup_bytes_per_cell(config_, iso_));
         gate_est.cpu_state_bytes        = bytes_for_cpu_state(gate_player_nodes, MAX_ACTIONS, nc);
         // v1.7.0: levelized backend pre-allocates 3 × total_nodes × nc floats
         // (reach_oop_, reach_ip_, value_) on top of the reference state.
@@ -748,10 +784,17 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     ctx.config                     = &config_;
     ctx.matchup_ev                 = &matchup_ev_;
     ctx.matchup_valid              = &matchup_valid_;
+    ctx.matchup_original_ranks     = &matchup_original_ranks_;
     ctx.matchup_category           = &matchup_category_;
+    ctx.matchup_showdown_coeff     = &matchup_showdown_coeff_;
+    ctx.matchup_showdown_count     = &matchup_showdown_count_;
     ctx.matchup_ev_per_runout      = &matchup_ev_per_runout_;
     ctx.matchup_valid_per_runout   = &matchup_valid_per_runout_;
     ctx.matchup_category_per_runout = &matchup_category_per_runout_;
+    ctx.matchup_showdown_coeff_per_runout = &matchup_showdown_coeff_per_runout_;
+    ctx.matchup_showdown_count_per_runout = &matchup_showdown_count_per_runout_;
+    ctx.matchup_original_ranks_per_runout = &matchup_original_ranks_per_runout_;
+    ctx.matchup_board_masks        = &matchup_board_masks_;
     ctx.ip_reach                   = &ip_reach_;
     ctx.oop_reach                  = &oop_reach_;
     ctx.resolved_locks             = &resolved_locks_;
@@ -837,6 +880,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         static_cast<float>(backend_->phase_backward_showdown_ms());
     timing.phase_backward_fold_ms       =
         static_cast<float>(backend_->phase_backward_fold_ms());
+    CpuBackendDiagnostics cpu_diag = backend_->cpu_diagnostics();
 
     // Step 6: finalize (normalize strategy_sum → strategy)
     stage_start = Clock::now();
@@ -905,6 +949,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         result.ev_vector = ev_;  // expose per-canonical-combo OOP EVs
     }
     result.timing              = timing;
+    result.cpu_diagnostics     = cpu_diag;
 
     // Sprint 1 (market-beating plan): every solve fills the resources block
     // with byte estimates and the budget decision so the UI / benchmark can
@@ -1026,7 +1071,10 @@ inline SolveResources Solver::estimate_only() {
     iso_ = compute_isomorphism(config_.board.data(), config_.board_size);
 
     GameTreeBuilder builder(config_);
-    builder.set_memory_policy(iso_.num_canonical, config_.memory_budget);
+    builder.set_memory_policy(
+        iso_.num_canonical,
+        config_.memory_budget,
+        matchup_bytes_per_cell(config_, iso_));
     tree_ = builder.build();
 
     SolveResources r;
@@ -1056,7 +1104,10 @@ inline SolveResources Solver::estimate_only() {
     const uint64_t total_n = tree_.total_nodes;
     const uint64_t matchup_count_est = std::max<uint64_t>(chance_child_count, 1);
 
-    r.estimated_matchup_bytes        = bytes_for_matchup_tables(matchup_count_est, nc);
+    r.estimated_matchup_bytes        = bytes_for_matchup_tables(
+        matchup_count_est,
+        nc,
+        matchup_bytes_per_cell(config_, iso_));
     r.estimated_cpu_state_bytes      = bytes_for_cpu_state(player_nodes, MAX_ACTIONS, nc);
     // v1.7.0: include the levelized backend's extra reach/value buffers in
     // the pre-solve estimate too, so the UI's ETA banner doesn't say "this
@@ -1188,7 +1239,11 @@ inline void compute_matchup_for_board(
     std::function<uint16_t(const Combo&)> eval_for_board,
     std::vector<float>& out_ev,
     std::vector<float>& out_valid,
-    std::vector<uint8_t>& out_category)
+    std::vector<uint8_t>& out_category,
+    std::vector<float>& out_showdown_coeff,
+    std::vector<int8_t>& out_showdown_count,
+    bool build_showdown_coeff,
+    std::vector<uint16_t>& out_original_ranks)
 {
     (void)solver_unused;
     uint16_t nc = iso.num_canonical;
@@ -1198,6 +1253,13 @@ inline void compute_matchup_for_board(
     // matrix used by the CPU showdown hot loop. Initialized to 0 (CAT_INVALID)
     // so any cell we don't touch (no valid pair found) stays invalid.
     out_category.assign(static_cast<size_t>(nc) * nc, 0u);
+    if (build_showdown_coeff) {
+        out_showdown_coeff.clear();
+        out_showdown_count.assign(static_cast<size_t>(nc) * nc, 0);
+    } else {
+        out_showdown_coeff.clear();
+        out_showdown_count.clear();
+    }
 
     const auto& combo_table = get_combo_table();
     CardMask board_mask = board_to_mask(board_cards, board_size);
@@ -1213,6 +1275,7 @@ inline void compute_matchup_for_board(
         if (combo_table[i].conflicts_with(board_mask)) continue;
         ranks[i] = eval_for_board(combo_table[i]);
     }
+    out_original_ranks = ranks;
 
     // v1.4.1 Phase 3: row-parallel matchup precompute. Each ci writes a
     // disjoint row of out_ev/out_valid (idx = ci*nc+cj is unique per ci),
@@ -1261,6 +1324,13 @@ inline void compute_matchup_for_board(
                 else if (ev_val < -0.5f) cat = 2;   // CAT_LOSE
                 else                     cat = 3;   // CAT_TIE
                 out_category[idx] = cat;
+                if (build_showdown_coeff) {
+                    if (cat == 1u) {
+                        out_showdown_count[idx] = static_cast<int8_t>(valid);
+                    } else if (cat == 2u) {
+                        out_showdown_count[idx] = static_cast<int8_t>(-valid);
+                    }
+                }
             }
         }
     }
@@ -1298,6 +1368,10 @@ inline void Solver::precompute_matchups() {
     matchup_ev_per_runout_.clear();
     matchup_valid_per_runout_.clear();
     matchup_category_per_runout_.clear();
+    matchup_showdown_coeff_per_runout_.clear();
+    matchup_showdown_count_per_runout_.clear();
+    matchup_original_ranks_per_runout_.clear();
+    matchup_board_masks_.clear();
     std::map<std::vector<uint8_t>, int32_t> sig_to_idx;
 
     std::vector<int32_t>& matchup_idx = tree_.matchup_idx;
@@ -1318,15 +1392,18 @@ inline void Solver::precompute_matchups() {
         std::sort(sig.begin(), sig.end());
         return sig;
     };
-
     // Sprint 1 (market-beating plan): hard byte cap at the actual allocation
     // site. The tree builder's gate is the FIRST line of defence (refuses to
     // enumerate runouts that wouldn't fit). This is the SECOND — even if the
     // tree somehow ends up with more matchup signatures than budgeted, refuse
     // to allocate. Throws a structured runtime_error which main.cpp formats
     // as JSON for the UI.
-    const uint64_t per_table_bytes =
-        2ULL * static_cast<uint64_t>(nc) * static_cast<uint64_t>(nc) * sizeof(float);
+    const bool build_showdown_coeff =
+        should_build_signed_showdown_coeff(config_, iso_);
+    const uint64_t bytes_per_matchup_cell =
+        matchup_bytes_per_cell(config_, iso_);
+    const uint64_t per_table_bytes = bytes_for_matchup_tables(
+        1, nc, bytes_per_matchup_cell);
     // Reserve half the host budget for matchup tables (same split as the
     // tree builder gate). Floor of 3 GB matches the builder's safety floor.
     const uint64_t matchup_byte_cap = (config_.memory_budget.host_bytes > 0)
@@ -1352,6 +1429,14 @@ inline void Solver::precompute_matchups() {
                 static_cast<double>(next_bytes)  / (1024.0 * 1024.0 * 1024.0),
                 static_cast<double>(matchup_byte_cap) / (1024.0 * 1024.0 * 1024.0),
                 new_idx + 1, static_cast<unsigned>(nc));
+            snprintf(buf, sizeof(buf),
+                "precompute_matchups would allocate %.2f GB (cap %.2f GB, "
+                "%d tables x %u canonical^2 x %llu B). Reduce flop runout enumeration, "
+                "use --strategy-tree-evs none, or raise --host-memory-mb.",
+                static_cast<double>(next_bytes)  / (1024.0 * 1024.0 * 1024.0),
+                static_cast<double>(matchup_byte_cap) / (1024.0 * 1024.0 * 1024.0),
+                new_idx + 1, static_cast<unsigned>(nc),
+                static_cast<unsigned long long>(bytes_per_matchup_cell));
             throw std::runtime_error(buf);
         }
 
@@ -1359,12 +1444,24 @@ inline void Solver::precompute_matchups() {
         // Compute matchup table for this board signature.
         std::vector<float> ev, valid;
         std::vector<uint8_t> category;
+        std::vector<float> showdown_coeff;
+        std::vector<int8_t> showdown_count;
+        std::vector<uint16_t> original_ranks;
         uint8_t bs = static_cast<uint8_t>(sig.size());
         compute_matchup_for_board(*this, iso_, sig.data(), bs,
-            make_eval_for(sig.data(), bs), ev, valid, category);
+            make_eval_for(sig.data(), bs), ev, valid, category,
+            showdown_coeff, showdown_count, build_showdown_coeff, original_ranks);
+        matchup_board_masks_.push_back(board_to_mask(sig.data(), bs));
         matchup_ev_per_runout_.push_back(std::move(ev));
         matchup_valid_per_runout_.push_back(std::move(valid));
         matchup_category_per_runout_.push_back(std::move(category));
+        if (build_showdown_coeff) {
+            matchup_showdown_coeff_per_runout_.push_back(
+                std::move(showdown_coeff));
+            matchup_showdown_count_per_runout_.push_back(
+                std::move(showdown_count));
+        }
+        matchup_original_ranks_per_runout_.push_back(std::move(original_ranks));
         return new_idx;
     };
 
@@ -1397,10 +1494,20 @@ inline void Solver::precompute_matchups() {
         matchup_ev_       = matchup_ev_per_runout_[0];
         matchup_valid_    = matchup_valid_per_runout_[0];
         matchup_category_ = matchup_category_per_runout_[0];
+        matchup_showdown_coeff_ = !matchup_showdown_coeff_per_runout_.empty()
+            ? matchup_showdown_coeff_per_runout_[0]
+            : std::vector<float>{};
+        matchup_showdown_count_ = !matchup_showdown_count_per_runout_.empty()
+            ? matchup_showdown_count_per_runout_[0]
+            : std::vector<int8_t>{};
+        matchup_original_ranks_ = matchup_original_ranks_per_runout_[0];
     } else {
         matchup_ev_.assign(static_cast<size_t>(nc) * nc, 0.0f);
         matchup_valid_.assign(static_cast<size_t>(nc) * nc, 0.0f);
         matchup_category_.assign(static_cast<size_t>(nc) * nc, 0u);
+        matchup_showdown_coeff_.clear();
+        matchup_showdown_count_.clear();
+        matchup_original_ranks_.assign(NUM_COMBOS, UINT16_MAX);
     }
 }
 

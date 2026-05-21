@@ -10,6 +10,7 @@
 
 #include "memory_budget.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 #include <array>
@@ -312,7 +313,7 @@ struct SolverConfig {
     /// avoiding the K parallel-region creations per iteration.
     /// Surfaced as `--cpu-persistent-omp 0|1`. Reverted to default if
     /// paired-benchmark measurement doesn't show a clean win.
-    bool cpu_persistent_omp = false;
+    bool cpu_persistent_omp = true;  ///< Production default; CLI can pass 0 for A/B.
 
     /// Sprint 1 (market-beating plan): the host RAM / GPU VRAM / JSON /
     /// strategy-tree budget that gates every large allocation in the solve
@@ -386,6 +387,165 @@ struct SolverTiming {
     uint32_t matchup_tables = 0;
     uint32_t postsolve_threads = 1;
 };
+
+/// CPU backend runtime choices for sparse/combo traversal. These counters are
+/// intentionally cheap and per-solve, not per-iteration, so benchmark JSON can
+/// explain which gates actually fired without needing a profiler attached.
+struct CpuBackendDiagnostics {
+    bool available = false;
+    uint32_t canonical_combos = 0;
+
+    uint32_t oop_active_count = 0;
+    uint32_t ip_active_count = 0;
+    uint32_t oop_active_run_count = 0;
+    uint32_t ip_active_run_count = 0;
+    uint32_t oop_active_block_count = 0;
+    uint32_t ip_active_block_count = 0;
+    uint32_t oop_active_block_span = 0;
+    uint32_t ip_active_block_span = 0;
+
+    float oop_active_density = 0.0f;
+    float ip_active_density = 0.0f;
+    float oop_avg_run_length = 0.0f;
+    float ip_avg_run_length = 0.0f;
+
+    bool oop_terminal_active_list = false;
+    bool ip_terminal_active_list = false;
+    bool oop_active_runs = false;
+    bool ip_active_runs = false;
+    bool oop_active_blocks = false;
+    bool ip_active_blocks = false;
+    bool oop_sparse_traversal = false;
+    bool ip_sparse_traversal = false;
+    bool oop_block_strategy = false;
+    bool ip_block_strategy = false;
+    bool oop_block_strategy_sum = false;
+    bool ip_block_strategy_sum = false;
+    bool oop_block_traversal = false;
+    bool ip_block_traversal = false;
+    bool oop_terminal_active2 = false;
+    bool ip_terminal_active2 = false;
+    bool ip_terminal_output_skip = false;
+    bool oop_sparse_opp_reach_build = false;
+    bool ip_sparse_opp_reach_build = false;
+    bool fold_blocker_shortcut = false;
+    bool fold_blocker_precomputed = false;
+    bool showdown_rank_blocker_shortcut = false;
+    bool showdown_signed_coeff_shortcut = false;
+    bool sparse_terminal_no_full_clear_enabled = false;
+
+    uint32_t matchup_category_table_count = 0;
+    uint32_t matchup_category_rows = 0;
+    uint64_t matchup_category_cells = 0;
+    uint64_t matchup_category_invalid_cells = 0;
+    uint64_t matchup_category_win_cells = 0;
+    uint64_t matchup_category_lose_cells = 0;
+    uint64_t matchup_category_tie_cells = 0;
+    uint64_t matchup_zero_rake_payoff_cells = 0;
+    float matchup_category_invalid_density = 0.0f;
+    float matchup_category_win_density = 0.0f;
+    float matchup_category_lose_density = 0.0f;
+    float matchup_category_tie_density = 0.0f;
+    float matchup_zero_rake_payoff_density = 0.0f;
+    uint32_t matchup_payoff_row_nonzero_min = 0;
+    uint32_t matchup_payoff_row_nonzero_p50 = 0;
+    uint32_t matchup_payoff_row_nonzero_p95 = 0;
+    uint32_t matchup_payoff_row_nonzero_max = 0;
+    float matchup_payoff_row_nonzero_avg = 0.0f;
+    float matchup_payoff_row_density_avg = 0.0f;
+};
+
+inline void populate_matchup_category_diagnostics(
+    CpuBackendDiagnostics& d,
+    const std::vector<std::vector<uint8_t>>* per_runout_tables,
+    const std::vector<uint8_t>* root_table,
+    uint32_t nc)
+{
+    if (nc == 0u) return;
+
+    std::vector<const std::vector<uint8_t>*> tables;
+    if (per_runout_tables != nullptr && !per_runout_tables->empty()) {
+        tables.reserve(per_runout_tables->size());
+        for (const auto& table : *per_runout_tables) {
+            tables.push_back(&table);
+        }
+    } else if (root_table != nullptr && !root_table->empty()) {
+        tables.push_back(root_table);
+    }
+
+    d.matchup_category_table_count = static_cast<uint32_t>(tables.size());
+    if (tables.empty()) return;
+
+    std::vector<uint32_t> row_nonzero_counts;
+    uint64_t nonzero_sum = 0;
+    uint32_t min_row = UINT32_MAX;
+    uint32_t max_row = 0;
+
+    for (const auto* table_ptr : tables) {
+        if (table_ptr == nullptr) continue;
+        const auto& table = *table_ptr;
+        const std::size_t rows = table.size() / nc;
+        row_nonzero_counts.reserve(row_nonzero_counts.size() + rows);
+        for (std::size_t r = 0; r < rows; ++r) {
+            uint32_t row_nonzero = 0;
+            const std::size_t row_off = r * static_cast<std::size_t>(nc);
+            for (uint32_t c = 0; c < nc; ++c) {
+                const uint8_t cat = table[row_off + c];
+                ++d.matchup_category_cells;
+                if (cat == 1u) {
+                    ++d.matchup_category_win_cells;
+                    ++d.matchup_zero_rake_payoff_cells;
+                    ++row_nonzero;
+                } else if (cat == 2u) {
+                    ++d.matchup_category_lose_cells;
+                    ++d.matchup_zero_rake_payoff_cells;
+                    ++row_nonzero;
+                } else if (cat == 3u) {
+                    ++d.matchup_category_tie_cells;
+                } else {
+                    ++d.matchup_category_invalid_cells;
+                }
+            }
+            row_nonzero_counts.push_back(row_nonzero);
+            nonzero_sum += row_nonzero;
+            min_row = std::min(min_row, row_nonzero);
+            max_row = std::max(max_row, row_nonzero);
+        }
+    }
+
+    d.matchup_category_rows =
+        static_cast<uint32_t>(row_nonzero_counts.size());
+    if (d.matchup_category_cells != 0u) {
+        const float inv_cells =
+            1.0f / static_cast<float>(d.matchup_category_cells);
+        d.matchup_category_invalid_density =
+            static_cast<float>(d.matchup_category_invalid_cells) * inv_cells;
+        d.matchup_category_win_density =
+            static_cast<float>(d.matchup_category_win_cells) * inv_cells;
+        d.matchup_category_lose_density =
+            static_cast<float>(d.matchup_category_lose_cells) * inv_cells;
+        d.matchup_category_tie_density =
+            static_cast<float>(d.matchup_category_tie_cells) * inv_cells;
+        d.matchup_zero_rake_payoff_density =
+            static_cast<float>(d.matchup_zero_rake_payoff_cells) * inv_cells;
+    }
+
+    if (!row_nonzero_counts.empty()) {
+        std::sort(row_nonzero_counts.begin(), row_nonzero_counts.end());
+        const std::size_t p50_idx = row_nonzero_counts.size() / 2u;
+        const std::size_t p95_idx =
+            ((row_nonzero_counts.size() - 1u) * 95u) / 100u;
+        d.matchup_payoff_row_nonzero_min = min_row;
+        d.matchup_payoff_row_nonzero_p50 = row_nonzero_counts[p50_idx];
+        d.matchup_payoff_row_nonzero_p95 = row_nonzero_counts[p95_idx];
+        d.matchup_payoff_row_nonzero_max = max_row;
+        d.matchup_payoff_row_nonzero_avg =
+            static_cast<float>(nonzero_sum)
+            / static_cast<float>(row_nonzero_counts.size());
+        d.matchup_payoff_row_density_avg =
+            d.matchup_payoff_row_nonzero_avg / static_cast<float>(nc);
+    }
+}
 
 /// Sprint 1 (market-beating plan): per-solve resource report. Every solve
 /// fills this with byte-level estimates and the budget decision so the UI
@@ -495,6 +655,10 @@ struct SolverResult {
 
     /// Sprint 1: per-solve resource estimate + budget decision.
     SolveResources resources;
+
+    /// CPU-only sparse traversal / terminal gate diagnostics. Empty for GPU
+    /// backends and older backends that do not expose these choices.
+    CpuBackendDiagnostics cpu_diagnostics;
 };
 
 } // namespace deepsolver

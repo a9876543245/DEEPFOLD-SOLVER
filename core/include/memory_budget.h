@@ -62,7 +62,18 @@ constexpr float kGpuVramReservedFraction = 0.75f;
 
 /// Each matchup table is a pair of float matrices: EV (nc × nc) and valid
 /// (nc × nc). We track the "× 2" explicitly so the formula is auditable.
-constexpr uint64_t kMatchupMatricesPerRunout = 2;
+/// v1.8.3: zero-rake compressed CPU solves pass 3 because they also keep a
+/// signed showdown coefficient matrix. The category byte matrix is slack.
+constexpr uint64_t kBaseMatchupMatricesPerRunout = 2;
+constexpr uint64_t kSignedMatchupMatricesPerRunout = 3;
+constexpr uint64_t kMatchupMatricesPerRunout = kBaseMatchupMatricesPerRunout;
+// Byte-accurate estimator constants used by bytes_for_matchup_tables().
+constexpr uint64_t kMatchupCategoryBytesPerCell = sizeof(uint8_t);
+constexpr uint64_t kBaseMatchupBytesPerCell =
+    2ULL * sizeof(float) + kMatchupCategoryBytesPerCell;
+constexpr uint64_t kSignedCountMatchupBytesPerCell =
+    kBaseMatchupBytesPerCell + sizeof(int8_t);
+constexpr uint64_t kMatchupBytesPerCell = kBaseMatchupBytesPerCell;
 
 /// CPU backend keeps three float arrays per (player_node × max_actions × nc):
 /// regrets, strategy_sum, current_strategy. The accumulating action_values
@@ -129,11 +140,15 @@ struct SolveFootprintEstimate {
 /// `runout_tables` is the number of distinct board signatures the tree
 /// will reference. `nc` is iso.num_canonical (canonical combo count).
 /// Pass these from the caller — this header doesn't see the IsomorphismMapping.
-inline uint64_t bytes_for_matchup_tables(uint64_t runout_tables, uint64_t nc) {
+/// `bytes_per_cell` already includes element sizes.
+inline uint64_t bytes_for_matchup_tables(
+    uint64_t runout_tables,
+    uint64_t nc,
+    uint64_t bytes_per_cell = memory_budget::kMatchupBytesPerCell)
+{
     return runout_tables
          * nc * nc
-         * memory_budget::kMatchupMatricesPerRunout
-         * sizeof(float);
+         * bytes_per_cell;
 }
 
 /// Bytes for the CPU CFR state. Counts regrets + strategy_sum + current_strategy

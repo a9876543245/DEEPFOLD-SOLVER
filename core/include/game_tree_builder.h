@@ -67,10 +67,14 @@ public:
     /// byte-based instead of an arbitrary "projected <= 2000". When
     /// `nc_canonical_estimate == 0` the builder falls back to the legacy
     /// runout-count heuristic.
-    void set_memory_policy(uint16_t nc_canonical_estimate,
-                           const MemoryBudget& budget) {
+    void set_memory_policy(
+        uint16_t nc_canonical_estimate,
+        const MemoryBudget& budget,
+        uint64_t matchup_bytes_per_cell =
+            memory_budget::kMatchupBytesPerCell) {
         nc_estimate_   = nc_canonical_estimate;
         budget_        = budget;
+        matchup_bytes_per_cell_ = matchup_bytes_per_cell;
         budget_set_    = true;
     }
 
@@ -85,6 +89,8 @@ private:
     std::vector<TreeNode> nodes_;
     uint16_t      nc_estimate_ = 0;
     MemoryBudget  budget_      = MemoryBudget::defaults();
+    uint64_t      matchup_bytes_per_cell_ =
+        memory_budget::kMatchupBytesPerCell;
     bool          budget_set_  = false;
 
     /// Add a node to the tree and return its index
@@ -364,7 +370,8 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
                 // 10-point plan calls out.
                 const uint64_t matchup_bytes = bytes_for_matchup_tables(
                     static_cast<uint64_t>(projected_leaves),
-                    static_cast<uint64_t>(nc_estimate_));
+                    static_cast<uint64_t>(nc_estimate_),
+                    matchup_bytes_per_cell_);
                 const uint64_t matchup_cap = (budget_.host_bytes > 0)
                     ? (budget_.host_bytes / 2ULL)
                     : (3ULL * 1024 * 1024 * 1024); // 3 GB safety floor

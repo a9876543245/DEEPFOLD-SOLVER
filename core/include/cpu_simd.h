@@ -37,6 +37,11 @@ namespace deepsolver::cpu_simd {
 // Trivial helpers stay in the header (no SIMD distinction needed).
 // ---------------------------------------------------------------------------
 
+struct ActiveRun {
+    uint16_t start;
+    uint16_t count;
+};
+
 inline void vec_set_zero(float* x, std::size_t n) {
     std::memset(x, 0, sizeof(float) * n);
 }
@@ -52,6 +57,7 @@ inline void vec_copy(float* dst, const float* src, std::size_t n) {
 
 struct Kernels {
     void  (*vec_mul_in_place)(float* x, const float* y, std::size_t n);
+    void  (*vec_mul)(float* dst, const float* a, const float* b, std::size_t n);
     void  (*vec_scale_in_place)(float* x, float s, std::size_t n);
     void  (*vec_add_in_place)(float* dst, const float* src, std::size_t n);
     void  (*vec_axpy)(float* dst, float a, const float* src, std::size_t n);
@@ -61,6 +67,9 @@ struct Kernels {
     void  (*vec_pos_normalize)(float* strat, const float* regret,
                                const float* inv_pos_sum,
                                const float* uniform_or_zero, std::size_t n);
+    void  (*vec_pos_normalize2)(float* strat0, float* strat1,
+                                const float* regret0, const float* regret1,
+                                std::size_t n);
     void  (*vec_regret_update)(float* regret, const float* action_val,
                                const float* node_val, std::size_t n);
     void  (*vec_decay_add)(float* dst, float decay, const float* src, std::size_t n);
@@ -78,8 +87,25 @@ struct Kernels {
                               std::size_t n);
     float (*dot_valid_reach)(const float* valid_row, const float* opp_reach_w,
                              std::size_t n);
+    float (*dot_valid_reach_active)(const float* valid_row,
+                                    const float* opp_reach_w,
+                                    const uint16_t* active_indices,
+                                    std::size_t active_count);
+    float (*dot_valid_reach_active_runs)(const float* valid_row,
+                                         const float* opp_reach_w,
+                                         const ActiveRun* active_runs,
+                                         std::size_t run_count);
     void  (*fold_ip_step)(float* out_vals, const float* valid_row,
-                          float rw_ci, std::size_t n);
+                          float rw_ci, const uint8_t* skip_mask,
+                          std::size_t n);
+    void  (*fold_ip_step_active)(float* out_vals, const float* valid_row,
+                                 float rw_ci,
+                                 const uint16_t* active_indices,
+                                 std::size_t active_count);
+    void  (*fold_ip_step_active_runs)(float* out_vals, const float* valid_row,
+                                      float rw_ci,
+                                      const ActiveRun* active_runs,
+                                      std::size_t run_count);
 
     // v1.8.0 P3-8 spike: full-row variants that fuse the per-c outer loop
     // into the kernel itself. The per-call versions above made
@@ -95,8 +121,8 @@ struct Kernels {
     //
     // Layout: ev/valid_matrix is row-major [c × n + j]. out is n floats.
     //
-    // v1.8.1+ optional sparse-OOP skip: when `skip_mask` is non-null, rows
-    // where skip_mask[c] != 0 set out[c]=0 and skip the inner reduction.
+    // v1.8.1+ optional sparse skip: when `skip_mask` is non-null, output
+    // combos where skip_mask[c] != 0 are left at 0 and skipped.
     // The caller is responsible for guaranteeing that skipping is safe —
     // i.e. that out[c] either won't propagate or will only be multiplied
     // by 0 at every ancestor. Safe usage: combos that are 0-reach from
@@ -106,8 +132,7 @@ struct Kernels {
     // distorts CFR convergence.
     //
     // Pass nullptr for the skip_mask to disable (dense path), preserving
-    // the original v1.8.0 behavior for any caller that doesn't have a
-    // pre-validated mask.
+    // the original v1.8.0 behavior for callers without a pre-validated mask.
     //
     // v1.8.2 A2 encoding: category_matrix is a per-cell uint8_t in
     // {0=invalid, 1=win, 2=lose, 3=tie}, pre-thresholded at precompute time
@@ -123,8 +148,110 @@ struct Kernels {
     void  (*showdown_ip_full)(const uint8_t* category_matrix,
                               const float* valid_matrix,
                               const float* opp_reach_w,
+                              const uint8_t* skip_mask,
                               float* out, std::size_t n,
                               float win_p, float lose_p, float tie_p);
+    void  (*showdown_oop_signed_zero_rake)(const float* signed_valid_matrix,
+                                           const float* opp_reach_w,
+                                           const uint8_t* skip_mask,
+                                           float* out, std::size_t n,
+                                           float win_p);
+    void  (*showdown_ip_signed_zero_rake)(const float* signed_valid_matrix,
+                                           const float* opp_reach_w,
+                                           const uint8_t* skip_mask,
+                                           float* out, std::size_t n,
+                                           float win_p);
+    void  (*showdown_oop_signed_count_zero_rake)(const int8_t* signed_count_matrix,
+                                                 const float* opp_reach,
+                                                 const float* inv_weights,
+                                                 const uint8_t* skip_mask,
+                                                 float* out, std::size_t n,
+                                                 float win_p);
+    void  (*showdown_ip_signed_count_zero_rake)(const int8_t* signed_count_matrix,
+                                                const float* opp_reach,
+                                                const float* inv_weights,
+                                                const uint8_t* skip_mask,
+                                                float* out, std::size_t n,
+                                                float win_p);
+
+    // Active-index variants for root-range sparse terminal output. The
+    // active list contains canonical output combos whose root reach is
+    // non-zero for the traverser. Kernels zero the whole output row first,
+    // then compute only those indices. This is stricter than skip_mask:
+    // dense/mid-density ranges stay on the contiguous kernels, while very
+    // sparse ranges avoid scanning output combos that cannot propagate.
+    void  (*showdown_oop_full_active)(const uint8_t* category_matrix,
+                                      const float* valid_matrix,
+                                      const float* opp_reach_w,
+                                      const uint16_t* active_indices,
+                                      std::size_t active_count,
+                                      float* out, std::size_t n,
+                                      float win_p, float lose_p, float tie_p,
+                                      bool clear_full_output);
+    void  (*showdown_ip_full_active)(const uint8_t* category_matrix,
+                                     const float* valid_matrix,
+                                     const float* opp_reach_w,
+                                     const uint16_t* active_indices,
+                                     std::size_t active_count,
+                                     float* out, std::size_t n,
+                                     float win_p, float lose_p, float tie_p,
+                                     bool clear_full_output);
+    void  (*showdown_oop_full_active_runs)(const uint8_t* category_matrix,
+                                           const float* valid_matrix,
+                                           const float* opp_reach_w,
+                                           const ActiveRun* active_runs,
+                                           std::size_t run_count,
+                                           float* out, std::size_t n,
+                                           float win_p, float lose_p, float tie_p,
+                                           bool clear_full_output);
+    void  (*showdown_oop_full_active_opp_blocks)(
+                                           const uint8_t* category_matrix,
+                                           const float* valid_matrix,
+                                           const float* opp_reach_w,
+                                           const uint16_t* self_active_indices,
+                                           std::size_t self_active_count,
+                                           const ActiveRun* opp_blocks,
+                                           std::size_t opp_block_count,
+                                           float* out, std::size_t n,
+                                           float win_p, float lose_p, float tie_p,
+                                           bool clear_full_output);
+    void  (*showdown_ip_full_active_opp_blocks)(
+                                          const uint8_t* category_matrix,
+                                          const float* valid_matrix,
+                                          const float* opp_reach_w,
+                                          const uint16_t* self_active_indices,
+                                          std::size_t self_active_count,
+                                          const ActiveRun* opp_blocks,
+                                          std::size_t opp_block_count,
+                                          float* out, std::size_t n,
+                                          float win_p, float lose_p, float tie_p,
+                                          bool clear_full_output);
+    void  (*showdown_ip_full_active_runs)(const uint8_t* category_matrix,
+                                          const float* valid_matrix,
+                                          const float* opp_reach_w,
+                                          const ActiveRun* active_runs,
+                                          std::size_t run_count,
+                                          float* out, std::size_t n,
+                                          float win_p, float lose_p, float tie_p,
+                                          bool clear_full_output);
+    void  (*showdown_oop_full_active2)(const uint8_t* category_matrix,
+                                       const float* valid_matrix,
+                                       const float* opp_reach_w,
+                                       const uint16_t* self_active_indices,
+                                       std::size_t self_active_count,
+                                       const uint16_t* opp_active_indices,
+                                       std::size_t opp_active_count,
+                                       float* out, std::size_t n,
+                                       float win_p, float lose_p, float tie_p);
+    void  (*showdown_ip_full_active2)(const uint8_t* category_matrix,
+                                      const float* valid_matrix,
+                                      const float* opp_reach_w,
+                                      const uint16_t* self_active_indices,
+                                      std::size_t self_active_count,
+                                      const uint16_t* opp_active_indices,
+                                      std::size_t opp_active_count,
+                                      float* out, std::size_t n,
+                                      float win_p, float lose_p, float tie_p);
 
     // POST_OPTIMIZATION_REVIEW Sec 4.3 Phase 2 (kernel-level batching):
     // process M terminal-OOP showdowns that all share the same matchup
@@ -198,6 +325,9 @@ bool cpuid_supports_avx2_fma_os();
 inline void vec_mul_in_place(float* x, const float* y, std::size_t n) {
     kernels().vec_mul_in_place(x, y, n);
 }
+inline void vec_mul(float* dst, const float* a, const float* b, std::size_t n) {
+    kernels().vec_mul(dst, a, b, n);
+}
 inline void vec_scale_in_place(float* x, float s, std::size_t n) {
     kernels().vec_scale_in_place(x, s, n);
 }
@@ -221,6 +351,12 @@ inline void vec_pos_normalize(
     const float* inv_pos_sum, const float* uniform_or_zero, std::size_t n)
 {
     kernels().vec_pos_normalize(strat, regret, inv_pos_sum, uniform_or_zero, n);
+}
+inline void vec_pos_normalize2(
+    float* strat0, float* strat1,
+    const float* regret0, const float* regret1, std::size_t n)
+{
+    kernels().vec_pos_normalize2(strat0, strat1, regret0, regret1, n);
 }
 inline void vec_regret_update(
     float* regret, const float* action_val, const float* node_val, std::size_t n)
@@ -254,10 +390,39 @@ inline float dot_valid_reach(
 {
     return kernels().dot_valid_reach(valid_row, opp_reach_w, n);
 }
-inline void fold_ip_step(
-    float* out_vals, const float* valid_row, float rw_ci, std::size_t n)
+inline float dot_valid_reach_active(
+    const float* valid_row, const float* opp_reach_w,
+    const uint16_t* active_indices, std::size_t active_count)
 {
-    kernels().fold_ip_step(out_vals, valid_row, rw_ci, n);
+    return kernels().dot_valid_reach_active(
+        valid_row, opp_reach_w, active_indices, active_count);
+}
+inline float dot_valid_reach_active_runs(
+    const float* valid_row, const float* opp_reach_w,
+    const ActiveRun* active_runs, std::size_t run_count)
+{
+    return kernels().dot_valid_reach_active_runs(
+        valid_row, opp_reach_w, active_runs, run_count);
+}
+inline void fold_ip_step(
+    float* out_vals, const float* valid_row, float rw_ci,
+    const uint8_t* skip_mask, std::size_t n)
+{
+    kernels().fold_ip_step(out_vals, valid_row, rw_ci, skip_mask, n);
+}
+inline void fold_ip_step_active(
+    float* out_vals, const float* valid_row, float rw_ci,
+    const uint16_t* active_indices, std::size_t active_count)
+{
+    kernels().fold_ip_step_active(
+        out_vals, valid_row, rw_ci, active_indices, active_count);
+}
+inline void fold_ip_step_active_runs(
+    float* out_vals, const float* valid_row, float rw_ci,
+    const ActiveRun* active_runs, std::size_t run_count)
+{
+    kernels().fold_ip_step_active_runs(
+        out_vals, valid_row, rw_ci, active_runs, run_count);
 }
 
 inline void showdown_oop_full(
@@ -271,11 +436,158 @@ inline void showdown_oop_full(
 }
 inline void showdown_ip_full(
     const uint8_t* category_matrix, const float* valid_matrix,
-    const float* opp_reach_w, float* out, std::size_t n,
+    const float* opp_reach_w, const uint8_t* skip_mask,
+    float* out, std::size_t n,
     float win_p, float lose_p, float tie_p)
 {
-    kernels().showdown_ip_full(category_matrix, valid_matrix, opp_reach_w, out,
-                                n, win_p, lose_p, tie_p);
+    kernels().showdown_ip_full(category_matrix, valid_matrix, opp_reach_w,
+                                skip_mask, out, n, win_p, lose_p, tie_p);
+}
+inline void showdown_oop_signed_zero_rake(
+    const float* signed_valid_matrix, const float* opp_reach_w,
+    const uint8_t* skip_mask,
+    float* out, std::size_t n,
+    float win_p)
+{
+    kernels().showdown_oop_signed_zero_rake(
+        signed_valid_matrix, opp_reach_w, skip_mask, out, n, win_p);
+}
+inline void showdown_ip_signed_zero_rake(
+    const float* signed_valid_matrix, const float* opp_reach_w,
+    const uint8_t* skip_mask,
+    float* out, std::size_t n,
+    float win_p)
+{
+    kernels().showdown_ip_signed_zero_rake(
+        signed_valid_matrix, opp_reach_w, skip_mask, out, n, win_p);
+}
+inline void showdown_oop_signed_count_zero_rake(
+    const int8_t* signed_count_matrix, const float* opp_reach,
+    const float* inv_weights, const uint8_t* skip_mask,
+    float* out, std::size_t n,
+    float win_p)
+{
+    kernels().showdown_oop_signed_count_zero_rake(
+        signed_count_matrix, opp_reach, inv_weights, skip_mask, out, n, win_p);
+}
+inline void showdown_ip_signed_count_zero_rake(
+    const int8_t* signed_count_matrix, const float* opp_reach,
+    const float* inv_weights, const uint8_t* skip_mask,
+    float* out, std::size_t n,
+    float win_p)
+{
+    kernels().showdown_ip_signed_count_zero_rake(
+        signed_count_matrix, opp_reach, inv_weights, skip_mask, out, n, win_p);
+}
+inline void showdown_oop_full_active(
+    const uint8_t* category_matrix, const float* valid_matrix,
+    const float* opp_reach_w,
+    const uint16_t* active_indices, std::size_t active_count,
+    float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p,
+    bool clear_full_output = true)
+{
+    kernels().showdown_oop_full_active(
+        category_matrix, valid_matrix, opp_reach_w,
+        active_indices, active_count, out, n, win_p, lose_p, tie_p,
+        clear_full_output);
+}
+inline void showdown_ip_full_active(
+    const uint8_t* category_matrix, const float* valid_matrix,
+    const float* opp_reach_w,
+    const uint16_t* active_indices, std::size_t active_count,
+    float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p,
+    bool clear_full_output = true)
+{
+    kernels().showdown_ip_full_active(
+        category_matrix, valid_matrix, opp_reach_w,
+        active_indices, active_count, out, n, win_p, lose_p, tie_p,
+        clear_full_output);
+}
+inline void showdown_oop_full_active_runs(
+    const uint8_t* category_matrix, const float* valid_matrix,
+    const float* opp_reach_w,
+    const ActiveRun* active_runs, std::size_t run_count,
+    float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p,
+    bool clear_full_output = true)
+{
+    kernels().showdown_oop_full_active_runs(
+        category_matrix, valid_matrix, opp_reach_w,
+        active_runs, run_count, out, n, win_p, lose_p, tie_p,
+        clear_full_output);
+}
+inline void showdown_oop_full_active_opp_blocks(
+    const uint8_t* category_matrix, const float* valid_matrix,
+    const float* opp_reach_w,
+    const uint16_t* self_active_indices, std::size_t self_active_count,
+    const ActiveRun* opp_blocks, std::size_t opp_block_count,
+    float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p,
+    bool clear_full_output = true)
+{
+    kernels().showdown_oop_full_active_opp_blocks(
+        category_matrix, valid_matrix, opp_reach_w,
+        self_active_indices, self_active_count,
+        opp_blocks, opp_block_count, out, n, win_p, lose_p, tie_p,
+        clear_full_output);
+}
+inline void showdown_ip_full_active_opp_blocks(
+    const uint8_t* category_matrix, const float* valid_matrix,
+    const float* opp_reach_w,
+    const uint16_t* self_active_indices, std::size_t self_active_count,
+    const ActiveRun* opp_blocks, std::size_t opp_block_count,
+    float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p,
+    bool clear_full_output = true)
+{
+    kernels().showdown_ip_full_active_opp_blocks(
+        category_matrix, valid_matrix, opp_reach_w,
+        self_active_indices, self_active_count,
+        opp_blocks, opp_block_count, out, n, win_p, lose_p, tie_p,
+        clear_full_output);
+}
+inline void showdown_ip_full_active_runs(
+    const uint8_t* category_matrix, const float* valid_matrix,
+    const float* opp_reach_w,
+    const ActiveRun* active_runs, std::size_t run_count,
+    float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p,
+    bool clear_full_output = true)
+{
+    kernels().showdown_ip_full_active_runs(
+        category_matrix, valid_matrix, opp_reach_w,
+        active_runs, run_count, out, n, win_p, lose_p, tie_p,
+        clear_full_output);
+}
+inline void showdown_oop_full_active2(
+    const uint8_t* category_matrix, const float* valid_matrix,
+    const float* opp_reach_w,
+    const uint16_t* self_active_indices, std::size_t self_active_count,
+    const uint16_t* opp_active_indices, std::size_t opp_active_count,
+    float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p)
+{
+    kernels().showdown_oop_full_active2(
+        category_matrix, valid_matrix, opp_reach_w,
+        self_active_indices, self_active_count,
+        opp_active_indices, opp_active_count,
+        out, n, win_p, lose_p, tie_p);
+}
+inline void showdown_ip_full_active2(
+    const uint8_t* category_matrix, const float* valid_matrix,
+    const float* opp_reach_w,
+    const uint16_t* self_active_indices, std::size_t self_active_count,
+    const uint16_t* opp_active_indices, std::size_t opp_active_count,
+    float* out, std::size_t n,
+    float win_p, float lose_p, float tie_p)
+{
+    kernels().showdown_ip_full_active2(
+        category_matrix, valid_matrix, opp_reach_w,
+        self_active_indices, self_active_count,
+        opp_active_indices, opp_active_count,
+        out, n, win_p, lose_p, tie_p);
 }
 inline void showdown_oop_full_batch(
     const uint8_t* category_matrix, const float* valid_matrix,

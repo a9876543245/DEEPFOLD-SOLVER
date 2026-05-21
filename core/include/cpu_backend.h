@@ -29,8 +29,11 @@
 #include "types.h"
 #include "isomorphism.h"
 #include "cpu_simd.h"
+#include "fold_blocker.h"
+#include "showdown_rank_blocker.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -113,6 +116,54 @@ public:
         return (requested == 1u) ? 1u : 2u;
     }
 
+    CpuBackendDiagnostics cpu_diagnostics() const override {
+        CpuBackendDiagnostics d;
+        const uint32_t nc = (ctx_.iso != nullptr) ? ctx_.iso->num_canonical : 0u;
+        d.available = (nc != 0u);
+        d.canonical_combos = nc;
+        d.oop_active_count =
+            static_cast<uint32_t>(oop_terminal_active_indices_.size());
+        d.ip_active_count =
+            static_cast<uint32_t>(ip_terminal_active_indices_.size());
+        d.oop_active_run_count =
+            static_cast<uint32_t>(oop_terminal_active_runs_.size());
+        d.ip_active_run_count =
+            static_cast<uint32_t>(ip_terminal_active_runs_.size());
+        if (nc != 0u) {
+            d.oop_active_density =
+                static_cast<float>(d.oop_active_count) / static_cast<float>(nc);
+            d.ip_active_density =
+                static_cast<float>(d.ip_active_count) / static_cast<float>(nc);
+        }
+        auto avg_run_len = [](const std::vector<cpu_simd::ActiveRun>& runs) {
+            uint32_t total = 0u;
+            for (const auto& run : runs) total += run.count;
+            return runs.empty()
+                ? 0.0f
+                : static_cast<float>(total) / static_cast<float>(runs.size());
+        };
+        d.oop_avg_run_length = avg_run_len(oop_terminal_active_runs_);
+        d.ip_avg_run_length = avg_run_len(ip_terminal_active_runs_);
+        d.oop_terminal_active_list = oop_use_terminal_active_list_;
+        d.ip_terminal_active_list = ip_use_terminal_active_list_;
+        d.oop_active_runs = oop_use_active_runs_;
+        d.ip_active_runs = ip_use_active_runs_;
+        d.oop_terminal_active2 = oop_use_terminal_active2_;
+        d.ip_terminal_active2 = ip_use_terminal_active2_;
+        d.ip_terminal_output_skip = ip_use_terminal_output_skip_;
+        d.fold_blocker_shortcut = kFoldBlockerShortcutEnabled;
+        d.showdown_rank_blocker_shortcut =
+            use_rank_blocker_showdown_for_traverser(0)
+            || use_rank_blocker_showdown_for_traverser(1);
+        d.showdown_signed_coeff_shortcut =
+            use_signed_coeff_showdown_for_traverser(0)
+            || use_signed_coeff_showdown_for_traverser(1);
+        populate_matchup_category_diagnostics(
+            d, ctx_.matchup_category_per_runout,
+            ctx_.matchup_category, nc);
+        return d;
+    }
+
 private:
     SolverContext ctx_{};
 
@@ -124,9 +175,10 @@ private:
     // Final averaged strategy (populated in finalize())
     std::vector<std::vector<float>> strategy_;
 
-    // canonical_weights as float (precomputed once in prepare()) so SIMD
+    // canonical weights as float (precomputed once in prepare()) so SIMD
     // doesn't have to convert from uint16_t every time.
     std::vector<float> canonical_weights_f_;
+    std::vector<float> canonical_inv_weights_f_;
 
     // Per-traverser arenas: lets OOP and IP traversals run on separate
     // threads without contending on a shared bump pointer. Capacity is
@@ -155,6 +207,77 @@ private:
     // LevelizedCpuBackend — see that file for the correctness note).
     std::vector<uint8_t> oop_out_of_range_mask_;
     std::vector<uint8_t> ip_out_of_range_mask_;
+    std::vector<uint16_t> oop_terminal_active_indices_;
+    std::vector<uint16_t> ip_terminal_active_indices_;
+    std::vector<cpu_simd::ActiveRun> oop_terminal_active_runs_;
+    std::vector<cpu_simd::ActiveRun> ip_terminal_active_runs_;
+    bool oop_has_out_of_range_ = false;
+    bool ip_has_out_of_range_ = false;
+    bool ip_use_terminal_output_skip_ = false;
+    bool oop_use_terminal_active_list_ = false;
+    bool ip_use_terminal_active_list_ = false;
+    bool oop_use_active_runs_ = false;
+    bool ip_use_active_runs_ = false;
+    bool oop_use_terminal_active2_ = false;
+    bool ip_use_terminal_active2_ = false;
+    bool showdown_rank_blocker_supported_ = false;
+    bool showdown_signed_coeff_supported_ = false;
+    std::array<showdown_rank_blocker::Scratch, 2> showdown_rank_scratch_;
+
+    static constexpr bool kFoldBlockerShortcutEnabled = true;
+    static constexpr bool kShowdownRankBlockerShortcutEnabled = true;
+
+    inline bool use_terminal_active_list_for_player(int player) const {
+        return (player == 0) ? oop_use_terminal_active_list_
+                             : ip_use_terminal_active_list_;
+    }
+    inline bool use_rank_blocker_showdown_for_traverser(int traverser) const {
+        return kShowdownRankBlockerShortcutEnabled
+            && showdown_rank_blocker_supported_
+            && !use_terminal_active_list_for_player(traverser);
+    }
+    inline bool use_signed_coeff_showdown_for_traverser(int traverser) const {
+        return showdown_signed_coeff_supported_
+            && !use_terminal_active_list_for_player(traverser)
+            && !use_rank_blocker_showdown_for_traverser(traverser);
+    }
+
+    static inline void build_active_runs(
+        const std::vector<uint16_t>& active,
+        std::vector<cpu_simd::ActiveRun>& runs)
+    {
+        runs.clear();
+        runs.reserve(active.size());
+        if (active.empty()) return;
+        uint16_t start = active.front();
+        uint16_t prev = start;
+        uint16_t count = 1;
+        for (std::size_t k = 1; k < active.size(); ++k) {
+            const uint16_t c = active[k];
+            if (c == static_cast<uint16_t>(prev + 1)) {
+                prev = c;
+                ++count;
+                continue;
+            }
+            runs.push_back({start, count});
+            start = prev = c;
+            count = 1;
+        }
+        runs.push_back({start, count});
+    }
+    static inline bool active_runs_are_worth_using(
+        const std::vector<uint16_t>& active,
+        const std::vector<cpu_simd::ActiveRun>& runs)
+    {
+        return !runs.empty() && (runs.size() * 4u <= active.size());
+    }
+    static inline void vec_scale_active_runs(
+        float* dst, float s, const std::vector<cpu_simd::ActiveRun>& runs)
+    {
+        for (const auto& run : runs) {
+            cpu_simd::vec_scale_in_place(dst + run.start, s, run.count);
+        }
+    }
 
     // ---- Internal methods ----
     void compute_strategy();
@@ -193,8 +316,11 @@ inline void CpuBackend::prepare(const SolverContext& ctx) {
 
     // Precompute canonical_weights as float for SIMD reach * weight ops.
     canonical_weights_f_.resize(nc);
+    canonical_inv_weights_f_.resize(nc);
     for (uint16_t k = 0; k < nc; ++k) {
-        canonical_weights_f_[k] = static_cast<float>(ctx.iso->canonical_weights[k]);
+        const float w = static_cast<float>(ctx.iso->canonical_weights[k]);
+        canonical_weights_f_[k] = w;
+        canonical_inv_weights_f_[k] = (w > 0.0f) ? (1.0f / w) : 0.0f;
     }
 
     // Reach scratch buffers: one OOP + one IP for each potential traverser
@@ -214,16 +340,94 @@ inline void CpuBackend::prepare(const SolverContext& ctx) {
     // v1.8.1+ out-of-range skip masks built from root reach.
     oop_out_of_range_mask_.assign(nc, 0);
     ip_out_of_range_mask_.assign(nc, 0);
+    oop_terminal_active_indices_.clear();
+    ip_terminal_active_indices_.clear();
+    oop_terminal_active_runs_.clear();
+    ip_terminal_active_runs_.clear();
+    oop_terminal_active_indices_.reserve(nc);
+    ip_terminal_active_indices_.reserve(nc);
+    oop_has_out_of_range_ = false;
+    ip_has_out_of_range_ = false;
+    oop_use_terminal_active_list_ = false;
+    ip_use_terminal_active_list_ = false;
+    oop_use_active_runs_ = false;
+    ip_use_active_runs_ = false;
+    oop_use_terminal_active2_ = false;
+    ip_use_terminal_active2_ = false;
+    showdown_signed_coeff_supported_ = false;
+    showdown_rank_blocker_supported_ =
+        kShowdownRankBlockerShortcutEnabled
+        && ctx.matchup_original_ranks_per_runout != nullptr
+        && showdown_rank_blocker::supports_singleton_iso(*ctx.iso);
+    showdown_signed_coeff_supported_ =
+        ctx.matchup_showdown_count_per_runout != nullptr
+        && !ctx.matchup_showdown_count_per_runout->empty();
+    uint16_t ip_out_of_range_count = 0;
     if (ctx.oop_reach != nullptr) {
         for (uint16_t c = 0; c < nc; ++c) {
-            if ((*ctx.oop_reach)[c] == 0.0f) oop_out_of_range_mask_[c] = 1;
+            if ((*ctx.oop_reach)[c] == 0.0f) {
+                oop_out_of_range_mask_[c] = 1;
+                oop_has_out_of_range_ = true;
+            } else {
+                oop_terminal_active_indices_.push_back(c);
+            }
+        }
+    } else {
+        for (uint16_t c = 0; c < nc; ++c) {
+            oop_terminal_active_indices_.push_back(c);
         }
     }
     if (ctx.ip_reach != nullptr) {
         for (uint16_t c = 0; c < nc; ++c) {
-            if ((*ctx.ip_reach)[c] == 0.0f) ip_out_of_range_mask_[c] = 1;
+            if ((*ctx.ip_reach)[c] == 0.0f) {
+                ip_out_of_range_mask_[c] = 1;
+                ip_has_out_of_range_ = true;
+                ++ip_out_of_range_count;
+            } else {
+                ip_terminal_active_indices_.push_back(c);
+            }
+        }
+    } else {
+        for (uint16_t c = 0; c < nc; ++c) {
+            ip_terminal_active_indices_.push_back(c);
         }
     }
+    build_active_runs(oop_terminal_active_indices_, oop_terminal_active_runs_);
+    build_active_runs(ip_terminal_active_indices_, ip_terminal_active_runs_);
+    ip_use_terminal_output_skip_ =
+        (static_cast<uint32_t>(ip_out_of_range_count) * 8u
+         >= static_cast<uint32_t>(nc) * 7u);
+    constexpr uint32_t kActiveListDensityDen = 4u; // active <= 25%
+    oop_use_terminal_active_list_ =
+        (static_cast<uint32_t>(oop_terminal_active_indices_.size())
+            * kActiveListDensityDen
+         <= static_cast<uint32_t>(nc));
+    ip_use_terminal_active_list_ =
+        (static_cast<uint32_t>(ip_terminal_active_indices_.size())
+            * kActiveListDensityDen
+         <= static_cast<uint32_t>(nc));
+    oop_use_active_runs_ =
+        oop_use_terminal_active_list_
+        && active_runs_are_worth_using(
+            oop_terminal_active_indices_, oop_terminal_active_runs_);
+    ip_use_active_runs_ =
+        ip_use_terminal_active_list_
+        && active_runs_are_worth_using(
+            ip_terminal_active_indices_, ip_terminal_active_runs_);
+    // Active2 terminal kernels are available as tested infrastructure, but
+    // disabled in the production path for now. Their scalar indexed reduce
+    // changes CFR trajectory enough to break tight reference parity, and it
+    // did not improve narrow wall-clock versus the one-sided active path.
+    constexpr uint32_t kActive2DensityDen = 8u; // active <= 12.5%
+    constexpr bool kEnableTerminalActive2 = false;
+    oop_use_terminal_active2_ = kEnableTerminalActive2 &&
+        (static_cast<uint32_t>(oop_terminal_active_indices_.size())
+            * kActive2DensityDen
+         <= static_cast<uint32_t>(nc));
+    ip_use_terminal_active2_ = kEnableTerminalActive2 &&
+        (static_cast<uint32_t>(ip_terminal_active_indices_.size())
+            * kActive2DensityDen
+         <= static_cast<uint32_t>(nc));
 
     // Reserve scratch arena capacity. Worst case per recursion frame at a
     // player decision node is (max_actions * nc) for action_vals + (nc) for
@@ -363,37 +567,188 @@ inline void CpuBackend::cfr_traverse(
              static_cast<std::size_t>(mi) < ctx_.matchup_category_per_runout->size())
                 ? (*ctx_.matchup_category_per_runout)[mi]
                 : *ctx_.matchup_category;
+        const std::vector<int8_t>* matchup_showdown_count_table = nullptr;
+        if (ctx_.matchup_showdown_count_per_runout && mi >= 0 &&
+            static_cast<std::size_t>(mi) < ctx_.matchup_showdown_count_per_runout->size()) {
+            matchup_showdown_count_table =
+                &(*ctx_.matchup_showdown_count_per_runout)[mi];
+        } else {
+            matchup_showdown_count_table = ctx_.matchup_showdown_count;
+        }
+        const auto* matchup_original_ranks =
+            (ctx_.matchup_original_ranks_per_runout && mi >= 0 &&
+             static_cast<std::size_t>(mi) < ctx_.matchup_original_ranks_per_runout->size())
+                ? &(*ctx_.matchup_original_ranks_per_runout)[mi]
+                : ctx_.matchup_original_ranks;
         const auto* matchup_valid    = matchup_valid_table.data();
         const auto* matchup_category = matchup_category_table.data();
+        const int8_t* matchup_showdown_count =
+            (matchup_showdown_count_table != nullptr &&
+             matchup_showdown_count_table->size() >=
+                 static_cast<std::size_t>(nc) * nc)
+                ? matchup_showdown_count_table->data()
+                : nullptr;
+
+        // Precompute opp_reach * canonical_weights once per terminal so
+        // the inner SIMD loop only does reach_w * valid * payoff.
+        const float* opp_reach = (traverser == 0) ? reach_ip : reach_oop;
+
+        // v1.8.1+ out-of-range skip mask — see cpu_backend_levelized.h for
+        // the correctness note.
+        const bool use_active_list = (traverser == 0)
+            ? oop_use_terminal_active_list_
+            : ip_use_terminal_active_list_;
+        const std::vector<uint16_t>& active_indices = (traverser == 0)
+            ? oop_terminal_active_indices_
+            : ip_terminal_active_indices_;
+        const std::vector<uint16_t>& opp_active_indices = (traverser == 0)
+            ? ip_terminal_active_indices_
+            : oop_terminal_active_indices_;
+        const std::vector<cpu_simd::ActiveRun>& active_runs = (traverser == 0)
+            ? oop_terminal_active_runs_
+            : ip_terminal_active_runs_;
+        const std::vector<cpu_simd::ActiveRun>& opp_active_runs = (traverser == 0)
+            ? ip_terminal_active_runs_
+            : oop_terminal_active_runs_;
+        const bool use_active_runs =
+            use_active_list && ((traverser == 0) ? oop_use_active_runs_
+                                                 : ip_use_active_runs_);
+        const bool use_opp_active_runs = (traverser == 0)
+            ? ip_use_active_runs_
+            : oop_use_active_runs_;
+        const bool use_dual_active = use_active_list
+            && ((traverser == 0) ? ip_use_terminal_active2_
+                                 : oop_use_terminal_active2_);
+        const bool has_skip = (traverser == 0)
+            ? oop_has_out_of_range_
+            : ip_use_terminal_output_skip_;
+        const uint8_t* skip_mask = (!use_active_list && has_skip)
+            ? ((traverser == 0)
+                ? oop_out_of_range_mask_.data()
+                : ip_out_of_range_mask_.data())
+            : nullptr;
+        const bool use_signed_coeff_showdown =
+            tt == TerminalType::SHOWDOWN
+            && use_signed_coeff_showdown_for_traverser(traverser)
+            && matchup_showdown_count != nullptr
+            && tie_payoff == 0.0f
+            && lose_payoff == -win_payoff;
+
+        if (tt != TerminalType::SHOWDOWN
+            && kFoldBlockerShortcutEnabled
+            && !use_active_list) {
+            CardMask board_mask = 0;
+            if (ctx_.matchup_board_masks && mi >= 0 &&
+                static_cast<std::size_t>(mi) < ctx_.matchup_board_masks->size()) {
+                board_mask = (*ctx_.matchup_board_masks)[static_cast<std::size_t>(mi)];
+            } else if (ctx_.config != nullptr) {
+                board_mask = board_to_mask(
+                    ctx_.config->board.data(), ctx_.config->board_size);
+            }
+
+            uint32_t parent = tree.parent_indices[node_idx];
+            float unmatched_bet = (parent < tree.total_nodes)
+                ? tree.bet_into[parent] : 0.0f;
+            float matched_pot = pot_total - unmatched_bet;
+            float fold_win_gain  = matched_pot * 0.5f - rake;
+            float fold_lose_loss = -matched_pot * 0.5f;
+            float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
+            const float self_payoff =
+                ((traverser == 0 && sign_oop > 0)
+                 || (traverser == 1 && sign_oop < 0))
+                    ? fold_win_gain
+                    : fold_lose_loss;
+            fold_blocker::fold_dense(
+                *ctx_.iso, board_mask, opp_reach, skip_mask,
+                self_payoff, out_vals, nc);
+            return;
+        }
 
         // Precompute opp_reach * canonical_weights once per terminal so
         // the inner SIMD loop only does reach_w * valid * payoff.
         std::size_t mark = arena.mark();
-        float* opp_reach_w = arena.alloc(nc);
-        const float* opp_reach = (traverser == 0) ? reach_ip : reach_oop;
-        for (uint16_t k = 0; k < nc; ++k) {
-            opp_reach_w[k] = opp_reach[k] * canonical_weights_f_[k];
+        float* opp_reach_w = nullptr;
+        if (!use_signed_coeff_showdown) {
+            opp_reach_w = arena.alloc(nc);
+            cpu_simd::vec_copy(opp_reach_w, opp_reach, nc);
+            cpu_simd::vec_mul_in_place(opp_reach_w, canonical_weights_f_.data(), nc);
         }
-
-        // v1.8.1+ out-of-range skip mask — see cpu_backend_levelized.h for
-        // the correctness note.
-        const uint8_t* skip_mask = (traverser == 0)
-            ? oop_out_of_range_mask_.data()
-            : ip_out_of_range_mask_.data();
 
         if (tt == TerminalType::SHOWDOWN) {
             // v1.8.0 P3-8 spike: full-matrix kernels — see cpu_simd.h for
             // why. Same numeric output as the per-c loop (parity test
             // gates this); just hoists SIMD-constant setup out of the c
             // loop so we don't rebuild vwin/vlose/vtie nc times per call.
-            if (traverser == 0) {
-                cpu_simd::showdown_oop_full(
-                    matchup_category, matchup_valid, opp_reach_w, skip_mask,
-                    out_vals, nc, win_payoff, lose_payoff, tie_payoff);
+            const bool use_rank_blocker_showdown =
+                use_rank_blocker_showdown_for_traverser(traverser)
+                && matchup_original_ranks != nullptr
+                && matchup_original_ranks->size() >= NUM_COMBOS;
+            if (use_rank_blocker_showdown) {
+                showdown_rank_blocker::showdown_dense_singleton(
+                    *ctx_.iso, *matchup_original_ranks, opp_reach_w, skip_mask,
+                    out_vals, nc, win_payoff, lose_payoff, tie_payoff,
+                    showdown_rank_scratch_[static_cast<std::size_t>(traverser)]);
+            } else if (use_signed_coeff_showdown) {
+                if (traverser == 0) {
+                    cpu_simd::showdown_oop_signed_count_zero_rake(
+                        matchup_showdown_count, opp_reach,
+                        canonical_inv_weights_f_.data(), skip_mask,
+                        out_vals, nc, win_payoff);
+                } else {
+                    cpu_simd::showdown_ip_signed_count_zero_rake(
+                        matchup_showdown_count, opp_reach,
+                        canonical_inv_weights_f_.data(), skip_mask,
+                        out_vals, nc, win_payoff);
+                }
+            } else if (traverser == 0) {
+                if (use_dual_active) {
+                    cpu_simd::showdown_oop_full_active2(
+                        matchup_category, matchup_valid, opp_reach_w,
+                        active_indices.data(), active_indices.size(),
+                        opp_active_indices.data(), opp_active_indices.size(),
+                        out_vals, nc, win_payoff, lose_payoff, tie_payoff);
+                } else if (use_active_list) {
+                    if (use_active_runs) {
+                        cpu_simd::showdown_oop_full_active_runs(
+                            matchup_category, matchup_valid, opp_reach_w,
+                            active_runs.data(), active_runs.size(),
+                            out_vals, nc, win_payoff, lose_payoff, tie_payoff);
+                    } else {
+                        cpu_simd::showdown_oop_full_active(
+                            matchup_category, matchup_valid, opp_reach_w,
+                            active_indices.data(), active_indices.size(),
+                            out_vals, nc, win_payoff, lose_payoff, tie_payoff);
+                    }
+                } else {
+                    cpu_simd::showdown_oop_full(
+                        matchup_category, matchup_valid, opp_reach_w, skip_mask,
+                        out_vals, nc, win_payoff, lose_payoff, tie_payoff);
+                }
             } else {
-                cpu_simd::showdown_ip_full(
-                    matchup_category, matchup_valid, opp_reach_w, out_vals, nc,
-                    win_payoff, lose_payoff, tie_payoff);
+                if (use_dual_active) {
+                    cpu_simd::showdown_ip_full_active2(
+                        matchup_category, matchup_valid, opp_reach_w,
+                        active_indices.data(), active_indices.size(),
+                        opp_active_indices.data(), opp_active_indices.size(),
+                        out_vals, nc, win_payoff, lose_payoff, tie_payoff);
+                } else if (use_active_list) {
+                    if (use_active_runs) {
+                        cpu_simd::showdown_ip_full_active_runs(
+                            matchup_category, matchup_valid, opp_reach_w,
+                            active_runs.data(), active_runs.size(),
+                            out_vals, nc, win_payoff, lose_payoff, tie_payoff);
+                    } else {
+                        cpu_simd::showdown_ip_full_active(
+                            matchup_category, matchup_valid, opp_reach_w,
+                            active_indices.data(), active_indices.size(),
+                            out_vals, nc, win_payoff, lose_payoff, tie_payoff);
+                    }
+                } else {
+                    cpu_simd::showdown_ip_full(
+                        matchup_category, matchup_valid, opp_reach_w, skip_mask,
+                        out_vals, nc,
+                        win_payoff, lose_payoff, tie_payoff);
+                }
             }
         } else {
             // Fold terminal — asymmetric pot. Winner only gets the matched
@@ -418,29 +773,100 @@ inline void CpuBackend::cfr_traverse(
                 // For OOP: out_vals[c] = self_payoff * Σ_cj (reach_w[cj] * valid[c, cj])
                 // Inner cj is contiguous — single SIMD dot product per c.
                 // v1.8.1+ out-of-range skip.
-                for (uint16_t c = 0; c < nc; ++c) {
-                    if (skip_mask[c]) {
-                        out_vals[c] = 0.0f;
-                        continue;
+                if (use_active_list) {
+                    cpu_simd::vec_set_zero(out_vals, nc);
+                    auto eval_fold_combo = [&](uint16_t c) {
+                        const float* valid_row =
+                            matchup_valid + static_cast<std::size_t>(c) * nc;
+                        float opp_total;
+                        if (use_dual_active) {
+                            opp_total = use_opp_active_runs
+                                ? cpu_simd::dot_valid_reach_active_runs(
+                                    valid_row, opp_reach_w,
+                                    opp_active_runs.data(), opp_active_runs.size())
+                                : cpu_simd::dot_valid_reach_active(
+                                    valid_row, opp_reach_w,
+                                    opp_active_indices.data(), opp_active_indices.size());
+                        } else {
+                            opp_total = cpu_simd::dot_valid_reach(valid_row, opp_reach_w, nc);
+                        }
+                        out_vals[c] = self_payoff * opp_total;
+                    };
+                    if (use_active_runs) {
+                        for (const auto& run : active_runs) {
+                            const uint16_t end =
+                                static_cast<uint16_t>(run.start + run.count);
+                            for (uint16_t c = run.start; c < end; ++c) {
+                                eval_fold_combo(c);
+                            }
+                        }
+                    } else {
+                        for (uint16_t c : active_indices) eval_fold_combo(c);
                     }
-                    const float* valid_row =
-                        matchup_valid + static_cast<std::size_t>(c) * nc;
-                    float opp_total =
-                        cpu_simd::dot_valid_reach(valid_row, opp_reach_w, nc);
-                    out_vals[c] = self_payoff * opp_total;
+                } else {
+                    for (uint16_t c = 0; c < nc; ++c) {
+                        if (skip_mask && skip_mask[c]) {
+                            out_vals[c] = 0.0f;
+                            continue;
+                        }
+                        const float* valid_row =
+                            matchup_valid + static_cast<std::size_t>(c) * nc;
+                        float opp_total =
+                            cpu_simd::dot_valid_reach(valid_row, opp_reach_w, nc);
+                        out_vals[c] = self_payoff * opp_total;
+                    }
                 }
             } else {
                 // For IP: loop-swap to ci-outer so the inner valid_row scan is
                 // contiguous. Final scale by self_payoff after the loop.
                 cpu_simd::vec_set_zero(out_vals, nc);
-                for (uint16_t ci = 0; ci < nc; ++ci) {
-                    float rw_ci = opp_reach_w[ci];
-                    if (rw_ci == 0.0f) continue;
-                    const float* valid_row =
-                        matchup_valid + static_cast<std::size_t>(ci) * nc;
-                    cpu_simd::fold_ip_step(out_vals, valid_row, rw_ci, nc);
+                if (use_dual_active) {
+                    for (uint16_t ci : opp_active_indices) {
+                        float rw_ci = opp_reach_w[ci];
+                        if (rw_ci == 0.0f) continue;
+                        const float* valid_row =
+                            matchup_valid + static_cast<std::size_t>(ci) * nc;
+                        if (use_active_runs) {
+                            cpu_simd::fold_ip_step_active_runs(
+                                out_vals, valid_row, rw_ci,
+                                active_runs.data(), active_runs.size());
+                        } else {
+                            cpu_simd::fold_ip_step_active(
+                                out_vals, valid_row, rw_ci,
+                                active_indices.data(), active_indices.size());
+                        }
+                    }
+                } else {
+                    for (uint16_t ci = 0; ci < nc; ++ci) {
+                        float rw_ci = opp_reach_w[ci];
+                        if (rw_ci == 0.0f) continue;
+                        const float* valid_row =
+                            matchup_valid + static_cast<std::size_t>(ci) * nc;
+                        if (use_active_list) {
+                            if (use_active_runs) {
+                                cpu_simd::fold_ip_step_active_runs(
+                                    out_vals, valid_row, rw_ci,
+                                    active_runs.data(), active_runs.size());
+                            } else {
+                                cpu_simd::fold_ip_step_active(
+                                    out_vals, valid_row, rw_ci,
+                                    active_indices.data(), active_indices.size());
+                            }
+                        } else {
+                            cpu_simd::fold_ip_step(
+                                out_vals, valid_row, rw_ci, skip_mask, nc);
+                        }
+                    }
                 }
-                cpu_simd::vec_scale_in_place(out_vals, self_payoff, nc);
+                if (use_active_list) {
+                    if (use_active_runs) {
+                        vec_scale_active_runs(out_vals, self_payoff, active_runs);
+                    } else {
+                        for (uint16_t c : active_indices) out_vals[c] *= self_payoff;
+                    }
+                } else {
+                    cpu_simd::vec_scale_in_place(out_vals, self_payoff, nc);
+                }
             }
         }
 

@@ -50,12 +50,19 @@ const OUT_RAW_DIR = join(REPO_ROOT, 'gto_output/presolved/raw');
 const args = parseArgs(process.argv.slice(2));
 
 function parseArgs(argv) {
-  const out = { dryRun: false, iterations: 3000, exploitability: 0.2, maxTreeNodes: 2000 };
+  const out = {
+    dryRun: false,
+    iterations: 3000,
+    exploitability: 0.2,
+    dcfrSchedule: 'postflop',
+    maxTreeNodes: 2000,
+  };
   for (let i = 0; i < argv.length; ++i) {
     const a = argv[i];
     if (a === '--dry-run')          out.dryRun = true;
     else if (a === '--iterations')  out.iterations = parseInt(argv[++i], 10);
     else if (a === '--exploitability') out.exploitability = parseFloat(argv[++i]);
+    else if (a === '--dcfr-schedule') out.dcfrSchedule = argv[++i];
     else throw new Error(`unknown arg: ${a}`);
   }
   return out;
@@ -165,6 +172,8 @@ function solveOne(exe, item) {
       '--flop-sizes',    flopSizesStr,
       '--turn-sizes',    sizes.turnBetSizes.join(','),
       '--river-sizes',   sizes.riverBetSizes.join(','),
+      '--dcfr-schedule', args.dcfrSchedule,
+      '--cpu-persistent-omp', '1',
       '--postsolve',     'full',
       '--strategy-tree-evs', 'visible',
       '--strategy-tree-max-nodes', String(args.maxTreeNodes),

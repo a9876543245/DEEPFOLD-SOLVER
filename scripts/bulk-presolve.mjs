@@ -71,6 +71,7 @@ function parseArgs(argv) {
     iterAnyLite: 1000,        // Any × Lite sizing — small tree, fast
     iterDefault: 1000,        // safety fallback for any tuple we didn't classify
     exploitability: 0.2,
+    dcfrSchedule: 'postflop',
     maxTreeNodes: 2000,
   };
   for (let i = 0; i < argv.length; ++i) {
@@ -83,6 +84,7 @@ function parseArgs(argv) {
     else if (a === '--backend')   out.backend = argv[++i];
     else if (a === '--iterations') out.iterations = parseInt(argv[++i], 10);
     else if (a === '--exploitability') out.exploitability = parseFloat(argv[++i]);
+    else if (a === '--dcfr-schedule') out.dcfrSchedule = argv[++i];
     else if (a === '--max-tree-nodes') out.maxTreeNodes = parseInt(argv[++i], 10);
     else throw new Error(`unknown arg: ${a}`);
   }
@@ -225,6 +227,8 @@ function solveOne(exe, spot) {
       '--flop-sizes',    sizes.flopBetSizes.join(','),
       '--turn-sizes',    sizes.turnBetSizes.join(','),
       '--river-sizes',   sizes.riverBetSizes.join(','),
+      '--dcfr-schedule', args.dcfrSchedule,
+      '--cpu-persistent-omp', '1',
       '--postsolve',     'full',
       '--strategy-tree-evs', 'visible',
       '--strategy-tree-max-nodes', String(args.maxTreeNodes),

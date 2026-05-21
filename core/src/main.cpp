@@ -105,12 +105,10 @@ struct CLIArgs {
     //                                  kept as parity oracle / debug escape hatch
     std::string cpu_backend_kind = "levelized";
 
-    // v1.8.0 Sprint 3 (gated): opt-in persistent OpenMP team for the
-    // levelized backend's forward / backward passes. Default 0 = the safe
-    // per-level parallel-region path. Flip to 1 to use a single team per
-    // pass with `omp for` distributing each level. Wired via SolverConfig
-    // so paired benchmark mode can A/B it cleanly.
-    int cpu_persistent_omp = 0;
+    // v1.8.0 Sprint 3: persistent OpenMP team for the levelized backend's
+    // forward / backward passes. Default 1 for production CPU solves; pass
+    // 0 to A/B against the old per-level parallel-region path.
+    int cpu_persistent_omp = 1;
 
     // Sprint 1 (market-beating plan): per-solve memory budget overrides.
     // Default 0 = use the SolverConfig defaults (6 GB host, 100 MB JSON,
@@ -307,6 +305,9 @@ Arguments:
   --gpu-info               Print detected GPU info and exit
   --benchmark <preset>     Run a fixed scenario for perf tracking, emit benchmark JSON.
                            Presets:
+                             narrow   - AsKd7c, AA/KK/QQ/AK only, 100 iter
+                             medium_sparse - AsKd7c, 169 combos/player, 100 iter
+                             monotone - AsKsQs monotone, full ranges, 20 iter
                              standard — AsKd7c rainbow, full ranges, 100 iter
                              matrix   — sweep (scenario × backend × threads),
                                         emits aggregated JSON. Add --include-scalar
@@ -333,8 +334,7 @@ Arguments:
   --cpu-persistent-omp <0|1>
                            Levelized only. Wraps forward_pass / backward_pass in
                            a single `omp parallel` region per pass instead of
-                           one per level. Default 0; opt in for big trees where
-                           per-level team-creation overhead is significant.
+                           one per level. Default 1; use 0 only for A/B profiling.
   --help, -h               Show this help message
 
 Output:
@@ -503,6 +503,136 @@ std::string escape_json(const std::string& s) {
     return result;
 }
 
+const char* json_bool(bool value) {
+    return value ? "true" : "false";
+}
+
+void write_cpu_diagnostics_json(
+    std::ostream& out,
+    const CpuBackendDiagnostics& d,
+    const std::string& indent) {
+    const std::ios::fmtflags old_flags = out.flags();
+    const std::streamsize old_precision = out.precision();
+    const std::string inner = indent + "  ";
+
+    out << std::fixed << std::setprecision(4);
+    out << indent << "{\n";
+    out << inner << "\"available\": " << json_bool(d.available) << ",\n";
+    out << inner << "\"canonical_combos\": " << d.canonical_combos << ",\n";
+    out << inner << "\"oop_active_count\": " << d.oop_active_count << ",\n";
+    out << inner << "\"ip_active_count\": " << d.ip_active_count << ",\n";
+    out << inner << "\"oop_active_density\": " << d.oop_active_density << ",\n";
+    out << inner << "\"ip_active_density\": " << d.ip_active_density << ",\n";
+    out << inner << "\"oop_active_run_count\": "
+        << d.oop_active_run_count << ",\n";
+    out << inner << "\"ip_active_run_count\": "
+        << d.ip_active_run_count << ",\n";
+    out << inner << "\"oop_active_block_count\": "
+        << d.oop_active_block_count << ",\n";
+    out << inner << "\"ip_active_block_count\": "
+        << d.ip_active_block_count << ",\n";
+    out << inner << "\"oop_active_block_span\": "
+        << d.oop_active_block_span << ",\n";
+    out << inner << "\"ip_active_block_span\": "
+        << d.ip_active_block_span << ",\n";
+    out << inner << "\"oop_avg_run_length\": "
+        << d.oop_avg_run_length << ",\n";
+    out << inner << "\"ip_avg_run_length\": "
+        << d.ip_avg_run_length << ",\n";
+    out << inner << "\"oop_terminal_active_list\": "
+        << json_bool(d.oop_terminal_active_list) << ",\n";
+    out << inner << "\"ip_terminal_active_list\": "
+        << json_bool(d.ip_terminal_active_list) << ",\n";
+    out << inner << "\"oop_active_runs\": "
+        << json_bool(d.oop_active_runs) << ",\n";
+    out << inner << "\"ip_active_runs\": "
+        << json_bool(d.ip_active_runs) << ",\n";
+    out << inner << "\"oop_active_blocks\": "
+        << json_bool(d.oop_active_blocks) << ",\n";
+    out << inner << "\"ip_active_blocks\": "
+        << json_bool(d.ip_active_blocks) << ",\n";
+    out << inner << "\"oop_sparse_traversal\": "
+        << json_bool(d.oop_sparse_traversal) << ",\n";
+    out << inner << "\"ip_sparse_traversal\": "
+        << json_bool(d.ip_sparse_traversal) << ",\n";
+    out << inner << "\"oop_block_strategy\": "
+        << json_bool(d.oop_block_strategy) << ",\n";
+    out << inner << "\"ip_block_strategy\": "
+        << json_bool(d.ip_block_strategy) << ",\n";
+    out << inner << "\"oop_block_strategy_sum\": "
+        << json_bool(d.oop_block_strategy_sum) << ",\n";
+    out << inner << "\"ip_block_strategy_sum\": "
+        << json_bool(d.ip_block_strategy_sum) << ",\n";
+    out << inner << "\"oop_block_traversal\": "
+        << json_bool(d.oop_block_traversal) << ",\n";
+    out << inner << "\"ip_block_traversal\": "
+        << json_bool(d.ip_block_traversal) << ",\n";
+    out << inner << "\"oop_terminal_active2\": "
+        << json_bool(d.oop_terminal_active2) << ",\n";
+    out << inner << "\"ip_terminal_active2\": "
+        << json_bool(d.ip_terminal_active2) << ",\n";
+    out << inner << "\"ip_terminal_output_skip\": "
+        << json_bool(d.ip_terminal_output_skip) << ",\n";
+    out << inner << "\"oop_sparse_opp_reach_build\": "
+        << json_bool(d.oop_sparse_opp_reach_build) << ",\n";
+    out << inner << "\"ip_sparse_opp_reach_build\": "
+        << json_bool(d.ip_sparse_opp_reach_build) << ",\n";
+    out << inner << "\"fold_blocker_shortcut\": "
+        << json_bool(d.fold_blocker_shortcut) << ",\n";
+    out << inner << "\"fold_blocker_precomputed\": "
+        << json_bool(d.fold_blocker_precomputed) << ",\n";
+    out << inner << "\"showdown_rank_blocker_shortcut\": "
+        << json_bool(d.showdown_rank_blocker_shortcut) << ",\n";
+    out << inner << "\"showdown_signed_coeff_shortcut\": "
+        << json_bool(d.showdown_signed_coeff_shortcut) << ",\n";
+    out << inner << "\"sparse_terminal_no_full_clear_enabled\": "
+        << json_bool(d.sparse_terminal_no_full_clear_enabled) << ",\n";
+    out << inner << "\"matchup_category\": {\n";
+    out << inner << "  \"tables\": "
+        << d.matchup_category_table_count << ",\n";
+    out << inner << "  \"rows\": "
+        << d.matchup_category_rows << ",\n";
+    out << inner << "  \"cells\": "
+        << d.matchup_category_cells << ",\n";
+    out << inner << "  \"invalid_cells\": "
+        << d.matchup_category_invalid_cells << ",\n";
+    out << inner << "  \"win_cells\": "
+        << d.matchup_category_win_cells << ",\n";
+    out << inner << "  \"lose_cells\": "
+        << d.matchup_category_lose_cells << ",\n";
+    out << inner << "  \"tie_cells\": "
+        << d.matchup_category_tie_cells << ",\n";
+    out << inner << "  \"zero_rake_payoff_cells\": "
+        << d.matchup_zero_rake_payoff_cells << ",\n";
+    out << inner << "  \"invalid_density\": "
+        << d.matchup_category_invalid_density << ",\n";
+    out << inner << "  \"win_density\": "
+        << d.matchup_category_win_density << ",\n";
+    out << inner << "  \"lose_density\": "
+        << d.matchup_category_lose_density << ",\n";
+    out << inner << "  \"tie_density\": "
+        << d.matchup_category_tie_density << ",\n";
+    out << inner << "  \"zero_rake_payoff_density\": "
+        << d.matchup_zero_rake_payoff_density << ",\n";
+    out << inner << "  \"row_payoff_nonzero_min\": "
+        << d.matchup_payoff_row_nonzero_min << ",\n";
+    out << inner << "  \"row_payoff_nonzero_p50\": "
+        << d.matchup_payoff_row_nonzero_p50 << ",\n";
+    out << inner << "  \"row_payoff_nonzero_p95\": "
+        << d.matchup_payoff_row_nonzero_p95 << ",\n";
+    out << inner << "  \"row_payoff_nonzero_max\": "
+        << d.matchup_payoff_row_nonzero_max << ",\n";
+    out << inner << "  \"row_payoff_nonzero_avg\": "
+        << d.matchup_payoff_row_nonzero_avg << ",\n";
+    out << inner << "  \"row_payoff_density_avg\": "
+        << d.matchup_payoff_row_density_avg << "\n";
+    out << inner << "}\n";
+    out << indent << "}";
+
+    out.flags(old_flags);
+    out.precision(old_precision);
+}
+
 std::string result_to_json(
     const SolverResult& result, const CLIArgs& args,
     const std::string& backend_name,
@@ -566,6 +696,10 @@ std::string result_to_json(
     json << "    \"postsolve_threads\": " << result.timing.postsolve_threads << "\n";
     json << "  },\n";
     json << std::setprecision(2);
+
+    json << "  \"cpu_diagnostics\": ";
+    write_cpu_diagnostics_json(json, result.cpu_diagnostics, "  ");
+    json << ",\n";
 
     // Sprint 1 (market-beating plan): per-solve resource estimate. Lets the
     // UI / benchmark show "this run was 12 MB host, 4 MB JSON, tree truncated
@@ -1035,13 +1169,28 @@ struct PairedScenario {
     const char* name;
     const char* board;
     int iterations;
+    const char* range;
 };
 
+static constexpr const char* kMediumSparseRange =
+    "AA:1,KK:1,QQ:1,JJ:1,TT:1,99:1,88:1,77:1,66:1,55:1,44:1,33:1,22:1,"
+    "AKs:1,AQs:1,AJs:1,ATs:1,A9s:1,A8s:1,A7s:1,A6s:1,A5s:1,A4s:1,A3s:1,A2s:1,"
+    "KQs:1,KJs:1,KTs:1,QJs:1,QTs:1,JTs:1,T9s:1,98s:1,87s:1,"
+    "AKo:1,AQo:1,AJo:1,KQo:1";
+
 static const PairedScenario* lookup_paired_case(const std::string& name) {
-    static const PairedScenario kStandard = { "standard", "AsKd7c", 100 };
-    static const PairedScenario kMonotone = { "monotone", "AsKsQs",  20 };
+    static const PairedScenario kStandard = { "standard", "AsKd7c", 100, "" };
+    static const PairedScenario kMonotone = { "monotone", "AsKsQs",  20, "" };
+    static const PairedScenario kNarrow   = {
+        "narrow", "AsKd7c", 100, "AA:1,KK:1,QQ:1,AKs:1,AKo:1"
+    };
+    static const PairedScenario kMediumSparse = {
+        "medium_sparse", "AsKd7c", 100, kMediumSparseRange
+    };
     if (name == "standard") return &kStandard;
     if (name == "monotone") return &kMonotone;
+    if (name == "narrow")   return &kNarrow;
+    if (name == "medium_sparse") return &kMediumSparse;
     return nullptr;
 }
 
@@ -1074,6 +1223,11 @@ static PairedRun run_one_paired(const PairedScenario& scen,
     sc.compute_combo_evs = false;
     sc.compute_exploitability = false;
     sc.parallel_postsolve = false;
+    if (scen.range != nullptr && scen.range[0] != '\0') {
+        apply_range_string(scen.range, sc.ip_range_weights);
+        apply_range_string(scen.range, sc.oop_range_weights);
+        sc.has_custom_ranges = true;
+    }
 
     Solver solver(sc, BackendType::CPU);
     auto result = solver.solve();
@@ -1099,7 +1253,8 @@ bool run_benchmark_paired(std::ostream& out,
     const PairedScenario* scen = lookup_paired_case(case_name);
     if (!scen) {
         std::cerr << "{\"status\":\"error\",\"message\":\"unknown --benchmark-case: "
-                  << case_name << " (valid: standard | monotone)\"}\n";
+                  << case_name
+                  << " (valid: standard | monotone | narrow | medium_sparse)\"}\n";
         return false;
     }
     const uint32_t threads = (threads_override >= 0)
@@ -1160,6 +1315,7 @@ bool run_benchmark_paired(std::ostream& out,
     out << "  \"benchmark\": \"paired\",\n";
     out << "  \"case\": \""               << scen->name  << "\",\n";
     out << "  \"board\": \""              << scen->board << "\",\n";
+    out << "  \"range\": \""              << scen->range << "\",\n";
     out << "  \"iterations\": "           << scen->iterations << ",\n";
     out << "  \"runs_per_label\": "       << runs_per_label << ",\n";
     out << "  \"order\": \"alternating BCBC\",\n";
@@ -1246,9 +1402,33 @@ int main(int argc, char* argv[]) {
             args.ip_range_str.clear();   // empty = default full range
             args.oop_range_str.clear();
             // Keep postsolve full so combo_evs + exploitability are measured too.
+        } else if (args.benchmark == "narrow") {
+            args.board_str = "AsKd7c";
+            args.pot       = 100.0f;
+            args.stack     = 500.0f;
+            args.iterations = 100;
+            args.ip_range_str  = "AA:1,KK:1,QQ:1,AKs:1,AKo:1";
+            args.oop_range_str = "AA:1,KK:1,QQ:1,AKs:1,AKo:1";
+        } else if (args.benchmark == "medium_sparse") {
+            args.board_str = "AsKd7c";
+            args.pot       = 100.0f;
+            args.stack     = 500.0f;
+            args.iterations = 100;
+            args.ip_range_str  = kMediumSparseRange;
+            args.oop_range_str = kMediumSparseRange;
+        } else if (args.benchmark == "monotone") {
+            // AsKsQs exercises canonical-compressed matchup tables and
+            // chance-runout grouping; keep it shorter than standard.
+            args.board_str = "AsKsQs";
+            args.pot       = 100.0f;
+            args.stack     = 500.0f;
+            args.iterations = 20;
+            args.ip_range_str.clear();
+            args.oop_range_str.clear();
         } else {
             std::cerr << "{\"status\":\"error\",\"message\":\"unknown --benchmark preset: "
-                      << args.benchmark << "\"}\n";
+                      << args.benchmark
+                      << " (valid: standard | monotone | narrow | medium_sparse | matrix)\"}\n";
             return 1;
         }
     }
@@ -1312,6 +1492,7 @@ int main(int argc, char* argv[]) {
         // v1.8.0 Sprint 3 gated rollout: forward the persistent-OMP request
         // to the backend. Field stays default-false in SolverConfig — only
         // explicit --cpu-persistent-omp 1 enables it.
+        // Production default is on; --cpu-persistent-omp 0 keeps an A/B escape hatch.
         config.cpu_persistent_omp = (args.cpu_persistent_omp != 0);
 
         // v1.4.0 Phase 2: apply --cpu-simd policy. set_policy() is idempotent
@@ -1550,7 +1731,11 @@ int main(int argc, char* argv[]) {
                       << "    \"simd\": \"" << escape_json(result.resources.cpu_simd) << "\",\n"
                       << "    \"threads\": " << result.resources.cpu_threads_effective << ",\n"
                       << "    \"backend_kind\": \"" << escape_json(result.resources.cpu_backend_kind) << "\"\n"
-                      << "  },\n"
+                      << "  },\n";
+            std::cout << "  \"cpu_diagnostics\": ";
+            write_cpu_diagnostics_json(
+                std::cout, result.cpu_diagnostics, "  ");
+            std::cout << ",\n"
                       << "  \"timing\": {\n"
                       << "    \"total_ms\": " << result.timing.total_ms << ",\n"
                       << "    \"tree_build_ms\": " << result.timing.tree_build_ms << ",\n"
