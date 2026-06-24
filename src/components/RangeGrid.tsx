@@ -74,14 +74,14 @@ function aggressionColor(score: number): string {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
-/** Format an EV value for cell display. Signed, 1 decimal for small values
- *  to avoid "+0" hiding small wins, integer for big ones. */
+/** Format an EV value for cell display. Signed; keep 1 decimal below 100 so
+ *  close mixes stay comparable (the old >=10 branch rounded 24.3 -> "24",
+ *  hiding sub-unit differences), integer only for large values to fit cells.
+ *  Unit is chips, matching StrategyPanel's combo EV readout. */
 function formatEv(ev: number): string {
   if (!Number.isFinite(ev)) return '—';
-  const abs = Math.abs(ev);
   const sign = ev >= 0 ? '+' : '';
-  if (abs >= 100) return `${sign}${ev.toFixed(0)}`;
-  if (abs >= 10) return `${sign}${ev.toFixed(0)}`;
+  if (Math.abs(ev) >= 100) return `${sign}${ev.toFixed(0)}`;
   return `${sign}${ev.toFixed(1)}`;
 }
 
@@ -123,7 +123,10 @@ function strategyToGradient(entries: { action: string; frequency: number; color:
     const end = cumulative * 100;
     stops.push(`${entry.color} ${start.toFixed(1)}% ${end.toFixed(1)}%`);
   }
-  return `linear-gradient(135deg, ${stops.join(', ')})`;
+  // Horizontal (to right) so a cell's action mix reads as proportional widths
+  // at a glance — the core high-frequency study action. A 135deg diagonal
+  // makes "70/30" impossible to read without hovering.
+  return `linear-gradient(to right, ${stops.join(', ')})`;
 }
 
 /** Generate heatmap color for a single action frequency */
@@ -354,7 +357,7 @@ export function RangeGrid({
       {/* View Mode Switcher */}
       {result && onDisplayModeChange && viewSide === 'acting' && (
         <div style={{
-          display: 'flex', alignItems: 'center', gap: 6,
+          display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap',
           padding: '6px 10px', background: 'var(--color-glass)',
           borderRadius: 8, border: '1px solid var(--color-glass-border)',
         }}>
@@ -444,6 +447,33 @@ export function RangeGrid({
               </div>
             )}
           </div>
+
+          {/* Per-action one-click isolate chips — skip the mode+dropdown detour.
+              Clicking a chip jumps straight to that action's frequency heatmap. */}
+          {actions.length > 0 && (
+            <>
+              <span style={{ width: 1, height: 16, background: 'var(--color-glass-border)', margin: '0 2px' }} />
+              {actions.map(action => {
+                const active = displayMode === 'action-heatmap' && heatmapAction === action;
+                return (
+                  <button key={action}
+                    onClick={() => { onDisplayModeChange('action-heatmap', action); setShowActionPicker(false); }}
+                    title={`Isolate ${action} frequency across the whole range`}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 5,
+                      padding: '4px 8px', borderRadius: 6, cursor: 'pointer',
+                      border: active ? '1px solid var(--color-accent)' : '1px solid transparent',
+                      background: active ? 'var(--color-bg-tertiary)' : 'transparent',
+                      fontSize: 11, fontWeight: 600, fontFamily: 'inherit',
+                      color: 'var(--color-text-secondary)', transition: 'all 150ms ease',
+                    }}>
+                    <span style={{ width: 8, height: 8, borderRadius: 2, background: getActionColor(action) }} />
+                    {action}
+                  </button>
+                );
+              })}
+            </>
+          )}
         </div>
       )}
 

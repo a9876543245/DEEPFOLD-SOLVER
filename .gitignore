@@ -3,6 +3,7 @@ node_modules/
 dist/
 dist-ssr/
 core/build/
+core/build_cpu/
 src-tauri/target/
 src-tauri/binaries/
 release/

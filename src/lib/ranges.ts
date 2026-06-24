@@ -39,6 +39,37 @@ export function getRangeFrequency(range: Record<string, number>, combo: string):
 }
 
 /**
+ * Derive the postflop pot+stack (in chips) for a given matchup at a given
+ * effective stack depth.
+ *
+ * Each matchup's `defaultPot` / `defaultStack` are encoded at 100BB; this
+ * scales them linearly. The convention is 1 BB = 10 chips, matching the
+ * rest of the codebase.
+ *
+ * Single source of truth — replaces the earlier split between
+ * `handleMatchupChange` (used matchup defaults) and an effect that
+ * hard-coded 5.5bb / 22bb regardless of position. Position-pair specific
+ * pot values (e.g. BTN vs BB 3BP ≠ SB vs BB 3BP) now flow from the
+ * matchup data itself instead of being overridden.
+ *
+ * Note: linear scaling is only valid near 100BB. Short-stack 3-bet sizing
+ * compresses in practice (jam-or-fold), so SolverControls warns when the
+ * user's stack deviates far from the GameContext's effective_bb.
+ */
+export function derivePotStack(
+  matchup: PositionMatchup,
+  effectiveBB: number,
+): { potChips: number; stackChips: number } {
+  const BB_TO_CHIPS = 10;
+  const BASE_BB = 100;
+  const scale = effectiveBB / BASE_BB;
+  return {
+    potChips:   Math.round(matchup.defaultPot   * BB_TO_CHIPS * scale),
+    stackChips: Math.round(matchup.defaultStack * BB_TO_CHIPS * scale),
+  };
+}
+
+/**
  * All available 6-max matchups (SRP + 3-Bet Pot).
  */
 export const MATCHUPS: PositionMatchup[] = [

@@ -9,13 +9,21 @@ interface Props {
   loading: boolean;
 }
 
+/** Format internal chip amount as BB for display. 1 BB = 10 chips (same
+ *  convention as MATCHUPS / derivePotStack). Trims trailing .0 so whole
+ *  values like 22 BB show as "22" instead of "22.0". */
+function toBB(chips: number): string {
+  const v = chips / 10;
+  return Number.isInteger(v) ? String(v) : v.toFixed(1);
+}
+
 /** Map action types to display colors */
 const ACTION_TYPE_COLORS: Record<string, string> = {
-  check: '#30D158',
+  check: '#30C8C0',  // teal — kept in sync with ACTION_COLORS in lib/poker.ts
   bet: '#FF453A',
   raise: '#BF5AF2',
   call: '#30D158',
-  fold: '#636366',
+  fold: '#0A84FF',   // blue — kept in sync with ACTION_COLORS in lib/poker.ts
   allin: '#FF9F0A',
 };
 
@@ -50,7 +58,7 @@ export function ActionBar({ node, onAction, loading }: Props) {
               </span>{' '}
               {t('action.folds')} — {lastStep.player === 'OOP' ? 'IP' : 'OOP'} {t('action.wins')}{' '}
               <span className="text-mono" style={{ color: 'var(--color-green)' }}>
-                {node.pot}
+                {toBB(node.pot)} BB
               </span>
             </>
           ) : (
@@ -106,10 +114,10 @@ export function ActionBar({ node, onAction, loading }: Props) {
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>
-            Pot: <span className="text-mono" style={{ color: 'var(--color-green)', fontWeight: 600 }}>{node.pot}</span>
+            Pot: <span className="text-mono" style={{ color: 'var(--color-green)', fontWeight: 600 }}>{toBB(node.pot)} BB</span>
           </div>
           <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>
-            Stack: <span className="text-mono" style={{ fontWeight: 600 }}>{node.effectiveStack}</span>
+            Stack: <span className="text-mono" style={{ fontWeight: 600 }}>{toBB(node.effectiveStack)} BB</span>
           </div>
         </div>
       </div>
@@ -118,7 +126,7 @@ export function ActionBar({ node, onAction, loading }: Props) {
       <div style={{
         display: 'flex', gap: 6, flexWrap: 'wrap',
       }}>
-        {node.actions.map((action) => {
+        {node.actions.map((action, idx) => {
           const color = ACTION_TYPE_COLORS[action.type] || '#8E8E93';
           const isFold = action.type === 'fold';
 
@@ -157,6 +165,17 @@ export function ActionBar({ node, onAction, loading }: Props) {
                 (e.currentTarget as HTMLButtonElement).style.borderColor = `${color}50`;
               }}
             >
+              {/* Keyboard hint — 1-9 trigger the Nth action (matches App.tsx) */}
+              {idx < 9 && (
+                <span className="text-mono" style={{
+                  fontSize: 9, fontWeight: 700, lineHeight: 1,
+                  padding: '1px 4px', borderRadius: 3,
+                  background: `${color}22`, color,
+                  opacity: 0.7,
+                }}>
+                  {idx + 1}
+                </span>
+              )}
               {/* Action icon */}
               <span style={{ fontSize: 12, color }}>
                 {action.type === 'check' ? '✓' :
@@ -173,13 +192,13 @@ export function ActionBar({ node, onAction, loading }: Props) {
               }}>
                 {action.label}
               </span>
-              {/* Amount */}
+              {/* Amount — displayed in BB, not chips */}
               {action.amount !== undefined && action.type !== 'allin' && (
                 <span className="text-mono" style={{
                   fontSize: 10, fontWeight: 500,
                   color: 'var(--color-text-tertiary)',
                 }}>
-                  ({action.amount})
+                  ({toBB(action.amount)} BB)
                 </span>
               )}
             </button>

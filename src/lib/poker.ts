@@ -35,9 +35,9 @@ export const RANK_VALUES: Record<string, number> = {
 // Strategy action colors (GTO Wizard-like palette)
 export const ACTION_COLORS: Record<string, string> = {
   'Not in range': '#1C1C1E',
-  'Fold': '#636366',
-  'Check': '#30D158',
-  'Call': '#30D158',
+  'Fold': '#0A84FF',   // blue — matches PioVIEWER/GTO Wizard muscle memory (was grey, read as out-of-range)
+  'Check': '#30C8C0',  // teal — distinct from Call green so passive check-back vs call don't blur
+  'Call': '#30D158',   // green
   'Bet_33': '#FF453A',
   'Bet_75': '#FF6B35',
   'Bet': '#FF453A',
@@ -195,6 +195,11 @@ export interface SolverResponse {
   /** v1.3.0: which stop condition ended the solve. Empty when the engine
    *  predates v1.3.0 (e.g. loaded from an old .dsolver file). */
   early_stop_reason?: EarlyStopReason;
+  /** True when the flop runout enumeration collapsed to the single-child
+   *  fallback (memory gate): turn/river equity is approximated from the stale
+   *  flop matchup. UI shows a warning so the solve isn't trusted as exact on
+   *  later streets. */
+  runout_approximated?: boolean;
   global_strategy: Record<string, string>;
   /** Per-combo strategy frequencies: { "AA": { "Check": 0.1, "Bet_33": 0.6, ... }, ... } */
   combo_strategies?: Record<string, ComboStrategy>;

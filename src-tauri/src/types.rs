@@ -168,6 +168,12 @@ pub struct SolverResponse {
     /// "iter_cap" / "time_budget" / "exploit_target" / "" (legacy).
     #[serde(default)]
     pub early_stop_reason: String,
+    /// True when the flop runout enumeration collapsed to the single-child
+    /// fallback (memory gate): turn/river equity is approximated from the
+    /// stale flop matchup. UI shows a warning. `default` so older saved
+    /// .dsolver files (no field) keep loading.
+    #[serde(default)]
+    pub runout_approximated: bool,
     pub global_strategy: std::collections::HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_combo_analysis: Option<ComboAnalysis>,

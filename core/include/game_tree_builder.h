@@ -92,6 +92,11 @@ private:
     uint64_t      matchup_bytes_per_cell_ =
         memory_budget::kMatchupBytesPerCell;
     bool          budget_set_  = false;
+    /// Set true when the memory gate forces the single-child runout fallback
+    /// (no card dealt → turn/river solved on the stale flop matchup). Surfaced
+    /// so the result can warn that runout equity is approximated rather than
+    /// degrading silently.
+    bool          runout_collapsed_ = false;
 
     /// Add a node to the tree and return its index
     uint32_t add_node(TreeNode node);
@@ -386,7 +391,9 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
             // Legacy single-child fallback: emit one child without dealing a
             // card. Terminal eval uses the root matchup. Correct CFR-wise,
             // just no per-runout equity. Used only when iso can't tame the
-            // memory blowup (typically rainbow flops).
+            // memory blowup (typically rainbow flops). Flag it so the result
+            // can tell the user the turn/river equity is approximated.
+            runout_collapsed_ = true;
             TreeNode child;
             child.type = NodeType::PLAYER_OOP;
             child.street = next_street;
@@ -623,6 +630,7 @@ inline FlatGameTree GameTreeBuilder::flatten() const {
         }
     }
 
+    flat.runout_approximated = runout_collapsed_;
     return flat;
 }
 

@@ -30,6 +30,11 @@ interface Props {
   /** v1.3.0: called when the user clicks Stop during loading. Should
    *  invoke the cancel_solve Tauri command. */
   onStop?: () => void;
+  /** Effective stack (BB) implied by the current GameContext. Used to
+   *  compute how far the user-edited `stack` drifts from the depth the
+   *  preflop range was built for; drives the SPR readout + deviation
+   *  warning. Pass null when no context is active. */
+  expectedEffectiveBB?: number | null;
 }
 
 /**
@@ -43,6 +48,7 @@ export function SolverControls({
   sizingKey = 'standard', onSizingChange,
   memoryProfile = 'balanced', onMemoryProfileChange,
   solveMode = 'standard', onSolveModeChange, onStop,
+  expectedEffectiveBB = null,
 }: Props) {
   const t = useT();
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -65,50 +71,117 @@ export function SolverControls({
   ];
   const activeMemoryPreset = MEMORY_PROFILE_PRESETS[memoryProfile];
 
+  // SPR + stack-depth deviation. Both feed the info row below the
+  // pot/stack inputs. 1 BB = 10 chips (same convention as MATCHUPS and
+  // derivePotStack).
+  const BB_CHIPS = 10;
+  const effectiveBBNow = stack / BB_CHIPS;
+  const spr = pot > 0 ? stack / pot : 0;
+  const deviation = expectedEffectiveBB != null && expectedEffectiveBB > 0
+    ? Math.abs(effectiveBBNow - expectedEffectiveBB) / expectedEffectiveBB
+    : 0;
+  // > 40% → strong warning (red): preflop range is likely wrong for this depth
+  // > 20% → soft warning (yellow): edges of the comfort zone
+  // else  → quiet info readout
+  const deviationLevel: 'red' | 'yellow' | null =
+    expectedEffectiveBB == null ? null
+    : deviation > 0.40 ? 'red'
+    : deviation > 0.20 ? 'yellow'
+    : null;
+
   return (
     <div className="glass-panel" style={{ padding: 16 }}>
       <span className="text-label" style={{ marginBottom: 12, display: 'block' }}>
         {t('config')}
       </span>
 
-      {/* Pot Size */}
+      {/* Pot Size — displayed/edited in BB. Internal state (pot prop) is
+       *  still chips since the engine + rest of codebase use chips; only
+       *  the input layer is BB. 1 BB = 10 chips. Step 1 BB on +/-. */}
       <div style={{ marginBottom: 12 }}>
         <label style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 4, display: 'block' }}>
-          {t('config.potSize')}
+          {t('config.potSize')} ({t('gctx.bb')})
         </label>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           <button className="btn-secondary" style={{ padding: '6px 10px', fontSize: 14 }}
-            onClick={() => onPotChange(Math.max(1, pot - 10))}>-</button>
+            onClick={() => onPotChange(Math.max(BB_CHIPS, pot - BB_CHIPS))}>-</button>
           <input
             className="input-field text-mono"
             type="number"
-            value={pot}
-            onChange={(e) => onPotChange(Number(e.target.value))}
+            step="0.5"
+            value={pot / BB_CHIPS}
+            onChange={(e) => {
+              const bb = Number(e.target.value);
+              if (!Number.isFinite(bb) || bb <= 0) return;
+              onPotChange(Math.round(bb * BB_CHIPS));
+            }}
             style={{ textAlign: 'center', width: 80 }}
           />
           <button className="btn-secondary" style={{ padding: '6px 10px', fontSize: 14 }}
-            onClick={() => onPotChange(pot + 10)}>+</button>
+            onClick={() => onPotChange(pot + BB_CHIPS)}>+</button>
+          <span style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>{t('gctx.bb')}</span>
         </div>
       </div>
 
-      {/* Effective Stack */}
-      <div style={{ marginBottom: 12 }}>
+      {/* Effective Stack — same BB-input pattern. Step 5 BB on +/- (keeps
+       *  the previous "25 chips" feel — 25 chips = 2.5 BB; we round to 5
+       *  BB for a cleaner increment). */}
+      <div style={{ marginBottom: 8 }}>
         <label style={{ fontSize: 12, color: 'var(--color-text-secondary)', marginBottom: 4, display: 'block' }}>
-          {t('config.effStack')}
+          {t('config.effStack')} ({t('gctx.bb')})
         </label>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           <button className="btn-secondary" style={{ padding: '6px 10px', fontSize: 14 }}
-            onClick={() => onStackChange(Math.max(1, stack - 25))}>-</button>
+            onClick={() => onStackChange(Math.max(BB_CHIPS, stack - 5 * BB_CHIPS))}>-</button>
           <input
             className="input-field text-mono"
             type="number"
-            value={stack}
-            onChange={(e) => onStackChange(Number(e.target.value))}
+            step="1"
+            value={stack / BB_CHIPS}
+            onChange={(e) => {
+              const bb = Number(e.target.value);
+              if (!Number.isFinite(bb) || bb <= 0) return;
+              onStackChange(Math.round(bb * BB_CHIPS));
+            }}
             style={{ textAlign: 'center', width: 80 }}
           />
           <button className="btn-secondary" style={{ padding: '6px 10px', fontSize: 14 }}
-            onClick={() => onStackChange(stack + 25)}>+</button>
+            onClick={() => onStackChange(stack + 5 * BB_CHIPS)}>+</button>
+          <span style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>{t('gctx.bb')}</span>
         </div>
+      </div>
+
+      {/* Derived info: SPR + stack-depth deviation warning. SPR is the
+       *  real driver of postflop strategy, so we surface it directly.
+       *  (Effective BB itself is no longer printed here — the stack input
+       *  above is already in BB, so duplicating it adds noise.) Deviation
+       *  warns when the user has manually overridden the stack far from
+       *  what the preflop range was solved for. */}
+      <div style={{ marginBottom: 12, fontSize: 11, lineHeight: 1.4 }}>
+        <div style={{ color: 'var(--color-text-tertiary)' }}>
+          {t('config.spr')}: <span className="text-mono" style={{ color: 'var(--color-text-secondary)', fontWeight: 600 }}>
+            {spr.toFixed(1)}
+          </span>
+        </div>
+        {deviationLevel && (
+          <div style={{
+            marginTop: 4, padding: '4px 8px', borderRadius: 4,
+            fontWeight: 600,
+            background: deviationLevel === 'red'
+              ? 'rgba(255, 69, 58, 0.12)'
+              : 'rgba(255, 159, 10, 0.12)',
+            color: deviationLevel === 'red'
+              ? 'var(--color-red, #FF453A)'
+              : 'var(--color-orange, #FF9F0A)',
+            border: deviationLevel === 'red'
+              ? '1px solid rgba(255, 69, 58, 0.3)'
+              : '1px solid rgba(255, 159, 10, 0.3)',
+          }}>
+            {deviationLevel === 'red'
+              ? t('config.stackDeviation.strong').replace('{bb}', String(expectedEffectiveBB))
+              : t('config.stackDeviation.soft').replace('{bb}', String(expectedEffectiveBB))}
+          </div>
+        )}
       </div>
 
       {/* Bet Size Presets */}

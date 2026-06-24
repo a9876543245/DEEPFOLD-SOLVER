@@ -11,6 +11,9 @@
  *   A2       — category_u8 + valid_f32, 5 bytes/cell. category encodes
  *              {0=invalid, 1=win, 2=lose, 3=tie} pre-thresholded at precompute.
  *              Loses no precision; valid stays exact float.
+ *   signed   ??signed_valid_f32, 4 bytes/cell. zero-rake-only coefficient:
+ *              win=+valid, lose=-valid, tie/invalid=0. Exact for the default
+ *              rake-free path and removes category decode/blend work.
  *
  * For each candidate we report:
  *   ms / call          — wall time per terminal call
@@ -197,6 +200,40 @@ static void showdown_a2(
 }
 
 // ---------------------------------------------------------------------------
+// Signed-valid zero-rake kernel. Exact only when tie payoff is zero and lose
+// payoff is -win payoff:
+//
+//   coeff = +valid for OOP-win, -valid for OOP-lose, 0 for tie/invalid.
+//   out[c] = win_p * sum_j(coeff[c,j] * opp_reach_w[j])
+//
+// This is a candidate production fast path for default rake-free solves. It
+// needs an extra precomputed matrix, so the bench tells us whether the hot-loop
+// win is large enough to justify that memory tradeoff.
+// ---------------------------------------------------------------------------
+static void showdown_signed_zero_rake(
+    const float* signed_valid_matrix,
+    const float* opp_reach_w,
+    float* out, std::size_t n,
+    float win_p)
+{
+    for (std::size_t c = 0; c < n; ++c) {
+        const float* coeff_row = signed_valid_matrix + c * n;
+        __m256 acc = _mm256_setzero_ps();
+        std::size_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            __m256 coeff = _mm256_loadu_ps(coeff_row + i);
+            __m256 reach = _mm256_loadu_ps(opp_reach_w + i);
+            acc = _mm256_fmadd_ps(coeff, reach, acc);
+        }
+        float sum = hsum256(acc);
+        for (; i < n; ++i) {
+            sum += coeff_row[i] * opp_reach_w[i];
+        }
+        out[c] = sum * win_p;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Synthetic data generator. Mirrors the rough distribution of a real
 // 3-card-flop matchup table:
 //   ~5% invalid (card overlap) — both ev and valid set to 0.
@@ -207,6 +244,7 @@ struct MatchupTable {
     std::vector<float>   ev;
     std::vector<float>   valid;
     std::vector<uint8_t> category;       // pre-thresholded
+    std::vector<float>   signed_valid;   // zero-rake payoff coefficient
 };
 
 static MatchupTable make_table(uint64_t seed) {
@@ -214,6 +252,7 @@ static MatchupTable make_table(uint64_t seed) {
     t.ev.assign(kCells, 0.0f);
     t.valid.assign(kCells, 0.0f);
     t.category.assign(kCells, CAT_INVALID);
+    t.signed_valid.assign(kCells, 0.0f);
 
     std::mt19937_64 rng(seed);
     std::uniform_real_distribution<float> uev(-1.0f, 1.0f);
@@ -226,9 +265,15 @@ static MatchupTable make_table(uint64_t seed) {
         float vl = uval(rng);
         t.ev[k]    = ev;
         t.valid[k] = vl;
-        if      (ev >  0.5f) t.category[k] = CAT_WIN;
-        else if (ev < -0.5f) t.category[k] = CAT_LOSE;
-        else                 t.category[k] = CAT_TIE;
+        if (ev > 0.5f) {
+            t.category[k] = CAT_WIN;
+            t.signed_valid[k] = vl;
+        } else if (ev < -0.5f) {
+            t.category[k] = CAT_LOSE;
+            t.signed_valid[k] = -vl;
+        } else {
+            t.category[k] = CAT_TIE;
+        }
     }
     return t;
 }
@@ -291,6 +336,10 @@ static double bytes_per_call_a2() {
     // category_u8 + valid_f32
     return static_cast<double>(kCells) * 5.0;
 }
+static double bytes_per_call_signed() {
+    // signed_valid_f32
+    return static_cast<double>(kCells) * 4.0;
+}
 
 static Result run_baseline(int threads, std::size_t calls,
                             const std::vector<MatchupTable>& tables,
@@ -332,29 +381,70 @@ static Result run_a2(int threads, std::size_t calls,
     };
 }
 
+static Result run_signed(int threads, std::size_t calls,
+                         const std::vector<MatchupTable>& tables,
+                         const std::vector<std::vector<float>>& reaches,
+                         std::vector<std::vector<float>>& out_per_thread) {
+    const std::size_t T = tables.size();
+    auto fn = [&](std::size_t k, int tid) {
+        const MatchupTable& mt = tables[k % T];
+        const std::vector<float>& rch = reaches[(k + tid) % reaches.size()];
+        showdown_signed_zero_rake(mt.signed_valid.data(), rch.data(),
+                                  out_per_thread[tid].data(), kNc,
+                                  1.0f);
+    };
+    double s = run_calls(threads, calls, fn);
+    return Result{
+        s,
+        calls / s,
+        (calls * bytes_per_call_signed() / s) / 1e9,
+    };
+}
+
 // ---------------------------------------------------------------------------
-// Sanity check: baseline and A2 must agree to within FP rounding on a
-// representative call. If they diverge here we have a bug in A2's encoding.
+// Sanity check: baseline and candidates must agree to within FP rounding on a
+// representative call. If they diverge here we have an encoding bug.
 // ---------------------------------------------------------------------------
 static bool verify_parity(const MatchupTable& mt, const std::vector<float>& rch,
                           float win_p, float lose_p, float tie_p) {
-    std::vector<float> out_b(kNc, 0.0f), out_a(kNc, 0.0f);
+    std::vector<float> out_b(kNc, 0.0f);
+    std::vector<float> out_a(kNc, 0.0f);
+    std::vector<float> out_s(kNc, 0.0f);
     showdown_baseline(mt.ev.data(), mt.valid.data(), rch.data(),
                       out_b.data(), kNc, win_p, lose_p, tie_p);
     showdown_a2(mt.category.data(), mt.valid.data(), rch.data(),
                 out_a.data(), kNc, win_p, lose_p, tie_p);
-    float max_diff = 0.0f;
+    const bool signed_applicable = (tie_p == 0.0f && lose_p == -win_p);
+    if (signed_applicable) {
+        showdown_signed_zero_rake(mt.signed_valid.data(), rch.data(),
+                                  out_s.data(), kNc, win_p);
+    }
+    float max_diff_a2 = 0.0f;
+    float max_diff_signed = 0.0f;
     for (std::size_t c = 0; c < kNc; ++c) {
         float d = std::abs(out_b[c] - out_a[c]);
-        if (d > max_diff) max_diff = d;
+        if (d > max_diff_a2) max_diff_a2 = d;
+        if (signed_applicable) {
+            float ds = std::abs(out_b[c] - out_s[c]);
+            if (ds > max_diff_signed) max_diff_signed = ds;
+        }
     }
     constexpr float kTol = 1e-4f;
-    if (max_diff > kTol) {
-        std::cerr << "[parity] FAIL  max|baseline - a2| = " << max_diff
+    if (max_diff_a2 > kTol) {
+        std::cerr << "[parity] FAIL  max|baseline - a2| = " << max_diff_a2
                   << " (tol " << kTol << ")\n";
         return false;
     }
-    std::cout << "[parity] PASS  max|baseline - a2| = " << max_diff << "\n";
+    if (signed_applicable && max_diff_signed > kTol) {
+        std::cerr << "[parity] FAIL  max|baseline - signed| = "
+                  << max_diff_signed << " (tol " << kTol << ")\n";
+        return false;
+    }
+    std::cout << "[parity] PASS  max|baseline - a2| = " << max_diff_a2;
+    if (signed_applicable) {
+        std::cout << "  max|baseline - signed| = " << max_diff_signed;
+    }
+    std::cout << "\n";
     return true;
 }
 
@@ -396,12 +486,21 @@ static void run_scenario(const char* label, int threads,
                         1.0f, -1.0f, 0.0f);
         };
         run_calls(threads, num_tables, warm_a);
+        auto warm_s = [&](std::size_t k, int tid) {
+            const MatchupTable& mt = tables[k % num_tables];
+            showdown_signed_zero_rake(mt.signed_valid.data(),
+                                      reaches[tid].data(), outs[tid].data(),
+                                      kNc, 1.0f);
+        };
+        run_calls(threads, num_tables, warm_s);
     }
 
     Result rb = run_baseline(threads, calls, tables, reaches, outs);
     Result ra = run_a2(threads, calls, tables, reaches, outs);
+    Result rs = run_signed(threads, calls, tables, reaches, outs);
 
     const double speedup = rb.seconds / ra.seconds;
+    const double signed_speedup = rb.seconds / rs.seconds;
     std::cout << std::fixed << std::setprecision(4);
     std::cout << "--- " << label << "  threads=" << threads
               << "  tables=" << num_tables
@@ -412,8 +511,13 @@ static void run_scenario(const char* label, int threads,
     std::cout << "  a2:        " << ra.seconds * 1000.0 << " ms total | "
               << (ra.seconds / calls) * 1e6 << " us/call | "
               << ra.gb_per_sec_effective << " GB/s\n";
+    std::cout << "  signed:    " << rs.seconds * 1000.0 << " ms total | "
+              << (rs.seconds / calls) * 1e6 << " us/call | "
+              << rs.gb_per_sec_effective << " GB/s\n";
     std::cout << "  speedup:   " << speedup << "x  (a2 is "
-              << (speedup > 1.0 ? "faster" : "slower") << ")\n\n";
+              << (speedup > 1.0 ? "faster" : "slower") << ")\n";
+    std::cout << "  signed:    " << signed_speedup << "x  (signed is "
+              << (signed_speedup > 1.0 ? "faster" : "slower") << ")\n\n";
 }
 
 }  // anonymous namespace

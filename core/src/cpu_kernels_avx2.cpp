@@ -1378,6 +1378,166 @@ static void showdown_ip_full_active2(
     }
 }
 
+static void showdown_oop_full_batch_tiled4(
+    const uint8_t* category_matrix, const float* valid_matrix,
+    std::size_t n,
+    std::size_t num_terminals,
+    const float* const* opp_reach_w_array,
+    const uint8_t* skip_mask,
+    float* const* out_array,
+    const float* win_p_array,
+    const float* lose_p_array,
+    const float* tie_p_array,
+    std::size_t c_lo, std::size_t c_hi)
+{
+    const __m256i v_one   = _mm256_set1_epi32(1);
+    const __m256i v_two   = _mm256_set1_epi32(2);
+    const __m256i v_three = _mm256_set1_epi32(3);
+
+    for (std::size_t c = c_lo; c < c_hi; ++c) {
+        if (skip_mask && skip_mask[c]) {
+            for (std::size_t t = 0; t < num_terminals; ++t) {
+                out_array[t][c] = 0.0f;
+            }
+            continue;
+        }
+
+        const uint8_t* cat_row   = category_matrix + c * n;
+        const float*   valid_row = valid_matrix    + c * n;
+
+        std::size_t t = 0;
+        for (; t + 4 <= num_terminals; t += 4) {
+            const __m256 vwin0  = _mm256_set1_ps(win_p_array[t + 0]);
+            const __m256 vlose0 = _mm256_set1_ps(lose_p_array[t + 0]);
+            const __m256 vtie0  = _mm256_set1_ps(tie_p_array[t + 0]);
+            const __m256 vwin1  = _mm256_set1_ps(win_p_array[t + 1]);
+            const __m256 vlose1 = _mm256_set1_ps(lose_p_array[t + 1]);
+            const __m256 vtie1  = _mm256_set1_ps(tie_p_array[t + 1]);
+            const __m256 vwin2  = _mm256_set1_ps(win_p_array[t + 2]);
+            const __m256 vlose2 = _mm256_set1_ps(lose_p_array[t + 2]);
+            const __m256 vtie2  = _mm256_set1_ps(tie_p_array[t + 2]);
+            const __m256 vwin3  = _mm256_set1_ps(win_p_array[t + 3]);
+            const __m256 vlose3 = _mm256_set1_ps(lose_p_array[t + 3]);
+            const __m256 vtie3  = _mm256_set1_ps(tie_p_array[t + 3]);
+
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+
+            std::size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                __m128i cat8  = _mm_loadl_epi64(
+                    reinterpret_cast<const __m128i*>(cat_row + i));
+                __m256i cat32 = _mm256_cvtepu8_epi32(cat8);
+                __m256 m_win  = _mm256_castsi256_ps(_mm256_cmpeq_epi32(cat32, v_one));
+                __m256 m_lose = _mm256_castsi256_ps(_mm256_cmpeq_epi32(cat32, v_two));
+                __m256 m_tie  = _mm256_castsi256_ps(_mm256_cmpeq_epi32(cat32, v_three));
+                __m256 valid8 = _mm256_loadu_ps(valid_row + i);
+
+                __m256 payoff0 = _mm256_setzero_ps();
+                payoff0 = _mm256_blendv_ps(payoff0, vwin0,  m_win);
+                payoff0 = _mm256_blendv_ps(payoff0, vlose0, m_lose);
+                payoff0 = _mm256_blendv_ps(payoff0, vtie0,  m_tie);
+                acc0 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(opp_reach_w_array[t + 0] + i), valid8),
+                    payoff0, acc0);
+
+                __m256 payoff1 = _mm256_setzero_ps();
+                payoff1 = _mm256_blendv_ps(payoff1, vwin1,  m_win);
+                payoff1 = _mm256_blendv_ps(payoff1, vlose1, m_lose);
+                payoff1 = _mm256_blendv_ps(payoff1, vtie1,  m_tie);
+                acc1 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(opp_reach_w_array[t + 1] + i), valid8),
+                    payoff1, acc1);
+
+                __m256 payoff2 = _mm256_setzero_ps();
+                payoff2 = _mm256_blendv_ps(payoff2, vwin2,  m_win);
+                payoff2 = _mm256_blendv_ps(payoff2, vlose2, m_lose);
+                payoff2 = _mm256_blendv_ps(payoff2, vtie2,  m_tie);
+                acc2 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(opp_reach_w_array[t + 2] + i), valid8),
+                    payoff2, acc2);
+
+                __m256 payoff3 = _mm256_setzero_ps();
+                payoff3 = _mm256_blendv_ps(payoff3, vwin3,  m_win);
+                payoff3 = _mm256_blendv_ps(payoff3, vlose3, m_lose);
+                payoff3 = _mm256_blendv_ps(payoff3, vtie3,  m_tie);
+                acc3 = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(opp_reach_w_array[t + 3] + i), valid8),
+                    payoff3, acc3);
+            }
+
+            float sum0 = hsum256(acc0);
+            float sum1 = hsum256(acc1);
+            float sum2 = hsum256(acc2);
+            float sum3 = hsum256(acc3);
+            for (std::size_t k = i; k < n; ++k) {
+                const uint8_t cat = cat_row[k];
+                if (cat == 0) continue;
+                const float valid = valid_row[k];
+                const float p0 = (cat == 1) ? win_p_array[t + 0]
+                               : (cat == 2) ? lose_p_array[t + 0]
+                                            : tie_p_array[t + 0];
+                const float p1 = (cat == 1) ? win_p_array[t + 1]
+                               : (cat == 2) ? lose_p_array[t + 1]
+                                            : tie_p_array[t + 1];
+                const float p2 = (cat == 1) ? win_p_array[t + 2]
+                               : (cat == 2) ? lose_p_array[t + 2]
+                                            : tie_p_array[t + 2];
+                const float p3 = (cat == 1) ? win_p_array[t + 3]
+                               : (cat == 2) ? lose_p_array[t + 3]
+                                            : tie_p_array[t + 3];
+                sum0 += opp_reach_w_array[t + 0][k] * valid * p0;
+                sum1 += opp_reach_w_array[t + 1][k] * valid * p1;
+                sum2 += opp_reach_w_array[t + 2][k] * valid * p2;
+                sum3 += opp_reach_w_array[t + 3][k] * valid * p3;
+            }
+            out_array[t + 0][c] = sum0;
+            out_array[t + 1][c] = sum1;
+            out_array[t + 2][c] = sum2;
+            out_array[t + 3][c] = sum3;
+        }
+
+        for (; t < num_terminals; ++t) {
+            const __m256 vwin  = _mm256_set1_ps(win_p_array[t]);
+            const __m256 vlose = _mm256_set1_ps(lose_p_array[t]);
+            const __m256 vtie  = _mm256_set1_ps(tie_p_array[t]);
+            __m256 acc = _mm256_setzero_ps();
+
+            std::size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                __m128i cat8  = _mm_loadl_epi64(
+                    reinterpret_cast<const __m128i*>(cat_row + i));
+                __m256i cat32 = _mm256_cvtepu8_epi32(cat8);
+                __m256 m_win  = _mm256_castsi256_ps(_mm256_cmpeq_epi32(cat32, v_one));
+                __m256 m_lose = _mm256_castsi256_ps(_mm256_cmpeq_epi32(cat32, v_two));
+                __m256 m_tie  = _mm256_castsi256_ps(_mm256_cmpeq_epi32(cat32, v_three));
+                __m256 payoff = _mm256_setzero_ps();
+                payoff = _mm256_blendv_ps(payoff, vwin,  m_win);
+                payoff = _mm256_blendv_ps(payoff, vlose, m_lose);
+                payoff = _mm256_blendv_ps(payoff, vtie,  m_tie);
+                acc = _mm256_fmadd_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(opp_reach_w_array[t] + i),
+                                  _mm256_loadu_ps(valid_row + i)),
+                    payoff, acc);
+            }
+
+            float sum = hsum256(acc);
+            for (std::size_t k = i; k < n; ++k) {
+                const uint8_t cat = cat_row[k];
+                if (cat == 0) continue;
+                float p;
+                if      (cat == 1) p = win_p_array[t];
+                else if (cat == 2) p = lose_p_array[t];
+                else               p = tie_p_array[t];
+                sum += opp_reach_w_array[t][k] * valid_row[k] * p;
+            }
+            out_array[t][c] = sum;
+        }
+    }
+}
+
 // v1.8.2 Phase 2 (kernel-level batching). Processes M terminals in a single
 // kernel call, all sharing the same matchup table. Key restructuring:
 //
@@ -1462,6 +1622,14 @@ static void showdown_oop_full_batch(
         return;
     }
 
+    showdown_oop_full_batch_tiled4(
+        category_matrix, valid_matrix, n, num_terminals,
+        opp_reach_w_array, skip_mask, out_array,
+        win_p_array, lose_p_array, tie_p_array,
+        c_lo, c_hi);
+    return;
+
+#if 0
     // Per-terminal broadcasts hoisted out of the c/i loops. 32-byte aligned
     // so we can _mm256_load_ps from them directly.
     alignas(32) float vwin_buf [kMaxBatch * 8];
@@ -1543,6 +1711,7 @@ static void showdown_oop_full_batch(
             out_array[t][c] = sum;
         }
     }
+#endif
 }
 
 static void showdown_oop_signed_count_zero_rake_8row_no_skip(

@@ -398,6 +398,15 @@ private:
     /// Phase 1 chance-enumeration: per-runout matchup tables. Indexed by
     /// FlatGameTree.matchup_idx[node]. Entry [0] mirrors matchup_ev_.
     std::vector<std::vector<float>> matchup_ev_per_runout_;
+
+    /// CPU-postsolve-only fused product ev·valid (4B/cell), built in
+    /// precompute_matchups when a postsolve pass will run and the host budget
+    /// allows. Empty ⇒ fall back to reading matchup_ev × matchup_valid (8B).
+    /// Halves showdown read bandwidth on the bandwidth-bound best-response
+    /// probe path. NOT uploaded to GPU and never read by the CFR matchup_ev
+    /// path (which sign-thresholds ev) — so it can't perturb iteration or GPU
+    /// results; parity is value-based and still holds.
+    std::vector<std::vector<float>> matchup_ev_valid_per_runout_;
     std::vector<std::vector<float>> matchup_valid_per_runout_;
     std::vector<std::vector<uint8_t>> matchup_category_per_runout_;
     std::vector<std::vector<float>> matchup_showdown_coeff_per_runout_;
@@ -804,12 +813,21 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
 
     // Step 5: run DCFR iterations through backend
     //
-    // v1.3.0: stop conditions, in priority order each iteration:
-    //   1. time_budget — wall-clock exceeds time_budget_seconds (NEW)
-    //   2. iter_cap    — hit max_iterations (legacy default)
-    // (exploit-target early-stop is on the v1.4.0 roadmap — needs per-iter
-    // compute_exploitability which is expensive, would need a cheaper
-    // approximation to sample at every check interval.)
+    // Stop conditions, in priority order each iteration:
+    //   1. time_budget     — wall-clock exceeds time_budget_seconds
+    //   2. exploit_target  — running-average exploitability <= target,
+    //                        sampled every exploitability_check_interval iters
+    //                        (only when target_exploitability > 0)
+    //   3. iter_cap        — hit max_iterations
+    //
+    // The exploit_target check finalizes a NON-DESTRUCTIVE snapshot of the
+    // running-average strategy and runs best-response on it: CpuBackend
+    // finalize() writes only the separate strategy_ buffer (regrets_ /
+    // strategy_sum_ / current_strategy_ untouched), and GpuBackend regenerates
+    // current_strategy from regrets at the start of every iterate(), so
+    // sampling mid-loop never perturbs CFR state. Gated on
+    // target_exploitability > 0 — parity tests set it to 0 to force a fixed
+    // iteration count and disable interim checks.
     //
     // CFR is anytime — the strategy at any iter N is the running average,
     // useful even if we stop early. So time_budget=300 gives the user
@@ -818,6 +836,29 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     stage_start = Clock::now();
     std::string early_stop_reason;
     const int exp_check_interval = std::max(1, config_.exploitability_check_interval);
+    const bool exploit_early_stop =
+        config_.compute_exploitability && config_.target_exploitability > 0.0f;
+    // Adaptive cadence: each exploitability check pays a full best-response
+    // postsolve pass (hundreds of ms on turn/river trees — measured 352ms on
+    // an 8-core box, ~167 CFR iters' worth). A fixed every-N-iters cadence
+    // over-probes: when one probe costs as much as ~167 iterations, probing
+    // every 50 iters spends most of the solve inside best-response passes, and
+    // overshooting the target by a few dozen iters (cheap, and yields a
+    // *better* strategy) is far cheaper than an extra probe.
+    //
+    // So the cadence self-calibrates: first probe at `exp_check_interval` to
+    // measure the probe cost, then the next probe is scheduled no sooner than
+    // ~2× the probe-cost-in-iters away (and coarser still while far from
+    // target). This is bounded below by `exp_check_interval`, so it can never
+    // probe MORE often than the old fixed cadence — on slow-per-iter spots
+    // (deep river) where a probe is cheap relative to an iteration, it falls
+    // back to the base interval automatically. We still only ever STOP on a
+    // measured cross, so coarser probing never stops early — it just stops
+    // *checking* so wastefully. next_exp_check holds the 1-based iteration
+    // (== t+1) at which the next probe is allowed to fire.
+    int next_exp_check = exp_check_interval;
+    double exploit_probe_overhead_ms = 0.0;  // cumulative probe cost, to back
+                                             // it out of the per-iter estimate
     const auto iter_start = Clock::now();
     for (int t = 0; t < config_.max_iterations; ++t) {
         backend_->iterate(t);
@@ -839,6 +880,54 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
                 }
                 break;
             }
+        }
+
+        // Exploit-target early-stop: sample running-average exploitability
+        // every check interval and stop once it meets the declared target.
+        // Skipped on the final iteration (the postsolve pass computes it
+        // anyway). finalize() here is a measurement-only snapshot — see the
+        // non-destructiveness note above the loop.
+        if (exploit_early_stop &&
+            (t + 1) >= next_exp_check &&
+            (t + 1) < config_.max_iterations) {
+            const auto probe_start = Clock::now();
+            backend_->finalize();
+            strategy_ = backend_->strategy();
+            solved_ = true;
+            const float exploit_pct = compute_exploitability();
+            const auto probe_end = Clock::now();
+            const float target_pct = config_.target_exploitability * 100.0f;
+            if (exploit_pct <= target_pct) {
+                early_stop_reason = "exploit_target";
+                exploitability_pct_ = exploit_pct;
+                if (progress_cb) {
+                    progress_cb(t + 1, exploit_pct,
+                                elapsed_since(start_time, Clock::now()));
+                }
+                break;
+            }
+            // Self-calibrating cadence. probe_ms is what this best-response
+            // pass cost; per_iter_ms is the clean CFR cost (total iteration
+            // wall-time so far minus the probe overhead we've accumulated,
+            // divided by iters done). Schedule the next probe ~2× the
+            // probe-cost-in-iters out, so probe overhead stays a modest
+            // fraction of the segment it covers, and coarsen further while far
+            // from target (we clearly aren't about to stop). Floored at the
+            // base interval, capped at 16× to keep latency bounded.
+            const double probe_ms = elapsed_since(probe_start, probe_end);
+            exploit_probe_overhead_ms += probe_ms;
+            const double clean_iter_ms = std::max(1e-3,
+                static_cast<double>(elapsed_since(iter_start, probe_end))
+                    - exploit_probe_overhead_ms);
+            const double per_iter_ms =
+                clean_iter_ms / static_cast<double>(t + 1);
+            int stride = static_cast<int>(2.0 * probe_ms / per_iter_ms);
+            const float ratio = (target_pct > 0.0f)
+                ? (exploit_pct / target_pct) : 1.0f;
+            if (ratio > 4.0f) stride *= 2;
+            stride = std::min(std::max(stride, exp_check_interval),
+                              exp_check_interval * 16);
+            next_exp_check = (t + 1) + stride;
         }
 
         // v1.4.1: progress callback fires EVERY iter so the UI progress bar
@@ -891,11 +980,25 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     stage_end = Clock::now();
     timing.finalize_ms = elapsed_since(stage_start, stage_end);
 
+    // When the solve early-stopped on the exploitability target, the final
+    // interim probe already computed the exact best-response exploitability on
+    // THIS strategy: no iterate() runs after the probe, finalize() is
+    // deterministic, and apply_node_locks() — the only post-probe step that can
+    // perturb strategy_ — is a no-op without resolved locks. So in the
+    // lock-free target-reached case the final best-response pass would just
+    // recompute a number we already hold. Skip it (and let combo_evs run
+    // uncontended), reusing the probe's exploitability_pct_. Saves a full
+    // best-response pass (~150-300ms on turn/river) on every such solve.
+    const bool exploit_from_probe =
+        (early_stop_reason == "exploit_target") && resolved_locks_.empty();
+    const bool need_final_exploit =
+        config_.compute_exploitability && !exploit_from_probe;
+
     // Step 7: optional post-solve CPU passes (EV + exploitability)
     stage_start = Clock::now();
     if (config_.parallel_postsolve &&
         config_.compute_combo_evs &&
-        config_.compute_exploitability) {
+        need_final_exploit) {
         auto ev_future = std::async(std::launch::async, [&]() {
             auto pass_start = Clock::now();
             compute_combo_evs();
@@ -923,14 +1026,16 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             ev_.assign(iso_.num_canonical, 0.0f);
         }
 
-        if (config_.compute_exploitability) {
+        if (need_final_exploit) {
             auto pass_start = Clock::now();
             exploitability_pct_ = compute_exploitability();
             auto pass_end = Clock::now();
             timing.exploitability_ms = elapsed_since(pass_start, pass_end);
-        } else {
+        } else if (!config_.compute_exploitability) {
             exploitability_pct_ = 0.0f;
         }
+        // else: exploit_from_probe — keep the probe's exploitability_pct_;
+        // timing.exploitability_ms stays 0 (no recompute happened).
     }
     stage_end = Clock::now();
     timing.postsolve_ms = elapsed_since(stage_start, stage_end);
@@ -941,6 +1046,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     result.exploitability_pct  = exploitability_pct_;
     result.combo_evs_computed  = config_.compute_combo_evs;
     result.exploitability_computed = config_.compute_exploitability;
+    result.runout_approximated = tree_.runout_approximated;
     result.early_stop_reason   = early_stop_reason;
     result.action_labels       = get_action_labels_at(0);
     result.global_strategy     = extract_global_strategy_at(0);
@@ -1509,6 +1615,34 @@ inline void Solver::precompute_matchups() {
         matchup_showdown_count_.clear();
         matchup_original_ranks_.assign(NUM_COMBOS, UINT16_MAX);
     }
+
+    // Fused ev·valid for the CPU best-response showdown (see member doc). Built
+    // only when a postsolve pass will run and the extra fused bytes fit inside
+    // the same host budget that already bounds the matchup tables; otherwise
+    // left empty so postsolve transparently falls back to the unfused read.
+    matchup_ev_valid_per_runout_.clear();
+    const bool postsolve_will_run =
+        config_.compute_exploitability || config_.compute_combo_evs;
+    if (postsolve_will_run && !matchup_ev_per_runout_.empty()) {
+        const size_t ntab = matchup_ev_per_runout_.size();
+        const uint64_t fused_total =
+            static_cast<uint64_t>(ntab) * nc * nc * sizeof(float);
+        const uint64_t tables_total =
+            static_cast<uint64_t>(ntab) * per_table_bytes;
+        if (tables_total + fused_total <= matchup_byte_cap) {
+            matchup_ev_valid_per_runout_.resize(ntab);
+            #if defined(_OPENMP)
+            #pragma omp parallel for schedule(dynamic, 1)
+            #endif
+            for (int64_t t = 0; t < static_cast<int64_t>(ntab); ++t) {
+                const auto& ev = matchup_ev_per_runout_[static_cast<size_t>(t)];
+                const auto& va = matchup_valid_per_runout_[static_cast<size_t>(t)];
+                auto& evxv = matchup_ev_valid_per_runout_[static_cast<size_t>(t)];
+                evxv.resize(ev.size());
+                for (size_t i = 0; i < ev.size(); ++i) evxv[i] = ev[i] * va[i];
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1587,6 +1721,13 @@ inline std::vector<float> Solver::cpu_ev_traverse(
             ? matchup_ev_per_runout_[mi] : matchup_ev_;
         const auto& m_valid = (mi >= 0 && static_cast<size_t>(mi) < matchup_valid_per_runout_.size())
             ? matchup_valid_per_runout_[mi] : matchup_valid_;
+        // Fused ev·valid fast path (half the showdown read bytes); see the
+        // matching block in cpu_best_response_traverse. nullptr ⇒ unfused.
+        const float* evxv = (!matchup_ev_valid_per_runout_.empty() &&
+                             mi >= 0 &&
+                             static_cast<size_t>(mi) < matchup_ev_valid_per_runout_.size() &&
+                             !matchup_ev_valid_per_runout_[mi].empty())
+            ? matchup_ev_valid_per_runout_[mi].data() : nullptr;
 
         if (tt == TerminalType::SHOWDOWN) {
             if (perspective == 0) {
@@ -1601,31 +1742,58 @@ inline std::vector<float> Solver::cpu_ev_traverse(
                     config_.postsolve_threads,
                     [&](uint32_t cidx) {
                         uint16_t c = static_cast<uint16_t>(cidx);
+                        const size_t base = static_cast<size_t>(c) * nc;
                         float val = 0.0f;
-                        for (uint16_t cj = 0; cj < nc; ++cj) {
-                            size_t idx = static_cast<size_t>(c) * nc + cj;
-                            val += weighted_ip[cj] * m_ev[idx] * m_valid[idx];
+                        if (evxv) {
+                            const float* row = evxv + base;
+                            for (uint16_t cj = 0; cj < nc; ++cj)
+                                val += weighted_ip[cj] * row[cj];
+                        } else {
+                            for (uint16_t cj = 0; cj < nc; ++cj)
+                                val += weighted_ip[cj] * m_ev[base + cj] * m_valid[base + cj];
                         }
                         values[c] = val * half_pot;
                     });
             } else {
+                // IP traverser: values[c] = Σ_ci weighted_oop[ci] · (−m_ev[ci,c]) · m_valid[ci,c].
+                // The natural loop fixes c and sweeps ci, so m_ev[ci*nc + c] is
+                // COLUMN-strided — a fresh cache line on nearly every one of the
+                // nc² accesses. Restructure into a row-major accumulate: stream
+                // each matrix row ci contiguously, scaled by its (negated)
+                // reach, into the output. Parallelize over disjoint output
+                // blocks (writes never collide) and skip zero-reach rows
+                // (sparse ranges). Same result up to float add order; ~16× less
+                // cache-line traffic and the inner loop vectorizes.
                 std::vector<float> weighted_oop(nc, 0.0f);
                 for (uint16_t ci = 0; ci < nc; ++ci) {
                     weighted_oop[ci] = reach_oop[ci] *
                         static_cast<float>(iso_.canonical_weights[ci]);
                 }
+                constexpr uint32_t blk = 32;
+                const uint32_t nblocks = (static_cast<uint32_t>(nc) + blk - 1) / blk;
                 detail::postsolve_parallel_for(
-                    static_cast<uint32_t>(nc),
+                    nblocks,
                     config_.parallel_postsolve,
                     config_.postsolve_threads,
-                    [&](uint32_t cidx) {
-                        uint16_t c = static_cast<uint16_t>(cidx);
-                        float val = 0.0f;
+                    [&](uint32_t b) {
+                        const uint32_t c0 = b * blk;
+                        const uint32_t c1 = std::min<uint32_t>(nc, c0 + blk);
                         for (uint16_t ci = 0; ci < nc; ++ci) {
-                            size_t idx = static_cast<size_t>(ci) * nc + c;
-                            val += weighted_oop[ci] * (-m_ev[idx]) * m_valid[idx];
+                            float s = weighted_oop[ci];
+                            if (s == 0.0f) continue;
+                            s *= half_pot;
+                            const size_t base = static_cast<size_t>(ci) * nc;
+                            if (evxv) {
+                                const float* row = evxv + base;
+                                for (uint32_t c = c0; c < c1; ++c)
+                                    values[c] -= s * row[c];
+                            } else {
+                                const float* ev_row = &m_ev[base];
+                                const float* va_row = &m_valid[base];
+                                for (uint32_t c = c0; c < c1; ++c)
+                                    values[c] -= s * ev_row[c] * va_row[c];
+                            }
                         }
-                        values[c] = val * half_pot;
                     });
             }
         } else {
@@ -1656,23 +1824,34 @@ inline std::vector<float> Solver::cpu_ev_traverse(
                         values[c] = sign * gain * opp_total;
                     });
             } else {
+                // IP traverser fold terminal: values[c] = sign·gain·Σ_ci
+                // weighted_oop[ci]·m_valid[ci,c]. Same column-stride problem as
+                // the showdown branch — restructure to a row-major accumulate
+                // over disjoint output blocks with a zero-reach skip.
                 std::vector<float> weighted_oop(nc, 0.0f);
                 for (uint16_t ci = 0; ci < nc; ++ci) {
                     weighted_oop[ci] = reach_oop[ci] *
                         static_cast<float>(iso_.canonical_weights[ci]);
                 }
+                const float sg = sign * gain;
+                constexpr uint32_t blk = 32;
+                const uint32_t nblocks = (static_cast<uint32_t>(nc) + blk - 1) / blk;
                 detail::postsolve_parallel_for(
-                    static_cast<uint32_t>(nc),
+                    nblocks,
                     config_.parallel_postsolve,
                     config_.postsolve_threads,
-                    [&](uint32_t cidx) {
-                        uint16_t c = static_cast<uint16_t>(cidx);
-                        float opp_total = 0.0f;
+                    [&](uint32_t b) {
+                        const uint32_t c0 = b * blk;
+                        const uint32_t c1 = std::min<uint32_t>(nc, c0 + blk);
                         for (uint16_t ci = 0; ci < nc; ++ci) {
-                            size_t idx = static_cast<size_t>(ci) * nc + c;
-                            opp_total += weighted_oop[ci] * m_valid[idx];
+                            float s = weighted_oop[ci];
+                            if (s == 0.0f) continue;
+                            s *= sg;
+                            const float* va_row = &m_valid[static_cast<size_t>(ci) * nc];
+                            for (uint32_t c = c0; c < c1; ++c) {
+                                values[c] += s * va_row[c];
+                            }
                         }
-                        values[c] = sign * gain * opp_total;
                     });
             }
         }
@@ -1794,6 +1973,14 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
             ? matchup_ev_per_runout_[mi] : matchup_ev_;
         const auto& m_valid = (mi >= 0 && static_cast<size_t>(mi) < matchup_valid_per_runout_.size())
             ? matchup_valid_per_runout_[mi] : matchup_valid_;
+        // Fused ev·valid fast path: when precompute built it (postsolve + budget
+        // ok), the showdown reads one 4B/cell matrix instead of ev+valid (8B) —
+        // halves the bandwidth on this memory-bound pass. nullptr ⇒ unfused.
+        const float* evxv = (!matchup_ev_valid_per_runout_.empty() &&
+                             mi >= 0 &&
+                             static_cast<size_t>(mi) < matchup_ev_valid_per_runout_.size() &&
+                             !matchup_ev_valid_per_runout_[mi].empty())
+            ? matchup_ev_valid_per_runout_[mi].data() : nullptr;
 
         if (tt == TerminalType::SHOWDOWN) {
             if (player == 0) {
@@ -1808,31 +1995,58 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
                     config_.postsolve_threads,
                     [&](uint32_t cidx) {
                         uint16_t c = static_cast<uint16_t>(cidx);
+                        const size_t base = static_cast<size_t>(c) * nc;
                         float val = 0.0f;
-                        for (uint16_t cj = 0; cj < nc; ++cj) {
-                            size_t idx = static_cast<size_t>(c) * nc + cj;
-                            val += weighted_ip[cj] * m_ev[idx] * m_valid[idx];
+                        if (evxv) {
+                            const float* row = evxv + base;
+                            for (uint16_t cj = 0; cj < nc; ++cj)
+                                val += weighted_ip[cj] * row[cj];
+                        } else {
+                            for (uint16_t cj = 0; cj < nc; ++cj)
+                                val += weighted_ip[cj] * m_ev[base + cj] * m_valid[base + cj];
                         }
                         values[c] = val * half_pot;
                     });
             } else {
+                // IP traverser: values[c] = Σ_ci weighted_oop[ci] · (−m_ev[ci,c]) · m_valid[ci,c].
+                // The natural loop fixes c and sweeps ci, so m_ev[ci*nc + c] is
+                // COLUMN-strided — a fresh cache line on nearly every one of the
+                // nc² accesses. Restructure into a row-major accumulate: stream
+                // each matrix row ci contiguously, scaled by its (negated)
+                // reach, into the output. Parallelize over disjoint output
+                // blocks (writes never collide) and skip zero-reach rows
+                // (sparse ranges). Same result up to float add order; ~16× less
+                // cache-line traffic and the inner loop vectorizes.
                 std::vector<float> weighted_oop(nc, 0.0f);
                 for (uint16_t ci = 0; ci < nc; ++ci) {
                     weighted_oop[ci] = reach_oop[ci] *
                         static_cast<float>(iso_.canonical_weights[ci]);
                 }
+                constexpr uint32_t blk = 32;
+                const uint32_t nblocks = (static_cast<uint32_t>(nc) + blk - 1) / blk;
                 detail::postsolve_parallel_for(
-                    static_cast<uint32_t>(nc),
+                    nblocks,
                     config_.parallel_postsolve,
                     config_.postsolve_threads,
-                    [&](uint32_t cidx) {
-                        uint16_t c = static_cast<uint16_t>(cidx);
-                        float val = 0.0f;
+                    [&](uint32_t b) {
+                        const uint32_t c0 = b * blk;
+                        const uint32_t c1 = std::min<uint32_t>(nc, c0 + blk);
                         for (uint16_t ci = 0; ci < nc; ++ci) {
-                            size_t idx = static_cast<size_t>(ci) * nc + c;
-                            val += weighted_oop[ci] * (-m_ev[idx]) * m_valid[idx];
+                            float s = weighted_oop[ci];
+                            if (s == 0.0f) continue;
+                            s *= half_pot;
+                            const size_t base = static_cast<size_t>(ci) * nc;
+                            if (evxv) {
+                                const float* row = evxv + base;
+                                for (uint32_t c = c0; c < c1; ++c)
+                                    values[c] -= s * row[c];
+                            } else {
+                                const float* ev_row = &m_ev[base];
+                                const float* va_row = &m_valid[base];
+                                for (uint32_t c = c0; c < c1; ++c)
+                                    values[c] -= s * ev_row[c] * va_row[c];
+                            }
                         }
-                        values[c] = val * half_pot;
                     });
             }
         } else {
@@ -1863,23 +2077,34 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
                         values[c] = sign * gain * opp_total;
                     });
             } else {
+                // IP traverser fold terminal: values[c] = sign·gain·Σ_ci
+                // weighted_oop[ci]·m_valid[ci,c]. Same column-stride problem as
+                // the showdown branch — restructure to a row-major accumulate
+                // over disjoint output blocks with a zero-reach skip.
                 std::vector<float> weighted_oop(nc, 0.0f);
                 for (uint16_t ci = 0; ci < nc; ++ci) {
                     weighted_oop[ci] = reach_oop[ci] *
                         static_cast<float>(iso_.canonical_weights[ci]);
                 }
+                const float sg = sign * gain;
+                constexpr uint32_t blk = 32;
+                const uint32_t nblocks = (static_cast<uint32_t>(nc) + blk - 1) / blk;
                 detail::postsolve_parallel_for(
-                    static_cast<uint32_t>(nc),
+                    nblocks,
                     config_.parallel_postsolve,
                     config_.postsolve_threads,
-                    [&](uint32_t cidx) {
-                        uint16_t c = static_cast<uint16_t>(cidx);
-                        float opp_total = 0.0f;
+                    [&](uint32_t b) {
+                        const uint32_t c0 = b * blk;
+                        const uint32_t c1 = std::min<uint32_t>(nc, c0 + blk);
                         for (uint16_t ci = 0; ci < nc; ++ci) {
-                            size_t idx = static_cast<size_t>(ci) * nc + c;
-                            opp_total += weighted_oop[ci] * m_valid[idx];
+                            float s = weighted_oop[ci];
+                            if (s == 0.0f) continue;
+                            s *= sg;
+                            const float* va_row = &m_valid[static_cast<size_t>(ci) * nc];
+                            for (uint32_t c = c0; c < c1; ++c) {
+                                values[c] += s * va_row[c];
+                            }
                         }
-                        values[c] = sign * gain * opp_total;
                     });
             }
         }

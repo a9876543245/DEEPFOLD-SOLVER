@@ -152,6 +152,12 @@ struct FlatGameTree {
     uint32_t total_nodes = 0;
     uint32_t total_edges = 0;
 
+    /// True when a flop chance node hit the single-child runout fallback
+    /// (memory gate): turn/river were solved on the stale flop matchup, so
+    /// per-runout equity is approximated. Surfaced to the result/UI as a
+    /// warning instead of degrading silently.
+    bool runout_approximated = false;
+
     void reserve(uint32_t est_nodes, uint32_t est_edges) {
         node_types.reserve(est_nodes);
         pots.reserve(est_nodes);
@@ -246,7 +252,19 @@ struct SolverConfig {
         STANDARD = 0,
         POSTFLOP_STYLE = 1,
     };
-    DcfrSchedule dcfr_schedule = DcfrSchedule::STANDARD;
+    // Default POSTFLOP_STYLE (2026-06-25): converges ~3-4× faster to a given
+    // exploitability than STANDARD (flop reaches 0.5% in ~900 iters vs STANDARD
+    // ~4000) and to less-mixed, more PIO-like equilibria. The cross-backend
+    // parity "failure" that looked like a blocker was diagnosed (bisection) as
+    // BENIGN: POSTFLOP's sharp convergence is float-sensitive in the early
+    // iterations, so on sparse ranges the reference and levelized backends take
+    // transiently-different trajectories that RECONVERGE (medium-sparse AhKh EV
+    // 86.0/78.6 at 60 iters → 60.0/60.2 at 2000, both exploit ~0.3%). Not a
+    // logic bug — both backends are correct CFR implementations. The strict
+    // bit-exact parity fixtures are pinned to STANDARD (where exact match is the
+    // right gate); test_parity_postflop_convergence covers POSTFLOP. Pass
+    // --dcfr-schedule standard to restore textbook accumulative DCFR.
+    DcfrSchedule dcfr_schedule = DcfrSchedule::POSTFLOP_STYLE;
 
     // Cash-game rake. Applied at every fold/showdown terminal:
     //   rake = min(pot_at_terminal * rake_rate, rake_cap)
@@ -314,6 +332,12 @@ struct SolverConfig {
     /// Surfaced as `--cpu-persistent-omp 0|1`. Reverted to default if
     /// paired-benchmark measurement doesn't show a clean win.
     bool cpu_persistent_omp = true;  ///< Production default; CLI can pass 0 for A/B.
+
+    /// Experimental: force the persistent-OMP backend to batch OOP level-0
+    /// showdown terminals through the full category/valid matrix kernel.
+    /// Default off because rank-blocker / signed-count terminal shortcuts are
+    /// usually faster when available; this exists for controlled A/B profiling.
+    bool cpu_showdown_batch = false;
 
     /// Sprint 1 (market-beating plan): the host RAM / GPU VRAM / JSON /
     /// strategy-tree budget that gates every large allocation in the solve
@@ -608,6 +632,12 @@ struct SolverResult {
     float exploitability_pct = 0.0f;
     bool combo_evs_computed = false;
     bool exploitability_computed = false;
+
+    /// True when the flop runout enumeration collapsed to the single-child
+    /// fallback (memory gate) → turn/river equity is approximated from the
+    /// stale flop matchup. The UI shows a warning so the solve isn't trusted
+    /// as exact on later streets.
+    bool runout_approximated = false;
 
     /// v1.3.0: why did the iteration loop stop?
     ///   "iter_cap"        — hit max_iterations (full run)

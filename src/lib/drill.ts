@@ -1,21 +1,19 @@
 /**
  * Drill scenario generation and scoring engine.
  *
- * Generates random GTO quiz scenarios from preflop ranges + random boards,
- * scores user answers against the correct mixed strategy, and tracks session
- * results.
+ * Generates GTO quiz scenarios from REAL pre-solved spots (bundled solutions in
+ * the Tauri app; a clearly-flagged heuristic demo only when no bundle exists or
+ * in browser mode), and scores the user's chosen action against the solved
+ * strategy's frequency for that action.
+ *
+ * Scoring is GTO-frequency match, not EV-loss: the engine emits per-combo node
+ * EV but not per-action EV, so true EV-loss isn't computable from the current
+ * output. Each scenario carries `isDemo`/`source` so the UI can label honestly.
  */
 
-import {
-  GRID_LABELS,
-  parseBoardCards,
-  getHandStrength,
-  RANK_VALUES,
-  SUITS,
-  RANKS,
-} from './poker';
 import type { ComboStrategy } from './poker';
-import { MATCHUPS, parseRange } from './ranges';
+import { MATCHUPS } from './ranges';
+import { getBundledOrDemo, BOARD_TEMPLATES } from './presolvedSpots';
 
 // ============================================================================
 // Types
@@ -25,11 +23,15 @@ export interface DrillScenario {
   id: number;
   board: string;
   matchupLabel: string;
-  heroPosition: string; // 'IP' or 'OOP'
+  heroPosition: string; // Always 'OOP' — pre-solved root is the OOP flop decision
   heroCombo: string; // Grid label like "AKs"
   correctStrategy: ComboStrategy;
   availableActions: string[];
   boardTexture: string;
+  /** True if the strategy is the heuristic demo, not a real solve. */
+  isDemo: boolean;
+  /** Provenance of the strategy: 'bundled' | 'live' | 'demo'. */
+  source?: 'bundled' | 'live' | 'demo';
 }
 
 export interface DrillResult {
@@ -48,197 +50,58 @@ export interface DrillSession {
 }
 
 // ============================================================================
-// Board generation
-// ============================================================================
-
-/** Generate a random 3-card flop from the 52-card deck. */
-export function generateRandomBoard(): string {
-  const deck: string[] = [];
-  for (const r of RANKS) {
-    for (const s of SUITS) {
-      deck.push(`${r}${s}`);
-    }
-  }
-
-  // Fisher-Yates partial shuffle — pick 3
-  for (let i = deck.length - 1; i > deck.length - 4; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [deck[i], deck[j]] = [deck[j], deck[i]];
-  }
-
-  return deck[deck.length - 1] + deck[deck.length - 2] + deck[deck.length - 3];
-}
-
-// ============================================================================
-// Board texture classification
-// ============================================================================
-
-/** Classify the texture of a 3-card board. */
-export function classifyBoardTexture(board: string): string {
-  const cards = parseBoardCards(board);
-  const ranks = cards.map((c) => RANK_VALUES[c[0]] || 0).sort((a, b) => b - a);
-  const suits = cards.map((c) => c[1]);
-
-  const tags: string[] = [];
-
-  // Suit analysis
-  const suitCounts: Record<string, number> = {};
-  for (const s of suits) {
-    suitCounts[s] = (suitCounts[s] || 0) + 1;
-  }
-  const maxSuitCount = Math.max(...Object.values(suitCounts));
-  if (maxSuitCount === 3) {
-    tags.push('Monotone');
-  }
-
-  // Paired board
-  const rankSet = new Set(ranks);
-  if (rankSet.size < ranks.length) {
-    tags.push('Paired');
-  }
-
-  // Connectedness: check if any two cards are within 2 gaps
-  const connected =
-    Math.abs(ranks[0] - ranks[1]) <= 2 ||
-    Math.abs(ranks[1] - ranks[2]) <= 2 ||
-    Math.abs(ranks[0] - ranks[2]) <= 2;
-
-  if (maxSuitCount === 2 && connected) {
-    tags.push('Wet');
-  }
-
-  // High / Low
-  if (ranks[0] >= RANK_VALUES['Q']) {
-    tags.push('High');
-  } else if (ranks[0] <= RANK_VALUES['9']) {
-    tags.push('Low');
-  }
-
-  if (tags.length === 0) {
-    return 'Dry';
-  }
-
-  return tags.join(' / ');
-}
-
-// ============================================================================
-// Contextual strategy generation (simplified copy from useSolver.ts)
-// ============================================================================
-
-/**
- * Produce a mixed strategy for a given hand strength.
- * This is a simplified version of the contextualStrategy function in useSolver.ts.
- * Only handles the 'none' facing-action case (initial action on flop).
- */
-function contextualStrategy(strength: number, idx: number): ComboStrategy {
-  const noise = Math.sin(idx * 137.5) * 0.08;
-
-  if (strength > 0.85) {
-    return {
-      Check: 0.15 + noise * 0.5,
-      'Bet 33%': 0.2,
-      'Bet 75%': 0.5 - noise * 0.3,
-      'All-in': 0.15,
-    };
-  } else if (strength > 0.65) {
-    return {
-      Check: 0.1,
-      'Bet 33%': 0.55 + noise,
-      'Bet 75%': 0.3 - noise,
-      'All-in': 0.05,
-    };
-  } else if (strength > 0.45) {
-    return {
-      Check: 0.55 + noise,
-      'Bet 33%': 0.35 - noise,
-      'Bet 75%': 0.08,
-      'All-in': 0.02,
-    };
-  } else if (strength > 0.25) {
-    return {
-      Check: 0.72 + noise,
-      'Bet 33%': 0.18 - noise * 0.5,
-      'Bet 75%': 0.08,
-      'All-in': 0.02,
-    };
-  } else {
-    return {
-      Check: 0.65,
-      'Bet 33%': 0.15 + noise,
-      'Bet 75%': 0.12 - noise,
-      'All-in': 0.08,
-    };
-  }
-}
-
-// ============================================================================
 // Scenario generation
 // ============================================================================
 
-/** Generate a single drill scenario. */
-export function generateDrillScenario(id: number): DrillScenario {
-  // 1. Random matchup
-  const matchup = MATCHUPS[Math.floor(Math.random() * MATCHUPS.length)];
+/**
+ * Generate a single drill scenario from a real pre-solved spot.
+ *
+ * The pre-solved bundle covers the OOP flop root decision, so the hero is OOP
+ * and the correct strategy is the solver's actual mixed strategy for the picked
+ * combo. Falls back to the heuristic demo spot (flagged via `isDemo`) only when
+ * no bundle is available (browser mode / missing bundle).
+ */
+export async function generateDrillScenario(id: number): Promise<DrillScenario> {
+  const matchupIdx = Math.floor(Math.random() * MATCHUPS.length);
+  const boardIdx = Math.floor(Math.random() * BOARD_TEMPLATES.length);
+  const matchup = MATCHUPS[matchupIdx];
 
-  // 2. Random board
-  const board = generateRandomBoard();
-  const boardTexture = classifyBoardTexture(board);
+  const spot = await getBundledOrDemo(matchupIdx, boardIdx);
 
-  // 3. Pick hero side (IP or OOP)
-  const isHeroIP = Math.random() < 0.5;
-  const heroPosition = isHeroIP ? 'IP' : 'OOP';
-  const heroRangeStr = isHeroIP ? matchup.ipRange : matchup.oopRange;
+  // Only quiz combos that actually have a solved strategy at this node.
+  const comboLabels = Object.keys(spot.comboStrategies).filter((label) => {
+    const s = spot.comboStrategies[label];
+    return s && Object.values(s).some((f) => f > 0.005);
+  });
+  const heroCombo =
+    comboLabels.length > 0
+      ? comboLabels[Math.floor(Math.random() * comboLabels.length)]
+      : 'AKs';
 
-  // 4. Parse range and pick a random combo weighted by frequency
-  const parsedRange = parseRange(heroRangeStr);
-  const entries = Object.entries(parsedRange).filter(([, freq]) => freq > 0.05);
+  const correctStrategy = spot.comboStrategies[heroCombo] ?? {};
 
-  if (entries.length === 0) {
-    // Fallback: use first matchup entry
-    entries.push(['AKs', 1.0]);
-  }
-
-  // Weighted random selection
-  const totalWeight = entries.reduce((sum, [, freq]) => sum + freq, 0);
-  let roll = Math.random() * totalWeight;
-  let heroCombo = entries[0][0];
-  for (const [combo, freq] of entries) {
-    roll -= freq;
-    if (roll <= 0) {
-      heroCombo = combo;
-      break;
-    }
-  }
-
-  // 5. Generate strategy for the chosen combo
-  const boardCards = parseBoardCards(board);
-  const boardRanks = boardCards
-    .map((c) => c[0])
-    .sort((a, b) => (RANK_VALUES[b] || 0) - (RANK_VALUES[a] || 0));
-  const strength = getHandStrength(heroCombo, boardRanks);
-  const strategy = contextualStrategy(strength, id * 31 + heroCombo.charCodeAt(0));
-
-  // Normalize strategy to sum to 1
-  const total = Object.values(strategy).reduce((s, v) => s + v, 0);
-  const normalized: ComboStrategy = {};
-  for (const [action, freq] of Object.entries(strategy)) {
-    normalized[action] = freq / total;
-  }
-
-  // 6. Extract available actions (freq > 1%)
-  const availableActions = Object.entries(normalized)
-    .filter(([, freq]) => freq > 0.01)
-    .map(([action]) => action);
+  // Offer the node's full action menu (from the aggregate strategy), not just
+  // the actions this combo happens to take — otherwise the menu leaks the
+  // answer. Fall back to the combo's own actions if the aggregate is empty.
+  const menu = Object.keys(spot.globalStrategy);
+  const availableActions =
+    menu.length > 0
+      ? menu
+      : Object.entries(correctStrategy)
+          .filter(([, freq]) => freq > 0.01)
+          .map(([action]) => action);
 
   return {
     id,
-    board,
+    board: spot.board,
     matchupLabel: `${matchup.oop} vs ${matchup.ip} (${matchup.potType})`,
-    heroPosition,
+    heroPosition: 'OOP',
     heroCombo,
-    correctStrategy: normalized,
+    correctStrategy,
     availableActions,
-    boardTexture,
+    boardTexture: spot.boardTexture,
+    isDemo: spot.isDemo,
+    source: spot.source,
   };
 }
 
@@ -246,7 +109,7 @@ export function generateDrillScenario(id: number): DrillScenario {
 // Scoring
 // ============================================================================
 
-/** Score a user's answer against the correct strategy. */
+/** Score a user's answer against the solved strategy's action frequencies. */
 export function scoreDrillAnswer(
   userAction: string,
   correctStrategy: ComboStrategy,
@@ -296,11 +159,10 @@ export function scoreDrillAnswer(
 // ============================================================================
 
 /** Create a new drill session with the given number of scenarios. */
-export function createDrillSession(count: number = 10): DrillSession {
-  const scenarios: DrillScenario[] = [];
-  for (let i = 0; i < count; i++) {
-    scenarios.push(generateDrillScenario(i));
-  }
+export async function createDrillSession(count: number = 10): Promise<DrillSession> {
+  const scenarios = await Promise.all(
+    Array.from({ length: count }, (_, i) => generateDrillScenario(i)),
+  );
 
   return {
     scenarios,

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { X, RotateCcw, ArrowRight, Trophy, CheckCircle, AlertTriangle } from 'lucide-react';
+import { X, RotateCcw, ArrowRight, Trophy, CheckCircle, AlertTriangle, Loader2 } from 'lucide-react';
 import { SUIT_SYMBOLS, SUIT_COLORS, RANK_VALUES, getActionColor } from '../lib/poker';
 import type { Suit } from '../lib/poker';
 import { parseBoardCards } from '../lib/poker';
@@ -226,9 +226,13 @@ export function DrillMode({ onClose }: Props) {
   const [scoreAnim, setScoreAnim] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // --- Initialize session ---
+  // --- Initialize session (async: loads real pre-solved spots) ---
   useEffect(() => {
-    setSession(createDrillSession(SCENARIO_COUNT));
+    let cancelled = false;
+    createDrillSession(SCENARIO_COUNT).then((s) => {
+      if (!cancelled) setSession(s);
+    });
+    return () => { cancelled = true; };
   }, []);
 
   // --- Timer ---
@@ -291,15 +295,41 @@ export function DrillMode({ onClose }: Props) {
   }, [session]);
 
   const handleRestart = useCallback(() => {
-    setSession(createDrillSession(SCENARIO_COUNT));
+    setSession(null);               // show the loading screen while re-solving
     setPhase('question');
     setSelectedAction(null);
     setCurrentResult(null);
     setTimer(0);
+    createDrillSession(SCENARIO_COUNT).then(setSession);
   }, []);
 
   // --- Render guards ---
-  if (!session) return null;
+  if (!session) {
+    return (
+      <div style={{
+        position: 'fixed', inset: 0, zIndex: 200,
+        background: 'var(--color-bg-primary)',
+        display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center', gap: 16,
+      }}>
+        <button
+          onClick={onClose}
+          aria-label="Close"
+          style={{
+            position: 'absolute', top: 16, right: 20,
+            background: 'transparent', border: 'none',
+            color: 'var(--color-text-tertiary)', cursor: 'pointer',
+          }}
+        >
+          <X size={20} />
+        </button>
+        <Loader2 size={32} style={{ animation: 'spin 1s linear infinite', color: 'var(--color-accent)' }} />
+        <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--color-text-secondary)' }}>
+          Loading solved spots…
+        </div>
+      </div>
+    );
+  }
 
   const scenario = session.scenarios[session.currentIndex];
   const boardCards = parseBoardCards(scenario.board);
@@ -368,6 +398,21 @@ export function DrillMode({ onClose }: Props) {
             color: 'var(--color-text-tertiary)',
           }}>
             {scenario.boardTexture}
+          </span>
+          <span
+            title={scenario.isDemo
+              ? 'Heuristic demo strategy — no bundled solve for this spot (browser mode or missing bundle).'
+              : 'Real solver output (bundled GTO solution).'}
+            style={{
+              padding: '2px 10px',
+              borderRadius: 6,
+              background: scenario.isDemo ? 'rgba(255,159,10,0.15)' : 'rgba(48,209,88,0.15)',
+              color: scenario.isDemo ? 'var(--color-orange)' : '#30D158',
+              fontSize: 11,
+              fontWeight: 700,
+              letterSpacing: '0.5px',
+            }}>
+            {scenario.isDemo ? 'DEMO' : 'GTO'}
           </span>
         </div>
       </div>

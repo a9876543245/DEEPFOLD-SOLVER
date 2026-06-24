@@ -29,6 +29,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <initializer_list>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -95,6 +96,11 @@ static SolverConfig make_parity_config() {
     config.max_iterations = 60;
     config.target_exploitability = 0.0f;       // run all 60 iters, no early stop
     config.exploitability_check_interval = 1000;  // disable interim checks
+    // Pin the STANDARD schedule: these fixtures assert BIT-EXACT cross-backend
+    // match, which only holds for STANDARD. POSTFLOP_STYLE (the production
+    // default) is float-sensitive early and is covered separately by
+    // test_parity_postflop_convergence.
+    config.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
     return config;
 }
 
@@ -308,6 +314,7 @@ static void test_parity_river_no_chance() {
         sc.max_iterations = 130;
         sc.target_exploitability = 0.0f;
         sc.exploitability_check_interval = 1000;
+        sc.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
         return sc;
     };
 
@@ -351,6 +358,7 @@ static void test_parity_flop_limited_sizing() {
         sc.max_iterations = 100;
         sc.target_exploitability = 0.0f;
         sc.exploitability_check_interval = 1000;
+        sc.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
         // Constrain to a single sizing on flop (skip turn/river — board is
         // 3-card so they're not in the tree anyway). Smaller branching →
         // strategy converges faster, tolerance can tighten.
@@ -394,6 +402,26 @@ static void test_parity_flop_limited_sizing() {
 // just need ref vs lvl agreement to gate against drift).
 // ----------------------------------------------------------------------------
 
+static void apply_uniform_grid_labels(
+    SolverConfig& sc,
+    std::initializer_list<const char*> labels)
+{
+    sc.has_custom_ranges = true;
+    sc.oop_range_weights.fill(0.0f);
+    sc.ip_range_weights.fill(0.0f);
+    const auto& combo_table = get_combo_table();
+    for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+        const std::string grid = combo_to_grid_label(combo_table[i]);
+        for (const char* label : labels) {
+            if (grid == label) {
+                sc.oop_range_weights[i] = 1.0f;
+                sc.ip_range_weights[i]  = 1.0f;
+                break;
+            }
+        }
+    }
+}
+
 static void test_parity_narrow_range_skip() {
     auto& eval = get_evaluator();
     eval.initialize();
@@ -409,24 +437,13 @@ static void test_parity_narrow_range_skip() {
         sc.max_iterations = 60;
         sc.target_exploitability = 0.0f;
         sc.exploitability_check_interval = 1000;
+        sc.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
 
         // Narrow ranges — set most combos to 0 weight so the skip mask
         // fires on the bulk of the canonical-combo space.
-        sc.has_custom_ranges = true;
-        sc.oop_range_weights.fill(0.0f);
-        sc.ip_range_weights.fill(0.0f);
-        const auto& combo_table = get_combo_table();
-        auto in = [&](const std::string& label) {
-            for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
-                if (combo_to_grid_label(combo_table[i]) == label) {
-                    sc.oop_range_weights[i] = 1.0f;
-                    sc.ip_range_weights[i]  = 1.0f;
-                }
-            }
-        };
-        for (auto& l : { std::string("AA"), std::string("KK"), std::string("QQ"),
-                         std::string("JJ"), std::string("TT"), std::string("AKs"),
-                         std::string("AKo") }) in(l);
+        apply_uniform_grid_labels(sc, {
+            "AA", "KK", "QQ", "JJ", "TT", "AKs", "AKo"
+        });
         return sc;
     };
 
@@ -453,6 +470,123 @@ static void test_parity_narrow_range_skip() {
     auto m_ref = strategy_map(r_ref.global_strategy);
     auto m_lvl = strategy_map(r_lvl.global_strategy);
     assert_strategy_close(m_ref, m_lvl, 0.5f, "narrow range ref vs levelized");
+}
+
+static void test_parity_medium_sparse_range() {
+    auto& eval = get_evaluator();
+    eval.initialize();
+    cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+
+    auto make_cfg = []() {
+        SolverConfig sc;
+        sc.pot = 100.0f;
+        sc.effective_stack = 500.0f;
+        sc.board_size = 3;
+        auto board = parse_board("AsKd7c");
+        for (size_t i = 0; i < 3; ++i) sc.board[i] = board[i];
+        sc.max_iterations = 60;
+        sc.target_exploitability = 0.0f;
+        sc.exploitability_check_interval = 1000;
+        sc.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
+
+        // Active-list should fire here, but sparse traversal should not.
+        apply_uniform_grid_labels(sc, {
+            "AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66",
+            "55", "44", "33", "22",
+            "AKs", "AQs", "AJs", "ATs", "A9s", "A8s", "A7s", "A6s",
+            "A5s", "A4s", "A3s", "A2s",
+            "KQs", "KJs", "KTs", "QJs", "QTs", "JTs", "T9s", "98s", "87s",
+            "AKo", "AQo", "AJo", "KQo"
+        });
+        return sc;
+    };
+
+    auto cfg_ref = make_cfg();
+    cfg_ref.cpu_backend_kind = SolverConfig::CpuBackendKind::REFERENCE;
+    Solver s_ref(cfg_ref);
+    auto r_ref = s_ref.solve();
+    auto akh_ref = s_ref.analyze_combo("AhKh");
+
+    auto cfg_lvl = make_cfg();
+    cfg_lvl.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
+    Solver s_lvl(cfg_lvl);
+    auto r_lvl = s_lvl.solve();
+    auto akh_lvl = s_lvl.analyze_combo("AhKh");
+
+    std::cout << "  medium sparse ref  exploit=" << r_ref.exploitability_pct
+              << "%  AhKh ev=" << akh_ref.ev << "\n";
+    std::cout << "  medium sparse lvl  exploit=" << r_lvl.exploitability_pct
+              << "%  AhKh ev=" << akh_lvl.ev << "\n";
+
+    assert_near(akh_ref.ev, akh_lvl.ev, 0.05f,
+                "medium sparse: AhKh EV must match within 0.05 chip");
+
+    auto m_ref = strategy_map(r_ref.global_strategy);
+    auto m_lvl = strategy_map(r_lvl.global_strategy);
+    assert_strategy_close(m_ref, m_lvl, 0.5f,
+                          "medium sparse ref vs levelized");
+}
+
+// POSTFLOP_STYLE convergence parity. Unlike STANDARD, the postflop schedule
+// converges to sharp, less-mixed equilibria and is float-sensitive in the early
+// iterations: on sparse ranges the reference and levelized backends take
+// transiently-different trajectories that RECONVERGE. So the strict bit-exact
+// match used for STANDARD (test_parity_*_range above, pinned to STANDARD) is the
+// wrong gate here — it would flag benign early-iter drift. Instead we assert the
+// property that actually matters: under POSTFLOP both backends reach the SAME
+// low-exploitability equilibrium. Verified 2026-06-25 on this fixture: AhKh EV
+// ref/lvl was 86.0/78.6 at 60 iters but 60.0/60.2 at 2000 iters (both exploit
+// ~0.3%). We solve to 600 iters where both have clearly reconverged.
+static void test_parity_postflop_convergence() {
+    auto& eval = get_evaluator();
+    eval.initialize();
+    cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+
+    auto make_cfg = []() {
+        SolverConfig sc;
+        sc.pot = 100.0f;
+        sc.effective_stack = 500.0f;
+        sc.board_size = 3;
+        auto board = parse_board("AsKd7c");
+        for (size_t i = 0; i < 3; ++i) sc.board[i] = board[i];
+        sc.max_iterations = 600;
+        sc.target_exploitability = 0.0f;
+        sc.exploitability_check_interval = 1000000;
+        sc.dcfr_schedule = SolverConfig::DcfrSchedule::POSTFLOP_STYLE;
+        apply_uniform_grid_labels(sc, {
+            "AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66",
+            "55", "44", "33", "22",
+            "AKs", "AQs", "AJs", "ATs", "A9s", "A8s", "A7s", "A6s",
+            "A5s", "A4s", "A3s", "A2s",
+            "KQs", "KJs", "KTs", "QJs", "QTs", "JTs", "T9s", "98s", "87s",
+            "AKo", "AQo", "AJo", "KQo"
+        });
+        return sc;
+    };
+
+    auto cr = make_cfg();
+    cr.cpu_backend_kind = SolverConfig::CpuBackendKind::REFERENCE;
+    Solver sr(cr);
+    auto rr = sr.solve();
+    auto ar = sr.analyze_combo("AhKh");
+
+    auto cl = make_cfg();
+    cl.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
+    Solver sl(cl);
+    auto rl = sl.solve();
+    auto al = sl.analyze_combo("AhKh");
+
+    std::cout << "  postflop ref  exploit=" << rr.exploitability_pct
+              << "%  AhKh ev=" << ar.ev << "\n";
+    std::cout << "  postflop lvl  exploit=" << rl.exploitability_pct
+              << "%  AhKh ev=" << al.ev << "\n";
+
+    assert_near(rr.exploitability_pct, 0.0f, 2.0f,
+                "postflop: reference must converge (exploit <= 2%)");
+    assert_near(rl.exploitability_pct, 0.0f, 2.0f,
+                "postflop: levelized must converge (exploit <= 2%)");
+    assert_near(ar.ev, al.ev, 2.0f,
+                "postflop: converged AhKh EV must match within 2 chips");
 }
 
 // ----------------------------------------------------------------------------
@@ -485,6 +619,7 @@ static void test_parity_persistent_omp_toggle() {
         sc.max_iterations = 60;
         sc.target_exploitability = 0.0f;
         sc.exploitability_check_interval = 1000;
+        sc.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
         sc.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
         sc.cpu_threads = 4;        // multi-thread to actually exercise the diff
         sc.cpu_persistent_omp = persistent;
@@ -552,11 +687,13 @@ int main(int argc, char* argv[]) {
         RUN_TEST(test_parity_persistent_omp_toggle);
         RUN_TEST(test_parity_river_no_chance);
         RUN_TEST(test_parity_narrow_range_skip);
+        RUN_TEST(test_parity_medium_sparse_range);
     }
     if (suite == "extended" || suite == "all") {
         RUN_TEST(test_parity_scalar_vs_avx2);
         RUN_TEST(test_parity_levelized_thread_cap);
         RUN_TEST(test_parity_flop_limited_sizing);
+        RUN_TEST(test_parity_postflop_convergence);
     }
 
     std::cout << "=== " << g_tests_passed << " / " << g_tests_run

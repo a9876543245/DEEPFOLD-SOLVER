@@ -88,7 +88,8 @@ struct CLIArgs {
     bool parallel_postsolve = true;
     uint32_t postsolve_threads = 0;
     bool force_cpu_postsolve = false;  // skip GPU postsolve fast path
-    std::string dcfr_schedule = "standard";  // "standard" | "postflop"
+    std::string dcfr_schedule = "postflop";  // "standard" | "postflop" — postflop
+                                             // converges ~3-4× faster (2026-06-25)
     float rake_rate = 0.0f;
     float rake_cap  = 0.0f;
 
@@ -109,6 +110,7 @@ struct CLIArgs {
     // forward / backward passes. Default 1 for production CPU solves; pass
     // 0 to A/B against the old per-level parallel-region path.
     int cpu_persistent_omp = 1;
+    int cpu_showdown_batch = 0;
 
     // Sprint 1 (market-beating plan): per-solve memory budget overrides.
     // Default 0 = use the SolverConfig defaults (6 GB host, 100 MB JSON,
@@ -259,6 +261,9 @@ CLIArgs parse_args(int argc, char* argv[]) {
         } else if (arg == "--cpu-persistent-omp" && i + 1 < argc) {
             std::string v = argv[++i];
             args.cpu_persistent_omp = (v == "1" || v == "true" || v == "True") ? 1 : 0;
+        } else if (arg == "--cpu-showdown-batch" && i + 1 < argc) {
+            std::string v = argv[++i];
+            args.cpu_showdown_batch = (v == "1" || v == "true" || v == "True") ? 1 : 0;
         } else if (arg == "--include-scalar") {
             args.include_scalar = 1;
         } else if (arg == "--benchmark-case" && i + 1 < argc) {
@@ -292,7 +297,9 @@ Arguments:
   --history <string>       Action history, e.g. "Check,Bet33" (optional)
   --target <string>        Target combo to analyze, e.g. "AhKh" (optional)
   --iterations <int>       Max DCFR iterations (default: 500)
-  --exploitability <float> Target exploitability % (default: 0.5)
+  --exploitability <float> Target exploitability % of pot; the solve stops early
+                           once the running-average reaches it (default: 0.5,
+                           checked every 50 iters; 0 = run all iterations)
   --backend <string>       Execution backend: auto | cpu | gpu (default: auto)
   --postsolve <string>     Reporting pass: full | ev | exploitability | none
   --fast-postsolve         Alias for --postsolve none
@@ -335,6 +342,9 @@ Arguments:
                            Levelized only. Wraps forward_pass / backward_pass in
                            a single `omp parallel` region per pass instead of
                            one per level. Default 1; use 0 only for A/B profiling.
+  --cpu-showdown-batch <0|1>
+                           Experimental levelized CPU A/B knob. Default 0.
+                           Forces OOP level-0 showdown group batching when 1.
   --help, -h               Show this help message
 
 Output:
@@ -662,6 +672,11 @@ std::string result_to_json(
          << (result.combo_evs_computed ? "true" : "false") << ",\n";
     json << "  \"exploitability_computed\": "
          << (result.exploitability_computed ? "true" : "false") << ",\n";
+    // Loud warning: flop runout collapsed to the stale-equity fallback, so
+    // turn/river equity is approximated. UI surfaces this so the solve isn't
+    // trusted as exact on later streets.
+    json << "  \"runout_approximated\": "
+         << (result.runout_approximated ? "true" : "false") << ",\n";
     json << "  \"timing\": {\n";
     json << std::setprecision(3);
     json << "    \"tree_build_ms\": " << result.timing.tree_build_ms << ",\n";
@@ -1494,6 +1509,7 @@ int main(int argc, char* argv[]) {
         // explicit --cpu-persistent-omp 1 enables it.
         // Production default is on; --cpu-persistent-omp 0 keeps an A/B escape hatch.
         config.cpu_persistent_omp = (args.cpu_persistent_omp != 0);
+        config.cpu_showdown_batch = (args.cpu_showdown_batch != 0);
 
         // v1.4.0 Phase 2: apply --cpu-simd policy. set_policy() is idempotent
         // and re-resolves the kernel table on next call to kernels(). Done

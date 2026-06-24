@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "deepsolver-app"
-version = "1.8.5"
+version = "1.8.7"
 dependencies = [
  "axum",
  "base64 0.22.1",

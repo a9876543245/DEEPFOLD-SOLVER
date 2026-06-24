@@ -13,6 +13,7 @@ import { useSolver } from './hooks/useSolver';
 import type { SolverRequest, NodeLock, ComboAnalysis, GameContext, MemoryProfile, SolveMode } from './lib/poker';
 import { getHandStrength, RANK_VALUES, SOLVE_MODE_PRESETS } from './lib/poker';
 import type { Position, PositionMatchup } from './lib/ranges';
+import { derivePotStack } from './lib/ranges';
 import { createRootNode, takeAction, dealCard, BET_SIZINGS } from './lib/gameTree';
 import type { GameTreeNode, GameAction, ActionStep } from './lib/gameTree';
 import { RangeEditorModal } from './components/RangeEditorModal';
@@ -96,17 +97,20 @@ function App() {
     gameContext, setCustomIpRange, setCustomOopRange);
 
   // When the user changes the effective stack via GameContextSelector,
-  // sync pot + chip stack so the solver tree builds at the right depth.
-  // pot defaults: SRP ≈ 2.5bb, 3BET ≈ 22bb (matches MATCHUPS defaults).
-  // 1 BB = 10 chips (matches existing convention in MATCHUPS).
+  // re-derive pot+stack from the *currently selected matchup* (not from a
+  // hard-coded 5.5bb/22bb table). This preserves position-pair-specific
+  // pot values — BTN vs BB 3BP and SB vs BB 3BP have different pot sizes
+  // and the matchup data already knows that.
+  //
+  // No matchup selected → no auto-derivation; leave the manual defaults
+  // (pot=100, stack=500) alone so the user can still solve a free spot
+  // without picking a matchup first.
   useEffect(() => {
-    if (gameContext.effectiveBB == null) return;
-    const newStackChips = gameContext.effectiveBB * 10;
-    const isThreeBet = selectedMatchup?.potType === '3BET';
-    const newPotChips = (isThreeBet ? 22 : 5.5) * 10;
-    setStack(newStackChips);
-    setPot(Math.round(newPotChips));
-  }, [gameContext.effectiveBB, selectedMatchup?.potType]);
+    if (gameContext.effectiveBB == null || !selectedMatchup) return;
+    const { potChips, stackChips } = derivePotStack(selectedMatchup, gameContext.effectiveBB);
+    setPot(potChips);
+    setStack(stackChips);
+  }, [gameContext.effectiveBB, selectedMatchup]);
 
   // Off-range combo cache state — actual sync useEffect lives below the
   // useSolver() call so it can read `result` without TDZ issues.
@@ -201,13 +205,15 @@ function App() {
     return customOopRange ?? selectedMatchup.oopRange;
   }, [selectedMatchup, heroPosition, customIpRange, customOopRange]);
 
-  // Auto-set pot/stack from matchup defaults
+  // Auto-set pot/stack from matchup defaults, scaled to the current
+  // effective stack depth (falls back to 100BB if the GameContext has no
+  // stack pinned — same as the matchup's encoded default).
   const handleMatchupChange = useCallback((matchup: PositionMatchup, heroPos: Position) => {
     setSelectedMatchup(matchup);
     setHeroPosition(heroPos);
-    // Apply default pot sizing from matchup (convert from bb to chips)
-    setPot(Math.round(matchup.defaultPot * 10));
-    setStack(Math.round(matchup.defaultStack * 10));
+    const { potChips, stackChips } = derivePotStack(matchup, gameContext.effectiveBB ?? 100);
+    setPot(potChips);
+    setStack(stackChips);
     // Reset tree on matchup change
     setCurrentNode(null);
     setHasSolved(false);
@@ -217,7 +223,7 @@ function App() {
     setCustomOopRange(null);
     setNodeLocks([]);
     reset();
-  }, [reset]);
+  }, [reset, gameContext.effectiveBB]);
 
   // Build solver request for given node context
   const buildRequest = useCallback((boardStr: string, actionPath?: ActionStep[], nodePot?: number, nodeStack?: number): SolverRequest => {
@@ -401,6 +407,49 @@ function App() {
       solve(buildRequest(navBoard, node.path, node.pot, node.effectiveStack));
     }
   }, [pot, stack, flopBoard, turnCard, riverCard, currentNode, loading, solve, navigate, pathToHistory, buildRequest, sizingKey]);
+
+  // Minimal keyboard study layer: ←/Backspace steps back one node along the
+  // line, 1-9 takes the Nth action at the current node (walk the line without
+  // the mouse), S = strategy-mix grid, E = EV grid. Ignored while typing in a
+  // field, while any modal owns the screen, or while a solve is in flight.
+  // (Forward redo is a follow-up — it needs a redo stack.)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const tgt = e.target as HTMLElement | null;
+      if (tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'TEXTAREA' || tgt.isContentEditable)) return;
+      if (showGuide || showSpotLibrary || showDrill || gtoBrowserOpen || editingRange || editingNodeLock) return;
+      if (loading) return;
+
+      // 1-9 → take the Nth available action at the current node.
+      if (e.key >= '1' && e.key <= '9') {
+        const idx = e.key.charCodeAt(0) - '1'.charCodeAt(0);
+        if (currentNode && !currentNode.isTerminal && idx < currentNode.actions.length) {
+          e.preventDefault();
+          handleAction(currentNode.actions[idx]);
+        }
+        return;
+      }
+
+      switch (e.key) {
+        case 'ArrowLeft':
+        case 'Backspace':
+          if (currentNode && currentNode.path.length > 0) {
+            e.preventDefault();
+            handleNavigate(currentNode.path.length - 2);
+          }
+          break;
+        case 's': case 'S':
+          setGridMode('mix');
+          break;
+        case 'e': case 'E':
+          setGridMode('ev');
+          break;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [currentNode, handleNavigate, handleAction, loading, showGuide, showSpotLibrary, showDrill, gtoBrowserOpen, editingRange, editingNodeLock]);
 
   // Click on a combo cell
   // In-range: instant local lookup from existing solve result
@@ -708,6 +757,7 @@ function App() {
           onSolve={handleSolve} loading={loading}
           sizingKey={sizingKey} onSizingChange={setSizingKey}
           memoryProfile={memoryProfile} onMemoryProfileChange={setMemoryProfile}
+          expectedEffectiveBB={gameContext.effectiveBB}
           solveMode={solveMode}
           onSolveModeChange={(m) => {
             // v1.3.0: changing mode resets iter cap to the preset, but the

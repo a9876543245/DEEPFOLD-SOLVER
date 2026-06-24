@@ -2449,6 +2449,37 @@ inline void LevelizedCpuBackend::backward_pass(int traverser) {
     };
 
 #if defined(_OPENMP)
+    const bool force_showdown_batch =
+        ctx_.config != nullptr && ctx_.config->cpu_showdown_batch;
+    const bool showdown_batch_shortcuts_clear =
+        !use_rank_blocker_showdown_for_traverser(0)
+        && !use_active_rank_blocker_showdown_for_traverser(0)
+        && !use_signed_coeff_showdown_for_traverser(0);
+    const bool persistent_oop_showdown_batch =
+        traverser == 0
+        && !sparse_value
+        && !block_value
+        && !sparse_opp_reach
+        && !showdowns_by_table_.empty()
+        && max_showdown_group_size_ >= 4
+        && (force_showdown_batch || showdown_batch_shortcuts_clear);
+
+    auto is_persistent_batched_showdown = [&](uint32_t n) -> bool {
+        if (!persistent_oop_showdown_batch) return false;
+        if (static_cast<NodeType>(tree.node_types[n]) != NodeType::TERMINAL) {
+            return false;
+        }
+        if (static_cast<TerminalType>(tree.terminal_types[n])
+            != TerminalType::SHOWDOWN) {
+            return false;
+        }
+        const int32_t mi = (n < tree.matchup_idx.size())
+            ? tree.matchup_idx[n] : -1;
+        return mi >= 0
+            && static_cast<std::size_t>(mi) < showdowns_by_table_.size()
+            && showdowns_by_table_[static_cast<std::size_t>(mi)].size() >= 4;
+    };
+
     // v1.8.0 Sprint 3: persistent OMP team variant. Same
     // structural argument as forward_pass ??single fork wraps the
     // level loop, implicit barrier between `omp for` iterations
@@ -2461,11 +2492,103 @@ inline void LevelizedCpuBackend::backward_pass(int traverser) {
             for (uint32_t L = 0; L < num_levels_; ++L) {
                 const uint32_t lo = level_offsets_[L];
                 const uint32_t hi = level_offsets_[L + 1];
+
+                if (persistent_oop_showdown_batch && L == 0) {
+                    for (const auto& group : showdowns_by_table_) {
+                        const std::size_t M = group.size();
+                        if (M < 4) continue;
+
+                        const int32_t mi = (group[0] < tree.matchup_idx.size())
+                            ? tree.matchup_idx[group[0]] : 0;
+                        const auto& matchup_valid_table =
+                            (ctx_.matchup_valid_per_runout && mi >= 0 &&
+                             static_cast<std::size_t>(mi) < ctx_.matchup_valid_per_runout->size())
+                                ? (*ctx_.matchup_valid_per_runout)[mi]
+                                : *ctx_.matchup_valid;
+                        const auto& matchup_category_table =
+                            (ctx_.matchup_category_per_runout && mi >= 0 &&
+                             static_cast<std::size_t>(mi) < ctx_.matchup_category_per_runout->size())
+                                ? (*ctx_.matchup_category_per_runout)[mi]
+                                : *ctx_.matchup_category;
+                        const float* valid_ptr = matchup_valid_table.data();
+                        const uint8_t* cat_ptr = matchup_category_table.data();
+                        const uint8_t* skip_mask = oop_has_out_of_range_
+                            ? oop_out_of_range_mask_.data()
+                            : nullptr;
+
+                        #pragma omp for schedule(static)
+                        for (int64_t ti = 0; ti < static_cast<int64_t>(M); ++ti) {
+                            const std::size_t t = static_cast<std::size_t>(ti);
+                            const uint32_t n = group[t];
+                            batch_reach_ptrs_[t] = batch_opp_reach_w_.data()
+                                + t * static_cast<std::size_t>(ctx_.iso->num_canonical);
+                            batch_out_ptrs_[t] = &value_[row_off(n)];
+
+                            const float pot_total = tree.pots[n];
+                            float rake = std::min(
+                                pot_total * ctx_.config->rake_rate,
+                                ctx_.config->rake_cap);
+                            if (rake < 0.0f) rake = 0.0f;
+                            const float half_pot = pot_total * 0.5f;
+                            batch_win_payoff_[t] = half_pot - rake;
+                            batch_lose_payoff_[t] = -half_pot;
+                            batch_tie_payoff_[t] = -0.5f * rake;
+
+                            float* opp_w_buf = batch_opp_reach_w_.data()
+                                + t * static_cast<std::size_t>(ctx_.iso->num_canonical);
+                            const float* opp_reach = &reach_ip_[row_off(n)];
+                            cpu_simd::vec_copy(
+                                opp_w_buf, opp_reach, ctx_.iso->num_canonical);
+                            cpu_simd::vec_mul_in_place(
+                                opp_w_buf,
+                                canonical_weights_f_.data(),
+                                ctx_.iso->num_canonical);
+                        }
+
+                        const int tid = omp_get_thread_num();
+                        const int nthr = omp_get_num_threads();
+                        const std::size_t nc_sz =
+                            static_cast<std::size_t>(ctx_.iso->num_canonical);
+                        const std::size_t c_lo = (nc_sz * static_cast<std::size_t>(tid))
+                            / static_cast<std::size_t>(nthr);
+                        const std::size_t c_hi = (nc_sz * static_cast<std::size_t>(tid + 1))
+                            / static_cast<std::size_t>(nthr);
+                        const double _bg_t0 = omp_get_wtime();
+                        cpu_simd::showdown_oop_full_batch(
+                            cat_ptr, valid_ptr, nc_sz, M,
+                            batch_reach_ptrs_.data(), skip_mask, batch_out_ptrs_.data(),
+                            batch_win_payoff_.data(), batch_lose_payoff_.data(),
+                            batch_tie_payoff_.data(), c_lo, c_hi);
+                        const double _bg_dt = omp_get_wtime() - _bg_t0;
+                        const uint32_t safe_tid =
+                            (tid < 0 || static_cast<uint32_t>(tid) >= cpu_threads_effective_)
+                                ? 0u : static_cast<uint32_t>(tid);
+                        showdown_acc_per_thread_[safe_tid] += _bg_dt;
+
+                        if (row_stride_ > ctx_.iso->num_canonical) {
+                            #pragma omp for schedule(static)
+                            for (int64_t ti = 0; ti < static_cast<int64_t>(M); ++ti) {
+                                const std::size_t t = static_cast<std::size_t>(ti);
+                                std::fill(
+                                    batch_out_ptrs_[t] + ctx_.iso->num_canonical,
+                                    batch_out_ptrs_[t] + row_stride_,
+                                    0.0f);
+                            }
+                        } else {
+                            #pragma omp barrier
+                        }
+                    }
+                }
+
                 #pragma omp for schedule(dynamic, 8)
                 for (int64_t idx = static_cast<int64_t>(lo);
                      idx < static_cast<int64_t>(hi); ++idx)
                 {
-                    process_node(node_order_[static_cast<std::size_t>(idx)]);
+                    const uint32_t n = node_order_[static_cast<std::size_t>(idx)];
+                    if (L == 0 && is_persistent_batched_showdown(n)) {
+                        continue;
+                    }
+                    process_node(n);
                 }
                 // implicit barrier here is required for level dependency
             }

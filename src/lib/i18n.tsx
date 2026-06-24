@@ -115,6 +115,17 @@ const dict: Dict = {
   'config': { en: 'Configuration', zh: '設定', ja: '設定' },
   'config.potSize': { en: 'Pot Size', zh: '底池大小', ja: 'ポットサイズ' },
   'config.effStack': { en: 'Effective Stack', zh: '有效籌碼', ja: '有効スタック' },
+  'config.spr': { en: 'SPR', zh: 'SPR', ja: 'SPR' },
+  'config.stackDeviation.soft': {
+    en: '⚠ Stack differs from {bb}BB by >20% — preflop range may be off.',
+    zh: '⚠ 籌碼偏離 {bb}BB 超過 20%,preflop 範圍可能失準。',
+    ja: '⚠ スタックが {bb}BB から 20% 以上ずれています。プリフロップレンジが不正確な可能性。',
+  },
+  'config.stackDeviation.strong': {
+    en: '⚠ Stack differs from {bb}BB by >40% — switch to a chart matching this depth.',
+    zh: '⚠ 籌碼偏離 {bb}BB 超過 40%,建議切換到對應碼量的 chart。',
+    ja: '⚠ スタックが {bb}BB から 40% 以上ずれています。該当する深さのチャートに切替推奨。',
+  },
   'config.betSizing': { en: 'Bet Sizing', zh: '下注尺寸', ja: 'ベットサイジング' },
   'config.lite': { en: 'Lite', zh: '輕量', ja: 'ライト' },
   'config.standard': { en: 'Standard', zh: '標準', ja: 'スタンダード' },

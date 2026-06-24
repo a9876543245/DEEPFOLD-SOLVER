@@ -289,6 +289,14 @@ if(BUILD_TESTS)
             /W4 /O2 /EHsc /arch:AVX2)
     endif()
 
+    add_executable(bench_showdown_batch
+        tests/bench_showdown_batch.cpp
+        ${CPU_KERNEL_SOURCES})
+    target_include_directories(bench_showdown_batch PRIVATE include)
+    if(MSVC)
+        target_compile_options(bench_showdown_batch PRIVATE /W4 /O2 /EHsc)
+    endif()
+
     # ----------------------------------------------------------------
     # Smoke-via-CLI: tiny solves that exercise the new memory-budget
     # surface end-to-end. Each runs in well under 10 seconds.

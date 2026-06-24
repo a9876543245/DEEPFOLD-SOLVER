@@ -9,7 +9,7 @@ import { RunoutReportModal } from './RunoutReportModal';
 import { ComboDrillPanel } from './ComboDrillPanel';
 import { SolveQualityBadge } from './SolveQualityBadge';
 
-import { Lock, BarChart3, Layers } from 'lucide-react';
+import { Lock, BarChart3, Layers, AlertTriangle } from 'lucide-react';
 
 interface Props {
   result: SolverResponse | null;
@@ -253,6 +253,22 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
             />
           </div>
         </div>
+        {result.runout_approximated && (
+          <div style={{
+            display: 'flex', alignItems: 'flex-start', gap: 8,
+            padding: '8px 10px', borderRadius: 'var(--radius-sm)',
+            background: 'rgba(255,159,10,0.12)',
+            border: '1px solid rgba(255,159,10,0.35)',
+            color: 'var(--color-orange)', fontSize: 11, lineHeight: 1.4,
+          }}>
+            <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+            <span>
+              Turn/river equity is <b>approximated</b> — this flop was too large to
+              enumerate every runout within the memory budget, so later streets reuse
+              the flop matchup. Raise the memory budget for an exact multi-street solve.
+            </span>
+          </div>
+        )}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
           <div style={{ background: 'var(--color-bg-tertiary)', borderRadius: 'var(--radius-sm)', padding: '6px 10px' }}>
             <div style={{ fontSize: 10, color: 'var(--color-text-tertiary)' }}>{t('panel.iterations')}</div>
@@ -366,16 +382,24 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
             Renders only when strategy_tree contains enumerated turn runouts
             for the current history. Counts >= 2 to skip the trivial single-
             child fallback case (rainbow flop). */}
-        {runoutAggregateCount >= 2 && (
+        {(() => {
+          const runoutEnabled = runoutAggregateCount >= 2;
+          return (
           <button
             type="button"
-            onClick={() => setShowRunoutReport(true)}
+            onClick={() => { if (runoutEnabled) setShowRunoutReport(true); }}
+            disabled={!runoutEnabled}
+            title={runoutEnabled
+              ? `Aggregate strategy across ${runoutAggregateCount} enumerated turn runouts`
+              : 'Only one turn runout class for this line (e.g. a rainbow flop) — nothing to aggregate yet. Pick a board with more turn diversity, or raise the memory budget so more runouts are enumerated.'}
             style={{
               marginTop: 10, padding: '8px 12px',
               border: '1px solid var(--color-glass-border)',
               borderRadius: 8, background: 'var(--color-glass)',
               color: 'var(--color-text-primary)',
-              cursor: 'pointer', fontSize: 12, fontWeight: 600,
+              cursor: runoutEnabled ? 'pointer' : 'not-allowed',
+              opacity: runoutEnabled ? 1 : 0.5,
+              fontSize: 12, fontWeight: 600,
               display: 'flex', alignItems: 'center', gap: 8,
               width: '100%', justifyContent: 'center',
             }}
@@ -388,10 +412,11 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
               fontSize: 10, fontWeight: 700,
               color: 'var(--color-text-secondary)',
             }}>
-              {runoutAggregateCount} turns
+              {runoutEnabled ? `${runoutAggregateCount} turns` : 'n/a'}
             </span>
           </button>
-        )}
+          );
+        })()}
 
         {/* 1326 Combo Drill — Day 3.
             Renders whenever the solve produced per-class strategies. Default
