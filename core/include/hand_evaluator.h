@@ -98,6 +98,11 @@ public:
     /// Get the hash-based table for GPU upload
     const uint16_t* get_hash_table() const { return hash_table_.data(); }
 
+    /// Get the parallel key table (prime products) for GPU upload. Required so
+    /// the device-side probe can verify it landed on the right slot instead of
+    /// returning the first non-empty one (which corrupts colliding hands).
+    const uint32_t* get_hash_keys() const { return hash_keys_.data(); }
+
     /// Sizes for GPU memory allocation
     static constexpr size_t FLUSH_TABLE_SIZE = 8192;
     static constexpr size_t UNIQUE5_TABLE_SIZE = 8192;
@@ -114,6 +119,13 @@ private:
 
     /// General hash lookup: indexed by prime product hash for remaining cases
     std::array<uint16_t, HASH_TABLE_SIZE> hash_table_{};
+
+    /// Prime-product key stored at each occupied hash slot. Open addressing
+    /// without a stored key cannot tell two colliding hands apart — 197 of the
+    /// 4888 paired-hand prime products collide mod HASH_TABLE_SIZE, so the
+    /// keyless probe silently returned a *different* hand's rank. We verify
+    /// this key on every probe.
+    std::array<uint32_t, HASH_TABLE_SIZE> hash_keys_{};
 
     /// Helper: generate the rank bitmask for a card
     static uint16_t rank_bit(Card c) { return 1u << card_rank(c); }

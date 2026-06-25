@@ -47,13 +47,19 @@ __device__ uint16_t d_unique5_table[8192];
 /// Hash lookup table
 __device__ uint16_t d_hash_table[65536];
 
+/// Parallel key table (prime products) for verified probing. Without it the
+/// device probe returns the first non-empty slot, aliasing colliding hands.
+__device__ uint32_t d_hash_keys[65536];
+
 /// Upload lookup tables from host to device __device__ arrays
 void upload_eval_tables(const uint16_t* flush_table,
                         const uint16_t* unique5_table,
-                        const uint16_t* hash_table) {
+                        const uint16_t* hash_table,
+                        const uint32_t* hash_keys) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_flush_table,  flush_table,   8192  * sizeof(uint16_t)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_unique5_table, unique5_table, 8192  * sizeof(uint16_t)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_hash_table,   hash_table,    65536 * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_hash_keys,    hash_keys,     65536 * sizeof(uint32_t)));
 }
 
 /// Device-side 5-card evaluation
@@ -77,7 +83,10 @@ __device__ __forceinline__ uint16_t d_evaluate5(
                   d_rank_primes[c4 / 4];
 
     uint32_t idx = pp % 65536;
-    while (d_hash_table[idx] == 0) {
+    // Verify the stored key (see CPU evaluate5): the old keyless probe returned
+    // the first non-empty slot, aliasing the 197 colliding paired-hand prime
+    // products to each other's rank.
+    while (d_hash_table[idx] != 0 && d_hash_keys[idx] != pp) {
         idx = (idx + 1) % 65536;
     }
     return d_hash_table[idx];

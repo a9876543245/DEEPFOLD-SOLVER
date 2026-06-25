@@ -536,7 +536,10 @@ static void test_parity_medium_sparse_range() {
 // property that actually matters: under POSTFLOP both backends reach the SAME
 // low-exploitability equilibrium. Verified 2026-06-25 on this fixture: AhKh EV
 // ref/lvl was 86.0/78.6 at 60 iters but 60.0/60.2 at 2000 iters (both exploit
-// ~0.3%). We solve to 600 iters where both have clearly reconverged.
+// ~0.3%). Solve to 1200 iters where both are clearly under 2%. (The hand-
+// evaluator hash-collision fix on 2026-06-25 corrected equities, which shifted
+// this SPR-5 flop fixture's trajectory just enough that 600 iters left the
+// reference at ~2.08%; 1200 restores comfortable margin.)
 static void test_parity_postflop_convergence() {
     auto& eval = get_evaluator();
     eval.initialize();
@@ -549,7 +552,7 @@ static void test_parity_postflop_convergence() {
         sc.board_size = 3;
         auto board = parse_board("AsKd7c");
         for (size_t i = 0; i < 3; ++i) sc.board[i] = board[i];
-        sc.max_iterations = 600;
+        sc.max_iterations = 1200;
         sc.target_exploitability = 0.0f;
         sc.exploitability_check_interval = 1000000;
         sc.dcfr_schedule = SolverConfig::DcfrSchedule::POSTFLOP_STYLE;

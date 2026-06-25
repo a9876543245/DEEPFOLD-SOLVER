@@ -417,6 +417,7 @@ void HandEvaluator::init_hash_table() {
             idx = (idx + 1) % HASH_TABLE_SIZE;
         }
         hash_table_[idx] = e.rank;
+        hash_keys_[idx]  = e.prime_product;  // store key for verified lookup
     }
 
     // Also store the prime products for reverse lookup during evaluation
@@ -461,8 +462,12 @@ uint16_t HandEvaluator::evaluate5(Card c0, Card c1, Card c2, Card c3, Card c4) c
                              rank_prime(c3) * rank_prime(c4);
 
     uint32_t idx = prime_product % HASH_TABLE_SIZE;
-    // Linear probe to find the entry
-    while (hash_table_[idx] == 0) {
+    // Linear probe to the slot whose stored key matches. The old code returned
+    // the first NON-EMPTY slot without checking the key, so any two hands whose
+    // prime products collided mod HASH_TABLE_SIZE returned each other's rank —
+    // silently corrupting equities for pairs/two-pair/trips/boats/quads. Verify
+    // the key; stop if we hit an empty slot (hand not in table → invalid input).
+    while (hash_table_[idx] != 0 && hash_keys_[idx] != prime_product) {
         idx = (idx + 1) % HASH_TABLE_SIZE;
     }
     return hash_table_[idx];

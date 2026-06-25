@@ -433,7 +433,8 @@ private:
                                         std::vector<float>& reach_oop,
                                         std::vector<float>& reach_ip,
                                         std::map<uint32_t, std::vector<float>>* out_node_values = nullptr,
-                                        const std::set<uint32_t>* visible_filter = nullptr) const;
+                                        const std::set<uint32_t>* visible_filter = nullptr,
+                                        std::map<uint32_t, float>* out_node_opp_reach = nullptr) const;
     void compute_combo_evs();
 
     // ---- Helpers ----
@@ -1687,7 +1688,8 @@ inline std::vector<float> Solver::cpu_ev_traverse(
     uint32_t node_idx, int perspective,
     std::vector<float>& reach_oop, std::vector<float>& reach_ip,
     std::map<uint32_t, std::vector<float>>* out_node_values,
-    const std::set<uint32_t>* visible_filter) const
+    const std::set<uint32_t>* visible_filter,
+    std::map<uint32_t, float>* out_node_opp_reach) const
 {
     // Helper: write the per-combo values to the out-map (if requested) and
     // then return them. Used at every return point so the map records every
@@ -1699,15 +1701,27 @@ inline std::vector<float> Solver::cpu_ev_traverse(
     // correctly — but we drop the per-combo vector once we've used it,
     // saving O(visited_nodes × nc × 4 B) of host RAM for the typical
     // 8-deep tree where only a few hundred nodes get emitted.
+    uint16_t nc = iso_.num_canonical;
     auto record = [&](std::vector<float>&& vals) -> std::vector<float> {
-        if (out_node_values) {
+        if (out_node_values || out_node_opp_reach) {
             const bool keep = (visible_filter == nullptr) ||
                               (visible_filter->find(node_idx) != visible_filter->end());
-            if (keep) (*out_node_values)[node_idx] = vals;
+            if (keep && out_node_values) (*out_node_values)[node_idx] = vals;
+            // Capture the OPPONENT's reach mass at this node so the caller can
+            // normalize the (counterfactual) values into conditional "chips per
+            // hand" — i.e. EV given the node is reached, the PIO convention.
+            // Normalizing by the ROOT opponent reach instead makes EVs shrink
+            // with depth by P(opponent reaches node).
+            if (keep && out_node_opp_reach) {
+                const auto& opp = (perspective == 0) ? reach_ip : reach_oop;
+                float s = 0.0f;
+                for (uint16_t c = 0; c < nc; ++c)
+                    s += opp[c] * static_cast<float>(iso_.canonical_weights[c]);
+                (*out_node_opp_reach)[node_idx] = s;
+            }
         }
         return std::move(vals);
     };
-    uint16_t nc = iso_.num_canonical;
     auto nt = static_cast<NodeType>(tree_.node_types[node_idx]);
 
     if (nt == NodeType::TERMINAL) {
@@ -1874,7 +1888,8 @@ inline std::vector<float> Solver::cpu_ev_traverse(
                                 ? tree_.runout_weight[child] : 1;
             if (weight == 0) weight = 1;
             std::vector<float> child_vals = cpu_ev_traverse(
-                child, perspective, reach_oop, reach_ip, out_node_values, visible_filter);
+                child, perspective, reach_oop, reach_ip, out_node_values,
+                visible_filter, out_node_opp_reach);
             for (uint16_t c = 0; c < nc; ++c) {
                 avg[c] += static_cast<float>(weight) * child_vals[c];
             }
@@ -1900,7 +1915,8 @@ inline std::vector<float> Solver::cpu_ev_traverse(
         for (uint8_t a = 0; a < na; ++a) {
             uint32_t child = tree_.children[action_offset + a];
             std::vector<float> child_vals =
-                cpu_ev_traverse(child, perspective, reach_oop, reach_ip, out_node_values, visible_filter);
+                cpu_ev_traverse(child, perspective, reach_oop, reach_ip,
+                                out_node_values, visible_filter, out_node_opp_reach);
             for (uint16_t c = 0; c < nc; ++c) {
                 node_vals[c] += strat[a * nc + c] * child_vals[c];
             }
@@ -1915,7 +1931,8 @@ inline std::vector<float> Solver::cpu_ev_traverse(
                 acting_reach[c] *= strat[a * nc + c];
             }
             std::vector<float> child_vals =
-                cpu_ev_traverse(child, perspective, reach_oop, reach_ip, out_node_values, visible_filter);
+                cpu_ev_traverse(child, perspective, reach_oop, reach_ip,
+                                out_node_values, visible_filter, out_node_opp_reach);
             for (uint16_t c = 0; c < nc; ++c) acting_reach[c] = saved[c];
             for (uint16_t c = 0; c < nc; ++c) node_vals[c] += child_vals[c];
         }
@@ -2847,35 +2864,31 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
     // gets values for the visible-or-all set — depending on ev_mode.
     std::map<uint32_t, std::vector<float>> node_vals_oop;
     std::map<uint32_t, std::vector<float>> node_vals_ip;
+    // Opponent reach mass at each recorded node, per perspective. Used to
+    // normalize EVs into conditional "chips per hand" (PIO convention) rather
+    // than counterfactual values that shrink with depth.
+    std::map<uint32_t, float> node_opp_oop;  // OOP-acting nodes → IP reach there
+    std::map<uint32_t, float> node_opp_ip;   // IP-acting nodes  → OOP reach there
     if (need_evs) {
         const std::set<uint32_t>* filter = nullptr;
         if (ev_mode == StrategyTreeEvMode::VISIBLE) {
             filter = &visible_nodes;
         }
         auto roop = oop_reach_, rip = ip_reach_;
-        cpu_ev_traverse(0, 0, roop, rip, &node_vals_oop, filter);
+        cpu_ev_traverse(0, 0, roop, rip, &node_vals_oop, filter, &node_opp_oop);
         roop = oop_reach_; rip = ip_reach_;
-        cpu_ev_traverse(0, 1, roop, rip, &node_vals_ip, filter);
+        cpu_ev_traverse(0, 1, roop, rip, &node_vals_ip, filter, &node_opp_ip);
     }
 
     // Aggregate per-canonical-combo values into per-grid-label EVs at one
     // node. Uses the acting player's reach as weights so labels with no
     // reach at this node contribute zero (rather than skewing the mean).
-    // Normalize raw cpu_ev_traverse values: they're scaled by total opponent
-    // reach × canonical_weight (so a wider opponent range inflates the
-    // numbers proportionally). Divide by that total to get chips per hand.
-    auto opp_total_weight = [&](bool acting_is_ip) -> float {
-        const auto& opp = acting_is_ip ? oop_reach_ : ip_reach_;
-        float total = 0.0f;
-        for (uint16_t c = 0; c < iso_.num_canonical; ++c) {
-            float w = static_cast<float>(iso_.canonical_weights[c]);
-            total += opp[c] * w;
-        }
-        return total;
-    };
-    float oop_norm = 1.0f / std::max(1e-6f, opp_total_weight(false)); // OOP acting → IP opp
-    float ip_norm  = 1.0f / std::max(1e-6f, opp_total_weight(true));  // IP acting  → OOP opp
-
+    // cpu_ev_traverse values are counterfactual: scaled by the OPPONENT's reach
+    // mass AT THIS NODE. Divide by that per-node mass to get conditional "chips
+    // per hand" (EV given the node is reached — the PIO convention). The old
+    // code divided by the ROOT opponent reach, which made EVs at deep nodes
+    // shrink by P(opponent reaches node) — e.g. a set facing an all-in showed
+    // ~+41 instead of the true +112 because IP only jams ~1/3 of its range.
     auto evs_at = [&](uint32_t node) -> std::vector<std::pair<std::string, float>> {
         if (!need_evs) return {};
         auto nt = static_cast<NodeType>(tree_.node_types[node]);
@@ -2885,7 +2898,10 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
         auto it = vals_map.find(node);
         if (it == vals_map.end()) return {};
         const std::vector<float>& vals = it->second;
-        float norm = acting_is_ip ? ip_norm : oop_norm;
+        const auto& opp_map = acting_is_ip ? node_opp_ip : node_opp_oop;
+        auto oit = opp_map.find(node);
+        float opp_mass = (oit != opp_map.end()) ? oit->second : 0.0f;
+        float norm = (opp_mass > 1e-6f) ? (1.0f / opp_mass) : 0.0f;
 
         const auto& reach = acting_is_ip ? ip_reach_ : oop_reach_;
         const auto& combo_table = get_combo_table();
