@@ -15,11 +15,16 @@
 #include "gpu_backend.h"
 #include "types.h"
 #include "isomorphism.h"
+#include "card.h"
+#include "showdown_rank_blocker.h"
 
 #include "util.cuh"
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -122,6 +127,30 @@ void launch_terminal_level(
     float rake_cap,
     float* d_node_values);
 
+void launch_rank_blocker_terminal_level(
+    const uint8_t* d_node_types,
+    const uint8_t* d_terminal_types,
+    const float* d_pots,
+    const uint32_t* d_parent_indices,
+    const float* d_bet_into,
+    const int32_t* d_matchup_idx,
+    const uint32_t* d_level_indices,
+    uint32_t num_level_nodes,
+    const uint16_t* d_combo_bucket,
+    const uint16_t* d_bucket_count,
+    const uint8_t* d_combo_card0,
+    const uint8_t* d_combo_card1,
+    const uint32_t* d_card_off,
+    const uint16_t* d_card_list,
+    uint32_t num_runouts,
+    const float* d_reach_opp_base,
+    uint16_t nc,
+    uint16_t max_bucket_count,
+    int perspective,
+    float rake_rate,
+    float rake_cap,
+    float* d_node_values);
+
 } // namespace gpu
 } // namespace deepsolver
 
@@ -166,6 +195,19 @@ struct DeviceMatchup {
     float*   canonical_weights   = nullptr;  // [nc] (float)
     uint16_t num_canonical       = 0;
     uint32_t num_runouts         = 1;        // 1 for legacy single-board
+
+    // Rank-blocker metadata: O(nc·~92) showdown/fold replacement for the dense
+    // O(nc²) terminal kernel. Only built for singleton-isomorphism boards
+    // (every canonical = 1 original, weight 1). When rb_valid is false the
+    // pointers are null and the backend falls back to terminal_level_kernel.
+    uint16_t* rb_combo_bucket    = nullptr;  // [num_runouts * nc] per-runout rank bucket (0xFFFF = invalid)
+    uint16_t* rb_bucket_count    = nullptr;  // [num_runouts] distinct-rank count per runout
+    uint8_t*  rb_combo_card0     = nullptr;  // [nc] runout-independent
+    uint8_t*  rb_combo_card1     = nullptr;  // [nc] runout-independent
+    uint32_t* rb_card_off        = nullptr;  // [NUM_CARDS+1] CSR offsets
+    uint16_t* rb_card_list       = nullptr;  // [2*nc] canonical combos using each card
+    uint16_t  rb_max_bucket_count = 0;       // max over runouts (shared-mem sizing)
+    bool      rb_valid           = false;
 };
 
 /// Per-player root-level reach probabilities, on device.
@@ -377,10 +419,85 @@ static DeviceMatchup upload_matchup(
     return dm;
 }
 
+/// Build + upload rank-blocker metadata into an already-populated DeviceMatchup.
+/// No-op (leaves rb_valid=false → dense-kernel fallback) unless the board has
+/// singleton isomorphism and at least one runout produced a valid rank table.
+static void upload_rank_blocker(
+    DeviceMatchup& dm,
+    const IsomorphismMapping& iso,
+    const std::vector<std::vector<uint16_t>>& ranks_per_runout)
+{
+    const uint16_t nc = iso.num_canonical;
+    if (nc == 0) return;
+    if (!showdown_rank_blocker::supports_singleton_iso(iso)) return;
+    // The kernel indexes combo_bucket by matchup_idx ∈ [0, num_runouts); the
+    // per-runout rank tables must cover exactly that range or we fall back.
+    if (ranks_per_runout.size() != dm.num_runouts) return;
+
+    const uint32_t R = dm.num_runouts;
+    constexpr uint16_t kNoBucket = showdown_rank_blocker::Scratch::kNoBucket;
+
+    std::vector<uint16_t> combo_bucket(static_cast<size_t>(R) * nc, kNoBucket);
+    std::vector<uint16_t> bucket_count(R, 0);
+    uint16_t max_bucket = 0;
+    bool any_valid = false;
+    for (uint32_t r = 0; r < R; ++r) {
+        auto meta = showdown_rank_blocker::build_metadata(iso, ranks_per_runout[r]);
+        if (!meta.valid) continue;
+        any_valid = true;
+        bucket_count[r] = static_cast<uint16_t>(meta.bucket_count);
+        if (bucket_count[r] > max_bucket) max_bucket = bucket_count[r];
+        std::copy(meta.combo_bucket.begin(), meta.combo_bucket.end(),
+                  combo_bucket.begin() + static_cast<size_t>(r) * nc);
+    }
+    if (!any_valid || max_bucket == 0) return;
+
+    // Runout-independent: each canonical's two cards + per-card combo CSR.
+    // (The canonical set and its card assignment are fixed by the config board's
+    // isomorphism; only ranks/buckets vary per runout.)
+    const auto& combo_table = get_combo_table();
+    std::vector<uint8_t> card0(nc), card1(nc);
+    std::vector<std::vector<uint16_t>> per_card(NUM_CARDS);
+    for (uint16_t c = 0; c < nc; ++c) {
+        const uint16_t oi = iso.canonical_to_originals[c][0];
+        const Card a = combo_table[oi].cards[0];
+        const Card b = combo_table[oi].cards[1];
+        card0[c] = a;
+        card1[c] = b;
+        per_card[a].push_back(c);
+        per_card[b].push_back(c);
+    }
+    std::vector<uint32_t> card_off(NUM_CARDS + 1, 0);
+    std::vector<uint16_t> card_list;
+    card_list.reserve(static_cast<size_t>(2) * nc);
+    for (int card = 0; card < NUM_CARDS; ++card) {
+        card_off[card] = static_cast<uint32_t>(card_list.size());
+        for (uint16_t c : per_card[card]) card_list.push_back(c);
+    }
+    card_off[NUM_CARDS] = static_cast<uint32_t>(card_list.size());
+
+    dm.rb_combo_bucket = upload_vector(combo_bucket);
+    dm.rb_bucket_count = upload_vector(bucket_count);
+    dm.rb_combo_card0  = upload_vector(card0);
+    dm.rb_combo_card1  = upload_vector(card1);
+    dm.rb_card_off     = upload_vector(card_off);
+    dm.rb_card_list    = upload_vector(card_list);
+    dm.rb_max_bucket_count = max_bucket;
+    dm.rb_valid = true;
+}
+
 static void free_matchup(DeviceMatchup& dm) {
     free_device(dm.matchup_ev);
     free_device(dm.matchup_valid);
     free_device(dm.canonical_weights);
+    free_device(dm.rb_combo_bucket);
+    free_device(dm.rb_bucket_count);
+    free_device(dm.rb_combo_card0);
+    free_device(dm.rb_combo_card1);
+    free_device(dm.rb_card_off);
+    free_device(dm.rb_card_list);
+    dm.rb_max_bucket_count = 0;
+    dm.rb_valid = false;
     dm.num_canonical = 0;
     dm.num_runouts   = 1;
 }
@@ -746,6 +863,14 @@ void GpuBackend::prepare(const SolverContext& ctx) {
             impl_->matchup = upload_matchup(ev_one, val_one,
                                             ctx.iso->canonical_weights);
         }
+        // Rank-blocker fast path for singleton-isomorphism boards. Builds the
+        // per-runout rank buckets + per-card combo CSR; leaves rb_valid=false
+        // (dense-kernel fallback) for iso boards or missing rank tables.
+        if (ctx.matchup_original_ranks_per_runout &&
+            !ctx.matchup_original_ranks_per_runout->empty()) {
+            upload_rank_blocker(impl_->matchup, *ctx.iso,
+                                *ctx.matchup_original_ranks_per_runout);
+        }
         impl_->reach   = upload_reach(*ctx.ip_reach, *ctx.oop_reach);
         impl_->locks   = upload_locks(*ctx.resolved_locks);
 
@@ -894,22 +1019,36 @@ void GpuBackend::iterate(int iteration) {
             // Non-terminal nodes: lift children values + aggregate (kernel filters by type)
             const uint32_t* d_level = I.levels.node_order + start;
             if (L == 0) {
-                launch_terminal_level(
-                    I.tree.node_types,
-                    I.tree.terminal_types,
-                    I.tree.pots,
-                    I.tree.parent_indices,
-                    I.tree.bet_into,
-                    I.tree.matchup_idx,
-                    d_level, count,
-                    I.matchup.matchup_ev,
-                    I.matchup.matchup_valid,
-                    I.matchup.canonical_weights,
-                    I.matchup.num_runouts,
-                    reach_opp_base,
-                    nc, traverser,
-                    I.config->rake_rate, I.config->rake_cap,
-                    I.state.node_values);
+                if (I.matchup.rb_valid) {
+                    launch_rank_blocker_terminal_level(
+                        I.tree.node_types, I.tree.terminal_types, I.tree.pots,
+                        I.tree.parent_indices, I.tree.bet_into, I.tree.matchup_idx,
+                        d_level, count,
+                        I.matchup.rb_combo_bucket, I.matchup.rb_bucket_count,
+                        I.matchup.rb_combo_card0, I.matchup.rb_combo_card1,
+                        I.matchup.rb_card_off, I.matchup.rb_card_list,
+                        I.matchup.num_runouts, reach_opp_base, nc,
+                        I.matchup.rb_max_bucket_count, traverser,
+                        I.config->rake_rate, I.config->rake_cap,
+                        I.state.node_values);
+                } else {
+                    launch_terminal_level(
+                        I.tree.node_types,
+                        I.tree.terminal_types,
+                        I.tree.pots,
+                        I.tree.parent_indices,
+                        I.tree.bet_into,
+                        I.tree.matchup_idx,
+                        d_level, count,
+                        I.matchup.matchup_ev,
+                        I.matchup.matchup_valid,
+                        I.matchup.canonical_weights,
+                        I.matchup.num_runouts,
+                        reach_opp_base,
+                        nc, traverser,
+                        I.config->rake_rate, I.config->rake_cap,
+                        I.state.node_values);
+                }
             }
 
             launch_lift_child_values(
@@ -943,6 +1082,79 @@ void GpuBackend::iterate(int iteration) {
             I.tree.node_types, I.tree.active_player, I.tree.num_children,
             N, nc, A, traverser, strat_weight, decay_and_add ? 1 : 0);
     };
+
+    // Deterministic kernel-vs-kernel self-check (env DEEPSOLVER_RB_SELFCHECK).
+    // Runs the dense terminal kernel and the rank-blocker kernel on the SAME
+    // reach into separate buffers and reports the max divergence. Their only
+    // legitimate difference is FP summation order (~ULP); a large diff means a
+    // structural bug (indexing / category / per-runout slice). One-shot.
+    static const bool kRbSelfCheck =
+        (std::getenv("DEEPSOLVER_RB_SELFCHECK") != nullptr);
+    if (kRbSelfCheck && iteration == 0 && I.matchup.rb_valid &&
+        I.levels.num_levels > 0) {
+        const size_t span = static_cast<size_t>(N) * nc;
+        float* d_dense = alloc_device_zero<float>(span);
+        float* d_rb    = alloc_device_zero<float>(span);
+        const uint32_t start = I.host_level_offsets[0];
+        const uint32_t count = I.host_level_offsets[1] - start;
+        const uint32_t* d_level = I.levels.node_order + start;
+        for (int trav = 0; trav < 2; ++trav) {
+            float* reach_opp = (trav == 0) ? I.state.reach_scratch_ip
+                                           : I.state.reach_scratch_oop;
+            launch_terminal_level(
+                I.tree.node_types, I.tree.terminal_types, I.tree.pots,
+                I.tree.parent_indices, I.tree.bet_into, I.tree.matchup_idx,
+                d_level, count,
+                I.matchup.matchup_ev, I.matchup.matchup_valid,
+                I.matchup.canonical_weights, I.matchup.num_runouts,
+                reach_opp, nc, trav,
+                I.config->rake_rate, I.config->rake_cap, d_dense);
+            launch_rank_blocker_terminal_level(
+                I.tree.node_types, I.tree.terminal_types, I.tree.pots,
+                I.tree.parent_indices, I.tree.bet_into, I.tree.matchup_idx,
+                d_level, count,
+                I.matchup.rb_combo_bucket, I.matchup.rb_bucket_count,
+                I.matchup.rb_combo_card0, I.matchup.rb_combo_card1,
+                I.matchup.rb_card_off, I.matchup.rb_card_list,
+                I.matchup.num_runouts, reach_opp, nc,
+                I.matchup.rb_max_bucket_count, trav,
+                I.config->rake_rate, I.config->rake_cap, d_rb);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<float> hd(span), hr(span);
+            CUDA_CHECK(cudaMemcpy(hd.data(), d_dense, span * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(hr.data(), d_rb, span * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            double max_abs = 0.0, sum_ref = 0.0;
+            uint32_t worst_node = 0; uint16_t worst_c = 0;
+            for (uint32_t k = start; k < I.host_level_offsets[1]; ++k) {
+                uint32_t n2 = I.host_node_order[k];
+                if (static_cast<NodeType>(I.host_tree->node_types[n2]) !=
+                    NodeType::TERMINAL) continue;
+                for (uint16_t c = 0; c < nc; ++c) {
+                    size_t idx = static_cast<size_t>(n2) * nc + c;
+                    double d = std::fabs(static_cast<double>(hd[idx]) - hr[idx]);
+                    sum_ref += std::fabs(static_cast<double>(hd[idx]));
+                    if (d > max_abs) { max_abs = d; worst_node = n2; worst_c = c; }
+                }
+            }
+            std::fprintf(stderr,
+                "[RB-SELFCHECK] trav=%d nc=%u runouts=%u maxB=%u terminals=%u "
+                "max_abs_diff=%.6g (node=%u combo=%u dense=%.6g rb=%.6g) "
+                "sum|dense|=%.6g\n",
+                trav, static_cast<unsigned>(nc),
+                static_cast<unsigned>(I.matchup.num_runouts),
+                static_cast<unsigned>(I.matchup.rb_max_bucket_count),
+                static_cast<unsigned>(count), max_abs,
+                static_cast<unsigned>(worst_node),
+                static_cast<unsigned>(worst_c),
+                static_cast<double>(hd[static_cast<size_t>(worst_node) * nc + worst_c]),
+                static_cast<double>(hr[static_cast<size_t>(worst_node) * nc + worst_c]),
+                sum_ref);
+        }
+        cudaFree(d_dense);
+        cudaFree(d_rb);
+    }
 
     run_traverser(0);  // OOP
     run_traverser(1);  // IP
@@ -1118,22 +1330,36 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
         const uint32_t* d_level = levels.node_order + start;
 
         if (L == 0) {
-            launch_terminal_level(
-                tree.node_types,
-                tree.terminal_types,
-                tree.pots,
-                tree.parent_indices,
-                tree.bet_into,
-                tree.matchup_idx,
-                d_level, count,
-                matchup.matchup_ev,
-                matchup.matchup_valid,
-                matchup.canonical_weights,
-                matchup.num_runouts,
-                reach_opp_base,
-                nc, traverser,
-                config->rake_rate, config->rake_cap,
-                state.node_values);
+            if (matchup.rb_valid) {
+                launch_rank_blocker_terminal_level(
+                    tree.node_types, tree.terminal_types, tree.pots,
+                    tree.parent_indices, tree.bet_into, tree.matchup_idx,
+                    d_level, count,
+                    matchup.rb_combo_bucket, matchup.rb_bucket_count,
+                    matchup.rb_combo_card0, matchup.rb_combo_card1,
+                    matchup.rb_card_off, matchup.rb_card_list,
+                    matchup.num_runouts, reach_opp_base, nc,
+                    matchup.rb_max_bucket_count, traverser,
+                    config->rake_rate, config->rake_cap,
+                    state.node_values);
+            } else {
+                launch_terminal_level(
+                    tree.node_types,
+                    tree.terminal_types,
+                    tree.pots,
+                    tree.parent_indices,
+                    tree.bet_into,
+                    tree.matchup_idx,
+                    d_level, count,
+                    matchup.matchup_ev,
+                    matchup.matchup_valid,
+                    matchup.canonical_weights,
+                    matchup.num_runouts,
+                    reach_opp_base,
+                    nc, traverser,
+                    config->rake_rate, config->rake_cap,
+                    state.node_values);
+            }
         }
 
         launch_lift_child_values(

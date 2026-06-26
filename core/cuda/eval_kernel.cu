@@ -429,6 +429,183 @@ __global__ void terminal_level_kernel(
 }
 
 // ============================================================================
+// Rank-blocker terminal kernel (O(nc·~92) replacement for terminal_level_kernel)
+// ============================================================================
+//
+// For singleton-isomorphism boards (every canonical combo = exactly one
+// original, weight 1) the showdown category matrix is just rank comparison
+// plus private-card compatibility. This kernel mirrors the CPU
+// `showdown_rank_blocker` shortcut on the GPU:
+//
+//   1. scatter opponent reach into per-rank buckets (atomicAdd into shared mem),
+//   2. exclusive prefix-sum over buckets → `stronger`/`weaker`/`same` splits,
+//   3. per self-combo c, correct for card removal by iterating ONLY the ~92
+//      opponents that share either of c's two cards (card_list CSR).
+//
+// This is O(nc · ~92) per terminal vs the dense kernel's O(nc²), ~13× fewer
+// flops on a rainbow flop (nc≈1176). One CUDA block per terminal.
+//
+// Perspective-symmetric: the rank comparison is always c-vs-opponent, so the
+// same win/lose/tie split serves both OOP and IP traversers — only
+// `reach_opp_base` differs (set by the caller, exactly as the dense kernel).
+
+constexpr uint16_t kRbNoBucket = 0xFFFFu;  // mirrors showdown_rank_blocker::Scratch::kNoBucket
+constexpr int      kRbBlock    = 256;
+
+__global__ void rank_blocker_terminal_kernel(
+    const uint8_t* __restrict__ node_types,
+    const uint8_t* __restrict__ terminal_types,
+    const float* __restrict__ pots,
+    const uint32_t* __restrict__ parent_indices,
+    const float* __restrict__ bet_into,
+    const int32_t* __restrict__ matchup_idx,
+    const uint32_t* __restrict__ level_node_indices,
+    uint32_t num_level_nodes,
+    const uint16_t* __restrict__ combo_bucket,   // [num_runouts * nc] per-runout
+    const uint16_t* __restrict__ bucket_count,   // [num_runouts]
+    const uint8_t* __restrict__ combo_card0,     // [nc]
+    const uint8_t* __restrict__ combo_card1,     // [nc]
+    const uint32_t* __restrict__ card_off,       // [NUM_CARDS+1]
+    const uint16_t* __restrict__ card_list,      // [2*nc]
+    uint32_t num_runouts,
+    const float* __restrict__ reach_opp_base,    // [N * nc]
+    float* __restrict__ node_values,             // [N * nc]
+    uint16_t num_canonical,
+    uint16_t max_bucket_count,
+    int perspective,
+    float rake_rate,
+    float rake_cap)
+{
+    const uint32_t blk = blockIdx.x;
+    if (blk >= num_level_nodes) return;
+    const uint32_t n = level_node_indices[blk];
+    if (node_types[n] != NT_TERMINAL) return;   // uniform across the block
+
+    const int nc = static_cast<int>(num_canonical);
+    const int tid = threadIdx.x;
+
+    int32_t mi = matchup_idx[n];
+    if (mi < 0 || static_cast<uint32_t>(mi) >= num_runouts) mi = 0;
+    const uint16_t* __restrict__ mbucket = combo_bucket + static_cast<size_t>(mi) * nc;
+    const int B = static_cast<int>(bucket_count[mi]);
+    const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(n) * nc;
+    float* __restrict__ out_values = node_values + static_cast<size_t>(n) * nc;
+
+    // Shared memory layout: [s_total : max_B][s_prefix : max_B+1][s_chunk : blockDim]
+    extern __shared__ float smem[];
+    float* s_total  = smem;
+    float* s_prefix = smem + max_bucket_count;
+    float* s_chunk  = smem + (2 * static_cast<int>(max_bucket_count) + 1);
+
+    // 1) zero bucket totals, then scatter opponent reach into rank buckets.
+    for (int i = tid; i < B; i += blockDim.x) s_total[i] = 0.0f;
+    __syncthreads();
+    for (int o = tid; o < nc; o += blockDim.x) {
+        const uint16_t bo = mbucket[o];
+        if (bo != kRbNoBucket) {
+            const float r = reach_opp[o];
+            if (r != 0.0f) atomicAdd(&s_total[bo], r);
+        }
+    }
+    __syncthreads();
+
+    // 2) exclusive prefix-sum of s_total[0..B) → s_prefix[0..B]. Chunk scan:
+    //    each thread serial-scans a contiguous chunk, thread 0 scans the
+    //    per-chunk totals, then each thread adds its chunk offset.
+    const int chunk = (B + blockDim.x - 1) / blockDim.x;
+    const int start = tid * chunk;
+    const int stop  = min(start + chunk, B);
+    float local = 0.0f;
+    for (int i = start; i < stop; ++i) local += s_total[i];
+    s_chunk[tid] = local;
+    __syncthreads();
+    if (tid == 0) {
+        float acc = 0.0f;
+        for (int t = 0; t < blockDim.x; ++t) { float v = s_chunk[t]; s_chunk[t] = acc; acc += v; }
+        s_prefix[B] = acc;   // grand total
+    }
+    __syncthreads();
+    {
+        float run = s_chunk[tid];
+        for (int i = start; i < stop; ++i) { s_prefix[i] = run; run += s_total[i]; }
+    }
+    __syncthreads();
+    const float total = s_prefix[B];
+
+    // 3) per-node payoff constants (uniform across the block).
+    const float pot_total = pots[n];
+    const float half_pot  = pot_total * 0.5f;
+    float rake = fminf(pot_total * rake_rate, rake_cap);
+    if (rake < 0.0f) rake = 0.0f;
+    const float win_p  = half_pot - rake;
+    const float lose_p = -half_pot;
+    const float tie_p  = -0.5f * rake;
+
+    const uint8_t tt = terminal_types[n];
+    const bool is_showdown = (tt == TT_SHOWDOWN);
+
+    // Fold self-payoff (matches terminal_level_kernel / CPU fold_self_payoff).
+    const uint32_t parent = parent_indices[n];
+    const float matched_pot = pot_total - bet_into[parent];
+    const float fold_win_gain  = matched_pot * 0.5f - rake;
+    const float fold_lose_loss = -matched_pot * 0.5f;
+    const bool i_win = ((perspective == 0 && tt == TT_FOLD_IP) ||
+                        (perspective == 1 && tt == TT_FOLD_OOP));
+    const float self_payoff = i_win ? fold_win_gain : fold_lose_loss;
+
+    // 4) per self-combo value.
+    for (int c = tid; c < nc; c += blockDim.x) {
+        const uint16_t b16 = mbucket[c];
+        if (b16 == kRbNoBucket) { out_values[c] = 0.0f; continue; }
+        const int b = b16;
+        const uint8_t k0 = combo_card0[c];
+        const uint8_t k1 = combo_card1[c];
+        const uint32_t lo0 = card_off[k0], hi0 = card_off[k0 + 1];
+        const uint32_t lo1 = card_off[k1], hi1 = card_off[k1 + 1];
+
+        if (is_showdown) {
+            float stronger = s_prefix[b];
+            float weaker   = total - s_prefix[b + 1];
+            float same     = s_total[b];
+            // Subtract every opponent sharing card k0 or k1 (combo c itself
+            // appears in BOTH lists → subtracted twice from `same`).
+            for (uint32_t k = lo0; k < hi0; ++k) {
+                const uint16_t o = card_list[k];
+                const uint16_t bo = mbucket[o];
+                if (bo == kRbNoBucket) continue;
+                const float r = reach_opp[o];
+                if      (bo < b) stronger -= r;
+                else if (bo > b) weaker   -= r;
+                else             same     -= r;
+            }
+            for (uint32_t k = lo1; k < hi1; ++k) {
+                const uint16_t o = card_list[k];
+                const uint16_t bo = mbucket[o];
+                if (bo == kRbNoBucket) continue;
+                const float r = reach_opp[o];
+                if      (bo < b) stronger -= r;
+                else if (bo > b) weaker   -= r;
+                else             same     -= r;
+            }
+            same += reach_opp[c];   // undo the double subtraction of c
+            out_values[c] = win_p * weaker + lose_p * stronger + tie_p * same;
+        } else {
+            float opp_total = total;
+            for (uint32_t k = lo0; k < hi0; ++k) {
+                const uint16_t o = card_list[k];
+                if (mbucket[o] != kRbNoBucket) opp_total -= reach_opp[o];
+            }
+            for (uint32_t k = lo1; k < hi1; ++k) {
+                const uint16_t o = card_list[k];
+                if (mbucket[o] != kRbNoBucket) opp_total -= reach_opp[o];
+            }
+            opp_total += reach_opp[c];   // undo the double subtraction of c
+            out_values[c] = self_payoff * opp_total;
+        }
+    }
+}
+
+// ============================================================================
 // Host-side launch helpers
 // ============================================================================
 
@@ -492,6 +669,47 @@ void launch_terminal_level(
         d_canonical_weights, num_runouts,
         d_reach_opp_base, nc, perspective,
         rake_rate, rake_cap, d_node_values);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_rank_blocker_terminal_level(
+    const uint8_t* d_node_types,
+    const uint8_t* d_terminal_types,
+    const float* d_pots,
+    const uint32_t* d_parent_indices,
+    const float* d_bet_into,
+    const int32_t* d_matchup_idx,
+    const uint32_t* d_level_indices,
+    uint32_t num_level_nodes,
+    const uint16_t* d_combo_bucket,
+    const uint16_t* d_bucket_count,
+    const uint8_t* d_combo_card0,
+    const uint8_t* d_combo_card1,
+    const uint32_t* d_card_off,
+    const uint16_t* d_card_list,
+    uint32_t num_runouts,
+    const float* d_reach_opp_base,
+    uint16_t nc,
+    uint16_t max_bucket_count,
+    int perspective,
+    float rake_rate,
+    float rake_cap,
+    float* d_node_values)
+{
+    if (num_level_nodes == 0) return;
+    const int block = kRbBlock;
+    const uint32_t grid = num_level_nodes;   // one block per terminal
+    // shared: s_total[max_B] + s_prefix[max_B+1] + s_chunk[block]
+    const size_t shmem = (static_cast<size_t>(2) * max_bucket_count + 1 + block) * sizeof(float);
+
+    rank_blocker_terminal_kernel<<<grid, block, shmem>>>(
+        d_node_types, d_terminal_types, d_pots,
+        d_parent_indices, d_bet_into, d_matchup_idx,
+        d_level_indices, num_level_nodes,
+        d_combo_bucket, d_bucket_count,
+        d_combo_card0, d_combo_card1, d_card_off, d_card_list,
+        num_runouts, d_reach_opp_base, d_node_values,
+        nc, max_bucket_count, perspective, rake_rate, rake_cap);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -172,6 +172,25 @@ inline void postsolve_parallel_for(
 
 } // namespace detail
 
+// AUTO backend size heuristic. Tuned 2026-06-26 after the rank-blocker GPU
+// port (eval_kernel.cu) flipped the GPU from "slower at every size" to winning
+// on flop/turn. Measured end-to-end wall clock on an RTX 5090 (each solve is a
+// fresh process, so the GPU pays its full fixed cost every time):
+//
+//   board  nodes  GPU prepare  GPU/iter  CPU/iter   verdict
+//   river   33      128 ms      0.33 ms   0.16 ms   CPU 3.6× (GPU never wins)
+//   flop    549     129 ms      0.58 ms   1.04 ms   GPU above ~280 iters
+//   turn   3633     188 ms      1.04 ms   8.86 ms   GPU above ~20 iters
+//
+// The GPU carries a ~130 ms fixed prepare cost (CUDA context init + tree /
+// matchup upload) that the CPU does not. It only pays off when there is enough
+// total work — wide enough trees AND enough iterations — to amortize it. A
+// single `nodes × iterations` work estimate captures both axes; a hard
+// node floor catches tiny single-street (river) trees, where the GPU is slower
+// even per-iter so no iteration count rescues it.
+constexpr uint32_t kGpuAutoMinNodes = 256;        // below this → CPU (rivers, tiny spots)
+constexpr uint64_t kGpuAutoMinWork  = 150000;     // nodes × iters to amortize ~130ms prepare
+
 inline bool should_auto_select_gpu(
     const SolverConfig& config,
     const FlatGameTree& tree,
@@ -179,16 +198,21 @@ inline bool should_auto_select_gpu(
 {
     if (!GPU_BACKEND_FUNCTIONAL || !has_cuda_gpu()) return false;
 
-    (void)matchup_table_count;
+    (void)matchup_table_count;  // runout count is already reflected in total_nodes
 
-    // With the current CUDA backend, real solves on turn/river spots already
-    // beat the CPU path on supported NVIDIA hardware. Keep AUTO on CPU only
-    // for diagnostics/no-iteration calls where GPU upload would be pure fixed
-    // overhead. Explicit --backend cpu remains available for parity testing.
+    // Estimate-only / diagnostic calls: GPU upload would be pure fixed overhead.
     if (config.max_iterations <= 0) return false;
-    if (tree.total_nodes < 128 && config.max_iterations < 25) return false;
 
-    return true;
+    // Tiny trees (single-street river spots ~33 nodes): the GPU is slower even
+    // per-iteration here and the prepare cost dwarfs the whole solve. No
+    // iteration count makes GPU win, so floor it to CPU.
+    if (tree.total_nodes < kGpuAutoMinNodes) return false;
+
+    // Otherwise GPU wins once nodes × iterations clears the fixed prepare cost.
+    const uint64_t work =
+        static_cast<uint64_t>(tree.total_nodes) *
+        static_cast<uint64_t>(config.max_iterations);
+    return work >= kGpuAutoMinWork;
 }
 
 inline bool should_build_signed_showdown_coeff(
