@@ -314,6 +314,16 @@ fn build_solver_args(request: &SolverRequest, backend_override: Option<&str>) ->
         }
     }
 
+    // Stage 5: runout decomposition. Omit for "off"/None so the sidecar keeps
+    // its default (off). The sidecar picks the backend (GPU-adaptive for
+    // collapsed/rainbow boards, CPU for forced-on-enumerable) — no logic here.
+    if let Some(mode) = &request.decompose_runouts {
+        if mode == "auto" || mode == "on" {
+            args.push("--decompose-runouts".to_string());
+            args.push(mode.clone());
+        }
+    }
+
     // v1.4.0 Phase 2: CPU SIMD policy + thread count. Backend ignores these
     // when --backend gpu wins, but the engine still parses them so the UI
     // can pre-flight `--estimate-only` with the right CPU rate.

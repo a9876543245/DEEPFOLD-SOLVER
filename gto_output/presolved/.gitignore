@@ -1,3 +1,0 @@
-# Raw bulk-presolve outputs — not committed. Phase 2 (compact-presolved.mjs)
-# will produce the actual bundled .json.gz files in this directory.
-raw/

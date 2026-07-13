@@ -1,0 +1,34 @@
+{
+  "context": {
+    "game_type": "Cash",
+    "scenario_type": "vs_4B",
+    "hero_position": "BTN",
+    "villain_position": null,
+    "effective_bb": 100,
+    "description": "100bb 2.5x 500rake vs_4B: BTN @ UTG 2.5bb BTN 8.5bb BB 21.0bb UTG FOLD BTN",
+    "source": "ranges/qb_ranges/100bb 2.5x 500rake",
+    "source_path": "BTN/vs_4bet/UTG_2.5bb_BTN_8.5bb_BB_21.0bb_UTG_FOLD_BTN_AllIn.txt; BTN/vs_4bet/UTG_2.5bb_BTN_8.5bb_BB_21.0bb_UTG_FOLD_BTN_Call.txt; BTN/vs_4bet/UTG_2.5bb_BTN_8.5bb_BB_21.0bb_UTG_FOLD_BTN_FOLD.txt",
+    "preflop_line": "UTG 2.5bb BTN 8.5bb BB 21.0bb UTG FOLD BTN"
+  },
+  "strategy": {
+    "actions": [
+      {
+        "name": "All-in",
+        "color_bucket": "Orange"
+      },
+      {
+        "name": "Call",
+        "color_bucket": "Green"
+      },
+      {
+        "name": "Fold",
+        "color_bucket": "Blue"
+      }
+    ],
+    "upi_ranges": {
+      "All-in": "AA:0.132,AKs:0.728,AKo:0.440,KK:1.000",
+      "Call": "AA:0.868,A3s:0.110,A4s:0.150,A5s:0.230,AQs:0.742,AKs:0.272,AKo:0.360,44:0.044,54s:0.290,55:0.076,65s:0.274,66:0.188,76s:0.212,77:0.218,87s:0.162,88:0.234,99:0.224,T9s:0.186,TT:0.228,JTs:0.178,QTs:0.068,JJ:0.430,QJs:0.050,QQ:0.762",
+      "Fold": "A3s:0.486,A4s:0.438,A5s:0.304,A6s:0.082,A7s:0.254,A8s:0.682,A9s:0.546,ATs:0.274,AJs:0.286,AJo:0.260,AQs:0.088,AQo:0.334,K5s:0.232,K6s:0.044,88:0.016,K8s:0.078,T9s:0.250,Q9s:0.168,K9s:0.396,TT:0.092,JTs:0.266,QTs:0.568,KTs:0.386,JJ:0.016,QJs:0.544,KJs:0.318,KJo:0.094,KQs:0.362,KQo:0.584"
+    }
+  }
+}

@@ -1,6 +1,6 @@
 /**
  * Preflop range data for 6-max SRP and 3-Bet Pot scenarios.
- * Source: TexasSolverGpu v0.2.0 precomputed GTO ranges.
+ * Source: precomputed GTO ranges.
  */
 
 export type Position = 'UTG' | 'MP' | 'CO' | 'BTN' | 'SB' | 'BB';
@@ -19,7 +19,7 @@ export interface PositionMatchup {
   defaultStack: number;
 }
 
-/** Parse a TexasSolver range string into a Record<combo, frequency> */
+/** Parse a preflop range string into a Record<combo, frequency> */
 export function parseRange(rangeStr: string): Record<string, number> {
   const result: Record<string, number> = {};
   if (!rangeStr) return result;

@@ -8,7 +8,7 @@
  *   - Global strategy frequencies sum to 100%
  *
  * These tests are intentionally cheap (< 60s each) so they can run in CI.
- * Larger benchmarks comparing against TexasSolver are handled by benchmark.cpp.
+ * Larger benchmarks are handled by benchmark.cpp.
  */
 
 #include "solver.h"

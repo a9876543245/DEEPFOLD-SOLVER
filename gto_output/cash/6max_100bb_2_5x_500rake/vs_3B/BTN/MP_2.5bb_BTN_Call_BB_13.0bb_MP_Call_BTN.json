@@ -1,0 +1,34 @@
+{
+  "context": {
+    "game_type": "Cash",
+    "scenario_type": "vs_3B",
+    "hero_position": "BTN",
+    "villain_position": null,
+    "effective_bb": 100,
+    "description": "100bb 2.5x 500rake vs_3B: BTN @ MP 2.5bb BTN Call BB 13.0bb MP Call BTN",
+    "source": "ranges/qb_ranges/100bb 2.5x 500rake",
+    "source_path": "BTN/vs_3bet/MP_2.5bb_BTN_Call_BB_13.0bb_MP_Call_BTN_AllIn.txt; BTN/vs_3bet/MP_2.5bb_BTN_Call_BB_13.0bb_MP_Call_BTN_Call.txt; BTN/vs_3bet/MP_2.5bb_BTN_Call_BB_13.0bb_MP_Call_BTN_FOLD.txt",
+    "preflop_line": "MP 2.5bb BTN Call BB 13.0bb MP Call BTN"
+  },
+  "strategy": {
+    "actions": [
+      {
+        "name": "All-in",
+        "color_bucket": "Orange"
+      },
+      {
+        "name": "Call",
+        "color_bucket": "Green"
+      },
+      {
+        "name": "Fold",
+        "color_bucket": "Blue"
+      }
+    ],
+    "upi_ranges": {
+      "All-in": "AKo:0.074,JJ:0.130,QQ:0.024",
+      "Call": "A3s:0.018,A4s:0.032,A5s:0.060,ATs:0.046,AJs:0.228,AQs:0.128,AQo:0.026,22:0.170,33:0.156,44:0.144,54s:0.036,55:0.146,65s:0.036,66:0.204,76s:0.032,77:0.200,87s:0.004,88:0.230,99:0.246,T9s:0.010,TT:0.292,JTs:0.018,QTs:0.008,KTs:0.020,JJ:0.310,QJs:0.062,KJs:0.120,KQs:0.296",
+      "Fold": "A2s:0.050,A3s:0.328,A4s:0.360,A5s:0.436,A6s:0.086,A7s:0.154,A8s:0.196,A9s:0.386,ATs:0.736,AJs:0.448,AJo:0.202,AQo:0.470,22:0.086,33:0.066,44:0.124,54s:0.238,55:0.186,65s:0.138,66:0.294,76s:0.176,86s:0.058,K6s:0.060,77:0.468,87s:0.216,97s:0.020,88:0.458,98s:0.230,99:0.434,T9s:0.340,J9s:0.110,K9s:0.310,TT:0.254,JTs:0.462,QTs:0.314,KTs:0.576,QJs:0.432,KJs:0.334,KJo:0.078,KQs:0.284,KQo:0.306"
+    }
+  }
+}

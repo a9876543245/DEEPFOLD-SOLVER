@@ -83,9 +83,9 @@ const dict: Dict = {
   'gctx.bb': { en: 'BB', zh: 'BB', ja: 'BB' },
   'gctx.any': { en: 'Any', zh: '任意', ja: 'すべて' },
   'gctx.noScenarios': {
-    en: 'GTO chart library not available — using built-in TexasSolver ranges',
-    zh: 'GTO 圖庫未載入 — 使用內建 TexasSolver 範圍',
-    ja: 'GTOチャートライブラリが利用できません — 内蔵TexasSolverレンジを使用中',
+    en: 'GTO chart library not available — using built-in default ranges',
+    zh: 'GTO 圖庫未載入 — 使用內建範圍',
+    ja: 'GTOチャートライブラリが利用できません — 内蔵レンジを使用中',
   },
   // MTT scenario tooltips (folder names from gto_output/mtt/)
   'gctx.mtt.rfi':            { en: 'Raise First In', zh: '首位加注 (RFI)', ja: 'ファーストイン' },
@@ -151,6 +151,13 @@ const dict: Dict = {
   'config.solveMode.quick':    { en: 'Quick',       zh: '快速',      ja: 'クイック' },
   'config.solveMode.standard': { en: 'Standard',    zh: '標準',      ja: 'スタンダード' },
   'config.solveMode.deep':     { en: 'Deep',        zh: '深度',      ja: 'ディープ' },
+
+  // Stage 5: runout decomposition toggle
+  'config.decompose.label':     { en: 'Runout Equity', zh: '轉河牌權益', ja: 'ランナウト精度' },
+  'config.decompose.off':       { en: 'Fast',          zh: '快速',       ja: '高速' },
+  'config.decompose.auto':      { en: 'Exact',         zh: '精確',       ja: '正確' },
+  'config.decompose.hint.off':  { en: 'Turn/river equity approximated on boards too large to enumerate.', zh: '牌面過大無法窮舉時,轉牌/河牌權益為近似值。', ja: '列挙できない大きな盤面ではターン/リバーの期待値が近似されます。' },
+  'config.decompose.hint.auto': { en: 'Solves real turn/river runouts via decomposition (slower).', zh: '透過分解求解真實的轉牌/河牌(較慢)。', ja: '分解により実際のターン/リバーを求解します(低速)。' },
 
   // ---- Strategy Panel ----
   'panel.solverResult': { en: 'Solver Result', zh: '求解結果', ja: '求解結果' },

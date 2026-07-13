@@ -70,6 +70,14 @@ pub struct SolverRequest {
     /// stare at "estimated 5 hours" and walk away.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_budget_seconds: Option<u32>,
+    /// Stage 5: runout decomposition mode. "off" (default) keeps the legacy
+    /// collapse gate (turn/river equity approximated on boards too large to
+    /// enumerate). "auto" routes rainbow/collapsed boards through flop-trunk +
+    /// per-turn-card subgame decomposition (real runout equity,
+    /// runout_approximated=false). "on" forces it even on enumerable boards
+    /// (debug). None / "off" ⇒ arg omitted, sidecar keeps its default (off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decompose_runouts: Option<String>,
     /// v1.4.0 Phase 2: CPU SIMD policy override. None / "auto" = CPUID picks.
     /// "scalar" forces scalar kernels (parity test / debugging).
     /// "avx2" requires AVX2 CPU (engine aborts on detection failure).

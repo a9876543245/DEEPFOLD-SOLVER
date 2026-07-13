@@ -178,6 +178,17 @@ public:
     /// Must be called before any iterate() or finalize() call.
     virtual void prepare(const SolverContext& ctx) = 0;
 
+    /// Re-prepare for a NEW solve of the SAME board (tree + matchup tables
+    /// unchanged; only ranges/reach differ). Backends that keep board-fixed
+    /// device data resident (GPU: tree, matchup, level schedule) override this
+    /// to skip re-uploading it — the big win for runout decomposition, where a
+    /// pinned turn subgame is re-solved every outer iteration with new reach.
+    /// The result is bit-identical to a full prepare() (same board data reused,
+    /// solver state reset identically). Default = full prepare() (correct for
+    /// CPU and any backend with no resident board cache). The caller guarantees
+    /// the board (tree + matchup) matches the prior prepare() on this backend.
+    virtual void reprepare_keep_board(const SolverContext& ctx) { prepare(ctx); }
+
     /// Run ONE DCFR iteration. Expected sequence:
     ///   1. Compute current_strategy from regrets (regret matching)
     ///   2. Apply DCFR discount to regrets
@@ -307,6 +318,12 @@ std::string cuda_gpu_reject_reason();
 /// v1.2.2: used by ETA estimator since Pascal is ~10× slower than Ada at
 /// fp32+atomic CFR workloads.
 int cuda_compute_capability();
+
+/// Free device memory in bytes on CUDA device 0 (cudaMemGetInfo). Returns 0
+/// when there is no usable CUDA device or on a non-CUDA build. Used by the
+/// runout-decomposition pool to size how many turn-subgame matchups it can pin
+/// resident on the GPU without OOM (adaptive to the user's actual VRAM).
+uint64_t gpu_free_bytes();
 
 /// Factory: construct a backend of the requested type.
 ///

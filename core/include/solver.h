@@ -369,11 +369,19 @@ public:
     /// is hit, the walker returns without descending deeper into the
     /// remaining branches and `*out_truncated` (if non-null) is set to true
     /// so the caller can surface the truncation in the response payload.
+    /// `initial_chance_levels_seen` lets a caller treat the first chance the
+    /// walk encounters as if earlier chance levels were already consumed.
+    /// Decomposition uses this (=1) when building a turn subgame's tree so the
+    /// subgame's river is auto-skipped to lex-min (a "subsequent" chance)
+    /// instead of enumerated — matching the full-game contract where only the
+    /// FIRST chance (the turn, dealt by the trunk) is enumerated. Default 0 =
+    /// existing behavior (the first chance is enumerated).
     std::map<std::string, StrategyTreeEntry>
         build_strategy_tree(int max_player_depth = 8,
                             StrategyTreeEvMode ev_mode = StrategyTreeEvMode::VISIBLE,
                             uint32_t max_nodes = 0,
-                            bool* out_truncated = nullptr) const;
+                            bool* out_truncated = nullptr,
+                            int initial_chance_levels_seen = 0) const;
 
     /// Backward-compat overload — `include_combo_evs=true` ⇒ VISIBLE,
     /// `false` ⇒ NONE. Existing call sites keep working.
@@ -387,11 +395,128 @@ public:
     /// Name of the active backend (for logging / UI indicator)
     const char* backend_name() const { return backend_ ? backend_->name() : "none"; }
 
+    /// Host-RAM footprint of the cached matchup tables (the dominant, reusable
+    /// precompute). Used by decomposition Stage 3.5 to size a host cache of
+    /// per-leaf precompute (which is kept across GPU eviction so re-solves skip
+    /// the CPU matchup precompute, the rainbow bottleneck). Sums the per-runout
+    /// tables + the legacy base tables; the tree/iso are comparatively small.
+    uint64_t matchup_host_bytes() const {
+        uint64_t b = 0;
+        auto add_vv_f = [&](const std::vector<std::vector<float>>& vv) {
+            for (const auto& v : vv) b += v.size() * sizeof(float); };
+        auto add_vv_u8 = [&](const std::vector<std::vector<uint8_t>>& vv) {
+            for (const auto& v : vv) b += v.size(); };
+        auto add_vv_i8 = [&](const std::vector<std::vector<int8_t>>& vv) {
+            for (const auto& v : vv) b += v.size(); };
+        auto add_vv_u16 = [&](const std::vector<std::vector<uint16_t>>& vv) {
+            for (const auto& v : vv) b += v.size() * sizeof(uint16_t); };
+        add_vv_f(matchup_ev_per_runout_);
+        add_vv_f(matchup_ev_valid_per_runout_);
+        add_vv_f(matchup_valid_per_runout_);
+        add_vv_u8(matchup_category_per_runout_);
+        add_vv_f(matchup_showdown_coeff_per_runout_);
+        add_vv_i8(matchup_showdown_count_per_runout_);
+        add_vv_u16(matchup_original_ranks_per_runout_);
+        b += matchup_ev_.size() * sizeof(float);
+        b += matchup_valid_.size() * sizeof(float);
+        b += matchup_category_.size();
+        b += matchup_showdown_coeff_.size() * sizeof(float);
+        b += matchup_showdown_count_.size();
+        b += matchup_original_ranks_.size() * sizeof(uint16_t);
+        return b;
+    }
+
+    /// Streaming/subgame decomposition (opt-in): force solve() to use an
+    /// externally-provided isomorphism instead of computing one from this
+    /// solver's board. Used so a turn subgame can be solved in the PARENT
+    /// flop's canonical space — exactly mirroring how the monolithic tree
+    /// keeps a single (flop) iso across all per-runout boards. The pointer is
+    /// borrowed; the caller must keep it alive across solve(). nullptr (the
+    /// default) restores the normal "compute iso from my own board" behavior.
+    void set_forced_iso(const IsomorphismMapping* iso) { forced_iso_ = iso; }
+
+    /// Post-solve per-combo counterfactual root value for `perspective`
+    /// (0 = OOP, 1 = IP), seeded with this solve's entering reach. This is the
+    /// raw "EV-out-of-subgame" primitive the decomposition feeds back into the
+    /// trunk (same convention a terminal returns: opponent reach folded in,
+    /// own reach not). Length = num_canonical. Empty if not yet solved.
+    std::vector<float> root_values(int perspective) const {
+        if (!solved_ || strategy_.empty()) return {};
+        auto r_oop = oop_reach_;
+        auto r_ip  = ip_reach_;
+        return cpu_ev_traverse(0, perspective, r_oop, r_ip);
+    }
+
+    /// Post-solve per-combo best-response value at the root for `player`
+    /// (0 = OOP, 1 = IP), against this solve's fixed strategy and entering
+    /// reach. The decomposition uses this as the subgame's contribution when
+    /// best-responding over the trunk to measure full-game exploitability —
+    /// root EV alone is insufficient (a zero-sum game's value is identical for
+    /// every equilibrium, so matching values doesn't prove low exploitability).
+    /// Length = num_canonical. Empty if not yet solved.
+    std::vector<float> root_br_values(int player) const {
+        if (!solved_ || strategy_.empty()) return {};
+        auto r_oop = oop_reach_;
+        auto r_ip  = ip_reach_;
+        return cpu_best_response_traverse(0, player, r_oop, r_ip);
+    }
+
+    /// Streaming/subgame decomposition (opt-in): replace the entering ranges
+    /// without rebuilding. Pair with resolve() to re-solve the SAME board
+    /// (tree + matchup tables cached) against new ranges — the per-outer-iter
+    /// fast path that skips the dominant precompute cost.
+    void set_ranges(const std::array<float, NUM_COMBOS>& oop,
+                    const std::array<float, NUM_COMBOS>& ip) {
+        config_.oop_range_weights = oop;
+        config_.ip_range_weights  = ip;
+        config_.has_custom_ranges = true;
+    }
+
+    /// Re-solve reusing the cached tree / iso / matchup tables / backend from a
+    /// prior solve() (model-B from-scratch CFR with the current ranges). Falls
+    /// back to a full solve() if called before any solve(). CPU-only path; used
+    /// by solver_decomposed.h. ~O(precompute) cheaper than solve() because the
+    /// tree build and matchup precompute are skipped.
+    void resolve() {
+        if (!backend_ || tree_.total_nodes == 0) { solve(); return; }
+        initialize_reach_probs();
+        if (!config_.node_locks.empty()) resolve_node_locks();
+        SolverContext ctx = make_context();
+        backend_->prepare(ctx);
+        const int iters = std::max(1, config_.max_iterations);
+        for (int t = 0; t < iters; ++t) backend_->iterate(t);
+        backend_->finalize();
+        strategy_ = backend_->strategy();
+        apply_node_locks();
+        solved_ = true;
+    }
+
+    /// Like resolve(), but for re-solving the SAME board with new ranges across
+    /// many outer iterations: keeps board-fixed device data resident (GPU tree +
+    /// matchup + level schedule) via reprepare_keep_board(), skipping the
+    /// dominant matchup re-upload. Bit-identical to resolve() for the same
+    /// board. Used by the decomposition pinned-leaf fast path (Stage 3.5).
+    void resolve_keep_board() {
+        if (!backend_ || tree_.total_nodes == 0) { solve(); return; }
+        initialize_reach_probs();
+        if (!config_.node_locks.empty()) resolve_node_locks();
+        SolverContext ctx = make_context();
+        backend_->reprepare_keep_board(ctx);
+        const int iters = std::max(1, config_.max_iterations);
+        for (int t = 0; t < iters; ++t) backend_->iterate(t);
+        backend_->finalize();
+        strategy_ = backend_->strategy();
+        apply_node_locks();
+        solved_ = true;
+    }
+
 private:
     SolverConfig config_;
     BackendType  backend_type_;
     FlatGameTree tree_;
     IsomorphismMapping iso_;
+    /// Borrowed override for iso_ (see set_forced_iso). nullptr ⇒ compute it.
+    const IsomorphismMapping* forced_iso_ = nullptr;
     bool solved_ = false;
     int actual_iterations_run_ = 0;
 
@@ -447,6 +572,9 @@ private:
     void resolve_node_locks();
     void apply_node_locks();
     void precompute_matchups();
+    /// Assemble the borrowed-pointer SolverContext for backend prepare().
+    /// Shared by solve() and resolve() so the two never drift.
+    SolverContext make_context();
 
     // ---- Post-solve CPU passes (operate on strategy_) ----
     float compute_exploitability();
@@ -463,7 +591,12 @@ private:
 
     // ---- Helpers ----
     uint16_t evaluate_combo(const Combo& combo) const;
+public:
+    /// Public so the decomposition stitch (solver_decomposed.h) formats trunk
+    /// action labels with the SAME canonical strings the nav cache keys use.
+    /// Stateless pure function — exposing it adds no coupling.
     static std::string action_to_label(ActionType type, float amount, float pot);
+private:
     /// Trivial accessor used by build_strategy_tree's lambda — wraps
     /// tree_.children_offset[node] so the walk reads cleaner.
     uint32_t off_of(uint32_t node) const;
@@ -518,6 +651,30 @@ inline uint16_t Solver::evaluate_combo(const Combo& combo) const {
     }
 }
 
+inline SolverContext Solver::make_context() {
+    SolverContext ctx;
+    ctx.tree                       = &tree_;
+    ctx.iso                        = &iso_;
+    ctx.config                     = &config_;
+    ctx.matchup_ev                 = &matchup_ev_;
+    ctx.matchup_valid              = &matchup_valid_;
+    ctx.matchup_original_ranks     = &matchup_original_ranks_;
+    ctx.matchup_category           = &matchup_category_;
+    ctx.matchup_showdown_coeff     = &matchup_showdown_coeff_;
+    ctx.matchup_showdown_count     = &matchup_showdown_count_;
+    ctx.matchup_ev_per_runout      = &matchup_ev_per_runout_;
+    ctx.matchup_valid_per_runout   = &matchup_valid_per_runout_;
+    ctx.matchup_category_per_runout = &matchup_category_per_runout_;
+    ctx.matchup_showdown_coeff_per_runout = &matchup_showdown_coeff_per_runout_;
+    ctx.matchup_showdown_count_per_runout = &matchup_showdown_count_per_runout_;
+    ctx.matchup_original_ranks_per_runout = &matchup_original_ranks_per_runout_;
+    ctx.matchup_board_masks        = &matchup_board_masks_;
+    ctx.ip_reach                   = &ip_reach_;
+    ctx.oop_reach                  = &oop_reach_;
+    ctx.resolved_locks             = &resolved_locks_;
+    return ctx;
+}
+
 // ============================================================================
 // Solve entry point
 // ============================================================================
@@ -542,7 +699,8 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     // matchup table size). compute_isomorphism is pure and only reads the
     // flop/turn/river board cards already in config_, so reordering is safe.
     stage_start = Clock::now();
-    iso_ = compute_isomorphism(config_.board.data(), config_.board_size);
+    iso_ = forced_iso_ ? *forced_iso_
+                       : compute_isomorphism(config_.board.data(), config_.board_size);
     auto stage_end = Clock::now();
     timing.isomorphism_ms = elapsed_since(stage_start, stage_end);
 
@@ -812,26 +970,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         }
     }
 
-    SolverContext ctx;
-    ctx.tree                       = &tree_;
-    ctx.iso                        = &iso_;
-    ctx.config                     = &config_;
-    ctx.matchup_ev                 = &matchup_ev_;
-    ctx.matchup_valid              = &matchup_valid_;
-    ctx.matchup_original_ranks     = &matchup_original_ranks_;
-    ctx.matchup_category           = &matchup_category_;
-    ctx.matchup_showdown_coeff     = &matchup_showdown_coeff_;
-    ctx.matchup_showdown_count     = &matchup_showdown_count_;
-    ctx.matchup_ev_per_runout      = &matchup_ev_per_runout_;
-    ctx.matchup_valid_per_runout   = &matchup_valid_per_runout_;
-    ctx.matchup_category_per_runout = &matchup_category_per_runout_;
-    ctx.matchup_showdown_coeff_per_runout = &matchup_showdown_coeff_per_runout_;
-    ctx.matchup_showdown_count_per_runout = &matchup_showdown_count_per_runout_;
-    ctx.matchup_original_ranks_per_runout = &matchup_original_ranks_per_runout_;
-    ctx.matchup_board_masks        = &matchup_board_masks_;
-    ctx.ip_reach                   = &ip_reach_;
-    ctx.oop_reach                  = &oop_reach_;
-    ctx.resolved_locks             = &resolved_locks_;
+    SolverContext ctx = make_context();
     backend_->prepare(ctx);
     stage_end = Clock::now();
     timing.backend_prepare_ms = elapsed_since(stage_start, stage_end);
@@ -2779,7 +2918,8 @@ inline ComboAnalysis Solver::analyze_combo(const std::string& combo_str) const {
 
 inline std::map<std::string, Solver::StrategyTreeEntry>
 Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
-                             uint32_t max_nodes, bool* out_truncated) const {
+                             uint32_t max_nodes, bool* out_truncated,
+                             int initial_chance_levels_seen) const {
     std::map<std::string, StrategyTreeEntry> out;
     if (out_truncated) *out_truncated = false;
     if (!solved_) return out;
@@ -2880,7 +3020,7 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
                     visible_nodes.size() >= effective_max_nodes) return;
             }
         };
-        precount(0, 0, 0);
+        precount(0, 0, initial_chance_levels_seen);
     }
 
     // Pre-compute per-node EVs from each player's perspective by running
@@ -3102,7 +3242,7 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
 
     std::vector<uint8_t> empty_cards;
     std::vector<RunoutOption> empty_runouts;
-    walk(0, "", empty_cards, empty_runouts, 0, 0);
+    walk(0, "", empty_cards, empty_runouts, 0, initial_chance_levels_seen);
     if (out_truncated) *out_truncated = truncated;
     return out;
 }

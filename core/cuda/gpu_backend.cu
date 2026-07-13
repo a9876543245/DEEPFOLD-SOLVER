@@ -925,6 +925,52 @@ void GpuBackend::prepare(const SolverContext& ctx) {
     }
 }
 
+void GpuBackend::reprepare_keep_board(const SolverContext& ctx) {
+    if (!ctx.tree || !ctx.iso || !ctx.config ||
+        !ctx.ip_reach || !ctx.oop_reach) {
+        throw std::runtime_error("GpuBackend::reprepare_keep_board: null pointers in SolverContext");
+    }
+    // First prepare on this backend, or a board whose tree differs from the
+    // resident one → full prepare (uploads tree + matchup + levels). Only when
+    // the board matches do we keep them. tree node count is a cheap, sufficient
+    // signature here: the decomposition pins ONE board per backend, so the tree
+    // (hence matchup) never changes across re-solves of a pinned leaf.
+    if (!impl_->host_tree ||
+        ctx.tree->total_nodes != impl_->host_tree->total_nodes) {
+        prepare(ctx);
+        return;
+    }
+
+    // Keep board-fixed device data (tree, matchup + rank-blocker, levels). Re-do
+    // only the range-dependent parts. alloc_solver_state re-zeros regrets/
+    // strategy_sum and re-uniforms current_strategy EXACTLY as prepare() does,
+    // and the kept tree/matchup bytes are identical to a re-upload — so the
+    // ensuing CFR is bit-identical to a full prepare() for this board.
+    free_solver_state(impl_->state);
+    free_locks(impl_->locks);
+    free_reach(impl_->reach);
+    impl_->finalized = false;
+    impl_->prepared  = false;
+    impl_->config    = ctx.config;   // iso / host_tree are board-fixed; keep.
+
+    try {
+        impl_->reach = upload_reach(*ctx.ip_reach, *ctx.oop_reach);
+        impl_->locks = upload_locks(*ctx.resolved_locks);
+        impl_->state = alloc_solver_state(impl_->host_tree->total_nodes,
+                                          MAX_ACTIONS,
+                                          impl_->iso->num_canonical,
+                                          *impl_->host_tree);
+        impl_->prepared = true;
+    } catch (...) {
+        free_solver_state(impl_->state);
+        free_locks(impl_->locks);
+        free_reach(impl_->reach);
+        impl_->prepared = false;
+        impl_->finalized = false;
+        throw;
+    }
+}
+
 // ============================================================================
 // iterate: one DCFR iteration
 //   1. Regret matching → current_strategy

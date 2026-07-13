@@ -1,0 +1,34 @@
+{
+  "context": {
+    "game_type": "Cash",
+    "scenario_type": "vs_3B",
+    "hero_position": "CO",
+    "villain_position": null,
+    "effective_bb": 100,
+    "description": "100bb 2.5x 500rake vs_3B: CO @ CO 2.5bb BB 11.0bb CO",
+    "source": "ranges/qb_ranges/100bb 2.5x 500rake",
+    "source_path": "CO/vs_3bet/CO_2.5bb_BB_11.0bb_CO_24.0bb.txt; CO/vs_3bet/CO_2.5bb_BB_11.0bb_CO_Call.txt; CO/vs_3bet/CO_2.5bb_BB_11.0bb_CO_FOLD.txt",
+    "preflop_line": "CO 2.5bb BB 11.0bb CO"
+  },
+  "strategy": {
+    "actions": [
+      {
+        "name": "Raise 24.0bb",
+        "color_bucket": "Red"
+      },
+      {
+        "name": "Call",
+        "color_bucket": "Green"
+      },
+      {
+        "name": "Fold",
+        "color_bucket": "Blue"
+      }
+    ],
+    "upi_ranges": {
+      "Raise 24.0bb": "AA:1.000,A3s:0.090,A4s:0.162,A5s:0.076,A7s:0.084,A8s:0.206,A9s:0.274,ATs:0.148,AJo:0.176,AQo:0.454,AKs:0.970,AKo:0.360,K5s:0.058,K6s:0.092,77:0.078,88:0.156,99:0.092,T9s:0.052,J9s:0.100,K9s:0.236,TT:0.106,JTs:0.024,KTs:0.078,JJ:0.224,KJo:0.078,QQ:0.316,KQo:0.178,KK:0.726",
+      "Call": "A3s:0.704,A4s:0.838,A5s:0.924,A6s:0.056,A7s:0.254,A8s:0.402,A9s:0.584,ATs:0.852,AJs:1.000,AJo:0.008,AQs:1.000,AQo:0.546,AKs:0.030,AKo:0.640,22:0.104,33:0.174,44:0.246,54s:0.476,55:0.316,65s:0.442,66:0.612,76s:0.536,K6s:0.354,77:0.730,87s:0.546,K7s:0.032,88:0.844,98s:0.184,T8s:0.008,99:0.908,T9s:0.758,J9s:0.602,K9s:0.356,TT:0.894,JTs:0.976,QTs:1.000,KTs:0.922,JJ:0.776,QJs:1.000,KJs:1.000,QQ:0.684,KQs:1.000,KQo:0.344,KK:0.274",
+      "Fold": "A2s:1.000,A3s:0.206,A5o:0.504,A6s:0.944,A7s:0.662,A7o:0.010,A8s:0.390,A8o:0.678,A9s:0.142,A9o:1.000,ATo:1.000,AJo:0.816,22:0.122,33:0.086,K3s:0.706,44:0.754,K4s:1.000,55:0.684,Q5s:0.152,K5s:0.942,66:0.388,86s:0.040,Q6s:0.910,K6s:0.552,77:0.192,87s:0.340,97s:1.000,T7s:0.328,J7s:0.170,Q7s:1.000,K7s:0.968,98s:0.816,T8s:0.992,J8s:1.000,Q8s:1.000,K8s:1.000,T9s:0.190,T9o:0.084,J9s:0.298,Q9s:1.000,K9s:0.410,K9o:0.202,JTo:1.000,QTo:1.000,KTo:1.000,QJo:1.000,KJo:0.922,KQo:0.478"
+    }
+  }
+}

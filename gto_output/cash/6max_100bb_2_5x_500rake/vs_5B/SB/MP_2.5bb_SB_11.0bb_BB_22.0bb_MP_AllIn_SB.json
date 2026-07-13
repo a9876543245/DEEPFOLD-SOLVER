@@ -1,0 +1,29 @@
+{
+  "context": {
+    "game_type": "Cash",
+    "scenario_type": "vs_5B",
+    "hero_position": "SB",
+    "villain_position": null,
+    "effective_bb": 100,
+    "description": "100bb 2.5x 500rake vs_5B: SB @ MP 2.5bb SB 11.0bb BB 22.0bb MP AllIn SB",
+    "source": "ranges/qb_ranges/100bb 2.5x 500rake",
+    "source_path": "SB/vs_5bet/MP_2.5bb_SB_11.0bb_BB_22.0bb_MP_AllIn_SB_Call.txt; SB/vs_5bet/MP_2.5bb_SB_11.0bb_BB_22.0bb_MP_AllIn_SB_FOLD.txt",
+    "preflop_line": "MP 2.5bb SB 11.0bb BB 22.0bb MP AllIn SB"
+  },
+  "strategy": {
+    "actions": [
+      {
+        "name": "Call",
+        "color_bucket": "Green"
+      },
+      {
+        "name": "Fold",
+        "color_bucket": "Blue"
+      }
+    ],
+    "upi_ranges": {
+      "Call": "AA:1.000,KK:1.000",
+      "Fold": "A3s:0.144,A4s:0.548,A5s:0.792,A9s:0.040,ATs:1.000,AJs:1.000,AQs:1.000,AQo:1.000,AKs:1.000,AKo:1.000,44:0.054,54s:0.280,55:0.058,65s:0.206,66:0.262,76s:0.192,77:0.306,87s:0.092,88:0.496,99:0.954,T9s:0.140,J9s:0.116,K9s:0.120,TT:1.000,JTs:0.954,QTs:0.866,KTs:1.000,JJ:1.000,QJs:1.000,KJs:1.000,QQ:1.000,KQs:1.000,KQo:0.130"
+    }
+  }
+}

@@ -42,7 +42,7 @@ import { GameContextSelector } from './components/GameContextSelector';
  * Set back to `true` once the chart data passes the 5-rule sanity check
  * documented in STATUS-AND-ROADMAP.md.
  */
-// Re-enabled: gto_output is now generated from TexasSolverGPU text ranges.
+// Re-enabled: gto_output is now generated from imported text ranges.
 const GTO_CHART_LIBRARY_ENABLED = true;
 import { RunoutPicker } from './components/RunoutPicker';
 import { useGtoAutoRange } from './hooks/useGtoAutoRange';
@@ -84,7 +84,7 @@ function App() {
   // ranges. Default = Cash 6max 100bb (matches the legacy MATCHUPS dataset).
   const [gameContext, setGameContext] = useState<GameContext>({
     gameType: 'Cash',
-    scenarioType: 'texassolver_6max_100bb_2_5x_500rake',
+    scenarioType: '6max_100bb_2_5x_500rake',
     effectiveBB: 100,
   });
 
@@ -137,6 +137,12 @@ function App() {
   // budget. Default 'standard' = 300 iter / 5 min budget, the right
   // balance for most spots.
   const [solveMode, setSolveMode] = useState<SolveMode>('standard');
+
+  // Stage 5: runout decomposition toggle. 'off' = legacy (turn/river equity
+  // approximated on rainbow boards too large to enumerate). 'auto' = solve
+  // real turn/river runouts via flop-trunk + per-turn-card subgame
+  // decomposition (slower, no approximation). Orthogonal to solveMode.
+  const [decomposeRunouts, setDecomposeRunouts] = useState<'off' | 'auto'>('off');
 
   // Modals
   const [showGuide, setShowGuide] = useState(false);
@@ -251,6 +257,9 @@ function App() {
       // the user types a custom value into Advanced settings; otherwise
       // we use the mode preset.
       time_budget_seconds: SOLVE_MODE_PRESETS[solveMode].time_budget_seconds,
+      // Stage 5: runout decomposition. 'off' omits the flag (sidecar default);
+      // 'auto' solves real turn/river runouts on rainbow boards.
+      decompose_runouts: decomposeRunouts,
       // v1.7.0: GUI defaults to the levelized CPU backend (4-5x faster than
       // reference on a typical 8-thread laptop CPU). cpu_simd='auto' lets
       // CPUID pick AVX2 vs scalar at startup, cpu_threads=0 means "use
@@ -260,7 +269,7 @@ function App() {
       cpu_simd: 'auto',
       cpu_threads: 0,
     };
-  }, [pot, stack, iterations, selectedMatchup, getHeroRange, customIpRange, customOopRange, nodeLocks, sizingKey, memoryProfile, solveMode]);
+  }, [pot, stack, iterations, selectedMatchup, getHeroRange, customIpRange, customOopRange, nodeLocks, sizingKey, memoryProfile, solveMode, decomposeRunouts]);
 
   // Initial solve (root node)
   const handleSolve = useCallback(() => {
@@ -765,6 +774,8 @@ function App() {
             setSolveMode(m);
             setIterations(SOLVE_MODE_PRESETS[m].iterations);
           }}
+          decomposeRunouts={decomposeRunouts}
+          onDecomposeRunoutsChange={setDecomposeRunouts}
           onStop={async () => {
             // Pure abort — kills the engine subprocess. No partial result;
             // useSolver will see the killed process as an error and reset

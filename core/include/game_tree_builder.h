@@ -78,6 +78,15 @@ public:
         budget_set_    = true;
     }
 
+    /// Streaming/subgame decomposition (opt-in): when set, the flop→turn
+    /// chance node emits one subgame-leaf placeholder per canonical turn card
+    /// (preserving dealt_card / runout_weight / entering pot+stack) but does
+    /// NOT recurse into turn betting. The result is a small "trunk" — flop
+    /// betting whose turn chance children are leaves — that the decomposition
+    /// orchestrator (solver_decomposed.h) couples to per-turn-card subgames.
+    /// Default false ⇒ the builder behaves exactly as before.
+    void set_truncate_at_chance(bool on) { truncate_at_chance_ = on; }
+
     /// Build the full game tree and return it in SoA format.
     FlatGameTree build();
 
@@ -97,6 +106,8 @@ private:
     /// so the result can warn that runout equity is approximated rather than
     /// degrading silently.
     bool          runout_collapsed_ = false;
+    /// See set_truncate_at_chance(). Opt-in; default off.
+    bool          truncate_at_chance_ = false;
 
     /// Add a node to the tree and return its index
     uint32_t add_node(TreeNode node);
@@ -349,6 +360,37 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
             full_board.data(), static_cast<uint8_t>(full_board.size()));
 
         uint8_t cards_already = static_cast<uint8_t>(full_board.size());
+
+        // Streaming/subgame decomposition truncation (opt-in). At the
+        // flop→turn chance (next_street == 1), emit one subgame-leaf
+        // placeholder per canonical turn card but DO NOT recurse into turn
+        // betting. The decomposition orchestrator solves each leaf as an
+        // independent turn subgame and injects its per-combo root value here.
+        // Taken BEFORE the memory gate, so runout_collapsed_ is never set on
+        // this path and the OOM-prone full enumeration never happens.
+        if (truncate_at_chance_ && next_street == 1) {
+            for (const auto& rep : cr.reps) {
+                TreeNode child;
+                child.type = NodeType::PLAYER_OOP;   // subgame root acts first
+                child.street = next_street;
+                child.active_player = 0;
+                child.pot = n_pot;
+                child.stack = n_stack;
+                child.bet_into = 0;
+                child.raise_count = 0;
+                child.oop_has_initiative = true;
+                child.dealt_card = rep.card;
+                child.runout_weight = rep.weight;
+                child.runout_cards = n_runout_cards;
+                child.runout_cards.push_back(rep.card);
+                uint32_t child_idx = add_node(std::move(child));
+                nodes_[node_idx].children.push_back(
+                    {{ActionType::CHECK, static_cast<float>(rep.card)}, child_idx});
+                // No build_subtree(child_idx): leaf placeholder (0 children).
+            }
+            return;
+        }
+
         // Always enumerate at turn level (one chance step left). At flop
         // level enumerate only if matchup tables fit the host RAM budget.
         //

@@ -17,9 +17,11 @@
 #include "hand_evaluator.h"
 #include "solver.h"
 #include "solver_backend.h"
+#include "solver_decomposed.h"   // Stage 5: runout decomposition (opt-in route)
 #include "cpu_simd.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <sstream>
@@ -70,7 +72,7 @@ struct CLIArgs {
     std::vector<float> turn_sizes = {0.75f};
     std::vector<float> river_sizes = {0.75f};
 
-    // Custom ranges (TexasSolver format)
+    // Custom ranges (range-string format)
     std::string ip_range_str;
     std::string oop_range_str;
 
@@ -90,6 +92,12 @@ struct CLIArgs {
     bool force_cpu_postsolve = false;  // skip GPU postsolve fast path
     std::string dcfr_schedule = "postflop";  // "standard" | "postflop" — postflop
                                              // converges ~3-4× faster (2026-06-25)
+    /// Stage 5: runout decomposition route. "off" (default) = legacy behavior.
+    /// "auto" = decompose only when the builder would collapse the turn
+    /// (rainbow/huge) → real turn/river under bounded memory, runout_approximated
+    /// becomes false. "on" = always decompose (turn subgames) even on enumerable
+    /// boards. Default off until the full UI slice + a rainbow end-to-end is green.
+    std::string decompose_runouts = "off";   // off | auto | on
     float rake_rate = 0.0f;
     float rake_cap  = 0.0f;
 
@@ -196,6 +204,8 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.force_cpu_postsolve = false;
         } else if (arg == "--dcfr-schedule" && i + 1 < argc) {
             args.dcfr_schedule = argv[++i];
+        } else if (arg == "--decompose-runouts" && i + 1 < argc) {
+            args.decompose_runouts = argv[++i];
         } else if (arg == "--rake-rate" && i + 1 < argc) {
             args.rake_rate = std::stof(argv[++i]);
         } else if (arg == "--rake-cap" && i + 1 < argc) {
@@ -356,10 +366,10 @@ Example:
 }
 
 // ============================================================================
-// Range Parsing: TexasSolver format -> 1326-float weight array
+// Range Parsing: range-string format -> 1326-float weight array
 // ============================================================================
 
-/// Parse TexasSolver range string, e.g. "AA:1.0,AKs:0.5,A4o:1.0"
+/// Parse range string, e.g. "AA:1.0,AKs:0.5,A4o:1.0"
 /// Returns a map of grid_label -> weight
 void apply_range_string(const std::string& range_str, std::array<float, NUM_COMBOS>& weights) {
     if (range_str.empty()) return;
@@ -662,6 +672,7 @@ std::string result_to_json(
     json << "  \"force_cpu_postsolve\": "
          << (args.force_cpu_postsolve ? "true" : "false") << ",\n";
     json << "  \"dcfr_schedule\": \"" << escape_json(args.dcfr_schedule) << "\",\n";
+    json << "  \"decompose_runouts\": \"" << escape_json(args.decompose_runouts) << "\",\n";
     json << "  \"rake_rate\": " << args.rake_rate << ",\n";
     json << "  \"rake_cap\": " << args.rake_cap << ",\n";
     json << "  \"iterations_run\": " << result.iterations_run << ",\n";
@@ -1672,11 +1683,83 @@ int main(int argc, char* argv[]) {
             result.has_target = true;
         }
 
+        // ── Stage 5: runout decomposition route ──────────────────────────────
+        // When the monolithic build collapsed the turn (rainbow/huge → the amber
+        // "runout_approximated" path) OR the caller forced it, re-solve via the
+        // flop trunk + per-turn-card subgames so turn/river get REAL equity under
+        // bounded memory, and stitch the per-node strategies into the SAME nav
+        // cache the UI already consumes. The collapsed solve above is cheap (it
+        // collapsed to a tiny tree), so reading result.runout_approximated to
+        // decide costs almost nothing. Default-off ⇒ legacy path byte-identical.
+        deepsolver::DecomposedResult decomp;
+        bool decomposed = false;
+        const bool want_decompose =
+            (args.decompose_runouts == "on") ||
+            (args.decompose_runouts == "auto" && result.runout_approximated);
+        if (want_decompose) {
+            deepsolver::DecompositionOptions o;
+            // Iteration budget (env-overridable for tuning; gated behind the
+            // default-off flag, so these are dev defaults — not yet productized).
+            o.outer_iterations = 20;
+            o.inner_iterations = 120;
+            if (const char* e = std::getenv("DEEPSOLVER_DECOMP_OUTER")) o.outer_iterations = std::max(1, std::atoi(e));
+            if (const char* e = std::getenv("DEEPSOLVER_DECOMP_INNER")) o.inner_iterations = std::max(1, std::atoi(e));
+            o.build_nav            = args.emit_strategy_tree;
+            o.nav_max_player_depth = 8;
+            o.nav_max_nodes        = config.memory_budget.strategy_tree_max_nodes;  // 0 = unlimited
+            if (result.runout_approximated) {
+                // Rainbow/huge: adaptive GPU streaming. cap = -1 ⇒ pin as many
+                // turn subgames resident as the user's FREE VRAM allows (measured
+                // at runtime so it never OOMs — not every GPU has 32 GB), skipping
+                // the matchup re-upload for pinned leaves; stream the rest. (No
+                // CUDA → subgames fall back to CPU, still correct.)
+                o.subgame_backend  = BackendType::GPU;
+                o.gpu_resident_cap = -1;
+            } else {
+                // Forced on an enumerable board: parallel CPU subgames (better
+                // quality, already fast — no GPU benefit there).
+                o.subgame_backend = BackendType::CPU;
+                o.cache_subgames  = true;
+            }
+            decomp = deepsolver::solve_decomposed(config, o);
+            if (decomp.ok) {
+                decomposed = true;
+                result.runout_approximated     = false;  // the whole point.
+                result.exploitability_pct      = decomp.exploitability_pct;
+                result.exploitability_computed = true;
+                result.iterations_run          = decomp.outer_iterations_run;
+                backend_name = (o.subgame_backend == BackendType::GPU)
+                                   ? "decomposed-gpu" : "decomposed-cpu";
+                // Align the top-level "current node" view with the stitched nav
+                // cache (root unless a history path was requested).
+                auto it = decomp.strategy_tree.find(args.history);
+                if (it != decomp.strategy_tree.end()) {
+                    const auto& e = it->second;
+                    if (!e.acting.empty())           result.acting_player    = e.acting;
+                    if (!e.action_labels.empty())    result.action_labels    = e.action_labels;
+                    if (!e.global_strategy.empty())  result.global_strategy  = e.global_strategy;
+                    if (!e.combo_strategies.empty()) result.combo_strategies = e.combo_strategies;
+                    result.opponent_side  = e.opponent_side;
+                    result.opponent_range = e.opponent_range;
+                }
+            } else {
+                std::cerr << "[decompose] solve_decomposed failed (ok=false); "
+                             "keeping the monolithic result.\n";
+            }
+        }
+
         // Build strategy tree for client-side navigation cache (Route A).
         // Benchmarks can disable this to avoid measuring large JSON output.
         std::map<std::string, deepsolver::Solver::StrategyTreeEntry> strategy_tree;
         const std::map<std::string, deepsolver::Solver::StrategyTreeEntry>* strategy_tree_ptr = nullptr;
-        if (args.emit_strategy_tree) {
+        if (decomposed && args.emit_strategy_tree) {
+            // Stitched trunk + per-turn-card subgames (built in the route above).
+            strategy_tree = std::move(decomp.strategy_tree);
+            strategy_tree_ptr = &strategy_tree;
+            result.resources.strategy_tree_emitted_nodes =
+                static_cast<uint32_t>(strategy_tree.size());
+            result.resources.strategy_tree_truncated = decomp.strategy_tree_truncated;
+        } else if (args.emit_strategy_tree) {
             // Phase 3: pick the explicit mode if --strategy-tree-evs was set,
             // otherwise honor --no-strategy-tree-evs (NONE) or default to
             // VISIBLE (only emitted nodes cache an EV vector).

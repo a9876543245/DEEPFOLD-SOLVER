@@ -98,6 +98,12 @@ int cuda_compute_capability() {
     return prop.major * 10 + prop.minor;
 }
 
+uint64_t gpu_free_bytes() {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
+    return static_cast<uint64_t>(free_b);
+}
+
 // Why was the CUDA backend skipped? Returns an empty string when the GPU
 // IS usable (caller should not surface anything in that case). Otherwise
 // returns a short human-readable reason — used to populate
@@ -144,6 +150,7 @@ bool has_cuda_gpu() { return false; }
 std::string describe_cuda_gpu() { return ""; }
 std::string cuda_gpu_reject_reason() { return "Built without CUDA support."; }
 int cuda_compute_capability() { return 0; }
+uint64_t gpu_free_bytes() { return 0; }
 
 #endif
 

@@ -1,0 +1,29 @@
+{
+  "context": {
+    "game_type": "Cash",
+    "scenario_type": "vs_5B",
+    "hero_position": "MP",
+    "villain_position": null,
+    "effective_bb": 100,
+    "description": "100bb 2.5x 500rake vs_5B: MP @ UTG 2.5bb MP 8.5bb CO 20.0bb BTN AllIn SB Call BB Call UTG Call MP",
+    "source": "ranges/qb_ranges/100bb 2.5x 500rake",
+    "source_path": "MP/vs_5bet/UTG_2.5bb_MP_8.5bb_CO_20.0bb_BTN_AllIn_SB_Call_BB_Call_UTG_Call_MP_Call.txt; MP/vs_5bet/UTG_2.5bb_MP_8.5bb_CO_20.0bb_BTN_AllIn_SB_Call_BB_Call_UTG_Call_MP_FOLD.txt",
+    "preflop_line": "UTG 2.5bb MP 8.5bb CO 20.0bb BTN AllIn SB Call BB Call UTG Call MP"
+  },
+  "strategy": {
+    "actions": [
+      {
+        "name": "Call",
+        "color_bucket": "Green"
+      },
+      {
+        "name": "Fold",
+        "color_bucket": "Blue"
+      }
+    ],
+    "upi_ranges": {
+      "Call": "A4s:0.666,A8s:0.150,AKo:0.382,65s:0.282,K5s:0.008,66:0.070,76s:0.230,77:0.112,88:0.168,99:0.034,T9s:0.012,TT:0.154,QTs:0.012,JJ:0.554,QJs:0.452,QQ:0.112",
+      "Fold": "AA:1.000,A3s:0.162,A5s:0.960,A8s:0.018,A9s:0.290,ATs:0.708,AJs:1.000,AQs:1.000,AQo:0.896,AKs:1.000,AKo:0.618,44:0.014,54s:0.274,55:0.038,65s:0.004,K5s:0.004,66:0.042,76s:0.010,87s:0.134,88:0.048,99:0.286,T9s:0.030,K9s:0.116,TT:0.390,JTs:0.032,QTs:0.042,KTs:0.934,JJ:0.446,QJs:0.164,KJs:1.000,QQ:0.888,KQs:1.000,KQo:0.514,KK:1.000"
+    }
+  }
+}

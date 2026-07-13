@@ -27,6 +27,11 @@ interface Props {
    *  time budget. Defaults 'standard'. */
   solveMode?: SolveMode;
   onSolveModeChange?: (mode: SolveMode) => void;
+  /** Stage 5: runout decomposition mode. 'off' (default) = legacy collapse
+   *  gate (turn/river approximated on large rainbow boards). 'auto' = solve
+   *  real runouts via subgame decomposition. Orthogonal to solveMode. */
+  decomposeRunouts?: 'off' | 'auto';
+  onDecomposeRunoutsChange?: (mode: 'off' | 'auto') => void;
   /** v1.3.0: called when the user clicks Stop during loading. Should
    *  invoke the cancel_solve Tauri command. */
   onStop?: () => void;
@@ -48,6 +53,7 @@ export function SolverControls({
   sizingKey = 'standard', onSizingChange,
   memoryProfile = 'balanced', onMemoryProfileChange,
   solveMode = 'standard', onSolveModeChange, onStop,
+  decomposeRunouts = 'off', onDecomposeRunoutsChange,
   expectedEffectiveBB = null,
 }: Props) {
   const t = useT();
@@ -234,6 +240,37 @@ export function SolverControls({
         </div>
         <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginTop: 4 }}>
           {SOLVE_MODE_PRESETS[solveMode].description}
+        </div>
+      </div>
+
+      {/* Stage 5: runout decomposition toggle. 'off' keeps the legacy collapse
+          gate (turn/river equity approximated on rainbow boards too large to
+          enumerate); 'auto' solves real runouts via flop-trunk + per-turn-card
+          subgame decomposition. Independent of solveMode. */}
+      <div style={{ marginBottom: 8 }}>
+        <label style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginBottom: 6, display: 'block' }}>
+          {t('config.decompose.label')}
+        </label>
+        <div style={{ display: 'flex', gap: 6 }} role="radiogroup">
+          {(['off','auto'] as const).map(m => {
+            const active = decomposeRunouts === m;
+            return (
+              <button
+                key={m}
+                role="radio"
+                aria-checked={active}
+                disabled={loading}
+                className={`btn-pill ${active ? 'active' : ''}`}
+                onClick={() => onDecomposeRunoutsChange?.(m)}
+                style={{ flex: 1 }}
+              >
+                {t(`config.decompose.${m}`)}
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginTop: 4 }}>
+          {t(`config.decompose.hint.${decomposeRunouts}`)}
         </div>
       </div>
 

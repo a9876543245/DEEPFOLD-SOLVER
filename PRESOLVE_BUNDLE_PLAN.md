@@ -192,8 +192,8 @@ Spot ID scheme: `m<matchup_idx>_b<board_idx>_<sizing>_<stack>bb.json.gz`
 Example: `m12_b3_standard_100bb.json.gz`
 
 **Implementation notes**:
-- Look at existing `scripts/import-texassolvergpu-ranges.mjs` for prior art on iterating MATCHUPS
-- Range strings: `MATCHUPS[i].ipRange` and `oopRange` are in TexasSolver string format — pass directly via `--ip-range` / `--oop-range`
+- Look at existing `scripts/import-pio-ranges.mjs` for prior art on iterating MATCHUPS
+- Range strings: `MATCHUPS[i].ipRange` and `oopRange` are in range-string format — pass directly via `--ip-range` / `--oop-range`
 - `defaultPot` and `defaultStack` in MATCHUPS are in BB; multiply by 10 for chip units (matches existing `solveSpotReal` line 259-260)
 - Use `--backend cuda` for the GPU; verify availability via `--gpu-info` first
 - Add `--postsolve full --strategy-tree-evs visible` so the bundled JSON has everything the UI needs

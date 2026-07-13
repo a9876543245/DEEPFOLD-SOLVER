@@ -157,10 +157,23 @@ function pickCudaExe() {
 function solveOne(exe, item) {
   return new Promise((resolveFn, reject) => {
     const sizes = item.spot.sizes;
-    // Override flop sizes to single 0.75 — see header comment for rationale.
-    // Turn/river sizes stay at their normal Standard menu (only flop is the
-    // tree-explosion bottleneck on monotone × wide ranges).
-    const flopSizesStr = '0.75';
+    // v1.9.0: FULL standard sizing + a small host budget that trips the
+    // collapse gate — the mono spots now bundle exactly like every other
+    // big board (rainbows) already does: collapsed runouts, converged flop
+    // strategy (~0.5-1% exploit at 3000 iters), identical bet menus.
+    //
+    // History of this choice (all measured, see memory ship-190-in-progress):
+    //   v1.8.3 trick (single flop size, enumerate) — engine state-per-node
+    //     grew ~2× since; the tree now needs ~70 GB GPU state → OOM.
+    //   decomposed 30×150 — routes correctly but 2 h/spot at 27.9% exploit
+    //     (unconverged on real-size trees; fixture point doesn't extrapolate).
+    //   single-size-ALL-streets enumerate — fits (10.6 GB) but 3000 iters
+    //     left 10-14.5% exploit: these were the ONLY enumerated spots in the
+    //     bundle, 100× bigger game than the collapsed ones. Inconsistent and
+    //     under-converged.
+    // Collapsed + full menus is both consistent and converged; real-runout
+    // study on these boards is what the live Exact toggle is for.
+    const flopSizesStr = sizes.flopBetSizes.join(',');
     const cmdArgs = [
       '--pot',           String(item.spot.pot),
       '--stack',         String(item.spot.stack),
@@ -172,6 +185,10 @@ function solveOne(exe, item) {
       '--flop-sizes',    flopSizesStr,
       '--turn-sizes',    sizes.turnBetSizes.join(','),
       '--river-sizes',   sizes.riverBetSizes.join(','),
+      // Trip the collapse gate (cap = host/2 = 256 MB) so the mono boards
+      // collapse like the rainbow boards do at app-default budgets. Probe:
+      // runout_approximated=true, CUDA success.
+      '--host-memory-mb', '512',
       '--dcfr-schedule', args.dcfrSchedule,
       '--cpu-persistent-omp', '1',
       '--postsolve',     'full',

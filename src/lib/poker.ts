@@ -77,9 +77,9 @@ export interface SolverRequest {
   target_combo?: string;
   iterations?: number;
   exploitability?: number;
-  /** IP player's preflop range (TexasSolver format) */
+  /** IP player's preflop range (range-string format) */
   ip_range?: string;
-  /** OOP player's preflop range (TexasSolver format) */
+  /** OOP player's preflop range (range-string format) */
   oop_range?: string;
   /** JSON encoded string of NodeLock[] */
   node_locks?: string;
@@ -121,6 +121,12 @@ export interface SolverRequest {
    *    Quick=60, Standard=300, Deep=900. CFR is anytime — at any iter N the
    *  running average is the strategy, so stopping at the budget is fine. */
   time_budget_seconds?: number;
+  /** Stage 5: runout decomposition. 'off' (default) = legacy collapse gate
+   *  (turn/river equity approximated when the board is too large to
+   *  enumerate). 'auto' = solve real runouts on rainbow/collapsed boards via
+   *  flop-trunk + per-turn-card subgame decomposition. 'on' = force even on
+   *  enumerable boards (debug). undefined / 'off' ⇒ flag omitted. */
+  decompose_runouts?: 'off' | 'auto' | 'on';
   /** v1.4.0 Phase 2: CPU SIMD policy. undefined = auto (CPUID picks).
    *  "scalar" forces the scalar fallback (parity testing).
    *  "avx2" requires AVX2 hardware (engine aborts otherwise). */

@@ -38,6 +38,13 @@ public:
     GpuBackend& operator=(const GpuBackend&) = delete;
 
     void prepare(const SolverContext& ctx) override;
+    /// Re-solve the SAME board with new ranges: keeps the device-resident tree,
+    /// matchup tables, and level schedule (board-fixed), re-doing only reach,
+    /// node locks, and solver state. Skips the dominant matchup upload — the
+    /// runout-decomposition pinned-leaf fast path. Bit-identical to prepare()
+    /// for the same board. Falls back to a full prepare() if not previously
+    /// prepared (no resident board to keep).
+    void reprepare_keep_board(const SolverContext& ctx) override;
     void iterate(int iteration) override;
     void finalize() override;
     const std::vector<std::vector<float>>& strategy() const override { return strategy_; }

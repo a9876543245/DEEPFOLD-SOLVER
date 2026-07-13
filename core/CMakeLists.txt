@@ -4,6 +4,12 @@ cmake_minimum_required(VERSION 3.20)
 # CUDA is optional — detect availability
 # ============================================================================
 option(ENABLE_CUDA "Enable CUDA GPU acceleration" ON)
+# --use_fast_math trades precision for speed (fast div/sqrt, FMA, FTZ). Default
+# ON (production). Turn OFF to test whether GPU's lower-precision math biases
+# DCFR equilibria — e.g. the Stage-3 decomposition GPU-vs-CPU subgame quality
+# gap (see memory next_session_runout_decomposition). Build a separate dir with
+# -DCUDA_FAST_MATH=OFF so the production build dir stays untouched.
+option(CUDA_FAST_MATH "Use CUDA --use_fast_math (faster GPU math, lower precision)" ON)
 
 if(ENABLE_CUDA)
     include(CheckLanguage)
@@ -75,7 +81,11 @@ if(HAVE_CUDA)
     # native binary instead of paying a JIT cost on first launch.
     set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
 
-    add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
+    if(CUDA_FAST_MATH)
+        add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
+    else()
+        message(STATUS "CUDA --use_fast_math DISABLED (precision-mode build)")
+    endif()
     if(MSVC)
         add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/O2>")
         add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc>")
@@ -256,6 +266,27 @@ if(BUILD_TESTS)
     add_test(NAME CpuParityExtended COMMAND test_parity --suite=extended)
     set_tests_properties(CpuParityExtended PROPERTIES
         LABELS "parity;correctness" TIMEOUT 90)
+
+    # ----------------------------------------------------------------
+    # Streaming/subgame decomposition validation (Stage 1, opt-in).
+    # Solves a monotone flop both monolithically (oracle) and decomposed,
+    # printing an exploitability convergence sweep. Its OWN label so it stays
+    # out of the smoke/parity/correctness gates until the approach is proven.
+    # Run explicitly with: ctest -L decomposition --output-on-failure
+    # ----------------------------------------------------------------
+    add_executable(test_decomposition
+        tests/test_decomposition.cpp
+        src/hand_evaluator.cpp
+        src/backend_factory.cpp
+        ${CPU_KERNEL_SOURCES}
+    )
+    target_include_directories(test_decomposition PRIVATE include)
+    if(MSVC)
+        target_compile_options(test_decomposition PRIVATE /W4 /O2 /EHsc)
+        target_link_options(test_decomposition PRIVATE "/STACK:16777216")
+    endif()
+    add_test(NAME Decomposition COMMAND test_decomposition)
+    set_tests_properties(Decomposition PROPERTIES LABELS "decomposition" TIMEOUT 1200)
 
     # ----------------------------------------------------------------
     # Per-kernel scalar vs AVX2 parity (v1.8.0 Sprint 0.2). Loops every
@@ -445,6 +476,45 @@ if(BUILD_TESTS)
         add_test(NAME GpuPostsolveParity COMMAND test_gpu_postsolve)
         set_tests_properties(GpuPostsolveParity PROPERTIES
             LABELS "smoke;gpu" TIMEOUT 60)
+
+        # ----------------------------------------------------------------
+        # Stage 3: GPU subgame streaming validation. SAME source as the CPU
+        # `Decomposition` test, but compiled WITH DEEPSOLVER_USE_CUDA + the
+        # CUDA backend so create_backend(GPU) returns a real GpuBackend (the
+        # CPU-only target silently falls back to CpuBackend). The extra GPU
+        # block (guarded by #ifdef DEEPSOLVER_USE_CUDA in the test) streams
+        # subgames through the GpuBackend and asserts exploit parity with the
+        # monolithic oracle + bounded peak residency.
+        # ----------------------------------------------------------------
+        add_executable(test_decomposition_gpu
+            tests/test_decomposition.cpp
+            src/hand_evaluator.cpp
+            src/backend_factory.cpp
+            ${CPU_KERNEL_SOURCES}
+            cuda/cfr_kernel.cu
+            cuda/eval_kernel.cu
+            cuda/gpu_backend.cu
+        )
+        target_compile_definitions(test_decomposition_gpu PRIVATE DEEPSOLVER_USE_CUDA)
+        target_include_directories(test_decomposition_gpu PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+        )
+        set_target_properties(test_decomposition_gpu PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        )
+        target_link_libraries(test_decomposition_gpu PRIVATE cudart)
+        if(MSVC)
+            target_compile_options(test_decomposition_gpu PRIVATE
+                "$<$<COMPILE_LANGUAGE:CXX>:/W4>"
+                "$<$<COMPILE_LANGUAGE:CXX>:/O2>"
+                "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>")
+            target_link_options(test_decomposition_gpu PRIVATE "/STACK:16777216")
+        endif()
+        add_test(NAME DecompositionGpu COMMAND test_decomposition_gpu)
+        set_tests_properties(DecompositionGpu PROPERTIES
+            LABELS "decomposition;gpu" TIMEOUT 1800)
     endif()
 endif()
 

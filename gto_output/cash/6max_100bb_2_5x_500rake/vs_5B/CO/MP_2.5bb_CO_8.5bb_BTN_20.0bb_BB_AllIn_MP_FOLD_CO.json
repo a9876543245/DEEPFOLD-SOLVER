@@ -1,0 +1,29 @@
+{
+  "context": {
+    "game_type": "Cash",
+    "scenario_type": "vs_5B",
+    "hero_position": "CO",
+    "villain_position": null,
+    "effective_bb": 100,
+    "description": "100bb 2.5x 500rake vs_5B: CO @ MP 2.5bb CO 8.5bb BTN 20.0bb BB AllIn MP FOLD CO",
+    "source": "ranges/qb_ranges/100bb 2.5x 500rake",
+    "source_path": "CO/vs_5bet/MP_2.5bb_CO_8.5bb_BTN_20.0bb_BB_AllIn_MP_FOLD_CO_Call.txt; CO/vs_5bet/MP_2.5bb_CO_8.5bb_BTN_20.0bb_BB_AllIn_MP_FOLD_CO_FOLD.txt",
+    "preflop_line": "MP 2.5bb CO 8.5bb BTN 20.0bb BB AllIn MP FOLD CO"
+  },
+  "strategy": {
+    "actions": [
+      {
+        "name": "Call",
+        "color_bucket": "Green"
+      },
+      {
+        "name": "Fold",
+        "color_bucket": "Blue"
+      }
+    ],
+    "upi_ranges": {
+      "Call": "AA:1.000,KK:1.000",
+      "Fold": "A3s:0.256,A4s:0.862,A5s:0.626,A8s:0.288,A9s:0.664,ATs:1.000,AJs:1.000,AJo:0.682,AQs:1.000,AQo:1.000,AKs:1.000,AKo:1.000,44:0.042,54s:0.338,55:0.044,65s:0.310,66:0.190,76s:0.228,77:0.204,87s:0.074,88:0.306,99:0.440,T9s:0.004,TT:1.000,JTs:0.136,QTs:0.246,KTs:1.000,JJ:1.000,QJs:1.000,KJs:1.000,QQ:1.000,KQs:1.000,KQo:0.948"
+    }
+  }
+}
