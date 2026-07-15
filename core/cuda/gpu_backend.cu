@@ -971,6 +971,44 @@ void GpuBackend::reprepare_keep_board(const SolverContext& ctx) {
     }
 }
 
+void GpuBackend::reprepare_keep_state(const SolverContext& ctx) {
+    if (!ctx.tree || !ctx.iso || !ctx.config ||
+        !ctx.ip_reach || !ctx.oop_reach) {
+        throw std::runtime_error("GpuBackend::reprepare_keep_state: null pointers in SolverContext");
+    }
+    // Nothing resident to continue from (first solve on this backend, or a
+    // different board) → cold path, which handles both cases correctly.
+    if (!impl_->prepared || !impl_->host_tree || !impl_->state.regrets ||
+        ctx.tree->total_nodes != impl_->host_tree->total_nodes) {
+        reprepare_keep_board(ctx);
+        return;
+    }
+
+    // Keep board-fixed device data (tree, matchup, levels) AND the solver
+    // state (regrets, strategy_sum). current_strategy is recomputed from
+    // regrets by every iterate(), and finalize() only overwrites it with the
+    // normalized average — so neither needs restoring here. Refresh only the
+    // range-dependent uploads.
+    free_locks(impl_->locks);
+    free_reach(impl_->reach);
+    impl_->finalized = false;
+    impl_->config    = ctx.config;   // iso / host_tree are board-fixed; keep.
+
+    try {
+        impl_->reach = upload_reach(*ctx.ip_reach, *ctx.oop_reach);
+        impl_->locks = upload_locks(*ctx.resolved_locks);
+    } catch (...) {
+        // Reach/locks are gone but state is intact and unusable without them:
+        // drop the whole prepare so the next call rebuilds from scratch.
+        free_solver_state(impl_->state);
+        free_locks(impl_->locks);
+        free_reach(impl_->reach);
+        impl_->prepared  = false;
+        impl_->finalized = false;
+        throw;
+    }
+}
+
 // ============================================================================
 // iterate: one DCFR iteration
 //   1. Regret matching → current_strategy

@@ -189,6 +189,35 @@ public:
     /// the board (tree + matchup) matches the prior prepare() on this backend.
     virtual void reprepare_keep_board(const SolverContext& ctx) { prepare(ctx); }
 
+    /// Re-prepare for a re-solve of the SAME board that CONTINUES the existing
+    /// CFR state — regrets and strategy_sum are KEPT, not zeroed. Only the
+    /// range-dependent inputs (reach, node locks) are refreshed.
+    ///
+    /// This is the runout-decomposition warm-start: today every outer sweep
+    /// restarts each turn subgame from zero regrets, so a subgame is never
+    /// more than `inner_iterations` deep no matter how many outer sweeps run
+    /// (30×150 outer/inner still delivers a 150-iteration subgame). Keeping
+    /// the state lets the subgame accumulate across sweeps, and the caller
+    /// passes a CONTINUING iteration index to iterate() so the DCFR discount
+    /// schedule keeps decaying instead of restarting.
+    ///
+    /// Approximate by construction: regrets accumulated under the previous
+    /// sweep's opponent reach are stale when the reach moves. DCFR discounting
+    /// washes them out over sweeps, but this trades CFR's from-scratch
+    /// guarantee for depth — hence opt-in, measured, never the default.
+    ///
+    /// Default = reprepare_keep_board() (cold restart), which is always
+    /// correct — a backend that can't keep state simply gets no warm-start.
+    /// The caller guarantees the board matches the prior prepare().
+    virtual void reprepare_keep_state(const SolverContext& ctx) {
+        reprepare_keep_board(ctx);
+    }
+
+    /// Whether reprepare_keep_state() actually preserves CFR state on this
+    /// backend. False means warm-start silently degrades to a cold restart —
+    /// callers report it rather than claiming a warm-start that didn't happen.
+    virtual bool supports_warm_start() const { return false; }
+
     /// Run ONE DCFR iteration. Expected sequence:
     ///   1. Compute current_strategy from regrets (regret matching)
     ///   2. Apply DCFR discount to regrets

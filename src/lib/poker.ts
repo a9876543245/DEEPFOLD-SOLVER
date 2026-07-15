@@ -127,6 +127,13 @@ export interface SolverRequest {
    *  flop-trunk + per-turn-card subgame decomposition. 'on' = force even on
    *  enumerable boards (debug). undefined / 'off' ⇒ flag omitted. */
   decompose_runouts?: 'off' | 'auto' | 'on';
+  /** Roadmap ④: decomposition iteration presets (engine --decompose-* CLI
+   *  flags). undefined = engine dev defaults. Filled from DECOMPOSE_PRESETS
+   *  keyed on solveMode when Exact is on. */
+  decompose_outer?: number;
+  decompose_inner?: number;
+  decompose_trunk_iters?: number;
+  decompose_warm_start?: boolean;
   /** v1.4.0 Phase 2: CPU SIMD policy. undefined = auto (CPUID picks).
    *  "scalar" forces the scalar fallback (parity testing).
    *  "avx2" requires AVX2 hardware (engine aborts otherwise). */
@@ -174,6 +181,29 @@ export const SOLVE_MODE_PRESETS: Record<SolveMode, {
               description: 'Pro-grade quality — up to 5 min' },
   deep:     { iterations: 10000, time_budget_seconds: 900, exploitability: 0.2,
               description: 'Research-grade — up to 15 min' },
+};
+
+/** Roadmap ④: Exact-mode (runout decomposition) iteration presets, keyed on
+ *  solveMode. Values come from the 2026-07-15 convergence study on a real
+ *  bundle spot (805 leaves): subgame DEPTH (inner) dominates quality — 3×
+ *  inner beat 20× more trunk sweeps at lower cost — so presets scale inner
+ *  and keep outer minimal. trunk_iters (K) is nearly free and helps starved
+ *  trunks; warm-start lets persistent subgames accumulate depth.
+ *
+ *  MUST stay pow-4-safe: the engine's POSTFLOP schedule wipes the average
+ *  strategy at iterations 1,4,16,64,256,1024,4096, so the delivered pass
+ *  must not end just past a wipe. These exact tuples are static_assert-ed
+ *  in core/include/solver_decomposed.h (decomp_preset_pow4_safe) — change
+ *  BOTH sides together. */
+export const DECOMPOSE_PRESETS: Record<SolveMode, {
+  outer: number;        // sweeps (each re-solves every turn subgame)
+  inner: number;        // per-subgame CFR iterations per solve
+  trunk_iters: number;  // trunk CFR iterations per sweep (K)
+  warm_start: boolean;  // persistent subgames continue their CFR run
+}> = {
+  quick:    { outer: 2, inner: 150, trunk_iters: 300, warm_start: true },
+  standard: { outer: 2, inner: 450, trunk_iters: 300, warm_start: true },
+  deep:     { outer: 2, inner: 900, trunk_iters: 300, warm_start: true },
 };
 
 /** Mirrors `ResolvedMemoryBudget::from_profile()` in src-tauri/src/types.rs.
@@ -280,6 +310,11 @@ export interface SolveResources {
    *  Goal is order-of-magnitude accuracy — distinguishing "30 seconds"
    *  from "30 minutes" so users know whether to commit. */
   estimated_solve_seconds?: number;
+  /** Roadmap ④ (estimate-only): true when the builder already collapsed
+   *  the runout enumeration at estimate time — i.e. a Fast solve of this
+   *  spot would show the amber approximated banner, and Exact ('auto')
+   *  would engage decomposition. */
+  runout_approximated?: boolean;
   /** v1.4.0 Phase 2: actual SIMD mode used by the CPU CFR kernels.
    *  "avx2" or "scalar". Empty/missing on GPU solves. */
   cpu_simd?: string;
@@ -297,6 +332,39 @@ export interface EstimateResponse {
   /** "estimate" on success, "error" on failure. */
   status: string;
   resources: SolveResources;
+  /** Roadmap ④: Exact-mode feasibility pre-flight. Present when the request
+   *  had decompose_runouts auto/on. Prices the decomposed run (trunk build +
+   *  per-line subgame sampling) so the UI can show "Exact ≈ N min, expected
+   *  accuracy ~X" BEFORE the user commits. */
+  decompose?: DecomposeEstimate;
+}
+
+/** Mirrors the C++ "decompose" block of the --estimate-only JSON. */
+export interface DecomposeEstimate {
+  ok: boolean;
+  /** Whether 'auto' decomposition is predicted to actually engage on this
+   *  spot (builder collapse — exact — plus a state-vs-budget mirror that
+   *  deliberately over-predicts on iso boards: a false "will decompose"
+   *  shows a scary ETA that turns out fast; a false "won't" means an
+   *  unwarned 90-minute wait). */
+  would_engage: boolean;
+  leaves: number;
+  lines: number;
+  trunk_nodes: number;
+  sweeps: number;
+  outer: number;
+  inner: number;
+  trunk_iters_per_sweep: number;
+  warm_start: boolean;
+  per_sweep_seconds: number;
+  total_seconds: number;
+  spr: number;
+  /** 'high' (SPR ≤ 3) | 'medium' (SPR ≤ 6) | 'navigation' (deep SPR —
+   *  browse real runouts; equilibrium quality not achievable). */
+  quality_tier: 'high' | 'medium' | 'navigation' | string;
+  expected_exploit_lo_pct: number;
+  expected_exploit_hi_pct: number;
+  backend: string;
 }
 
 /** v1.3.0: which stop condition fired in the solve loop.

@@ -10,8 +10,8 @@ import { ActionNavigator } from './components/ActionNavigator';
 import { ActionBar } from './components/ActionBar';
 import { TurnRiverCardSelector } from './components/TurnRiverCardSelector';
 import { useSolver } from './hooks/useSolver';
-import type { SolverRequest, NodeLock, ComboAnalysis, GameContext, MemoryProfile, SolveMode } from './lib/poker';
-import { getHandStrength, RANK_VALUES, SOLVE_MODE_PRESETS } from './lib/poker';
+import type { SolverRequest, NodeLock, ComboAnalysis, GameContext, MemoryProfile, SolveMode, EstimateResponse } from './lib/poker';
+import { getHandStrength, RANK_VALUES, SOLVE_MODE_PRESETS, DECOMPOSE_PRESETS } from './lib/poker';
 import type { Position, PositionMatchup } from './lib/ranges';
 import { derivePotStack } from './lib/ranges';
 import { createRootNode, takeAction, dealCard, BET_SIZINGS } from './lib/gameTree';
@@ -143,6 +143,11 @@ function App() {
   // real turn/river runouts via flop-trunk + per-turn-card subgame
   // decomposition (slower, no approximation). Orthogonal to solveMode.
   const [decomposeRunouts, setDecomposeRunouts] = useState<'off' | 'auto'>('off');
+  // Roadmap ④: Exact feasibility pre-flight. When Exact is selected, ask the
+  // engine (--estimate-only) what a decomposed solve of the CURRENT config
+  // costs — leaves, ETA, SPR-keyed expected-accuracy band — so the toggle
+  // hint prices the commitment BEFORE the user hits Solve.
+  const [exactPreflight, setExactPreflight] = useState<EstimateResponse | null>(null);
 
   // Modals
   const [showGuide, setShowGuide] = useState(false);
@@ -260,6 +265,16 @@ function App() {
       // Stage 5: runout decomposition. 'off' omits the flag (sidecar default);
       // 'auto' solves real turn/river runouts on rainbow boards.
       decompose_runouts: decomposeRunouts,
+      // Roadmap ④: Exact iteration presets keyed on solveMode (subgame
+      // DEPTH dominates quality per the 2026-07-15 study — presets scale
+      // `inner`, keep sweeps minimal). Only attached when Exact is on so
+      // Fast requests stay byte-identical to v1.9.0.
+      ...(decomposeRunouts === 'auto' ? {
+        decompose_outer: DECOMPOSE_PRESETS[solveMode].outer,
+        decompose_inner: DECOMPOSE_PRESETS[solveMode].inner,
+        decompose_trunk_iters: DECOMPOSE_PRESETS[solveMode].trunk_iters,
+        decompose_warm_start: DECOMPOSE_PRESETS[solveMode].warm_start,
+      } : {}),
       // v1.7.0: GUI defaults to the levelized CPU backend (4-5x faster than
       // reference on a typical 8-thread laptop CPU). cpu_simd='auto' lets
       // CPUID pick AVX2 vs scalar at startup, cpu_threads=0 means "use
@@ -270,6 +285,32 @@ function App() {
       cpu_threads: 0,
     };
   }, [pot, stack, iterations, selectedMatchup, getHeroRange, customIpRange, customOopRange, nodeLocks, sizingKey, memoryProfile, solveMode, decomposeRunouts]);
+
+  // Roadmap ④: debounced pre-commit estimate for Exact mode. Fires when the
+  // Exact pill is on and any solve-shaping config changes; skipped outside
+  // Tauri (browser preview can't invoke the sidecar) and while a solve runs.
+  useEffect(() => {
+    if (decomposeRunouts !== 'auto' || loading) return;
+    if (flopBoard.length < 6) { setExactPreflight(null); return; }
+    if (!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) return;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const request = buildRequest(fullBoard);
+        const est = await invoke<EstimateResponse>('estimate_solve', { request });
+        if (!cancelled) setExactPreflight(est);
+      } catch (e) {
+        // Non-fatal: mark as failed (non-null, no decompose block) so the
+        // hint shows the static SPR copy instead of "Pricing…" forever.
+        console.warn('exact preflight estimate failed (non-fatal):', e);
+        if (!cancelled) {
+          setExactPreflight({ status: 'error', resources: {} } as EstimateResponse);
+        }
+      }
+    }, 600);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [decomposeRunouts, loading, flopBoard, fullBoard, buildRequest]);
 
   // Initial solve (root node)
   const handleSolve = useCallback(() => {
@@ -776,6 +817,7 @@ function App() {
           }}
           decomposeRunouts={decomposeRunouts}
           onDecomposeRunoutsChange={setDecomposeRunouts}
+          exactPreflight={exactPreflight}
           onStop={async () => {
             // Pure abort — kills the engine subprocess. No partial result;
             // useSolver will see the killed process as an error and reset

@@ -67,6 +67,31 @@ public:
     ~LevelizedCpuBackend() override = default;
 
     void prepare(const SolverContext& ctx) override;
+    /// Warm-start: carry regrets_ / strategy_sum_ across a re-solve.
+    ///
+    /// prepare() derives the out-of-range masks, terminal active lists and the
+    /// sparse-traversal decisions from ctx.oop_reach / ctx.ip_reach. Those move
+    /// with the ranges — a combo that regret-matching zeroed last sweep can
+    /// regain reach this one — so they MUST be rebuilt, or the terminal
+    /// kernels would keep skipping it and quietly compute the wrong values.
+    /// Hence: run the full prepare(), then put ONLY the CFR state back. Trying
+    /// to keep the parts that happen to be board-fixed is how that bug gets in.
+    /// current_strategy_ is not restored — regret matching recomputes it from
+    /// regrets_ at the top of every iterate().
+    void reprepare_keep_state(const SolverContext& ctx) override {
+        std::vector<float> keep_regrets, keep_strategy_sum;
+        keep_regrets.swap(regrets_);
+        keep_strategy_sum.swap(strategy_sum_);
+        prepare(ctx);
+        // Sizes differ only if the tree changed, in which case the carried
+        // state is meaningless — keep prepare()'s zeroed state (cold restart).
+        if (keep_regrets.size() == regrets_.size() &&
+            keep_strategy_sum.size() == strategy_sum_.size()) {
+            regrets_.swap(keep_regrets);
+            strategy_sum_.swap(keep_strategy_sum);
+        }
+    }
+    bool supports_warm_start() const override { return true; }
     void iterate(int iteration) override;
     void finalize() override;
     const std::vector<std::vector<float>>& strategy() const override { return strategy_; }

@@ -21,6 +21,7 @@
 #include "cpu_simd.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -98,6 +99,15 @@ struct CLIArgs {
     /// becomes false. "on" = always decompose (turn subgames) even on enumerable
     /// boards. Default off until the full UI slice + a rainbow end-to-end is green.
     std::string decompose_runouts = "off";   // off | auto | on
+    /// Roadmap ④ (post-v1.9.0): decomposition iteration presets, promoted
+    /// from the DEEPSOLVER_DECOMP_* env knobs to CLI flags so the UI's
+    /// solveMode presets (poker.ts DECOMPOSE_PRESETS) can drive them.
+    /// 0 / -1 = unset → keep the engine's dev defaults; env still wins over
+    /// CLI as the dev override.
+    int decompose_outer       = 0;    // --decompose-outer <sweeps>
+    int decompose_inner       = 0;    // --decompose-inner <per-subgame iters>
+    int decompose_trunk_iters = 0;    // --decompose-trunk-iters <K per sweep>
+    int decompose_warmstart   = -1;   // --decompose-warmstart 0|1
     float rake_rate = 0.0f;
     float rake_cap  = 0.0f;
 
@@ -206,6 +216,15 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.dcfr_schedule = argv[++i];
         } else if (arg == "--decompose-runouts" && i + 1 < argc) {
             args.decompose_runouts = argv[++i];
+        } else if (arg == "--decompose-outer" && i + 1 < argc) {
+            args.decompose_outer = std::max(0, std::stoi(argv[++i]));
+        } else if (arg == "--decompose-inner" && i + 1 < argc) {
+            args.decompose_inner = std::max(0, std::stoi(argv[++i]));
+        } else if (arg == "--decompose-trunk-iters" && i + 1 < argc) {
+            args.decompose_trunk_iters = std::max(0, std::stoi(argv[++i]));
+        } else if (arg == "--decompose-warmstart" && i + 1 < argc) {
+            std::string v = argv[++i];
+            args.decompose_warmstart = (v == "1" || v == "true" || v == "True") ? 1 : 0;
         } else if (arg == "--rake-rate" && i + 1 < argc) {
             args.rake_rate = std::stof(argv[++i]);
         } else if (arg == "--rake-cap" && i + 1 < argc) {
@@ -332,6 +351,19 @@ Arguments:
   --estimate-only          Build tree + estimate solve time/memory, emit JSON, exit.
                            Skips precompute_matchups + iterations. Sub-second on most
                            spots — used by the UI to show ETA before committing.
+                           With --decompose-runouts auto|on the JSON also carries a
+                           "decompose" block (leaves, per-sweep/total seconds, SPR-keyed
+                           expected-accuracy band) so the UI can price Exact mode.
+  --decompose-runouts <m>  off (default) | auto | on. auto re-solves collapsed/
+                           rainbow boards via flop-trunk + per-turn-card subgames
+                           (real runout equity); on forces it (debug).
+  --decompose-outer <n>    Outer sweeps (leaf value refreshes). Unset = engine default.
+  --decompose-inner <n>    Per-subgame CFR iterations per solve. Unset = engine default.
+  --decompose-trunk-iters <k>
+                           Trunk CFR iterations per sweep (K). Unset = engine default.
+  --decompose-warmstart <0|1>
+                           Warm-start persistent subgames across sweeps.
+                           DEEPSOLVER_DECOMP_* env vars override all four (dev knob).
   --time-budget-seconds <s> Hard wall-clock cap on the iteration phase. Stops at
                            min(iter cap, time budget). 0 = no time cap (default).
                            UI presets: Quick=60, Standard=300, Deep=900.
@@ -527,6 +559,40 @@ const char* json_bool(bool value) {
     return value ? "true" : "false";
 }
 
+// JSON has no inf/nan tokens — a single non-finite float invalidates the
+// whole response and wastes an otherwise-successful solve (seen once in a
+// bulk run: `"98s":inf` inside a combo_evs map, GPU run-to-run noise).
+// Sources guard their divisions; this is the emit-boundary backstop for
+// every solver-derived float.
+double jsafe(double v) {
+    return std::isfinite(v) ? v : 0.0;
+}
+
+// Roadmap ④: one resolver for the decomposition iteration budget, shared by
+// the solve route and the --estimate-only pre-flight so the ETA prices
+// exactly the run the user would get. Precedence: engine dev defaults →
+// CLI presets (--decompose-*) → DEEPSOLVER_DECOMP_* env (dev override wins).
+deepsolver::DecompositionOptions resolve_decomposition_options(const CLIArgs& args) {
+    deepsolver::DecompositionOptions o;
+    // Dev defaults, unchanged from the pre-preset era (keeps the existing
+    // test surface byte-identical when no flag/env is present).
+    o.outer_iterations = 20;
+    o.inner_iterations = 120;
+
+    if (args.decompose_outer > 0)       o.outer_iterations = args.decompose_outer;
+    if (args.decompose_inner > 0)       o.inner_iterations = args.decompose_inner;
+    if (args.decompose_trunk_iters > 0) o.trunk_iterations_per_sweep = args.decompose_trunk_iters;
+    if (args.decompose_warmstart >= 0)  o.warm_start_subgames = (args.decompose_warmstart != 0);
+
+    if (const char* e = std::getenv("DEEPSOLVER_DECOMP_OUTER")) o.outer_iterations = std::max(1, std::atoi(e));
+    if (const char* e = std::getenv("DEEPSOLVER_DECOMP_INNER")) o.inner_iterations = std::max(1, std::atoi(e));
+    if (const char* e = std::getenv("DEEPSOLVER_DECOMP_WARMSTART"))
+        o.warm_start_subgames = (std::atoi(e) != 0);
+    if (const char* e = std::getenv("DEEPSOLVER_DECOMP_TRUNK_ITERS"))
+        o.trunk_iterations_per_sweep = std::max(1, std::atoi(e));
+    return o;
+}
+
 void write_cpu_diagnostics_json(
     std::ostream& out,
     const CpuBackendDiagnostics& d,
@@ -676,7 +742,7 @@ std::string result_to_json(
     json << "  \"rake_rate\": " << args.rake_rate << ",\n";
     json << "  \"rake_cap\": " << args.rake_cap << ",\n";
     json << "  \"iterations_run\": " << result.iterations_run << ",\n";
-    json << "  \"exploitability_pct\": " << result.exploitability_pct << ",\n";
+    json << "  \"exploitability_pct\": " << jsafe(result.exploitability_pct) << ",\n";
     // v1.3.0: which stop condition fired ("iter_cap" / "time_budget").
     json << "  \"early_stop_reason\": \"" << escape_json(result.early_stop_reason) << "\",\n";
     json << "  \"combo_evs_computed\": "
@@ -763,7 +829,7 @@ std::string result_to_json(
     json << "  \"global_strategy\": {\n";
     for (size_t i = 0; i < result.global_strategy.size(); ++i) {
         json << "    \"" << escape_json(result.global_strategy[i].first) << "\": \""
-             << std::setprecision(1) << result.global_strategy[i].second << "%\"";
+             << std::setprecision(1) << jsafe(result.global_strategy[i].second) << "%\"";
         if (i + 1 < result.global_strategy.size()) json << ",";
         json << "\n";
     }
@@ -778,7 +844,7 @@ std::string result_to_json(
             json << "    \"" << escape_json(label) << "\": {";
             for (size_t j = 0; j < mix.size(); ++j) {
                 json << "\"" << escape_json(mix[j].first) << "\": "
-                     << std::setprecision(4) << mix[j].second;
+                     << std::setprecision(4) << jsafe(mix[j].second);
                 if (j + 1 < mix.size()) json << ", ";
             }
             json << "}";
@@ -803,7 +869,7 @@ std::string result_to_json(
         json << std::setprecision(4);
         for (size_t i = 0; i < result.opponent_range.size(); ++i) {
             json << "    \"" << escape_json(result.opponent_range[i].first)
-                 << "\": " << result.opponent_range[i].second;
+                 << "\": " << jsafe(result.opponent_range[i].second);
             if (i + 1 < result.opponent_range.size()) json << ",";
             json << "\n";
         }
@@ -817,12 +883,12 @@ std::string result_to_json(
         json << "    \"combo\": \"" << escape_json(result.target_analysis.combo_str) << "\",\n";
         json << "    \"best_action\": \"" << escape_json(result.target_analysis.best_action)
              << "\",\n";
-        json << "    \"ev\": " << std::setprecision(2) << result.target_analysis.ev << ",\n";
+        json << "    \"ev\": " << std::setprecision(2) << jsafe(result.target_analysis.ev) << ",\n";
         json << "    \"strategy_mix\": {\n";
         for (size_t i = 0; i < result.target_analysis.strategy_mix.size(); ++i) {
             json << "      \"" << escape_json(result.target_analysis.strategy_mix[i].first)
                  << "\": \"" << std::setprecision(0)
-                 << result.target_analysis.strategy_mix[i].second << "%\"";
+                 << jsafe(result.target_analysis.strategy_mix[i].second) << "%\"";
             if (i + 1 < result.target_analysis.strategy_mix.size()) json << ",";
             json << "\n";
         }
@@ -855,7 +921,7 @@ std::string result_to_json(
             for (size_t i = 0; i < entry.global_strategy.size(); ++i) {
                 json << "\"" << escape_json(entry.global_strategy[i].first) << "\":\""
                      << std::setprecision(1) << std::fixed
-                     << entry.global_strategy[i].second << "%\"";
+                     << jsafe(entry.global_strategy[i].second) << "%\"";
                 if (i + 1 < entry.global_strategy.size()) json << ",";
             }
             json << "},";
@@ -867,7 +933,7 @@ std::string result_to_json(
                 json << "\"" << escape_json(label) << "\":{";
                 for (size_t j = 0; j < mix.size(); ++j) {
                     json << "\"" << escape_json(mix[j].first) << "\":"
-                         << std::setprecision(4) << mix[j].second;
+                         << std::setprecision(4) << jsafe(mix[j].second);
                     if (j + 1 < mix.size()) json << ",";
                 }
                 json << "}";
@@ -880,7 +946,7 @@ std::string result_to_json(
             json << "\"opponent_range\":{";
             for (size_t i = 0; i < entry.opponent_range.size(); ++i) {
                 json << "\"" << escape_json(entry.opponent_range[i].first) << "\":"
-                     << std::setprecision(4) << entry.opponent_range[i].second;
+                     << std::setprecision(4) << jsafe(entry.opponent_range[i].second);
                 if (i + 1 < entry.opponent_range.size()) json << ",";
             }
             json << "}";
@@ -889,7 +955,7 @@ std::string result_to_json(
             json << ",\"combo_evs\":{";
             for (size_t i = 0; i < entry.combo_evs.size(); ++i) {
                 json << "\"" << escape_json(entry.combo_evs[i].first) << "\":"
-                     << std::setprecision(2) << entry.combo_evs[i].second;
+                     << std::setprecision(2) << jsafe(entry.combo_evs[i].second);
                 if (i + 1 < entry.combo_evs.size()) json << ",";
             }
             json << "}";
@@ -1644,14 +1710,85 @@ int main(int argc, char* argv[]) {
                       << "    \"budget_decision\": \"" << escape_json(r.budget_decision) << "\",\n"
                       << "    \"diagnostic\": \"" << escape_json(r.diagnostic) << "\",\n"
                       << "    \"fallback_reason\": \"" << escape_json(r.fallback_reason) << "\",\n"
+                      << "    \"runout_approximated\": " << json_bool(r.runout_approximated) << ",\n"
                       << "    \"ops_per_iteration\": " << r.ops_per_iteration << ",\n"
                       << "    \"backend_for_estimate\": \"" << escape_json(r.backend_for_estimate) << "\",\n"
                       << "    \"estimated_solve_seconds\": " << r.estimated_solve_seconds << ",\n"
                       << "    \"cpu_simd\": \"" << escape_json(r.cpu_simd) << "\",\n"
                       << "    \"cpu_threads_effective\": " << r.cpu_threads_effective << ",\n"
                       << "    \"cpu_backend_kind\": \"" << escape_json(r.cpu_backend_kind) << "\"\n"
-                      << "  }\n"
-                      << "}\n";
+                      << "  }";
+
+            // Roadmap ④: Exact-mode feasibility pre-flight. When the caller
+            // plans to decompose, price the decomposed run (trunk build +
+            // per-line subgame sampling — sub-second) and predict whether
+            // "auto" would actually engage, so the UI can show
+            // "Exact ≈ N min, expected accuracy ~X" BEFORE the user commits.
+            if (args.decompose_runouts == "auto" || args.decompose_runouts == "on") {
+                // Would "auto" engage? Builder-level collapse is the common
+                // Exact trigger (rainbow/huge boards) and is exact at
+                // estimate time. On top, mirror the ① state gate with the
+                // quantities the estimate has: enumerated state (exact) +
+                // matchup proxy (over-counts on iso boards — deliberately
+                // biases toward predicting "engages": a false "will
+                // decompose" shows a scary ETA that turns out fast; a false
+                // "won't" means an unwarned 90-minute wait).
+                bool engage_via_collapse = r.runout_approximated;
+                if (!engage_via_collapse) {
+                    const bool gpu_planned =
+                        r.backend_for_estimate.rfind("CUDA", 0) == 0;
+                    if (gpu_planned) {
+                        uint64_t budget = r.gpu_budget_bytes > 0
+                            ? r.gpu_budget_bytes
+                            : static_cast<uint64_t>(
+                                  static_cast<double>(gpu_free_bytes()) * 0.80);
+                        engage_via_collapse = budget > 0 &&
+                            (r.estimated_gpu_state_bytes +
+                             r.estimated_matchup_bytes) > budget;
+                    } else {
+                        engage_via_collapse = r.host_budget_bytes > 0 &&
+                            (r.estimated_matchup_bytes +
+                             r.estimated_cpu_state_bytes) > r.host_budget_bytes;
+                    }
+                }
+                const bool would_engage =
+                    (args.decompose_runouts == "on") || engage_via_collapse;
+
+                deepsolver::DecompositionOptions dopts =
+                    resolve_decomposition_options(args);
+                // Mirror the solve route's backend pick: collapse-driven
+                // decomposition streams subgames on the GPU; forced-on-
+                // enumerable runs parallel CPU subgames. (The estimator
+                // itself falls back to CPU pricing when no CUDA device.)
+                dopts.subgame_backend = engage_via_collapse
+                    ? BackendType::GPU : BackendType::CPU;
+                // Mirror the solve route's nav flag — extraction is a real
+                // per-leaf cost the ETA must include for app solves.
+                dopts.build_nav = args.emit_strategy_tree;
+                deepsolver::DecompositionEstimate de =
+                    deepsolver::estimate_decomposition(config, dopts);
+
+                std::cout << ",\n  \"decompose\": {\n"
+                          << "    \"ok\": " << json_bool(de.ok) << ",\n"
+                          << "    \"would_engage\": " << json_bool(would_engage) << ",\n"
+                          << "    \"leaves\": " << de.leaf_count << ",\n"
+                          << "    \"lines\": " << de.line_count << ",\n"
+                          << "    \"trunk_nodes\": " << de.trunk_nodes << ",\n"
+                          << "    \"sweeps\": " << de.sweeps << ",\n"
+                          << "    \"outer\": " << dopts.outer_iterations << ",\n"
+                          << "    \"inner\": " << dopts.inner_iterations << ",\n"
+                          << "    \"trunk_iters_per_sweep\": " << dopts.trunk_iterations_per_sweep << ",\n"
+                          << "    \"warm_start\": " << json_bool(dopts.warm_start_subgames) << ",\n"
+                          << "    \"per_sweep_seconds\": " << jsafe(de.per_sweep_seconds) << ",\n"
+                          << "    \"total_seconds\": " << jsafe(de.total_seconds) << ",\n"
+                          << "    \"spr\": " << jsafe(de.spr) << ",\n"
+                          << "    \"quality_tier\": \"" << escape_json(de.quality_tier) << "\",\n"
+                          << "    \"expected_exploit_lo_pct\": " << jsafe(de.expected_exploit_lo_pct) << ",\n"
+                          << "    \"expected_exploit_hi_pct\": " << jsafe(de.expected_exploit_hi_pct) << ",\n"
+                          << "    \"backend\": \"" << escape_json(de.backend_label) << "\"\n"
+                          << "  }";
+            }
+            std::cout << "\n}\n";
             return 0;
         }
 
@@ -1659,28 +1796,51 @@ int main(int argc, char* argv[]) {
         // it sits inside the timed iteration loop and otherwise contaminates the
         // throughput measurement with logging overhead (POST_OPTIMIZATION_REVIEW
         // Finding 1: standard benchmark collapsed to ~60 iter/s vs ~110+ silent).
-        SolverResult result = solver.solve(benchmark_mode ? ProgressCallback{} : progress);
-        std::string backend_name = solver.backend_name();
-
-        // Process history navigation
-        uint32_t target_node = 0;
-        if (!args.history.empty()) {
-            target_node = solver.navigate_to_node(args.history);
-            result.action_labels = solver.get_action_labels_at(target_node);
-            result.global_strategy = solver.extract_global_strategy_at(target_node);
-            result.combo_strategies = solver.extract_combo_strategies_at(target_node);
+        SolverResult result;
+        bool monolithic_ok = true;
+        std::string monolithic_err;
+        try {
+            result = solver.solve(benchmark_mode ? ProgressCallback{} : progress);
+        } catch (const std::exception& e) {
+            // Roadmap ① (post-v1.9.0): a backend OOM on an enumerated tree
+            // used to kill the whole run before --decompose-runouts could
+            // engage (the routing below reads result.runout_approximated
+            // AFTER the solve). The decomposed route manages its own bounded
+            // memory, so let it recover spots the monolithic path cannot
+            // allocate. Decompose off — or the decomposed solve also
+            // failing — rethrows the original error unchanged.
+            if (args.decompose_runouts != "auto" && args.decompose_runouts != "on") {
+                throw;
+            }
+            monolithic_ok = false;
+            monolithic_err = e.what();
+            std::cerr << "[decompose] monolithic solve failed ("
+                      << monolithic_err << "); attempting decomposed fallback\n";
         }
+        std::string backend_name = monolithic_ok ? solver.backend_name()
+                                                 : std::string("none");
 
-        // Acting player + opponent range (for UI view switcher)
-        result.acting_player = solver.acting_player_at(target_node);
-        auto opp = solver.extract_opponent_range_at(target_node);
-        result.opponent_side = opp.opponent;
-        result.opponent_range = std::move(opp.labels);
+        uint32_t target_node = 0;
+        if (monolithic_ok) {
+            // Process history navigation
+            if (!args.history.empty()) {
+                target_node = solver.navigate_to_node(args.history);
+                result.action_labels = solver.get_action_labels_at(target_node);
+                result.global_strategy = solver.extract_global_strategy_at(target_node);
+                result.combo_strategies = solver.extract_combo_strategies_at(target_node);
+            }
 
-        // Target combo analysis
-        if (!args.target_combo.empty()) {
-            result.target_analysis = solver.analyze_combo(args.target_combo);
-            result.has_target = true;
+            // Acting player + opponent range (for UI view switcher)
+            result.acting_player = solver.acting_player_at(target_node);
+            auto opp = solver.extract_opponent_range_at(target_node);
+            result.opponent_side = opp.opponent;
+            result.opponent_range = std::move(opp.labels);
+
+            // Target combo analysis
+            if (!args.target_combo.empty()) {
+                result.target_analysis = solver.analyze_combo(args.target_combo);
+                result.has_target = true;
+            }
         }
 
         // ── Stage 5: runout decomposition route ──────────────────────────────
@@ -1693,21 +1853,23 @@ int main(int argc, char* argv[]) {
         // decide costs almost nothing. Default-off ⇒ legacy path byte-identical.
         deepsolver::DecomposedResult decomp;
         bool decomposed = false;
+        // A failed monolithic solve counts as "approximated": the board could
+        // not enumerate within budget, which is exactly the case decomposition
+        // exists for (and the only way we reach here with !monolithic_ok).
+        const bool treat_as_approximated =
+            result.runout_approximated || !monolithic_ok;
         const bool want_decompose =
             (args.decompose_runouts == "on") ||
-            (args.decompose_runouts == "auto" && result.runout_approximated);
+            (args.decompose_runouts == "auto" && treat_as_approximated);
         if (want_decompose) {
-            deepsolver::DecompositionOptions o;
-            // Iteration budget (env-overridable for tuning; gated behind the
-            // default-off flag, so these are dev defaults — not yet productized).
-            o.outer_iterations = 20;
-            o.inner_iterations = 120;
-            if (const char* e = std::getenv("DEEPSOLVER_DECOMP_OUTER")) o.outer_iterations = std::max(1, std::atoi(e));
-            if (const char* e = std::getenv("DEEPSOLVER_DECOMP_INNER")) o.inner_iterations = std::max(1, std::atoi(e));
+            // Roadmap ④: iteration budget resolved by the shared helper
+            // (dev defaults → --decompose-* CLI presets → DEEPSOLVER_DECOMP_*
+            // env). Same resolver the --estimate-only pre-flight prices.
+            deepsolver::DecompositionOptions o = resolve_decomposition_options(args);
             o.build_nav            = args.emit_strategy_tree;
             o.nav_max_player_depth = 8;
             o.nav_max_nodes        = config.memory_budget.strategy_tree_max_nodes;  // 0 = unlimited
-            if (result.runout_approximated) {
+            if (treat_as_approximated) {
                 // Rainbow/huge: adaptive GPU streaming. cap = -1 ⇒ pin as many
                 // turn subgames resident as the user's FREE VRAM allows (measured
                 // at runtime so it never OOMs — not every GPU has 32 GB), skipping
@@ -1721,13 +1883,40 @@ int main(int argc, char* argv[]) {
                 o.subgame_backend = BackendType::CPU;
                 o.cache_subgames  = true;
             }
-            decomp = deepsolver::solve_decomposed(config, o);
+            // Exception-guarded: a mid-decompose throw (typical: another app
+            // claims VRAM mid-run and a streamed leaf's cudaMalloc fails) must
+            // degrade to the monolithic result we already hold — not kill the
+            // run. Leaving `decomposed=false` reuses the decomp.ok=false
+            // handling below, including the !monolithic_ok rethrow.
+            try {
+                decomp = deepsolver::solve_decomposed(config, o);
+            } catch (const std::exception& e) {
+                decomp.ok = false;
+                std::cerr << "[decompose] solve_decomposed threw ("
+                          << e.what() << "); keeping the monolithic result.\n";
+            }
             if (decomp.ok) {
+                // Roadmap ③ instrumentation: which leaves actually warm-started
+                // (streamed leaves past the VRAM pin budget stay cold), so a
+                // partial warm-start never reads as a full one.
+                std::cerr << "[decompose] outer=" << decomp.outer_iterations_run
+                          << " inner=" << o.inner_iterations
+                          << " trunk_iters=" << decomp.trunk_iterations_run
+                          << " leaves=" << decomp.leaf_count
+                          << " pinned=" << decomp.gpu_cap_used
+                          << " warm_leaves=" << decomp.warm_start_leaves
+                          << " warm_start=" << (o.warm_start_subgames ? "on" : "off")
+                          << " exploit=" << decomp.exploitability_pct << "%\n";
                 decomposed = true;
                 result.runout_approximated     = false;  // the whole point.
                 result.exploitability_pct      = decomp.exploitability_pct;
                 result.exploitability_computed = true;
-                result.iterations_run          = decomp.outer_iterations_run;
+                // Roadmap ④ (desktop e2e finding): the UI badge read
+                // "81.91% in 2 iter" — outer sweep count undersells the run.
+                // trunk_iterations_run (outer × K) is the number comparable
+                // to a monolithic solve's iteration count (see
+                // DecomposedResult docs), so report that.
+                result.iterations_run          = decomp.trunk_iterations_run;
                 backend_name = (o.subgame_backend == BackendType::GPU)
                                    ? "decomposed-gpu" : "decomposed-cpu";
                 // Align the top-level "current node" view with the stitched nav
@@ -1746,6 +1935,17 @@ int main(int argc, char* argv[]) {
                 std::cerr << "[decompose] solve_decomposed failed (ok=false); "
                              "keeping the monolithic result.\n";
             }
+        }
+
+        // No monolithic result to fall back on: the solve threw and the
+        // decomposed route didn't rescue it. Surface the original error.
+        if (!monolithic_ok && !decomposed) {
+            throw std::runtime_error(monolithic_err);
+        }
+        if (!monolithic_ok) {
+            result.resources.fallback_reason =
+                "Monolithic solve failed (" + monolithic_err +
+                "); recovered via runout decomposition.";
         }
 
         // Build strategy tree for client-side navigation cache (Route A).

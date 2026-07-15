@@ -355,6 +355,168 @@ int main(int argc, char** argv) {
            best_exploit, mres.exploitability_pct);
 
     // ======================================================================
+    // Roadmap ③ — subgame WARM-START arm.
+    //
+    // Default (cold) restarts every subgame from zero regrets each outer sweep,
+    // so a subgame is never deeper than inner_iterations however many sweeps
+    // run. This fixture's tiny turn subgames are already solved by inner=150,
+    // which is exactly why it converges here and why a REAL-size spot at the
+    // same 30x150 does not (measured: 27.9%). Warm-start lets a subgame
+    // accumulate outer x inner depth instead.
+    //
+    // What's asserted here is CORRECTNESS, not speed: warm-start carries
+    // regrets accumulated under the previous sweep's reach, so the risk is that
+    // it converges to something OTHER than the equilibrium. With a monolithic
+    // oracle in hand we can check the real thing — warm must land at oracle
+    // quality too. Run at a deliberately SHORT inner (where cold is starved) so
+    // the arms are actually distinguishable.
+    {
+        const int kWarmOuter = 30;
+        const int kWarmInner = 20;   // starved on purpose: cold can't converge.
+
+        auto run_arm = [&](bool warm) {
+            DecompositionOptions o;
+            o.outer_iterations = kWarmOuter;
+            o.inner_iterations = kWarmInner;
+            o.cache_subgames   = true;
+            o.warm_start_subgames = warm;
+            return solve_decomposed(make_fixture(), o);
+        };
+
+        DecomposedResult cold = run_arm(false);
+        DecomposedResult warm = run_arm(true);
+        if (!cold.ok || !warm.ok) {
+            printf("FAIL: warm-start arm did not run (ok=false).\n");
+            return 1;
+        }
+        printf("\n=== Roadmap ③ warm-start (outer=%d, inner=%d — starved inner) ===\n",
+               kWarmOuter, kWarmInner);
+        printf("  cold: exploit=%.4f%%  warm_leaves=%d\n",
+               cold.exploitability_pct, cold.warm_start_leaves);
+        printf("  warm: exploit=%.4f%%  warm_leaves=%d/%u\n",
+               warm.exploitability_pct, warm.warm_start_leaves, warm.leaf_count);
+
+        if (!std::isfinite(warm.exploitability_pct)) {
+            printf("FAIL: warm-start produced non-finite exploitability.\n");
+            return 1;
+        }
+        // Wiring guard: every leaf is cached here, so every leaf must warm-start.
+        // A silent fallback to the cold path would make the arms identical and
+        // the comparison meaningless.
+        if (warm.warm_start_leaves != static_cast<int>(warm.leaf_count)) {
+            printf("FAIL: only %d/%u leaves warm-started — warm-start not wired "
+                   "through the cached path.\n",
+                   warm.warm_start_leaves, warm.leaf_count);
+            return 1;
+        }
+        if (cold.warm_start_leaves != 0) {
+            printf("FAIL: cold arm reported %d warm leaves.\n", cold.warm_start_leaves);
+            return 1;
+        }
+        // The real assertion: warm-start must not converge somewhere OTHER than
+        // the equilibrium. Same oracle margin the cold sweep is held to.
+        if (warm.exploitability_pct > mres.exploitability_pct + kMargin) {
+            printf("FAIL: warm-start exploit %.4f%% exceeds monolithic %.4f%% + "
+                   "%.2f%% margin — stale regrets are pulling it off-equilibrium.\n",
+                   warm.exploitability_pct, mres.exploitability_pct, kMargin);
+            return 1;
+        }
+        printf("PASS — warm-start reaches oracle quality (%.4f%% vs monolithic "
+               "%.4f%%) at an inner count where cold is starved (%.4f%%).\n",
+               warm.exploitability_pct, mres.exploitability_pct,
+               cold.exploitability_pct);
+    }
+
+    // ======================================================================
+    // Roadmap ③-A — trunk_iterations_per_sweep.
+    //
+    // `outer_iterations` used to mean BOTH "trunk CFR iterations" and "subgame
+    // re-solves", 1:1 — so outer=8 gave the trunk 8 CFR iterations, where a
+    // monolithic solve of the same flop needs thousands. But at a chance node
+    // the trunk CFR reads a CACHED leaf value vector and never recurses into a
+    // subgame, so trunk iterations cost ~nothing next to a subgame sweep.
+    //
+    // Guards the two claims the ③ conclusion rests on:
+    //   1. K=1 is EXACTLY the old behaviour (trunk_iterations_run == outer).
+    //   2. K>1 is ~free. If a refactor ever makes a trunk iteration expensive
+    //      (e.g. by recursing into subgames instead of reading inj_), this fails.
+    //
+    // It deliberately does NOT assert that K improves exploitability, because
+    // that is NOT universally true and the direction depends on which side is
+    // starved. K trades trunk convergence against leaf-value staleness:
+    //   - This fixture (SPR 2, single 0.5 sizing, raise_cap 1) has an almost
+    //     converged trunk at K=1 (~0.96%), so extra trunk CFR just over-fits
+    //     the trunk to a value function refreshed only 8 times: K=200 measured
+    //     ~1.70% — WORSE.
+    //   - A real, badly-under-converged trunk goes the other way: AsKsQs via
+    //     the CLI (SPR 5, 0.33+0.75 menus, all-in on) at the same 8/60 measured
+    //     60.06% -> 25.72% at identical wall clock.
+    // Asserting the direction here would encode the wrong regime as the rule.
+    {
+        const int kOuter = 8, kInner = 60, kK = 200;
+
+        auto run_k = [&](int k) {
+            DecompositionOptions o;
+            o.outer_iterations = kOuter;
+            o.inner_iterations = kInner;
+            o.cache_subgames   = true;
+            o.trunk_iterations_per_sweep = k;
+            double t = now_ms();
+            DecomposedResult r = solve_decomposed(make_fixture(), o);
+            return std::make_pair(r, now_ms() - t);
+        };
+
+        auto [k1, k1_ms]  = run_k(1);
+        auto [kN, kN_ms]  = run_k(kK);
+        if (!k1.ok || !kN.ok) { printf("FAIL: trunk-iters arm did not run.\n"); return 1; }
+
+        printf("\n=== Roadmap ③-A trunk iterations (outer=%d, inner=%d) ===\n",
+               kOuter, kInner);
+        printf("  K=%3d: trunk_iters=%4d  exploit=%.4f%%  %.1fs\n",
+               1, k1.trunk_iterations_run, k1.exploitability_pct, k1_ms / 1000.0);
+        printf("  K=%3d: trunk_iters=%4d  exploit=%.4f%%  %.1fs\n",
+               kK, kN.trunk_iterations_run, kN.exploitability_pct, kN_ms / 1000.0);
+
+        if (k1.trunk_iterations_run != kOuter) {
+            printf("FAIL: K=1 ran %d trunk iterations, expected %d — the default "
+                   "is no longer the historical 1:1 coupling.\n",
+                   k1.trunk_iterations_run, kOuter);
+            return 1;
+        }
+        if (kN.trunk_iterations_run != kOuter * kK) {
+            printf("FAIL: K=%d ran %d trunk iterations, expected %d.\n",
+                   kK, kN.trunk_iterations_run, kOuter * kK);
+            return 1;
+        }
+        if (!std::isfinite(kN.exploitability_pct)) {
+            printf("FAIL: K=%d produced non-finite exploitability.\n", kK);
+            return 1;
+        }
+        if (kN.subgame_solves != k1.subgame_solves) {
+            printf("FAIL: K=%d ran %d subgame solves vs %d for K=1 — the extra "
+                   "trunk iterations must NOT re-solve subgames.\n",
+                   kK, kN.subgame_solves, k1.subgame_solves);
+            return 1;
+        }
+        // The economic claim: ~free. Generous bound — a wall-clock assertion on
+        // a shared machine must fail only on a real regression (a trunk
+        // iteration becoming O(subgame)), not on noise.
+        if (kN_ms > k1_ms * 2.0 + 5000.0) {
+            printf("FAIL: K=%d took %.1fs vs %.1fs for K=1 — trunk iterations "
+                   "are supposed to be nearly free (they read cached leaf "
+                   "values); something is re-solving subgames per trunk iter.\n",
+                   kK, kN_ms / 1000.0, k1_ms / 1000.0);
+            return 1;
+        }
+        printf("PASS — %dx trunk CFR costs %.1fs vs %.1fs and the same %d "
+               "subgame solves. Exploitability %.4f%% -> %.4f%% is NOT asserted: "
+               "this fixture's trunk is already converged at K=1, so K over-fits "
+               "it to stale leaf values (see comment).\n",
+               kK, k1_ms / 1000.0, kN_ms / 1000.0, kN.subgame_solves,
+               k1.exploitability_pct, kN.exploitability_pct);
+    }
+
+    // ======================================================================
     // Stage 5 — stitched UI navigation strategy tree (build_nav). Validates
     // that decomposition emits a navigable tree keyed EXACTLY like a monolithic
     // enumerated board: a flop root at the empty key, real turn cards enumerated

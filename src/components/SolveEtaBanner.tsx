@@ -50,6 +50,41 @@ export function SolveEtaBanner({ estimate, loading, timeBudgetSeconds }: Props) 
   if (!estimate || estimate.status !== 'estimate') return null;
 
   const r = estimate.resources;
+
+  // Roadmap ④: when Exact (runout decomposition) will engage, the
+  // monolithic ETA + time budget below are the WRONG numbers — the
+  // decomposed run re-solves every turn subgame per sweep and does not
+  // stop at the time budget. Headline the decompose pre-flight instead.
+  const de = estimate.decompose;
+  if (de?.ok && de.would_engage) {
+    return (
+      <div
+        style={{
+          padding: '10px 14px',
+          background: 'rgba(16, 185, 129, 0.10)',
+          border: '1px solid rgba(16, 185, 129, 0.45)',
+          borderRadius: 8,
+          fontSize: 12,
+          color: 'var(--color-text-primary)',
+          display: 'flex', alignItems: 'flex-start', gap: 10,
+          lineHeight: 1.5,
+        }}
+      >
+        <span style={{ fontSize: 16, lineHeight: 1, marginTop: 1 }}>⏱</span>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 600 }}>
+            Exact ≈ <strong>{humanizeSeconds(de.total_seconds)}</strong> on{' '}
+            {de.backend.endsWith('gpu') ? 'GPU' : 'CPU'} — real turn/river runouts
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginTop: 2 }}>
+            {de.leaves.toLocaleString()} runout subgames · {de.sweeps} sweeps ·
+            expected exploitability ~{de.expected_exploit_lo_pct}–{de.expected_exploit_hi_pct}% pot
+            · ETA may vary ±2× · time budget does not apply
+          </div>
+        </div>
+      </div>
+    );
+  }
   const rawEstimate = r.estimated_solve_seconds ?? 0;
   const backend = shortBackend(r.backend_for_estimate);
   const isCpu = backend === 'CPU';

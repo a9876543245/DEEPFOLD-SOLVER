@@ -203,6 +203,25 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
         }}>
           <span className="text-label">{t('panel.solverResult')}</span>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            {/* Roadmap ④: Exact-mode marker. The decomposed route reports
+                backend "decomposed-gpu"/"decomposed-cpu" — surface that the
+                strategies come from real-runout subgame solves so the
+                (often higher) exploitability number reads in context. */}
+            {result.backend?.startsWith('decomposed') && (
+              <div
+                title={`Real turn/river runouts via subgame decomposition (${result.backend})`}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 4,
+                  padding: '3px 8px', borderRadius: 999,
+                  background: 'rgba(16, 185, 129, 0.12)',
+                  border: '1px solid rgba(16, 185, 129, 0.35)',
+                  fontSize: 10, fontWeight: 700, letterSpacing: 0.3,
+                  color: '#10b981', cursor: 'help',
+                }}
+              >
+                {t('config.decompose.auto')} · {result.backend.endsWith('gpu') ? 'GPU' : 'CPU'}
+              </div>
+            )}
             {/* v1.4.0 Phase 2: tiny pill with the actual SIMD mode + thread
                 count the engine used. Renders only on CPU solves (the
                 resources fields are empty/0 on GPU runs). Lets users see

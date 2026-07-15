@@ -323,6 +323,31 @@ fn build_solver_args(request: &SolverRequest, backend_override: Option<&str>) ->
             args.push(mode.clone());
         }
     }
+    // Roadmap ④: decomposition iteration presets. Pass-through only — the
+    // preset → numbers mapping lives in poker.ts (DECOMPOSE_PRESETS), the
+    // resolution order (defaults → CLI → env) in the engine.
+    if let Some(v) = request.decompose_outer {
+        if v > 0 {
+            args.push("--decompose-outer".to_string());
+            args.push(v.to_string());
+        }
+    }
+    if let Some(v) = request.decompose_inner {
+        if v > 0 {
+            args.push("--decompose-inner".to_string());
+            args.push(v.to_string());
+        }
+    }
+    if let Some(v) = request.decompose_trunk_iters {
+        if v > 0 {
+            args.push("--decompose-trunk-iters".to_string());
+            args.push(v.to_string());
+        }
+    }
+    if let Some(v) = request.decompose_warm_start {
+        args.push("--decompose-warmstart".to_string());
+        args.push(if v { "1".to_string() } else { "0".to_string() });
+    }
 
     // v1.4.0 Phase 2: CPU SIMD policy + thread count. Backend ignores these
     // when --backend gpu wins, but the engine still parses them so the UI
@@ -452,7 +477,19 @@ async fn try_run_solver(
     // room to finish the in-flight iter and run finalize+postsolve before
     // Tauri's outer killswitch fires. Capped at 30 min to keep runaway
     // bounded.
-    let timeout_secs = if let Some(budget) = request.time_budget_seconds {
+    // Roadmap ④: Exact mode (runout decomposition) ignores time_budget BY
+    // DESIGN — every turn subgame runs its fixed `inner` iterations, and a
+    // real rainbow spot at the standard preset is ~1 h (the UI's pre-flight
+    // says so up front). The budget-derived killswitch below (e.g. Quick →
+    // 270 s) would kill every legitimate Exact run — found by the first
+    // desktop e2e, 2026-07-15. Keep runaway protection, but at an
+    // Exact-scale ceiling; the Stop button + kill_on_drop still cover
+    // interactive aborts.
+    let decompose_on = matches!(
+        request.decompose_runouts.as_deref(), Some("auto") | Some("on"));
+    let timeout_secs = if decompose_on {
+        6 * 3600
+    } else if let Some(budget) = request.time_budget_seconds {
         if budget > 0 {
             std::cmp::min((budget as u64).saturating_mul(3).saturating_add(90), 1800)
         } else {

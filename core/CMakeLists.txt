@@ -367,6 +367,66 @@ if(BUILD_TESTS)
         LABELS "smoke;memory" TIMEOUT 60
         PASS_REGULAR_EXPRESSION "\"strategy_tree_truncated\": true")
 
+    # Roadmap ② (post-v1.9.0): no non-finite float may ever reach the JSON
+    # output. A bulk run once emitted `"98s":inf` inside a combo_evs map
+    # (QdJhTc, GPU noise) which invalidated the entire response. Board and
+    # postsolve flags chosen to exercise every value-bearing emit path
+    # (combo EVs, strategies, opponent ranges, exploitability).
+    add_test(NAME CliJsonFiniteFloats
+        COMMAND deepsolver_core
+            --pot 100 --stack 500 --board QdJhTc
+            --iterations 5 --backend cpu
+            --postsolve full --strategy-tree-evs visible)
+    set_tests_properties(CliJsonFiniteFloats PROPERTIES
+        LABELS "smoke" TIMEOUT 120
+        # Matches `": inf`, `":inf`, `": "inf%`, `":-nan(ind)` etc. — any
+        # inf/nan token in a JSON value position, quoted or bare.
+        FAIL_REGULAR_EXPRESSION "\": *\"?-?(inf|nan)")
+
+    # Roadmap ① (post-v1.9.0): state-aware collapse gate. Monotone Ah9h4h at
+    # 2.83 GB host: the builder's worst-case matchup projection (~1.4 GB)
+    # passes the host/2 cap so the tree fully enumerates (~185k nodes), but
+    # the REAL footprint (446 deduped tables + CPU state ≈ 2.92 GB) busts
+    # the budget — pre-fix the CPU host gate REJECTED this solve. The state
+    # gate must instead rebuild collapsed and complete with
+    # runout_approximated=true. Deterministic on any machine: CPU branch,
+    # no hardware probe.
+    add_test(NAME CliMonoStateGateCollapse
+        COMMAND deepsolver_core
+            --pot 100 --stack 500 --board Ah9h4h
+            --iterations 5 --backend cpu --postsolve none
+            --host-memory-mb 2900)
+    set_tests_properties(CliMonoStateGateCollapse PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 60
+        # Emitted only when the gate fired AND the collapsed rebuild solved.
+        PASS_REGULAR_EXPRESSION "Enumerated runout tree needs")
+
+    # Roadmap ④ (post-v1.9.0): Exact-mode feasibility pre-flight. With
+    # --decompose-runouts, --estimate-only must emit the "decompose" block
+    # and predict engagement on a board whose enumerated state busts the
+    # budget (same spot as the state-gate test — deterministic CPU branch).
+    add_test(NAME CliExactPreflightEstimate
+        COMMAND deepsolver_core
+            --pot 100 --stack 500 --board Ah9h4h
+            --backend cpu --host-memory-mb 2900
+            --estimate-only --decompose-runouts auto)
+    set_tests_properties(CliExactPreflightEstimate PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "\"would_engage\": true")
+
+    # Roadmap ④: the --decompose-* preset flags must reach the resolved
+    # options the pre-flight prices (same resolver the real solve uses).
+    add_test(NAME CliExactPreflightPresetFlags
+        COMMAND deepsolver_core
+            --pot 100 --stack 500 --board Ah9h4h
+            --backend cpu --host-memory-mb 2900
+            --estimate-only --decompose-runouts auto
+            --decompose-outer 2 --decompose-inner 450
+            --decompose-trunk-iters 300 --decompose-warmstart 1)
+    set_tests_properties(CliExactPreflightPresetFlags PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "\"inner\": 450")
+
     # Sprint 1 (resource policy guide): pre-backend budget gates.
     # CPU host gate: matchup fits but total host estimate exceeds budget.
     add_test(NAME CliCpuHostBudgetReject

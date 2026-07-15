@@ -510,6 +510,35 @@ public:
         solved_ = true;
     }
 
+    /// Re-solve the SAME board CONTINUING the prior CFR run: regrets and
+    /// strategy_sum are kept, and iterations are indexed from `iter_offset`
+    /// so the DCFR discount schedule carries on rather than restarting.
+    ///
+    /// Used by the runout decomposition's warm-start: without this, every
+    /// outer sweep restarts each turn subgame from zero regrets, capping the
+    /// subgame at `max_iterations` of depth no matter how many sweeps run.
+    /// Pass `iter_offset = sweep_index * max_iterations` for a continuous
+    /// schedule. Backends that can't keep state fall back to a cold restart
+    /// (still correct — just no warm-start benefit); check
+    /// `backend_supports_warm_start()` to know which happened.
+    void resolve_keep_state(int iter_offset) {
+        if (!backend_ || tree_.total_nodes == 0) { solve(); return; }
+        initialize_reach_probs();
+        if (!config_.node_locks.empty()) resolve_node_locks();
+        SolverContext ctx = make_context();
+        backend_->reprepare_keep_state(ctx);
+        const int iters = std::max(1, config_.max_iterations);
+        for (int t = 0; t < iters; ++t) backend_->iterate(iter_offset + t);
+        backend_->finalize();
+        strategy_ = backend_->strategy();
+        apply_node_locks();
+        solved_ = true;
+    }
+
+    bool backend_supports_warm_start() const {
+        return backend_ && backend_->supports_warm_start();
+    }
+
 private:
     SolverConfig config_;
     BackendType  backend_type_;
@@ -720,6 +749,105 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     // Step 3: precompute matchup matrix + reach probs + node locks
     stage_start = Clock::now();
     precompute_matchups();
+
+    // ── Post-v1.9.0 roadmap ①: state-aware collapse gate ─────────────────
+    // The builder's runout gate models MATCHUP bytes only. A monotone flop's
+    // tiny nc (~344) sneaks its matchup projection under that cap, the tree
+    // fully enumerates, and the un-modeled per-node CFR state (scales with
+    // total_nodes × nc) can land at 61-145 GB — which no backend can
+    // allocate: GPU throws at prepare (the app then retries on CPU), CPU
+    // trips the host gate and rejects. Rainbow flops were only ever
+    // protected coincidentally (their matchup projection is also huge).
+    // Measure the ENUMERATED tree's real footprint against the planned
+    // backend's budget while collapsing is still possible, and rebuild
+    // collapsed when it cannot fit. Flop boards only — the collapse
+    // fallback exists at flop-level chance gates.
+    //
+    // Runs AFTER precompute_matchups on purpose: the table count must be
+    // the deduplicated matchup_ev_per_runout_.size() — a chance-children
+    // proxy over-counts ~30× on iso-engaged boards (every betting line
+    // re-lists the same canonical runouts) and would collapse boards that
+    // actually fit. The wasted precompute on a gated board is bounded by
+    // the builder's own matchup cap (≤ host_bytes/2).
+    std::string state_gate_diag;
+    if (!tree_.runout_approximated && config_.board_size == 3) {
+        const uint64_t nc      = iso_.num_canonical;
+        const uint64_t total_n = tree_.total_nodes;
+        const uint64_t tables  = std::max<uint64_t>(matchup_ev_per_runout_.size(), 1);
+        uint64_t player_n = 0;
+        for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
+            auto t = static_cast<NodeType>(tree_.node_types[n]);
+            if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) ++player_n;
+        }
+
+        // Which backend would this solve actually run on? Same call the
+        // real AUTO resolution below makes, so the answer cannot diverge.
+        BackendType planned = backend_type_;
+        if (planned == BackendType::AUTO) {
+            planned = should_auto_select_gpu(
+                          config_, tree_, matchup_ev_per_runout_.size())
+                      ? BackendType::GPU : BackendType::CPU;
+        }
+
+        uint64_t state_needed = 0, state_budget = 0;
+        const char* budget_label = "";
+        if (planned == BackendType::GPU) {
+            // Device footprint = CFR state + uploaded matchup tables (EV +
+            // valid float matrices per runout). Budget: explicit
+            // --gpu-memory-mb, else probe free VRAM with the same 0.80
+            // headroom factor GpuBackend's prepare pre-flight applies.
+            // Probe returning 0 (no device / driver failure) skips the gate
+            // — the existing prepare/create error paths handle that case.
+            state_needed = bytes_for_gpu_state(total_n, MAX_ACTIONS, nc)
+                         + tables * nc * nc * 2ULL * sizeof(float);
+            state_budget = config_.memory_budget.gpu_bytes > 0
+                ? config_.memory_budget.gpu_bytes
+                : static_cast<uint64_t>(
+                      static_cast<double>(gpu_free_bytes()) * 0.80);
+            budget_label = "VRAM";
+        } else {
+            // Host footprint: matchup tables + CPU CFR state — the two
+            // unbounded terms. The strategy-tree/JSON caches are excluded
+            // on purpose: they are bounded and auto-reducible, and leaving
+            // them out keeps this gate strictly no-more-eager than the
+            // pre-backend host gate (borderline boards keep today's reject
+            // path rather than newly collapsing).
+            state_needed = bytes_for_matchup_tables(
+                               tables, nc, matchup_bytes_per_cell(config_, iso_))
+                         + bytes_for_cpu_state(player_n, MAX_ACTIONS, nc);
+            if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
+                state_needed += bytes_for_levelized_cpu_extra(total_n, nc);
+            }
+            state_budget = config_.memory_budget.host_bytes;
+            budget_label = "host RAM";
+        }
+
+        if (state_budget > 0 && state_needed > state_budget) {
+            char buf[320];
+            snprintf(buf, sizeof(buf),
+                "Enumerated runout tree needs ~%.2f GB %s "
+                "(N=%u nodes, nc=%u, tables=%u) but only %.2f GB is available - "
+                "collapsed runouts instead (turn/river equity approximated).",
+                static_cast<double>(state_needed) / (1024.0 * 1024.0 * 1024.0),
+                budget_label,
+                tree_.total_nodes, static_cast<unsigned>(nc),
+                static_cast<unsigned>(tables),
+                static_cast<double>(state_budget) / (1024.0 * 1024.0 * 1024.0));
+            state_gate_diag = buf;
+
+            GameTreeBuilder collapsed_builder(config_);
+            collapsed_builder.set_memory_policy(
+                iso_.num_canonical,
+                config_.memory_budget,
+                matchup_bytes_per_cell(config_, iso_));
+            collapsed_builder.set_force_runout_collapse(true);
+            tree_ = collapsed_builder.build();
+            timing.tree_nodes = tree_.total_nodes;
+            timing.tree_edges = tree_.total_edges;
+            precompute_matchups();  // re-key matchup_idx for the new tree
+        }
+    }
+
     stage_end = Clock::now();
     timing.precompute_matchups_ms = elapsed_since(stage_start, stage_end);
     timing.matchup_tables = static_cast<uint32_t>(matchup_ev_per_runout_.size());
@@ -1260,6 +1388,14 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
                 ? auto_reduce_diag
                 : auto_reduce_diag + " " + r.diagnostic;
         }
+        // Roadmap ①: surface the state-gate collapse (tree rebuilt with
+        // collapsed runouts because enumerated CFR state couldn't fit the
+        // planned backend). Prepend for the same reason as auto_reduce_diag.
+        if (!state_gate_diag.empty()) {
+            r.diagnostic = r.diagnostic.empty()
+                ? state_gate_diag
+                : state_gate_diag + " " + r.diagnostic;
+        }
         // Sprint 1: surface the AUTO→CPU downgrade reason recorded by the
         // pre-backend gate. Empty string means no fallback happened.
         r.fallback_reason = fallback_reason;
@@ -1460,6 +1596,11 @@ inline SolveResources Solver::estimate_only() {
             (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED)
                 ? "levelized" : "reference";
     }
+
+    // Roadmap ④: surface the builder-level collapse so the estimate path can
+    // predict whether "--decompose-runouts auto" would engage (rainbow/huge
+    // boards collapse right here at build time — the common Exact case).
+    r.runout_approximated = tree_.runout_approximated;
 
     // Lightweight budget-decision label so the UI can flag "this will fail
     // the gate" before the user commits.
@@ -2127,7 +2268,11 @@ inline void Solver::compute_combo_evs() {
     }
     float scale = (total_ip_weight > 1e-6f) ? (1.0f / total_ip_weight) : 0.0f;
     for (uint16_t c = 0; c < nc; ++c) {
-        ev_[c] = oop_evs_raw[c] * scale;
+        const float v = oop_evs_raw[c] * scale;
+        // The GPU postsolve path can hand back non-finite raw values on
+        // run-to-run noise; keep ev_ finite so downstream consumers
+        // (analyze_combo, JSON) never see inf/nan.
+        ev_[c] = std::isfinite(v) ? v : 0.0f;
     }
 }
 
@@ -3084,7 +3229,12 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
         std::vector<std::pair<std::string, float>> out_pairs;
         for (auto& [label, sw] : sum_w) {
             if (sw <= 0.0f) continue;
-            out_pairs.push_back({label, sum_w_val[label] / sw});
+            const float v = sum_w_val[label] / sw;
+            // GPU run-to-run noise can land a non-finite value here (seen
+            // once in a bulk run: "98s":inf). Skip the label — "no data" is
+            // honest where a fabricated 0.0 EV would not be.
+            if (!std::isfinite(v)) continue;
+            out_pairs.push_back({label, v});
         }
         return out_pairs;
     };

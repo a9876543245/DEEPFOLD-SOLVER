@@ -87,6 +87,16 @@ public:
     /// Default false ⇒ the builder behaves exactly as before.
     void set_truncate_at_chance(bool on) { truncate_at_chance_ = on; }
 
+    /// Post-v1.9.0 roadmap ①: force the single-child runout fallback at every
+    /// chance gate. The matchup-byte gate below models matchup tables ONLY —
+    /// a monotone flop's tiny nc slips under it, the tree fully enumerates,
+    /// and the un-modeled per-node CFR state (total_nodes × nc) then kills
+    /// the backend at prepare. Solver::solve() measures the enumerated
+    /// tree's state footprint against the planned backend's budget and
+    /// re-builds with this set when it cannot fit. Default false ⇒ builder
+    /// behaves exactly as before.
+    void set_force_runout_collapse(bool on) { force_runout_collapse_ = on; }
+
     /// Build the full game tree and return it in SoA format.
     FlatGameTree build();
 
@@ -108,6 +118,8 @@ private:
     bool          runout_collapsed_ = false;
     /// See set_truncate_at_chance(). Opt-in; default off.
     bool          truncate_at_chance_ = false;
+    /// See set_force_runout_collapse(). Opt-in; default off.
+    bool          force_runout_collapse_ = false;
 
     /// Add a node to the tree and return its index
     uint32_t add_node(TreeNode node);
@@ -402,7 +414,12 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
         // — which silently OOMs. The byte-based gate refuses to enumerate
         // when the matchup tables alone would blow the host budget.
         bool enumerate;
-        if (cards_already >= 4) {
+        if (force_runout_collapse_) {
+            // Solver-driven rebuild: the enumerated tree's CFR state was
+            // measured over-budget. Collapse every chance level (matches the
+            // topology a rainbow flop's matchup gate produces naturally).
+            enumerate = false;
+        } else if (cards_already >= 4) {
             enumerate = true;
         } else {
             // Worst-case: river enumerates one child per remaining card

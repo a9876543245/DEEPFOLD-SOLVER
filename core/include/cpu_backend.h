@@ -96,6 +96,25 @@ public:
     ~CpuBackend() override = default;
 
     void prepare(const SolverContext& ctx) override;
+    /// Warm-start: carry regrets_ / strategy_sum_ across a re-solve. Runs the
+    /// full prepare() and puts only the CFR state back, so anything prepare()
+    /// derives from the ranges is correctly rebuilt (see the levelized
+    /// backend, where that's load-bearing). current_strategy_ is not restored
+    /// — regret matching recomputes it at the top of every iterate().
+    void reprepare_keep_state(const SolverContext& ctx) override {
+        std::vector<std::vector<float>> keep_regrets, keep_strategy_sum;
+        keep_regrets.swap(regrets_);
+        keep_strategy_sum.swap(strategy_sum_);
+        prepare(ctx);
+        // Sizes differ only if the tree changed, in which case the carried
+        // state is meaningless — keep prepare()'s zeroed state (cold restart).
+        if (keep_regrets.size() == regrets_.size() &&
+            keep_strategy_sum.size() == strategy_sum_.size()) {
+            regrets_.swap(keep_regrets);
+            strategy_sum_.swap(keep_strategy_sum);
+        }
+    }
+    bool supports_warm_start() const override { return true; }
     void iterate(int iteration) override;
     void finalize() override;
     const std::vector<std::vector<float>>& strategy() const override { return strategy_; }

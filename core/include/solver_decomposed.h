@@ -39,10 +39,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
+#include <iostream>
 #include <map>
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _OPENMP
@@ -105,6 +110,52 @@ struct DecompositionOptions {
     bool     build_nav = false;
     int      nav_max_player_depth = 8;   ///< matches main.cpp's build_strategy_tree depth.
     uint32_t nav_max_nodes = 0;          ///< 0 = unlimited; else global cap on emitted entries.
+
+    /// Roadmap ③ — WARM-START the per-leaf subgames across outer sweeps
+    /// (opt-in, default off; env DEEPSOLVER_DECOMP_WARMSTART=1).
+    ///
+    /// Default (off) re-solves every subgame from ZERO regrets each sweep, so
+    /// a subgame is never deeper than `inner_iterations` however many sweeps
+    /// run — and the final want_br pass, which fixes the DELIVERED strategy and
+    /// the reported exploitability, is likewise a fresh `inner_iterations`
+    /// solve. That is the measured cause of decomposition's high residual
+    /// exploitability on real-size spots, not the outer coupling.
+    ///
+    /// On, a leaf whose Solver instance persists (GPU-pinned, LRU-resident, or
+    /// CPU-cached) continues its CFR run: regrets + strategy_sum are kept and
+    /// the DCFR iteration index continues (sweep t runs iterations
+    /// [t·inner, (t+1)·inner)), so the subgame accumulates outer×inner depth.
+    /// Leaves that do NOT persist (streamed past the VRAM pin budget) are
+    /// rebuilt and stay cold — hence `warm_start_leaves` in the result, which
+    /// reports how many actually warm-started rather than assuming all did.
+    ///
+    /// Approximate by construction: regrets carried across a sweep were
+    /// accumulated under the previous sweep's reach. Off by default until the
+    /// convergence sweep says what it buys.
+    bool warm_start_subgames = false;
+
+    /// Roadmap ③ — trunk CFR iterations per subgame refresh (default 1 = the
+    /// historical behaviour, exactly).
+    ///
+    /// `outer_iterations` conflates two things that have wildly different
+    /// costs: how many times the trunk runs a CFR iteration, and how many
+    /// times all N leaf subgames are re-solved. They were 1:1, so outer=30
+    /// gives the trunk **30 CFR iterations** — while the monolithic solve of
+    /// the same flop uses 3000 to reach 0.5%. And each of those 30 costs a
+    /// full 805-subgame sweep (~12 min), so you cannot buy more.
+    ///
+    /// They don't need to be coupled: at a chance node the trunk CFR reads the
+    /// CACHED per-leaf value vector (inj_*) and never recurses into a subgame,
+    /// so a trunk iteration is O(trunk_nodes × nc) — microseconds against the
+    /// minutes a subgame sweep costs. Setting this to K runs K trunk CFR
+    /// iterations against each refreshed leaf value function, with a
+    /// continuous DCFR index (sweep t covers [t·K, (t+1)·K)).
+    ///
+    /// The approximation is the one this decomposition already makes: leaf
+    /// values are a value function captured at the sweep's entering reach, and
+    /// go stale as the trunk strategy moves within the sweep. K trades that
+    /// staleness for trunk convergence.
+    int trunk_iterations_per_sweep = 1;
 };
 
 struct DecomposedResult {
@@ -115,6 +166,11 @@ struct DecomposedResult {
     std::vector<float> root_value_oop;
     float exploitability_pct = 0.0f;   ///< True full-game exploitability.
     int   outer_iterations_run = 0;
+    /// Roadmap ③: total trunk CFR iterations = outer_iterations_run ×
+    /// trunk_iterations_per_sweep. Reported separately because it is the
+    /// number comparable to a monolithic solve's `iterations_run` — the outer
+    /// count only says how often the leaf value functions were refreshed.
+    int   trunk_iterations_run = 0;
     int   subgame_solves = 0;          ///< Total Solver::solve() calls.
     uint32_t trunk_nodes = 0;
     uint32_t leaf_count  = 0;          ///< Distinct (chance,turn-card) leaves.
@@ -127,6 +183,12 @@ struct DecomposedResult {
     /// (how many turn subgames stayed GPU-resident across outer sweeps). 0 on
     /// the fixed-cap / CPU paths.
     int gpu_cap_used = 0;
+    /// Roadmap ③: how many leaves actually warm-started on the last sweep
+    /// (persistent solver + a warm-start-capable backend). 0 when
+    /// opts.warm_start_subgames is off. Less than leaf_count means the rest
+    /// were streamed and stayed cold — the number to report rather than
+    /// claiming a warm-start that only partly happened.
+    int warm_start_leaves = 0;
 
     /// Stitched UI nav cache (only when opts.build_nav; empty otherwise). Same
     /// type/keys as Solver::build_strategy_tree so the existing sidecar JSON
@@ -245,6 +307,30 @@ private:
     void solve_one_subgame_gpu(int li, bool want_br, bool want_nav = false); ///< GPU LRU pool path.
     void solve_one_subgame_gpu_pinned(int li, bool want_br, bool want_nav = false); ///< adaptive pin-first-K.
     int  compute_adaptive_K(uint64_t free_start) const;   ///< K from measured free VRAM.
+
+    /// Re-solve a leaf whose Solver PERSISTED since the last sweep. Warm-start
+    /// (keep regrets + continue the DCFR schedule) when enabled and the backend
+    /// supports it; otherwise the cold same-board re-solve that has always run
+    /// here. `keep_board` marks a GPU-resident board (skip the matchup
+    /// re-upload); the CPU-cached path passes false.
+    void resolve_persistent(Solver* s, bool keep_board) {
+        if (opts_.warm_start_subgames && s->backend_supports_warm_start()) {
+            s->resolve_keep_state(sweep_ * opts_.inner_iterations);
+            ++warm_leaves_;
+        } else if (keep_board) {
+            s->resolve_keep_board();
+        } else {
+            s->resolve();
+        }
+    }
+
+    /// Outer sweep index; the warm-start iteration offset is
+    /// sweep_ × inner_iterations. The final want_br pass uses
+    /// sweep_ = outer_iterations so its schedule continues too.
+    int sweep_ = 0;
+    /// Leaves that actually warm-started on the current sweep. Atomic: the CPU
+    /// path solves leaves in an omp-parallel loop.
+    std::atomic<int> warm_leaves_{0};
 
     // Shared between the CPU and GPU paths.
     void leaf_ranges(int li, std::array<float, NUM_COMBOS>& oop_w,
@@ -594,7 +680,7 @@ inline void TrunkDecomposition::solve_one_subgame(int li, bool want_br, bool wan
         // ranges. Skips the dominant tree-build + matchup-precompute cost.
         s = leaf_solvers_[li].get();
         s->set_ranges(oop_w, ip_w);
-        s->resolve();
+        resolve_persistent(s, /*keep_board=*/false);
     } else {
         SolverConfig sub = make_sub_cfg(li, oop_w, ip_w);
         auto owned = std::make_unique<Solver>(sub, BackendType::CPU);
@@ -623,7 +709,9 @@ inline void TrunkDecomposition::solve_one_subgame_gpu(int li, bool want_br, bool
     if (slot >= 0) {
         Solver* s = gpu_slot_solver_[slot].get();
         s->set_ranges(oop_w, ip_w);
-        s->resolve_keep_board();   // same board resident → skip the matchup re-upload
+        // same board resident → skip the matchup re-upload (and, when
+        // warm-start is on, the regret reset too).
+        resolve_persistent(s, /*keep_board=*/true);
         gpu_slot_lru_[slot] = ++gpu_tick_;
         read_subgame_values(s, li, want_br, want_nav);
         return;
@@ -703,7 +791,9 @@ inline void TrunkDecomposition::solve_one_subgame_gpu_pinned(int li, bool want_b
             slot->solve();                 // first visit: full upload (board → device).
         } else {
             slot->set_ranges(oop_w, ip_w);
-            slot->resolve_keep_board();     // later sweeps: reuse resident board.
+            // later sweeps: reuse the resident board (and, with warm-start,
+            // continue this leaf's CFR run instead of restarting it).
+            resolve_persistent(slot.get(), /*keep_board=*/true);
         }
         read_subgame_values(slot.get(), li, want_br, want_nav);
     } else {
@@ -1130,7 +1220,11 @@ TrunkDecomposition::trunk_evs(uint32_t n) const {
     }
     for (auto& [label, sw] : sum_w) {
         if (sw <= 0.0f) continue;
-        out.push_back({label, sum_w_val[label] / sw});
+        const float v = sum_w_val[label] / sw;
+        // Mirror Solver::evs_at: skip non-finite labels instead of emitting
+        // inf/nan into the stitched nav tree.
+        if (!std::isfinite(v)) continue;
+        out.push_back({label, v});
     }
     return out;
 }
@@ -1272,16 +1366,44 @@ inline DecomposedResult TrunkDecomposition::run() {
     r.leaf_count    = static_cast<uint32_t>(leaves_.size());
     if (leaves_.empty()) return r;  // nothing to decompose (no turn chance).
 
+    // K trunk CFR iterations per subgame refresh. K=1 reproduces the original
+    // sequence exactly (regret_match → apply_discount → forward_reach →
+    // solve_all_subgames → cfr, with trunk_iter == t), so the default is
+    // byte-identical. K>1 re-runs only the cheap trunk half against the same
+    // refreshed leaf value functions — see trunk_iterations_per_sweep.
+    const int K = std::max(1, opts_.trunk_iterations_per_sweep);
+    int trunk_iter = 0;
     for (int t = 0; t < opts_.outer_iterations; ++t) {
-        regret_match();
-        apply_discount(t);
-        forward_reach(0, root_reach_oop_, root_reach_ip_, /*use_avg=*/false);
-        solve_all_subgames(/*want_br=*/false);   // re-solve subgames (model B).
-        std::vector<float> out0, out1;
-        cfr(0, 0, t, root_reach_oop_, root_reach_ip_, out0);
-        cfr(0, 1, t, root_reach_oop_, root_reach_ip_, out1);
+        for (int k = 0; k < K; ++k) {
+            regret_match();
+            apply_discount(trunk_iter);
+            if (k == 0) {
+                // Refresh the leaf value functions once per sweep, at the
+                // strategy regret_match just produced (the expensive half).
+                forward_reach(0, root_reach_oop_, root_reach_ip_, /*use_avg=*/false);
+                sweep_ = t;                              // warm-start iteration offset.
+                warm_leaves_ = 0;
+                // Roadmap ④: per-sweep wall telemetry — the number the
+                // pre-flight estimator predicts, so a long decomposed run
+                // is diagnosable (and the estimator calibratable) from a
+                // partial run's stderr.
+                const auto sweep_t0 = std::chrono::steady_clock::now();
+                solve_all_subgames(/*want_br=*/false);   // re-solve subgames (model B).
+                const double sweep_s = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - sweep_t0).count();
+                std::cerr << "[decompose] sweep " << (t + 1) << "/"
+                          << opts_.outer_iterations << " solved "
+                          << leaves_.size() << " subgames in "
+                          << sweep_s << "s\n";
+            }
+            std::vector<float> out0, out1;
+            cfr(0, 0, trunk_iter, root_reach_oop_, root_reach_ip_, out0);
+            cfr(0, 1, trunk_iter, root_reach_oop_, root_reach_ip_, out1);
+            ++trunk_iter;
+        }
         r.outer_iterations_run = t + 1;
     }
+    r.trunk_iterations_run = trunk_iter;
 
     finalize_strategy();
 
@@ -1291,8 +1413,25 @@ inline DecomposedResult TrunkDecomposition::run() {
     // reference backend so the delivered strategies + reported exploitability
     // are CPU-quality (the outer iters above stay on the GPU).
     forward_reach(0, root_reach_oop_, root_reach_ip_, /*use_avg=*/true);
-    solve_all_subgames(/*want_br=*/true, /*force_cpu=*/opts_.cpu_final_pass,
-                       /*want_nav=*/opts_.build_nav);
+    // The final pass fixes the DELIVERED subgame strategies and the reported
+    // exploitability, so warm-start matters most here: cold, this is a fresh
+    // `inner_iterations` solve however many sweeps preceded it. Continue the
+    // schedule past the last sweep. NOTE: cpu_final_pass routes this pass to
+    // fresh CPU solvers, which cannot continue the GPU leaves' state — that
+    // combination gets a cold final pass by construction.
+    sweep_ = opts_.outer_iterations;
+    warm_leaves_ = 0;
+    {
+        const auto final_t0 = std::chrono::steady_clock::now();
+        solve_all_subgames(/*want_br=*/true, /*force_cpu=*/opts_.cpu_final_pass,
+                           /*want_nav=*/opts_.build_nav);
+        std::cerr << "[decompose] final pass solved " << leaves_.size()
+                  << " subgames in "
+                  << std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - final_t0).count()
+                  << "s\n";
+    }
+    r.warm_start_leaves = warm_leaves_.load();
 
     ev(0, 0, root_reach_oop_, root_reach_ip_, r.root_value_oop);
 
@@ -1331,6 +1470,343 @@ inline DecomposedResult solve_decomposed(const SolverConfig& cfg,
                                          const DecompositionOptions& opts) {
     TrunkDecomposition d(cfg, opts);
     return d.run();
+}
+
+// ============================================================================
+// Roadmap ④ (post-v1.9.0): Exact-mode productization — preset schedule guard
+// + feasibility pre-flight estimator.
+// ============================================================================
+
+// ---- pow-4 schedule safety ------------------------------------------------
+//
+// The POSTFLOP DCFR schedule (compute_dcfr_factors) updates strategy_sum by
+// decay-and-add with weight ((t−p4)/(t−p4+1))^3, p4 = nearest lower power of
+// 4 — the accumulated average strategy is effectively WIPED each time the
+// iteration index crosses 1, 4, 16, 64, 256, 1024, 4096. A run whose
+// DELIVERED pass ends just past a wipe averages only a handful of
+// iterations (measured 2026-07-15: inner=120 crossers regressed). Three
+// windows matter for a (outer, inner, K) preset:
+//   cold leaves  — re-solved fresh each sweep: window [0, inner)
+//   warm leaves  — continue the DCFR index across sweeps; the delivered
+//                  final pass is [outer·inner, (outer+1)·inner)
+//   trunk        — accumulates outer·K continuous iterations from 0
+inline constexpr unsigned decomp_pow4_floor(unsigned t) {
+    unsigned p = 0;
+    for (unsigned x = 1; x != 0 && x <= t; x *= 4) {
+        p = x;
+        if (x > (~0u) / 4) break;
+    }
+    return p;
+}
+
+/// True when the delivered window [start, end) keeps enough post-wipe
+/// accumulation: the last wipe at or before `end` must leave at least
+/// max(64, span/3) iterations (capped at the window span itself).
+inline constexpr bool decomp_window_pow4_safe(unsigned start, unsigned end) {
+    if (end <= start) return false;
+    const unsigned span = end - start;
+    const unsigned wipe = decomp_pow4_floor(end);
+    const unsigned acc_from = (wipe > start) ? wipe : start;
+    const unsigned acc = end - acc_from;
+    unsigned need = span / 3u;
+    if (need < 64u) need = 64u;
+    if (need > span) need = span;
+    return acc >= need;
+}
+
+inline constexpr bool decomp_preset_pow4_safe(int outer, int inner, int k) {
+    return outer >= 1 && inner >= 1 && k >= 1
+        && decomp_window_pow4_safe(0u, static_cast<unsigned>(inner))
+        && decomp_window_pow4_safe(static_cast<unsigned>(outer * inner),
+                                   static_cast<unsigned>((outer + 1) * inner))
+        && decomp_window_pow4_safe(0u, static_cast<unsigned>(outer * k));
+}
+
+// These tuples MUST mirror DECOMPOSE_PRESETS in src/lib/poker.ts (quick /
+// standard / deep). If you change one side, change both — this assert is the
+// engine-side tripwire for a preset that lands on a strategy wipe.
+static_assert(decomp_preset_pow4_safe(2, 150, 300),
+              "quick decompose preset lands the delivered pass on a pow-4 wipe");
+static_assert(decomp_preset_pow4_safe(2, 450, 300),
+              "standard decompose preset lands the delivered pass on a pow-4 wipe");
+static_assert(decomp_preset_pow4_safe(2, 900, 300),
+              "deep decompose preset lands the delivered pass on a pow-4 wipe");
+
+// ---- feasibility pre-flight ------------------------------------------------
+//
+// estimate_decomposition() prices a decomposed solve BEFORE committing to it:
+// build the trunk only (set_truncate_at_chance — sub-second), count the
+// (betting line × turn card) leaves, and price one representative subgame per
+// betting line for the biggest lines. Emitted through --estimate-only so the
+// UI can show "Exact ≈ N min, expected accuracy ~X" before the user commits.
+//
+// Accuracy contract matches estimate_solve_seconds(): distinguish "30
+// seconds" from "30 minutes", not ±10%. Known omissions, all second-order:
+// adaptive-pin re-upload savings (real spots pin few leaves, e.g. 11/805),
+// trunk CFR (microseconds/iter), final-pass nav extraction.
+struct DecompositionEstimate {
+    bool     ok = false;
+    uint32_t leaf_count = 0;     ///< distinct (betting line × turn card) subgames
+    uint32_t line_count = 0;     ///< distinct betting lines feeding the chance street
+    uint32_t trunk_nodes = 0;
+    int      sweeps = 0;         ///< outer refreshes + 1 delivery pass
+    double   per_sweep_seconds = 0.0;
+    double   total_seconds = 0.0;
+    float    spr = 0.0f;         ///< effective_stack / pot at the ROOT
+    /// Honest quality banding, keyed on root SPR (2026-07-15 study):
+    ///   SPR ≤ 3  → "high"       (fixture SPR 2: 0.09–0.30% exploit)
+    ///   SPR ≤ 6  → "medium"     (AsKsQs SPR 5: 25–60%)
+    ///   else     → "navigation" (m0_b6 SPR 17.7: 187–256% — browse real
+    ///               runouts; don't sell equilibrium quality)
+    std::string quality_tier;
+    float    expected_exploit_lo_pct = 0.0f;
+    float    expected_exploit_hi_pct = 0.0f;
+    std::string backend_label;   ///< backend the pricing assumed
+};
+
+namespace decomp_estimate_detail {
+// GPU subgame pricing is a FLAT per-leaf rate: streamed turn subgames are
+// launch-bound (same regime the monolithic perf memos measured — kernel
+// size barely matters next to launch overhead), so per-leaf cost is
+// per-visit overhead + a per-iteration constant, independent of nc or
+// subgame tree size. Fitted on FOUR measured runs (RTX 5090, 2026-07-15):
+//   m0_b6  Ah9h4h 55/975 33/75 menus, 805 leaves, (5,150) → 73 min total
+//   m0_b6  same spot,                             (2,450) → 66 min total
+//   AsKd2c 100/500 default menus, 637 leaves, inner=50: sweep 437.5 s
+//                                             + final want_br pass 757.8 s
+// The rainbow run separates the sweep from the FINAL pass (best-response
+// values ≈ +73%); with that multiplier all four points reproduce within
+// ±4%. Slower GPUs scale roughly with launch latency, not FLOPs — we
+// accept the single calibration (the banner already says ±2×). River-leaf
+// subgames (turn-root boards) have fewer levels per iteration, so this
+// over-estimates there — the safe side.
+constexpr double kGpuSecondsPerLeafOverhead = 0.585;  ///< build + matchup + upload per visit
+constexpr double kGpuSecondsPerSubgameIter  = 1.7e-3; ///< launch-bound per-iteration cost
+/// The final delivery pass also computes best-response values — measured
+/// 1.73× a plain sweep on the rainbow datum (nav OFF). Applied as
+/// (outer + this) sweep-equivalents.
+constexpr double kFinalPassSweepEquivalents = 1.73;
+/// Nav-tree extraction on the final pass (opts.build_nav — always on for
+/// app solves): measured on the desktop e2e run (AsKd2c Lite quick,
+/// 245 leaves, wall 1406 s vs 798 s nav-off model ⇒ ~2.5 s/leaf at
+/// nc=1176). Extraction walks emitted nodes × nc-long EV vectors, so scale
+/// by nc/1176. This is the "§B nav-extraction parallelization" backlog
+/// cost, priced honestly until it's optimized.
+constexpr double kNavExtractSecondsPerLeafAtNc1176 = 2.5;
+// CPU subgames ARE compute-bound, so the CPU path prices from the sampled
+// sub-tree ops model (player_nodes × A × nc²) at the 1-thread rate, with a
+// fitted shape correction (the sampled trees over-state real work: they
+// are built under the subgame board's own enumeration while the real solve
+// forces the parent iso). No direct CPU wall measurement yet — ETA-grade.
+constexpr double kSubgameTreeOpsCorrection  = 0.48;
+constexpr double kCpuMatchupSecondsPerCell  = 1.2e-7; ///< per nc² cell per distinct runout table
+constexpr double kCpuFixedSecondsPerLeaf    = 0.07;   ///< Solver ctor + tree build + reach init
+}  // namespace decomp_estimate_detail
+
+inline DecompositionEstimate estimate_decomposition(const SolverConfig& cfg,
+                                                    const DecompositionOptions& opts) {
+    DecompositionEstimate e;
+    // Needs a chance street below the root (flop → turn leaves, or turn →
+    // river leaves). River roots have nothing to decompose.
+    if (cfg.board_size < 3 || cfg.board_size >= 5) return e;
+
+    // Subgames are FORCED into the parent board's canonical space (see the
+    // file header: trunk and subgames share one iso, no reach bridge), so
+    // their per-iteration ops and matchup cells scale with the PARENT nc² —
+    // pricing them at the subgame board's own (finer) iso over-counted 4×
+    // on the calibration spot.
+    IsomorphismMapping iso = compute_isomorphism(cfg.board.data(), cfg.board_size);
+    const uint64_t nc = iso.num_canonical;
+
+    GameTreeBuilder builder(cfg);
+    builder.set_truncate_at_chance(true);
+    FlatGameTree trunk = builder.build();
+    e.trunk_nodes = trunk.total_nodes;
+
+    // Leaves grouped by the (pot, stack) they enter the subgame with — one
+    // group per betting line; same-line turn cards share pot/stack and hence
+    // subgame tree shape. Group count is small (dozens), linear scan is fine.
+    struct Group {
+        float pot = 0.0f, stack = 0.0f;
+        uint32_t rep_leaf = 0;   ///< representative trunk node id
+        uint32_t count = 0;
+        double per_leaf_seconds = -1.0;  ///< filled for sampled groups
+    };
+    std::vector<Group> groups;
+    for (uint32_t n = 0; n < trunk.total_nodes; ++n) {
+        if (trunk.num_children[n] != 0) continue;
+        if (n >= trunk.dealt_card.size() || trunk.dealt_card[n] == 0xFFu) continue;
+        ++e.leaf_count;
+        const float p = trunk.pots[n], s = trunk.stacks[n];
+        bool found = false;
+        for (auto& g : groups) {
+            if (std::fabs(g.pot - p) < 1e-3f && std::fabs(g.stack - s) < 1e-3f) {
+                ++g.count;
+                found = true;
+                break;
+            }
+        }
+        if (!found) groups.push_back(Group{p, s, n, 1, -1.0});
+    }
+    if (e.leaf_count == 0) return e;
+    e.line_count = static_cast<uint32_t>(groups.size());
+
+    // Backend the subgames would run on. The GPU route needs an actual CUDA
+    // device — mirror the solve route's silent CPU fallback when absent.
+    const int cc = cuda_compute_capability();
+    const bool gpu = (opts.subgame_backend == BackendType::GPU) && cc > 0;
+    std::string label_lc;
+    if (gpu) {
+        label_lc = "cuda (subgame estimate)";
+    } else {
+        label_lc = (cfg.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED)
+                       ? "cpu-levelized" : "cpu-dcfr";
+        label_lc += (cpu_simd::active_mode() == cpu_simd::SimdMode::Avx2)
+                       ? "-avx2" : "-scalar";
+    }
+    // Each subgame solve is forced single-threaded (make_sub_cfg); the CPU
+    // path parallelizes ACROSS leaves instead, so its per-leaf rate is the
+    // 1-thread rate and the sweep total divides by the OMP team below.
+    const double rate = estimated_throughput_ops_per_sec(label_lc, cc, 1u);
+    e.backend_label = gpu ? "decomposed-gpu" : "decomposed-cpu";
+
+    const int inner = std::max(1, opts.inner_iterations);
+    if (gpu) {
+        // Launch-bound flat rate — subgame size doesn't move the needle
+        // (see constants above), so no sub-tree sampling needed.
+        const double per_leaf =
+            decomp_estimate_detail::kGpuSecondsPerLeafOverhead
+            + inner * decomp_estimate_detail::kGpuSecondsPerSubgameIter;
+        for (auto& g : groups) g.per_leaf_seconds = per_leaf;
+    } else {
+        // CPU: price one representative subgame per betting line for the
+        // deepest remaining-SPR lines (they own the biggest subtrees and
+        // dominate the sum); the rest inherit the nearest sampled SPR's
+        // per-leaf price.
+        std::sort(groups.begin(), groups.end(), [](const Group& a, const Group& b) {
+            const float sa = a.stack / std::max(a.pot, 1e-3f);
+            const float sb = b.stack / std::max(b.pot, 1e-3f);
+            return sa > sb;
+        });
+        constexpr size_t kMaxSampledLines = 6;
+        for (size_t gi = 0; gi < groups.size() && gi < kMaxSampledLines; ++gi) {
+            Group& g = groups[gi];
+            SolverConfig sub = cfg;  // inherit menus / budgets / CPU knobs
+            sub.board[cfg.board_size] = trunk.dealt_card[g.rep_leaf];
+            sub.board_size = static_cast<uint8_t>(cfg.board_size + 1);
+            sub.pot = g.pot;
+            sub.effective_stack = g.stack;
+            sub.oop_has_initiative = true;
+            sub.max_iterations = inner;
+
+            GameTreeBuilder sb(sub);
+            sb.set_memory_policy(nc, sub.memory_budget,
+                                 matchup_bytes_per_cell(sub, iso));
+            FlatGameTree st = sb.build();
+
+            uint64_t player_n = 0;
+            // Distinct runout tables the subgame's precompute will fill
+            // (dedup by dealt card — precompute keys tables per canonical
+            // board) + 1 for the subgame's own board.
+            bool seen[64] = {};
+            uint64_t tables = 1;
+            for (uint32_t n = 0; n < st.total_nodes; ++n) {
+                auto t = static_cast<NodeType>(st.node_types[n]);
+                if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) ++player_n;
+                if (n < st.dealt_card.size()) {
+                    const uint8_t dc = st.dealt_card[n];
+                    if (dc != 0xFFu && dc < 64 && !seen[dc]) {
+                        seen[dc] = true;
+                        ++tables;
+                    }
+                }
+            }
+
+            const double ops =
+                static_cast<double>(ops_per_solve_iteration(player_n, MAX_ACTIONS, nc))
+                * decomp_estimate_detail::kSubgameTreeOpsCorrection;
+            const double cfr_s = (rate > 0.0) ? ops * inner / rate : 0.0;
+            const double cells = static_cast<double>(tables)
+                               * static_cast<double>(nc)
+                               * static_cast<double>(nc);
+            g.per_leaf_seconds = decomp_estimate_detail::kCpuFixedSecondsPerLeaf
+                               + cells * decomp_estimate_detail::kCpuMatchupSecondsPerCell
+                               + cfr_s;
+            if (std::getenv("DEEPSOLVER_DECOMP_EST_DEBUG")) {
+                std::cerr << "[decomp-est] line pot=" << g.pot << " stack=" << g.stack
+                          << " count=" << g.count << " player_n=" << player_n
+                          << " nc=" << nc << " tables=" << tables
+                          << " cfr_s=" << cfr_s
+                          << " matchup_s=" << cells * decomp_estimate_detail::kCpuMatchupSecondsPerCell
+                          << " leaf_s=" << g.per_leaf_seconds << "\n";
+            }
+        }
+        // Unsampled lines inherit the nearest sampled price (by log-SPR).
+        for (auto& g : groups) {
+            if (g.per_leaf_seconds >= 0.0) continue;
+            const double gspr =
+                std::log(std::max(1e-3f, g.stack / std::max(g.pot, 1e-3f)));
+            double best = 1e30, price = 0.0;
+            for (size_t gi = 0; gi < groups.size() && gi < kMaxSampledLines; ++gi) {
+                const Group& s = groups[gi];
+                const double sspr =
+                    std::log(std::max(1e-3f, s.stack / std::max(s.pot, 1e-3f)));
+                const double d = std::fabs(gspr - sspr);
+                if (d < best) { best = d; price = s.per_leaf_seconds; }
+            }
+            g.per_leaf_seconds = price;
+        }
+    }
+
+    double sweep_total = 0.0;
+    for (const auto& g : groups) sweep_total += g.count * g.per_leaf_seconds;
+    if (!gpu) {
+        // CPU path solves leaves omp-parallel (each single-threaded).
+        unsigned threads = std::max(1u, std::thread::hardware_concurrency());
+#ifdef _OPENMP
+        threads = static_cast<unsigned>(std::max(1, omp_get_max_threads()));
+#endif
+        sweep_total /= static_cast<double>(
+            std::min<uint32_t>(threads, e.leaf_count));
+    }
+    e.per_sweep_seconds = sweep_total;
+    e.sweeps = std::max(1, opts.outer_iterations) + 1;
+    // Total = outer plain sweeps + one heavier delivery pass (BR values;
+    // multiplier measured on the rainbow datum, applied to both backends)
+    // + nav-tree extraction when the caller will build the UI cache.
+    e.total_seconds =
+        (std::max(1, opts.outer_iterations)
+         + decomp_estimate_detail::kFinalPassSweepEquivalents) * sweep_total;
+    if (opts.build_nav) {
+        e.total_seconds += static_cast<double>(e.leaf_count)
+            * decomp_estimate_detail::kNavExtractSecondsPerLeafAtNc1176
+            * (static_cast<double>(nc) / 1176.0);
+    }
+
+    e.spr = cfg.effective_stack / std::max(cfg.pot, 1e-3f);
+    if (e.spr <= 3.0f) {
+        e.quality_tier = "high";
+        e.expected_exploit_lo_pct = 0.1f;
+        e.expected_exploit_hi_pct = 1.0f;
+    } else if (e.spr <= 6.0f) {
+        e.quality_tier = "medium";
+        e.expected_exploit_lo_pct = 10.0f;
+        e.expected_exploit_hi_pct = 60.0f;
+    } else {
+        e.quality_tier = "navigation";
+        e.expected_exploit_lo_pct = 100.0f;
+        e.expected_exploit_hi_pct = 300.0f;
+    }
+    // The bands come from standard/deep-class runs (inner ≥ 450). A starved
+    // quick pass lands above them on non-trivial SPR (measured: AsKd2c SPR 5
+    // quick → 82%, (1,50) → 76%) — widen the ceiling so the promise stays
+    // honest.
+    if (opts.inner_iterations <= 150 && e.spr > 3.0f) {
+        e.expected_exploit_hi_pct *= 1.5f;
+    }
+
+    e.ok = true;
+    return e;
 }
 
 } // namespace deepsolver

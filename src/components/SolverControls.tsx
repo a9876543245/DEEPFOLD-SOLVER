@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { useT } from '../lib/i18n';
 import {
   MEMORY_PROFILE_PRESETS, SOLVE_MODE_PRESETS,
-  type MemoryProfile, type SolveMode,
+  type MemoryProfile, type SolveMode, type EstimateResponse,
 } from '../lib/poker';
 
 export type BetSizingKey = 'lite' | 'standard' | 'polar' | 'small_ball';
@@ -32,6 +32,10 @@ interface Props {
    *  real runouts via subgame decomposition. Orthogonal to solveMode. */
   decomposeRunouts?: 'off' | 'auto';
   onDecomposeRunoutsChange?: (mode: 'off' | 'auto') => void;
+  /** Roadmap ④: Exact feasibility pre-flight (--estimate-only with the
+   *  decompose block). Fed by App's debounced estimate when Exact is on;
+   *  null while unavailable (browser mode, estimating, or failed). */
+  exactPreflight?: EstimateResponse | null;
   /** v1.3.0: called when the user clicks Stop during loading. Should
    *  invoke the cancel_solve Tauri command. */
   onStop?: () => void;
@@ -54,6 +58,7 @@ export function SolverControls({
   memoryProfile = 'balanced', onMemoryProfileChange,
   solveMode = 'standard', onSolveModeChange, onStop,
   decomposeRunouts = 'off', onDecomposeRunoutsChange,
+  exactPreflight = null,
   expectedEffectiveBB = null,
 }: Props) {
   const t = useT();
@@ -269,9 +274,57 @@ export function SolverControls({
             );
           })}
         </div>
-        <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginTop: 4 }}>
-          {t(`config.decompose.hint.${decomposeRunouts}`)}
-        </div>
+        {decomposeRunouts === 'off' ? (
+          <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginTop: 4 }}>
+            {t('config.decompose.hint.off')}
+          </div>
+        ) : (() => {
+          // Roadmap ④: honest SPR-gated positioning. Prefer the engine's
+          // tier from the pre-flight; fall back to the same thresholds
+          // computed locally (mirrors solver_decomposed.h: ≤3 / ≤6 / above).
+          const de = exactPreflight?.decompose;
+          const tier = de?.ok
+            ? de.quality_tier
+            : (spr <= 3 ? 'high' : spr <= 6 ? 'medium' : 'navigation');
+          const tierColor =
+            tier === 'high' ? '#10b981'
+            : tier === 'medium' ? 'var(--color-text-tertiary)'
+            : '#f59e0b';
+          const fmtDuration = (s: number): string => {
+            if (!Number.isFinite(s) || s <= 0) return '—';
+            if (s < 90) return `${Math.max(1, Math.round(s))}s`;
+            if (s < 5400) return `${Math.round(s / 60)} min`;
+            return `${(s / 3600).toFixed(1)} h`;
+          };
+          const isTauriEnv = !!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+          return (
+            <div style={{ fontSize: 11, marginTop: 4, display: 'grid', gap: 3 }}>
+              <div style={{ color: tierColor }}>
+                {t(`config.decompose.hint.auto.${tier}`)}
+              </div>
+              {de?.ok && !de.would_engage && (
+                <div style={{ color: 'var(--color-text-tertiary)' }}>
+                  {t('config.decompose.preflight.noop')}
+                </div>
+              )}
+              {de?.ok && de.would_engage && (
+                <div className="text-mono" style={{ color: 'var(--color-text-secondary)' }}>
+                  {t('config.decompose.preflight', {
+                    time: fmtDuration(de.total_seconds),
+                    leaves: de.leaves,
+                    lo: de.expected_exploit_lo_pct,
+                    hi: de.expected_exploit_hi_pct,
+                  })}
+                </div>
+              )}
+              {exactPreflight === null && isTauriEnv && (
+                <div style={{ color: 'var(--color-text-tertiary)' }}>
+                  {t('config.decompose.preflight.estimating')}
+                </div>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
       {/* Solve / Stop Button — switches role based on loading state.

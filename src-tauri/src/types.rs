@@ -78,6 +78,17 @@ pub struct SolverRequest {
     /// (debug). None / "off" ⇒ arg omitted, sidecar keeps its default (off).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decompose_runouts: Option<String>,
+    /// Roadmap ④: decomposition iteration presets (engine --decompose-*
+    /// CLI flags). None = engine dev defaults. The UI fills these from
+    /// DECOMPOSE_PRESETS (poker.ts) keyed on solveMode when Exact is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decompose_outer: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decompose_inner: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decompose_trunk_iters: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decompose_warm_start: Option<bool>,
     /// v1.4.0 Phase 2: CPU SIMD policy override. None / "auto" = CPUID picks.
     /// "scalar" forces scalar kernels (parity test / debugging).
     /// "avx2" requires AVX2 CPU (engine aborts on detection failure).
@@ -252,6 +263,11 @@ pub struct SolveResources {
     pub diagnostic: String,
     #[serde(default)]
     pub fallback_reason: String,
+    /// Roadmap ④ (estimate-only path): builder already collapsed the runout
+    /// enumeration at estimate time ⇒ Fast shows the amber banner and Exact
+    /// ('auto') would engage decomposition.
+    #[serde(default)]
+    pub runout_approximated: bool,
     // v1.2.2: pre-iteration solve cost prediction. ops_per_iteration ≈
     // player_nodes × MAX_ACTIONS × nc² (dominant cost per CFR iteration).
     // estimated_solve_seconds is ops × max_iterations / backend_throughput.
@@ -282,6 +298,55 @@ pub struct EstimateResponse {
     pub status: String,
     /// All the SolveResources fields (memory + ETA + budget decision).
     pub resources: SolveResources,
+    /// Roadmap ④: Exact-mode feasibility pre-flight. Present when the
+    /// request had decompose_runouts auto/on — prices the decomposed run
+    /// so the UI can show "Exact ≈ N min, expected accuracy ~X" before the
+    /// user commits. `default` keeps older engines parseable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decompose: Option<DecomposeEstimate>,
+}
+
+/// Roadmap ④: mirrors the C++ "decompose" block of the --estimate-only
+/// JSON (see main.cpp estimate emit + solver_decomposed.h
+/// DecompositionEstimate). Every field defaulted so schema drift degrades
+/// gracefully instead of failing the whole estimate parse.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DecomposeEstimate {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub would_engage: bool,
+    #[serde(default)]
+    pub leaves: u32,
+    #[serde(default)]
+    pub lines: u32,
+    #[serde(default)]
+    pub trunk_nodes: u32,
+    #[serde(default)]
+    pub sweeps: i32,
+    #[serde(default)]
+    pub outer: i32,
+    #[serde(default)]
+    pub inner: i32,
+    #[serde(default)]
+    pub trunk_iters_per_sweep: i32,
+    #[serde(default)]
+    pub warm_start: bool,
+    #[serde(default)]
+    pub per_sweep_seconds: f64,
+    #[serde(default)]
+    pub total_seconds: f64,
+    #[serde(default)]
+    pub spr: f64,
+    /// "high" | "medium" | "navigation"
+    #[serde(default)]
+    pub quality_tier: String,
+    #[serde(default)]
+    pub expected_exploit_lo_pct: f64,
+    #[serde(default)]
+    pub expected_exploit_hi_pct: f64,
+    #[serde(default)]
+    pub backend: String,
 }
 
 /// Per-node strategy bundle, keyed by player-action history in `strategy_tree`.

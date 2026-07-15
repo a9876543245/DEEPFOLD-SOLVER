@@ -594,6 +594,12 @@ struct SolveResources {
     std::string fallback_reason;
     /// Human-readable diagnostic when budget_decision != "ok".
     std::string diagnostic;
+    /// Roadmap ④ (estimate-only path): true when the BUILDER already
+    /// collapsed the runout enumeration at estimate time — the same tree the
+    /// real solve would start from, so "auto" decomposition would engage.
+    /// (The post-precompute state gate is NOT mirrored here; the estimate's
+    /// decompose pre-flight adds a state-bytes check on top.)
+    bool runout_approximated           = false;
 
     // ---- v1.2.2: pre-iteration solve-time estimate ----
     // Populated post-gate, pre-iteration so the UI can show users an ETA

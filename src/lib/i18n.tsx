@@ -157,7 +157,39 @@ const dict: Dict = {
   'config.decompose.off':       { en: 'Fast',          zh: '快速',       ja: '高速' },
   'config.decompose.auto':      { en: 'Exact',         zh: '精確',       ja: '正確' },
   'config.decompose.hint.off':  { en: 'Turn/river equity approximated on boards too large to enumerate.', zh: '牌面過大無法窮舉時,轉牌/河牌權益為近似值。', ja: '列挙できない大きな盤面ではターン/リバーの期待値が近似されます。' },
-  'config.decompose.hint.auto': { en: 'Solves real turn/river runouts via decomposition (slower).', zh: '透過分解求解真實的轉牌/河牌(較慢)。', ja: '分解により実際のターン/リバーを求解します(低速)。' },
+  // Roadmap ④: honest, SPR-gated Exact positioning. Exact's real value is
+  // BROWSING true runouts; equilibrium-quality claims are only earned at
+  // low SPR (thresholds mirror the engine's quality_tier: ≤3 / ≤6 / above).
+  'config.decompose.hint.auto.high': {
+    en: 'Solves real turn/river runouts. At this SPR (≤3), Exact reaches near-equilibrium accuracy.',
+    zh: '求解真實的轉牌/河牌。此 SPR(≤3)下,精確模式可達接近均衡的精度。',
+    ja: '実際のターン/リバーを求解。このSPR(≤3)ではほぼ均衡精度に到達します。',
+  },
+  'config.decompose.hint.auto.medium': {
+    en: 'Browse real turn/river runouts. Accuracy at this SPR is moderate — expect a rougher strategy than a converged Fast solve.',
+    zh: '瀏覽真實的轉牌/河牌局面。此 SPR 下精度中等——策略會比已收斂的快速解粗糙。',
+    ja: '実際のターン/リバーを閲覧。このSPRでは精度は中程度——収束した高速解より粗い戦略になります。',
+  },
+  'config.decompose.hint.auto.navigation': {
+    en: 'Browse real turn/river runouts (navigation). At deep SPR, Exact cannot converge to equilibrium — use it to explore runouts, not as a quality upgrade.',
+    zh: '瀏覽真實的轉牌/河牌局面(導航用途)。深 SPR 下精確模式無法收斂到均衡——適合探索牌面走向,而非品質升級。',
+    ja: '実際のターン/リバーを閲覧(ナビゲーション用途)。深いSPRではExactは均衡に収束しません——ランナウト探索用であり、品質向上ではありません。',
+  },
+  'config.decompose.preflight': {
+    en: 'Exact ≈ {time} · {leaves} runout subgames · expected exploitability ~{lo}–{hi}% pot',
+    zh: '精確 ≈ {time} · {leaves} 個牌面子博弈 · 預期可剝削度 ~{lo}–{hi}% 底池',
+    ja: '正確 ≈ {time}・{leaves}ランナウト子ゲーム・予想搾取率 ~{lo}–{hi}% ポット',
+  },
+  'config.decompose.preflight.noop': {
+    en: 'This board enumerates fully within budget — Exact changes nothing here (no approximation to remove).',
+    zh: '此牌面可在預算內完整窮舉——精確模式在此不改變結果(沒有近似需要移除)。',
+    ja: 'このボードは予算内で完全列挙可能——ここではExactは結果を変えません(除去すべき近似がありません)。',
+  },
+  'config.decompose.preflight.estimating': {
+    en: 'Pricing Exact solve…',
+    zh: '正在估算精確求解成本…',
+    ja: 'Exactソルブのコストを見積もり中…',
+  },
 
   // ---- Strategy Panel ----
   'panel.solverResult': { en: 'Solver Result', zh: '求解結果', ja: '求解結果' },

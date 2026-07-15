@@ -45,6 +45,13 @@ public:
     /// for the same board. Falls back to a full prepare() if not previously
     /// prepared (no resident board to keep).
     void reprepare_keep_board(const SolverContext& ctx) override;
+    /// Warm-start: like reprepare_keep_board() but ALSO keeps the device solver
+    /// state (regrets + strategy_sum), so a re-solve continues the previous
+    /// CFR run instead of restarting from zero regrets. Only reach + node locks
+    /// are re-uploaded. Falls back to reprepare_keep_board() when there is no
+    /// resident state to continue.
+    void reprepare_keep_state(const SolverContext& ctx) override;
+    bool supports_warm_start() const override { return true; }
     void iterate(int iteration) override;
     void finalize() override;
     const std::vector<std::vector<float>>& strategy() const override { return strategy_; }
