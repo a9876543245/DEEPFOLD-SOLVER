@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { MATCHUPS, rangePercentage, countRangeCombos } from '../lib/ranges';
+import { MATCHUPS, rangePercentage, countRangeCombos, preflopRoles } from '../lib/ranges';
 import type { Position, PotType, PositionMatchup } from '../lib/ranges';
 import { useT } from '../lib/i18n';
 
@@ -61,6 +61,21 @@ export function PositionSelector({ selectedMatchup, onMatchupChange, onReset, on
   };
 
   const handleReset = () => { setHeroPosition(null); onReset?.(); };
+
+  /** "IP · Raiser" / "OOP · Caller". The role follows preflop action order,
+   *  not ip/oop — in UTG vs BTN it is UTG (OOP) who raised and BTN (IP) who
+   *  called. */
+  const roleLabel = (side: 'IP' | 'OOP'): string => {
+    if (!selectedMatchup) return side;
+    const { opener } = preflopRoles(selectedMatchup);
+    const pos = side === 'IP' ? selectedMatchup.ip : selectedMatchup.oop;
+    const role = pos === opener
+      ? t('position.roleRaiser')
+      : selectedMatchup.potType === '3BET'
+        ? t('position.role3bettor')
+        : t('position.roleCaller');
+    return `${side} · ${role}`;
+  };
 
   return (
     <div className="glass-panel" style={{ padding: 16 }}>
@@ -215,12 +230,11 @@ export function PositionSelector({ selectedMatchup, onMatchupChange, onReset, on
           </div>
 
           <div style={{ padding: 12, background: 'var(--color-bg-tertiary)', borderRadius: 8 }}>
-            <RangeBar position={selectedMatchup.ip} label={t('position.ipRaiser')}
+            <RangeBar position={selectedMatchup.ip} label={roleLabel('IP')}
               rangeStr={selectedMatchup.ipRange} isHero={selectedMatchup.ip === heroPosition}
               onEdit={() => onEditRange?.(true)} />
             <div style={{ height: 10 }} />
-            <RangeBar position={selectedMatchup.oop}
-              label={selectedMatchup.potType === '3BET' ? t('position.oop3bettor') : t('position.oopCaller')}
+            <RangeBar position={selectedMatchup.oop} label={roleLabel('OOP')}
               rangeStr={selectedMatchup.oopRange} isHero={selectedMatchup.oop === heroPosition}
               onEdit={() => onEditRange?.(false)} />
           </div>

@@ -163,7 +163,8 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
               </div>
             </div>
             <div style={{ background: 'var(--color-bg-tertiary)', borderRadius: 'var(--radius-sm)', padding: '6px 10px' }}>
-              <div style={{ fontSize: 10, color: 'var(--color-text-tertiary)' }}>{t('panel.iterations')}</div>
+              {/* Exact decompose phase: iteration/total carry subgame counts */}
+              <div style={{ fontSize: 10, color: 'var(--color-text-tertiary)' }}>{t(progress.decompose ? 'panel.subgames' : 'panel.iterations')}</div>
               <div className="text-mono" style={{ fontSize: 16, fontWeight: 700 }}>
                 {progress.iteration}<span style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>/{progress.total}</span>
               </div>

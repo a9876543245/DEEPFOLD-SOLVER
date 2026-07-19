@@ -452,6 +452,18 @@ __global__ void terminal_level_kernel(
 constexpr uint16_t kRbNoBucket = 0xFFFFu;  // mirrors showdown_rank_blocker::Scratch::kNoBucket
 constexpr int      kRbBlock    = 256;
 
+// Fixed-point scale (2^42) for the bucket scatter. float atomicAdd resolves
+// same-bucket conflicts in warp-scheduling order, which is not reproducible
+// across runs — measured as ~1e-4 strategy wobble on node-locked solves
+// (locks perturb the uniform iter-0 reach; equal addends had masked the
+// order-dependence). 64-bit integer adds are associative, so quantizing to
+// fixed point makes the sums bit-identical no matter the scheduling.
+// Precision: per-addend error ≤ 2^-43 absolute (reach ≤ ~1e2), total over
+// nc ≤ 1326 addends ≲ 1.5e-10 — far below float32 ulp of typical totals.
+// Overflow needs a reach sum > 2^64/2^42 ≈ 4.2e6; real sums are ≤ ~1e5.
+constexpr float  kRbFixedScale    = 4398046511104.0f;       // 2^42
+constexpr double kRbFixedInvScale = 1.0 / 4398046511104.0;  // 2^-42
+
 __global__ void rank_blocker_terminal_kernel(
     const uint8_t* __restrict__ node_types,
     const uint8_t* __restrict__ terminal_types,
@@ -491,21 +503,33 @@ __global__ void rank_blocker_terminal_kernel(
     const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(n) * nc;
     float* __restrict__ out_values = node_values + static_cast<size_t>(n) * nc;
 
-    // Shared memory layout: [s_total : max_B][s_prefix : max_B+1][s_chunk : blockDim]
-    extern __shared__ float smem[];
-    float* s_total  = smem;
-    float* s_prefix = smem + max_bucket_count;
-    float* s_chunk  = smem + (2 * static_cast<int>(max_bucket_count) + 1);
+    // Shared memory layout (ull array first for 8-byte alignment):
+    // [s_acc : max_B ull][s_total : max_B][s_prefix : max_B+1][s_chunk : blockDim]
+    extern __shared__ unsigned long long s_acc[];
+    float* smem_f   = reinterpret_cast<float*>(s_acc + max_bucket_count);
+    float* s_total  = smem_f;
+    float* s_prefix = smem_f + max_bucket_count;
+    float* s_chunk  = smem_f + (2 * static_cast<int>(max_bucket_count) + 1);
 
     // 1) zero bucket totals, then scatter opponent reach into rank buckets.
-    for (int i = tid; i < B; i += blockDim.x) s_total[i] = 0.0f;
+    //    Accumulate in 64-bit fixed point (see kRbFixedScale) so the result
+    //    does not depend on the atomic resolution order.
+    for (int i = tid; i < B; i += blockDim.x) s_acc[i] = 0ull;
     __syncthreads();
     for (int o = tid; o < nc; o += blockDim.x) {
         const uint16_t bo = mbucket[o];
         if (bo != kRbNoBucket) {
             const float r = reach_opp[o];
-            if (r != 0.0f) atomicAdd(&s_total[bo], r);
+            if (r != 0.0f) {
+                const unsigned long long q = __float2ull_rn(r * kRbFixedScale);
+                if (q != 0ull) atomicAdd(&s_acc[bo], q);
+            }
         }
+    }
+    __syncthreads();
+    for (int i = tid; i < B; i += blockDim.x) {
+        s_total[i] = static_cast<float>(
+            __ull2double_rn(s_acc[i]) * kRbFixedInvScale);
     }
     __syncthreads();
 
@@ -699,8 +723,10 @@ void launch_rank_blocker_terminal_level(
     if (num_level_nodes == 0) return;
     const int block = kRbBlock;
     const uint32_t grid = num_level_nodes;   // one block per terminal
-    // shared: s_total[max_B] + s_prefix[max_B+1] + s_chunk[block]
-    const size_t shmem = (static_cast<size_t>(2) * max_bucket_count + 1 + block) * sizeof(float);
+    // shared: s_acc[max_B] (ull) + s_total[max_B] + s_prefix[max_B+1] + s_chunk[block]
+    const size_t shmem =
+        static_cast<size_t>(max_bucket_count) * sizeof(unsigned long long) +
+        (static_cast<size_t>(2) * max_bucket_count + 1 + block) * sizeof(float);
 
     rank_blocker_terminal_kernel<<<grid, block, shmem>>>(
         d_node_types, d_terminal_types, d_pots,

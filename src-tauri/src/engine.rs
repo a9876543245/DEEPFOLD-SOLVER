@@ -26,6 +26,27 @@ struct EngineProgress {
     elapsed_ms: f32,
 }
 
+/// Payload for the `engine-progress-decompose` event, emitted once per
+/// `[decompose] … leaf I/L` stderr line during an Exact (runout
+/// decomposition) run, plus a `phase: "finalize"` tick when the
+/// `[decompose] outer=…` completion summary appears. Gives the UI real
+/// per-subgame progress where the bar previously parked at 99% (the
+/// monolithic pre-solve's last `[Iter]` line) for the whole decompose phase.
+#[derive(serde::Serialize, Clone)]
+struct DecomposeProgress {
+    /// "sweep" | "final" | "finalize".
+    phase: &'static str,
+    /// 1-based sweep number. 0 outside the sweep phase.
+    sweep: u32,
+    /// Total outer sweeps. Carried into final/finalize payloads from the
+    /// last seen sweep line so every event is self-contained.
+    sweep_total: u32,
+    /// Completed leaves (subgames) in the current pass. 0 for finalize.
+    leaf: u32,
+    /// Total leaves in the current pass. 0 for finalize.
+    leaf_total: u32,
+}
+
 /// v1.3.0: PID of the currently-running solve subprocess (0 = none).
 /// `cancel_solve` reads this and kills the process. Single global atomic
 /// is fine because the UI only allows one solve at a time and the
@@ -443,11 +464,19 @@ async fn try_run_solver(
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
         let mut collected = String::new();
+        // Outer-sweep count remembered across lines so "final pass" /
+        // "outer=" events (which don't repeat it) still carry it.
+        let mut last_sweep_total: u32 = 0;
         while let Ok(Some(line)) = lines.next_line().await {
             // Parse: "[Iter N] Exploitability: X% (Yms)"
             if let Some(progress) = parse_iter_line(&line) {
                 if let Some(handle) = app_for_progress.as_ref() {
                     let _ = handle.emit("engine-progress", progress);
+                }
+            } else if let Some(dp) = parse_decompose_line(&line, &mut last_sweep_total) {
+                // Parse: "[decompose] sweep S/T leaf I/L" etc. (Exact mode).
+                if let Some(handle) = app_for_progress.as_ref() {
+                    let _ = handle.emit("engine-progress-decompose", dp);
                 }
             }
             collected.push_str(&line);
@@ -629,6 +658,47 @@ fn parse_iter_line(line: &str) -> Option<EngineProgress> {
     Some(EngineProgress { iteration: iter, exploitability_pct, elapsed_ms })
 }
 
+/// Parse an Exact-mode (runout decomposition) progress line:
+///   `[decompose] sweep 1/2 leaf 37/245`   → phase "sweep"
+///   `[decompose] final pass leaf 37/245`  → phase "final"
+///   `[decompose] outer=2 inner=450 …`     → phase "finalize" (run summary;
+///                                            ev/BR + nav stitch + JSON left)
+/// The per-pass SUMMARY lines ("… solved N subgames in Xs") say "solved"
+/// where these say "leaf", so they fall through to None along with all other
+/// engine chatter. Line formats are set by
+/// solver_decomposed.h::solve_all_subgames and main.cpp — keep in sync.
+fn parse_decompose_line(line: &str, last_sweep_total: &mut u32) -> Option<DecomposeProgress> {
+    let rest = line.strip_prefix("[decompose] ")?;
+    if let Some(r) = rest.strip_prefix("sweep ") {
+        let (sweep, r) = split_u32(r)?;
+        let (sweep_total, r) = split_u32(r.strip_prefix('/')?)?;
+        let (leaf, r) = split_u32(r.strip_prefix(" leaf ")?)?;
+        let (leaf_total, _) = split_u32(r.strip_prefix('/')?)?;
+        *last_sweep_total = sweep_total;
+        return Some(DecomposeProgress { phase: "sweep", sweep, sweep_total, leaf, leaf_total });
+    }
+    if let Some(r) = rest.strip_prefix("final pass leaf ") {
+        let (leaf, r) = split_u32(r)?;
+        let (leaf_total, _) = split_u32(r.strip_prefix('/')?)?;
+        return Some(DecomposeProgress {
+            phase: "final", sweep: 0, sweep_total: *last_sweep_total, leaf, leaf_total,
+        });
+    }
+    if rest.starts_with("outer=") {
+        return Some(DecomposeProgress {
+            phase: "finalize", sweep: 0, sweep_total: *last_sweep_total, leaf: 0, leaf_total: 0,
+        });
+    }
+    None
+}
+
+/// Split a leading unsigned integer off `s`, returning (value, remainder).
+fn split_u32(s: &str) -> Option<(u32, &str)> {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    if end == 0 { return None; }
+    Some((s[..end].parse().ok()?, &s[end..]))
+}
+
 /// Parse the C++ engine's stderr for a JSON error payload and extract `.message`.
 /// Returns None if no error JSON found.
 fn extract_engine_error(stderr: &str) -> Option<String> {
@@ -721,4 +791,64 @@ pub async fn detect_gpu() -> Result<GpuInfo, String> {
         .map_err(|e| format!("Failed to parse GPU info: {}. Raw: {}", e, stdout))?;
 
     Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iter_line_parses() {
+        let p = parse_iter_line("[Iter 50] Exploitability: 1.25% (1771.25ms)").unwrap();
+        assert_eq!(p.iteration, 50);
+        assert!((p.exploitability_pct - 1.25).abs() < 1e-6);
+        assert!((p.elapsed_ms - 1771.25).abs() < 1e-3);
+        assert!(parse_iter_line("[decompose] sweep 1/2 leaf 3/245").is_none());
+    }
+
+    #[test]
+    fn decompose_sweep_line_parses() {
+        let mut total = 0u32;
+        let p = parse_decompose_line("[decompose] sweep 1/2 leaf 37/245", &mut total).unwrap();
+        assert_eq!(p.phase, "sweep");
+        assert_eq!((p.sweep, p.sweep_total, p.leaf, p.leaf_total), (1, 2, 37, 245));
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn decompose_final_line_carries_sweep_total() {
+        let mut total = 0u32;
+        parse_decompose_line("[decompose] sweep 2/2 leaf 245/245", &mut total).unwrap();
+        let p = parse_decompose_line("[decompose] final pass leaf 5/245", &mut total).unwrap();
+        assert_eq!(p.phase, "final");
+        assert_eq!((p.sweep, p.sweep_total, p.leaf, p.leaf_total), (0, 2, 5, 245));
+    }
+
+    #[test]
+    fn decompose_finalize_from_outer_summary() {
+        let mut total = 3u32;
+        let p = parse_decompose_line(
+            "[decompose] outer=2 inner=450 trunk_iters=600 leaves=245 pinned=64 \
+             warm_leaves=245 warm_start=on exploit=0.41%",
+            &mut total,
+        ).unwrap();
+        assert_eq!(p.phase, "finalize");
+        assert_eq!(p.sweep_total, 3);
+    }
+
+    #[test]
+    fn decompose_summary_and_chatter_ignored() {
+        let mut total = 0u32;
+        for line in [
+            "[decompose] sweep 1/2 solved 245 subgames in 437.5s",
+            "[decompose] final pass solved 245 subgames in 757.8s",
+            "[decompose] monolithic solve failed (x); attempting decomposed fallback",
+            "[decompose] solve_decomposed threw (x); keeping the monolithic result.",
+            "[Iter 50] Exploitability: 1.25% (1771.25ms)",
+            "{\"status\": \"error\", \"message\": \"boom\"}",
+        ] {
+            assert!(parse_decompose_line(line, &mut total).is_none(), "matched: {}", line);
+        }
+        assert_eq!(total, 0);
+    }
 }

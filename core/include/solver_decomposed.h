@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
@@ -764,9 +765,15 @@ inline int TrunkDecomposition::compute_adaptive_K(uint64_t free_start) const {
         uint64_t remain = (capb > per) ? (capb - per) : 0;
         avail = std::min(avail, remain);
     }
-    // Keep 15% headroom and reserve one `per` for the lone transient streamed
-    // solver that is briefly alive while solving a non-pinned leaf.
-    uint64_t usable = static_cast<uint64_t>(static_cast<double>(avail) * 0.85);
+    // Headroom: 25% of free VRAM, floored at 3 GB. The desktop app SHARES the
+    // GPU with its WebView renderer — pinning into the last ~1.5 GB starves it
+    // until the page crash-reloads mid-solve (observed on the 2026-07-18
+    // desktop e2e: plateau at 30.7/32.6 GB → WebView reload at leaf ~290).
+    // Also reserve one `per` for the lone transient streamed solver that is
+    // briefly alive while solving a non-pinned leaf.
+    uint64_t headroom = std::max<uint64_t>(
+        static_cast<uint64_t>(static_cast<double>(avail) * 0.25), 3ull << 30);
+    uint64_t usable = (avail > headroom) ? (avail - headroom) : 0;
     int more = (usable > per) ? static_cast<int>((usable - per) / per) : 0;
     int K = 1 + more;                                               // + leaf 0 (already resident)
     if (K < 1) K = 1;
@@ -786,33 +793,86 @@ inline void TrunkDecomposition::solve_one_subgame_gpu_pinned(int li, bool want_b
         std::unique_ptr<Solver>& slot = gpu_pinned_[static_cast<size_t>(li)];
         if (!slot) {
             SolverConfig sub = make_sub_cfg(li, oop_w, ip_w);
-            slot = std::make_unique<Solver>(sub, BackendType::GPU);
-            slot->set_forced_iso(&iso_);
-            slot->solve();                 // first visit: full upload (board → device).
+            try {
+                auto s = std::make_unique<Solver>(sub, BackendType::GPU);
+                s->set_forced_iso(&iso_);
+                s->solve();            // first visit: full upload (board → device).
+                slot = std::move(s);
+            } catch (const std::exception& e) {
+                // Pin overshot free VRAM. compute_adaptive_K sizes K from
+                // leaf 0's footprint, which under-measures when another
+                // process frees/takes VRAM during that sample (seen with the
+                // desktop WebView) or when later lines' subtrees are bigger.
+                // Stop pinning here — this and all later leaves stream.
+                gpu_cap_ = li;
+                std::fprintf(stderr,
+                             "[decompose] pin stopped at leaf %d (%s); "
+                             "streaming the rest\n", li, e.what());
+            }
         } else {
             slot->set_ranges(oop_w, ip_w);
             // later sweeps: reuse the resident board (and, with warm-start,
             // continue this leaf's CFR run instead of restarting it).
             resolve_persistent(slot.get(), /*keep_board=*/true);
         }
-        read_subgame_values(slot.get(), li, want_br, want_nav);
-    } else {
+        if (slot) {
+            read_subgame_values(slot.get(), li, want_br, want_nav);
+            int resident = 0;
+            for (const auto& s : gpu_pinned_) if (s) ++resident;
+            if (resident > gpu_peak_resident_) gpu_peak_resident_ = resident;
+            return;
+        }
+        // fall through: pin failed for THIS leaf too — stream it.
+    }
+    {
         SolverConfig sub = make_sub_cfg(li, oop_w, ip_w);
-        auto owned = std::make_unique<Solver>(sub, BackendType::GPU);
-        owned->set_forced_iso(&iso_);
-        owned->solve();
-        read_subgame_values(owned.get(), li, want_br, want_nav);
+        try {
+            auto owned = std::make_unique<Solver>(sub, BackendType::GPU);
+            owned->set_forced_iso(&iso_);
+            owned->solve();
+            read_subgame_values(owned.get(), li, want_br, want_nav);
+        } catch (const std::exception& e) {
+            // Transient GPU alloc failed (VRAM pressure spike from another
+            // process mid-run). Solve this ONE leaf on CPU instead of letting
+            // the whole decomposition degrade to the monolithic fallback.
+            std::fprintf(stderr,
+                         "[decompose] leaf %d GPU alloc failed (%s); "
+                         "CPU fallback for this leaf\n", li, e.what());
+            SolverConfig sub2 = make_sub_cfg(li, oop_w, ip_w);
+            sub2.cpu_threads = 0;  // serial GPU loop: let this leaf use all cores
+            auto owned = std::make_unique<Solver>(sub2, BackendType::CPU);
+            owned->set_forced_iso(&iso_);
+            owned->solve();
+            read_subgame_values(owned.get(), li, want_br, want_nav);
+        }
     }
 
     int resident = 0;
     for (const auto& s : gpu_pinned_) if (s) ++resident;
-    if (li >= gpu_cap_) ++resident;        // + the transient streamed solver
+    ++resident;                            // + the transient streamed solver
     if (resident > gpu_peak_resident_) gpu_peak_resident_ = resident;
 }
 
 inline void TrunkDecomposition::solve_all_subgames(bool want_br, bool force_cpu,
                                                   bool want_nav) {
     const int L = static_cast<int>(leaves_.size());
+    // Per-leaf progress line for the Tauri shell (engine.rs
+    // parse_decompose_line turns these into UI progress events — keep the
+    // two formats in sync). fprintf = one line-atomic write per completed
+    // leaf, safe from inside the OMP region; the counter (not `li`) keeps
+    // the reported count monotone under dynamic scheduling. run() sets
+    // `sweep_` before every call, so want_br alone distinguishes the final
+    // pass from a sweep here.
+    std::atomic<int> progress_done{0};
+    auto report_leaf = [&]() {
+        int d = progress_done.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (want_br) {
+            std::fprintf(stderr, "[decompose] final pass leaf %d/%d\n", d, L);
+        } else {
+            std::fprintf(stderr, "[decompose] sweep %d/%d leaf %d/%d\n",
+                         sweep_ + 1, opts_.outer_iterations, d, L);
+        }
+    };
     if (opts_.subgame_backend == BackendType::GPU && !force_cpu) {
         // GPU: a single turn subgame already saturates the device, so solve
         // them ONE AT A TIME (no host-level parallel-for). Nav is extracted
@@ -828,9 +888,13 @@ inline void TrunkDecomposition::solve_all_subgames(bool want_br, bool force_cpu,
                     gpu_cap_ = compute_adaptive_K(gpu_free_start_);
                     gpu_cap_resolved_ = true;
                 }
+                report_leaf();
             }
         } else {
-            for (int li = 0; li < L; ++li) solve_one_subgame_gpu(li, want_br, want_nav);
+            for (int li = 0; li < L; ++li) {
+                solve_one_subgame_gpu(li, want_br, want_nav);
+                report_leaf();
+            }
         }
     } else {
         // CPU: subgames are independent → solve in parallel. Each is forced
@@ -840,7 +904,10 @@ inline void TrunkDecomposition::solve_all_subgames(bool want_br, bool force_cpu,
 #if defined(_OPENMP)
         #pragma omp parallel for schedule(dynamic, 1)
 #endif
-        for (int li = 0; li < L; ++li) solve_one_subgame(li, want_br, want_nav);
+        for (int li = 0; li < L; ++li) {
+            solve_one_subgame(li, want_br, want_nav);
+            report_leaf();
+        }
     }
     subgame_solves_ += L;
 }

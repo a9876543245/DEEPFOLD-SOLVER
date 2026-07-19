@@ -1964,7 +1964,14 @@ inline void Solver::resolve_node_locks() {
             ci = iso_.original_to_canonical[lock.combo_idx];
         }
         if (ci == UINT16_MAX) continue;
-        resolved_locks_[{node_idx, ci}] = lock.strategy;
+        // Clamp to the node's real action count. The compact GPU layout
+        // allocates exactly num_children strategy rows per node, so a longer
+        // lock array would spill into the NEXT node's slots on device
+        // (CPU apply_node_locks already caps at n_act).
+        std::vector<float> strat = lock.strategy;
+        const uint8_t n_act = tree_.num_children[node_idx];
+        if (strat.size() > n_act) strat.resize(n_act);
+        resolved_locks_[{node_idx, ci}] = std::move(strat);
     }
 }
 

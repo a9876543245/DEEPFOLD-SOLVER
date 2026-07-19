@@ -51,6 +51,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -1015,10 +1016,43 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
         }
     }
     showdown_rank_metadata_per_runout_.clear();
+    // The rank-blocker now covers multi-original (iso) buckets too: the sweep
+    // runs over each canonical's live originals and averages back. Which of the
+    // two paths a terminal takes is decided per-metadata via Metadata::singleton
+    // -- they consume DIFFERENT reach conventions (weighted vs raw), so the two
+    // must not be swapped. See showdown_rank_blocker.h's build_prefixes_iso.
+    //
+    // DEEPSOLVER_FORCE_DENSE=1 routes showdown terminals back through the dense
+    // matrix. Kept as the A/B for the rank-blocker (the two must converge to the
+    // same equilibrium) and as the debug fallback once dense stops being the
+    // default path.
+    static const bool kForceDense =
+        (std::getenv("DEEPSOLVER_FORCE_DENSE") != nullptr);
+    // Route between the rank-blocker and the dense/signed-coeff paths. The
+    // rank-blocker's per-terminal fixed cost (~52*B floats, INDEPENDENT of nc)
+    // is only amortized by the O(nc^2) dense stream when nc is large. Iso boards
+    // have small nc by construction (mono flop 344 vs rainbow 1176), and there
+    // the zero-rake signed-coeff int8 dot-product wins (measured, 120-iter
+    // STANDARD: nc=344 -> 0.85x, nc=686 -> 1.04x; EV identical). So on iso boards
+    // take the rank-blocker only when there is no fast dense alternative (a raked
+    // solve has no signed-coeff path -- its only dense fallback is the slow
+    // category matrix, which the rank-blocker beats 1.2-1.63x) OR nc clears the
+    // measured crossover. Singleton boards (rainbow, nc always large) keep the
+    // shipped behavior unconditionally. See the A/B numbers in the OPUS plan A2.
+    const bool singleton_iso =
+        showdown_rank_blocker::supports_singleton_iso(*ctx.iso);
+    const bool zero_rake = ctx.config != nullptr
+        && ctx.config->rake_rate == 0.0f && ctx.config->rake_cap == 0.0f;
+    // Crossover sits in (344, 686]; the only iso nc values that exist between
+    // are >= 686, so any threshold in that gap behaves identically.
+    constexpr uint16_t kRbIsoMinCanonical = 512;
+    const bool rb_beneficial = singleton_iso || !zero_rake
+        || ctx.iso->num_canonical >= kRbIsoMinCanonical;
     showdown_rank_blocker_supported_ =
         kShowdownRankBlockerShortcutEnabled
-        && ctx.matchup_original_ranks_per_runout != nullptr
-        && showdown_rank_blocker::supports_singleton_iso(*ctx.iso);
+        && !kForceDense
+        && rb_beneficial
+        && ctx.matchup_original_ranks_per_runout != nullptr;
     if (showdown_rank_blocker_supported_) {
         const auto& rank_tables = *ctx.matchup_original_ranks_per_runout;
         showdown_rank_metadata_per_runout_.reserve(rank_tables.size());
@@ -1688,22 +1722,42 @@ inline void LevelizedCpuBackend::evaluate_terminal(
             const uint32_t safe_tid =
                 (tid < 0 || static_cast<uint32_t>(tid) >= cpu_threads_effective_)
                     ? 0u : static_cast<uint32_t>(tid);
-            showdown_rank_blocker::showdown_active_singleton_precomputed(
-                *matchup_rank_metadata, opp_reach_w,
-                active_indices.data(), active_indices.size(),
-                opp_active_indices.data(), opp_active_indices.size(),
-                clear_active_terminal_output,
-                out, row_stride_, win_payoff, lose_payoff, tie_payoff,
-                showdown_rank_scratch_[safe_tid]);
+            // Singleton takes canonical-weighted reach; iso takes RAW reach
+            // (its per-original expansion already supplies the orbit size).
+            if (matchup_rank_metadata->singleton) {
+                showdown_rank_blocker::showdown_active_singleton_precomputed(
+                    *matchup_rank_metadata, opp_reach_w,
+                    active_indices.data(), active_indices.size(),
+                    opp_active_indices.data(), opp_active_indices.size(),
+                    clear_active_terminal_output,
+                    out, row_stride_, win_payoff, lose_payoff, tie_payoff,
+                    showdown_rank_scratch_[safe_tid]);
+            } else {
+                showdown_rank_blocker::showdown_active_iso_precomputed(
+                    *matchup_rank_metadata, opp_reach,
+                    active_indices.data(), active_indices.size(),
+                    opp_active_indices.data(), opp_active_indices.size(),
+                    clear_active_terminal_output,
+                    out, row_stride_, win_payoff, lose_payoff, tie_payoff,
+                    showdown_rank_scratch_[safe_tid]);
+            }
         } else if (use_rank_blocker_showdown) {
             const uint32_t safe_tid =
                 (tid < 0 || static_cast<uint32_t>(tid) >= cpu_threads_effective_)
                     ? 0u : static_cast<uint32_t>(tid);
-            showdown_rank_blocker::showdown_dense_singleton_precomputed(
-                *matchup_rank_metadata, opp_reach_w,
-                skip_mask,
-                out, row_stride_, win_payoff, lose_payoff, tie_payoff,
-                showdown_rank_scratch_[safe_tid]);
+            if (matchup_rank_metadata->singleton) {
+                showdown_rank_blocker::showdown_dense_singleton_precomputed(
+                    *matchup_rank_metadata, opp_reach_w,
+                    skip_mask,
+                    out, row_stride_, win_payoff, lose_payoff, tie_payoff,
+                    showdown_rank_scratch_[safe_tid]);
+            } else {
+                showdown_rank_blocker::showdown_dense_iso_precomputed(
+                    *matchup_rank_metadata, opp_reach,
+                    skip_mask,
+                    out, row_stride_, win_payoff, lose_payoff, tie_payoff,
+                    showdown_rank_scratch_[safe_tid]);
+            }
         } else if (use_signed_coeff_showdown) {
             if (traverser == 0) {
                 cpu_simd::showdown_oop_signed_count_zero_rake(

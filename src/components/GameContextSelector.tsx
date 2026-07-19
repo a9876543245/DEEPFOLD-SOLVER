@@ -119,6 +119,16 @@ export function GameContextSelector({ value, onChange }: Props) {
     onChange({ ...value, effectiveBB: bb });
   };
 
+  // A scenarioType the library doesn't have — e.g. a default left behind by a
+  // dataset rename — matches no charts and silently disables GTO auto-load,
+  // showing only as a blank Format dropdown. Snap to a real bucket instead.
+  // This can't run on mount: `formats` is empty until the async scenario list
+  // lands, so it waits for a non-empty list before judging validity.
+  useEffect(() => {
+    if (formats.length === 0 || formats.includes(value.scenarioType)) return;
+    handleFormat(formats[0]);
+  }, [formats, value.scenarioType]);
+
   // Pretty label for a scenario_type. Cash buckets are self-describing
   // ("6max_100bb"); MTT buckets are short codes that need translation.
   const formatLabel = (st: string): string => {

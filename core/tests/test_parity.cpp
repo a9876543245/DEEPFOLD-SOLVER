@@ -392,6 +392,147 @@ static void test_parity_flop_limited_sizing() {
 }
 
 // ----------------------------------------------------------------------------
+// Iso-board (multi-original canonical bucket) rank-blocker parity.
+//
+// Every other parity fixture uses rainbow/singleton boards, so none of them
+// exercise the generalized rank-blocker (showdown_rank_blocker.h iso path).
+// The reference backend keeps its rank-blocker gated to singleton boards, so on
+// an iso board it runs the DENSE showdown terminal, while levelized runs the
+// iso rank-blocker. This is the CPU dense-vs-rb integration check (the GPU has
+// DEEPSOLVER_RB_SELFCHECK; the CPU had no equivalent before this).
+//
+// Two boards to cover both routing branches (see cpu_backend_levelized.h
+// prepare()): monotone AsKsQs (nc=344) is below the crossover so it needs rake
+// to force the rank-blocker on; two-tone AsKs7h (nc=721) clears it at zero rake.
+//
+// Tree topology matters for cost, so each fixture PINS it and asserts it:
+//
+//   collapsed  (fast)     -- a small host budget makes the flop chance gate
+//                            refuse runout enumeration (its matchup projection
+//                            is ~0.5 GB on the mono board vs budget/2), so the
+//                            tree is ~180 nodes / 1 matchup table and the whole
+//                            test runs in well under a second.
+//   enumerated (extended) -- the default 6 GB budget lets the mono board
+//                            enumerate (~52k nodes / 446 matchup tables).
+//                            120 dense-path iterations on that tree cost ~40s
+//                            (measured 2026-07-17, RTX 5090 box), which is why
+//                            it must NOT run under the smoke label. It is the
+//                            only CPU parity coverage of per-runout metadata
+//                            dispatch across many table signatures, so it is
+//                            kept -- in the extended suite.
+// ----------------------------------------------------------------------------
+
+struct IsoRbSpot { const char* board; float rake_rate, rake_cap; const char* tag; };
+
+static const IsoRbSpot kIsoRbSpots[] = {
+    {"AsKsQs", 0.05f, 3.0f, "mono nc=344 (raked -> rb)"},
+    {"AsKs7h", 0.0f,  0.0f, "two-tone nc=721 (zero-rake -> rb)"},
+};
+
+// host_budget_bytes == 0 keeps the default budget; nonzero overrides it (the
+// lever that flips the runout-enumeration gate). expect_enumerated pins the
+// resulting topology so a gate/estimator change can't silently turn the smoke
+// fixture into a 40-second solve (or hollow out the extended one).
+static void run_iso_rank_blocker_spot(const IsoRbSpot& sp,
+                                      uint64_t host_budget_bytes,
+                                      bool expect_enumerated)
+{
+    auto make = [&]() {
+        SolverConfig sc;
+        sc.pot = 100.0f;
+        sc.effective_stack = 200.0f;
+        sc.board_size = 3;
+        auto board = parse_board(sp.board);
+        for (size_t i = 0; i < 3; ++i) sc.board[i] = board[i];
+        sc.max_iterations = 120;
+        sc.target_exploitability = 0.0f;
+        sc.exploitability_check_interval = 1000;
+        sc.rake_rate = sp.rake_rate;
+        sc.rake_cap = sp.rake_cap;
+        // STANDARD: cross-backend match holds under float-order changes.
+        // (POSTFLOP is float-sensitive early -- see the pin note above.)
+        sc.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
+        if (host_budget_bytes > 0) {
+            sc.memory_budget.host_bytes = host_budget_bytes;
+        }
+        return sc;
+    };
+
+    auto cfg_ref = make();  // singleton-gated rb -> dense showdown terminal
+    cfg_ref.cpu_backend_kind = SolverConfig::CpuBackendKind::REFERENCE;
+    Solver s_ref(cfg_ref);
+    auto r_ref = s_ref.solve();
+    auto akh_ref = s_ref.analyze_combo("AhKh");
+
+    auto cfg_lvl = make();  // generalized rank-blocker (iso path)
+    cfg_lvl.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
+    Solver s_lvl(cfg_lvl);
+    auto r_lvl = s_lvl.solve();
+    auto akh_lvl = s_lvl.analyze_combo("AhKh");
+
+    std::cout << "  iso-rb " << sp.tag
+              << " [" << r_ref.timing.tree_nodes << " nodes, "
+              << r_ref.timing.matchup_tables << " tables]"
+              << " ref exploit=" << r_ref.exploitability_pct
+              << "% ev=" << akh_ref.ev
+              << " | lvl exploit=" << r_lvl.exploitability_pct
+              << "% ev=" << akh_lvl.ev << "\n";
+
+    assert_true(r_ref.runout_approximated == !expect_enumerated,
+                std::string(expect_enumerated
+                    ? "tree must ENUMERATE runouts on " : "tree must COLLAPSE runouts on ")
+                    + sp.board + " (ref)");
+    assert_true(r_lvl.runout_approximated == !expect_enumerated,
+                std::string(expect_enumerated
+                    ? "tree must ENUMERATE runouts on " : "tree must COLLAPSE runouts on ")
+                    + sp.board + " (lvl)");
+
+    // Routing pin: the fixture only tests dense-vs-rb if the backends actually
+    // take DIFFERENT showdown paths. If either assert fires, the fixture's
+    // premise changed (e.g. reference grew iso rank-blocker support) and the
+    // test needs a redesign, not a tolerance tweak.
+    assert_true(!r_ref.cpu_diagnostics.showdown_rank_blocker_shortcut,
+                std::string("reference must take the dense showdown on ")
+                    + sp.board);
+    assert_true(r_lvl.cpu_diagnostics.showdown_rank_blocker_shortcut,
+                std::string("levelized must take the rank-blocker showdown on ")
+                    + sp.board);
+
+    assert_near(akh_ref.ev, akh_lvl.ev, 0.10f,
+                std::string("iso rank-blocker EV must match dense on ")
+                    + sp.board);
+    auto m_ref = strategy_map(r_ref.global_strategy);
+    auto m_lvl = strategy_map(r_lvl.global_strategy);
+    assert_strategy_close(m_ref, m_lvl, 0.6f,
+                std::string("iso rank-blocker vs dense on ") + sp.board);
+}
+
+static void test_parity_iso_rank_blocker() {
+    auto& eval = get_evaluator();
+    eval.initialize();
+    cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+
+    // 128 MB host budget -> collapsed trees on both boards (see block comment).
+    constexpr uint64_t kSmallBudget = 128ULL * 1024 * 1024;
+    for (const auto& sp : kIsoRbSpots) {
+        run_iso_rank_blocker_spot(sp, kSmallBudget, /*expect_enumerated=*/false);
+    }
+}
+
+static void test_parity_iso_rank_blocker_enumerated() {
+    auto& eval = get_evaluator();
+    eval.initialize();
+    cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+
+    // Mono board only: it is the one whose default-budget tree enumerates
+    // (small nc slips under the matchup gate AND its measured CFR state fits
+    // 6 GB). The two-tone board collapses either way, so an enumerated variant
+    // of it does not exist to test.
+    run_iso_rank_blocker_spot(kIsoRbSpots[0], /*host_budget_bytes=*/0,
+                              /*expect_enumerated=*/true);
+}
+
+// ----------------------------------------------------------------------------
 // v1.8.1+ out-of-range skip parity. The new optimization skips terminal
 // evaluation for combos that are 0-reach from root (excluded from the
 // user's range). Mathematically safe because those combos propagate as 0
@@ -654,16 +795,19 @@ static void test_parity_persistent_omp_toggle() {
 // Main
 //
 // Supports --suite=fast|extended|all (default all). Split is data-driven from
-// measured per-test wall time — the slowest fixtures (forced-scalar SIMD,
-// thread-cap sweep, limited-sizing tight tolerance) live in extended so the
-// smoke loop stays under ~10s while still gating on the core algorithmic /
-// persistent-OMP / narrow-range correctness paths.
+// measured per-test wall time -- the slow fixtures (forced-scalar SIMD, the
+// 1200-iter POSTFLOP convergence run, the enumerated-runout iso board) live in
+// extended so the smoke loop stays fast while still gating on the core
+// algorithmic / persistent-OMP / rank-blocker-routing / range-mask paths.
 //
-//   fast      — ref-vs-lvl, persistent-OMP toggle, river_no_chance,
-//               narrow_range_skip. ~5–6s wall time.
-//   extended  — scalar_vs_avx2 (slow scalar path), levelized_thread_cap,
-//               flop_limited_sizing. ~17s wall time.
-//   all       — both subsets back-to-back.
+//   fast      -- ref-vs-lvl, persistent-OMP toggle, river_no_chance,
+//                iso_rank_blocker (collapsed trees), narrow_range_skip,
+//                medium_sparse_range. ~2s wall (2026-07-17, RTX 5090 box).
+//   extended  -- scalar_vs_avx2 (slow scalar path), levelized_thread_cap,
+//                flop_limited_sizing, postflop_convergence,
+//                iso_rank_blocker_enumerated (~40s alone -- 120 dense-path
+//                iterations on a 52k-node enumerated mono tree).
+//   all       -- both subsets back-to-back.
 // ----------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
@@ -689,6 +833,7 @@ int main(int argc, char* argv[]) {
         RUN_TEST(test_parity_reference_vs_levelized);
         RUN_TEST(test_parity_persistent_omp_toggle);
         RUN_TEST(test_parity_river_no_chance);
+        RUN_TEST(test_parity_iso_rank_blocker);
         RUN_TEST(test_parity_narrow_range_skip);
         RUN_TEST(test_parity_medium_sparse_range);
     }
@@ -697,6 +842,7 @@ int main(int argc, char* argv[]) {
         RUN_TEST(test_parity_levelized_thread_cap);
         RUN_TEST(test_parity_flop_limited_sizing);
         RUN_TEST(test_parity_postflop_convergence);
+        RUN_TEST(test_parity_iso_rank_blocker_enumerated);
     }
 
     std::cout << "=== " << g_tests_passed << " / " << g_tests_run

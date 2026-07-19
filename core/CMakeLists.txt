@@ -241,11 +241,14 @@ if(BUILD_TESTS)
     # extended fixtures (river / limited sizing / narrow range).
     #
     # Split into two ctest entries (POST_OPTIMIZATION_REVIEW Finding 2):
-    #   CpuParityFast      — fast subset (<10s) on smoke label so every
-    #                        CI run gates on it.
+    #   CpuParityFast      — fast subset (~2s; all fixtures pin collapsed /
+    #                        tiny trees) on smoke label so every CI run
+    #                        gates on it.
     #   CpuParityExtended  — slower tight-tolerance fixtures on the
     #                        correctness label; kept off smoke so the
-    #                        smoke loop returns to <10s wall-clock.
+    #                        smoke loop stays <10s wall-clock. Includes the
+    #                        enumerated-runout iso rank-blocker fixture
+    #                        (~40s alone), hence the 180s timeout.
     # Both run the same binary with --suite=fast|extended.
     # ----------------------------------------------------------------
     add_executable(test_parity
@@ -265,7 +268,7 @@ if(BUILD_TESTS)
 
     add_test(NAME CpuParityExtended COMMAND test_parity --suite=extended)
     set_tests_properties(CpuParityExtended PROPERTIES
-        LABELS "parity;correctness" TIMEOUT 90)
+        LABELS "parity;correctness" TIMEOUT 180)
 
     # ----------------------------------------------------------------
     # Streaming/subgame decomposition validation (Stage 1, opt-in).
@@ -294,8 +297,13 @@ if(BUILD_TESTS)
     # localize any future divergence between the scalar and AVX2 TUs
     # before it shows up as a backend-level symptom.
     # ----------------------------------------------------------------
+    # hand_evaluator: the iso rank-blocker test needs REAL hand ranks. Its
+    # equivalence to the dense terminal holds because rank is constant within a
+    # suit-isomorphism orbit, so synthetic ranks would break that invariant and
+    # make the comparison vacuous.
     add_executable(test_cpu_kernels
         tests/test_cpu_kernels.cpp
+        src/hand_evaluator.cpp
         ${CPU_KERNEL_SOURCES}
     )
     target_include_directories(test_cpu_kernels PRIVATE include)
@@ -536,6 +544,27 @@ if(BUILD_TESTS)
         add_test(NAME GpuPostsolveParity COMMAND test_gpu_postsolve)
         set_tests_properties(GpuPostsolveParity PROPERTIES
             LABELS "smoke;gpu" TIMEOUT 60)
+
+        # Node-locked GPU solves must be bit-exact across runs (rank-blocker
+        # bucket scatter uses order-independent fixed-point accumulation —
+        # see tests/cli_lock_determinism.cmake for the full story).
+        add_test(NAME CliGpuLockDeterminism
+            COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:deepsolver_core>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_lock_determinism.cmake)
+        set_tests_properties(CliGpuLockDeterminism PROPERTIES
+            LABELS "smoke;gpu" TIMEOUT 120)
+
+        # Ship gate: GPU must reach the CPU equilibrium on an ENUMERATED tree
+        # (the lift/normalize chance-row overflow corrupted every enumerated
+        # GPU solve while collapsed trees stayed bit-exact — see
+        # tests/cli_enumerated_parity.cmake for the full story).
+        add_test(NAME CliEnumeratedGpuParity
+            COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:deepsolver_core>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_enumerated_parity.cmake)
+        set_tests_properties(CliEnumeratedGpuParity PROPERTIES
+            LABELS "smoke;gpu;parity" TIMEOUT 300)
 
         # ----------------------------------------------------------------
         # Stage 3: GPU subgame streaming validation. SAME source as the CPU

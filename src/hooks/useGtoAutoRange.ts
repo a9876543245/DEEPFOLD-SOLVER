@@ -17,7 +17,7 @@
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { isTauri } from '../lib/tauriEnv';
-import { parseRange } from '../lib/ranges';
+import { parseRange, preflopRoles } from '../lib/ranges';
 import type { PositionMatchup, Position } from '../lib/ranges';
 import type { GameContext } from '../lib/poker';
 import type { GtoScenario, GtoChart } from '../components/GtoChartBrowser';
@@ -29,13 +29,6 @@ export interface AppliedGtoRange {
   description: string;
 }
 
-/** Map our MATCHUPS positions to chart hero_position labels. They differ
- *  for one role: our "MP" is the same seat as the dataset's "HJ" in
- *  6-handed games. */
-function chartHeroFor(pos: Position): string {
-  return pos === 'MP' ? 'HJ' : pos;
-}
-
 /** Extract the bundled-folder portion of a chart id ("cash/6max_100bb" /
  *  "mtt/vs_open_3b"). The chart library data update made `scenario_type`
  *  semantic ("RFI", "vs_Open", "vs_3B", ...) and no longer matches the
@@ -45,29 +38,33 @@ function chartFolder(s: GtoScenario): string {
   return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : s.id;
 }
 
-/** For a (potType, side) combination, return scenario_type names ranked
+/** For a (potType, role) combination, return scenario_type names ranked
  *  by how well they fit. The first match found in the bundled charts wins.
  *  Multiple candidates are listed because not every (folder × position)
- *  has every scenario type. */
+ *  has every scenario type.
+ *
+ *  Keyed on preflop role, NOT on ip/oop: the opener is OOP in half the
+ *  matchups, and asking for the wrong family silently mis-loads a range
+ *  (e.g. BTN's *open* in a pot where BTN only called). */
 function scenarioCandidates(
   potType: 'SRP' | '3BET',
-  side: 'IP' | 'OOP',
+  role: 'opener' | 'responder',
 ): string[] {
   // SRP context (single raise + call):
-  //   IP = the raiser → their range is the open (RFI)
-  //   OOP = the caller → their range is "vs_Open" facing IP's open
+  //   opener   → their range is the open (RFI)
+  //   responder → the caller → "vs_Open" facing the open
   // 3BET context (raise + 3-bet + call):
-  //   IP = the original raiser facing 3-bet → their range is "vs_3B"
-  //   OOP = the 3-bettor → their range is "vs_Open" with a 3-bet response
+  //   opener   → the original raiser facing a 3-bet → "vs_3B"
+  //   responder → the 3-bettor → "vs_Open" with a 3-bet response
   if (potType === 'SRP') {
-    return side === 'IP'
-      ? ['RFI', 'SB_vs_BB']                           // IP raiser
-      : ['vs_Open', 'vs_RFI'];                        // OOP caller
+    return role === 'opener'
+      ? ['RFI', 'SB_vs_BB']                           // the raiser
+      : ['vs_Open', 'vs_RFI'];                        // the caller
   }
   // 3BET
-  return side === 'IP'
-    ? ['vs_3B', 'vs_4B', 'vs_4B_allin']               // IP facing 3-bet
-    : ['vs_Open', 'vs_RFI'];                          // OOP 3-bettor
+  return role === 'opener'
+    ? ['vs_3B', 'vs_4B', 'vs_4B_allin']               // raiser facing the 3-bet
+    : ['vs_Open', 'vs_RFI'];                          // the 3-bettor
 }
 
 /** Find the best chart in `scenarios` matching (folder, position, scenario,
@@ -158,13 +155,17 @@ export function useGtoAutoRange(
     const folderPath = `${gameContext.gameType.toLowerCase()}/${gameContext.scenarioType}`;
     const potType = matchup.potType;  // "SRP" | "3BET"
 
+    const { opener } = preflopRoles(matchup);
+    const roleOf = (p: Position): 'opener' | 'responder' =>
+      p === opener ? 'opener' : 'responder';
+
     const ipChart  = findBestChart(
-      scenarios, folderPath, chartHeroFor(matchup.ip),
-      scenarioCandidates(potType, 'IP'), gameContext.effectiveBB,
+      scenarios, folderPath, matchup.ip,
+      scenarioCandidates(potType, roleOf(matchup.ip)), gameContext.effectiveBB,
     );
     const oopChart = findBestChart(
-      scenarios, folderPath, chartHeroFor(matchup.oop),
-      scenarioCandidates(potType, 'OOP'), gameContext.effectiveBB,
+      scenarios, folderPath, matchup.oop,
+      scenarioCandidates(potType, roleOf(matchup.oop)), gameContext.effectiveBB,
     );
 
     const newApplied: AppliedGtoRange[] = [];

@@ -68,9 +68,11 @@ const dict: Dict = {
   'position.heroOOP': { en: 'Hero OOP', zh: '主角 OOP', ja: 'ヒーロー OOP' },
   'position.srpPot': { en: 'Single Raise Pot', zh: '單次加注底池', ja: 'シングルレイズポット' },
   'position.3bpPot': { en: '3-Bet Pot', zh: '3-Bet 底池', ja: '3ベットポット' },
-  'position.ipRaiser': { en: 'IP · Raiser', zh: 'IP · 加注者', ja: 'IP · レイザー' },
-  'position.oopCaller': { en: 'OOP · Caller', zh: 'OOP · 跟注者', ja: 'OOP · コーラー' },
-  'position.oop3bettor': { en: 'OOP · 3-Bettor', zh: 'OOP · 3-Bet 者', ja: 'OOP · 3ベッター' },
+  // Roles carry no IP/OOP prefix — the opener is OOP in half the matchups
+  // (UTG vs BTN, SB vs BB, ...), so PositionSelector composes "<side> · <role>".
+  'position.roleRaiser': { en: 'Raiser', zh: '加注者', ja: 'レイザー' },
+  'position.roleCaller': { en: 'Caller', zh: '跟注者', ja: 'コーラー' },
+  'position.role3bettor': { en: '3-Bettor', zh: '3-Bet 者', ja: '3ベッター' },
   'reset': { en: 'Reset', zh: '重置', ja: 'リセット' },
 
   // ---- Game Context Selector (game type / scenario / stack depth) ----
@@ -194,6 +196,7 @@ const dict: Dict = {
   // ---- Strategy Panel ----
   'panel.solverResult': { en: 'Solver Result', zh: '求解結果', ja: '求解結果' },
   'panel.iterations': { en: 'Iterations', zh: '疊代次數', ja: '反復回数' },
+  'panel.subgames': { en: 'Subgames', zh: '子局面', ja: 'サブゲーム' },
   'panel.exploitability': { en: 'Exploitability', zh: '可剝削度', ja: '搾取可能性' },
   'panel.time': { en: 'Time', zh: '耗時', ja: '所要時間' },
   'panel.status': { en: 'Status', zh: '狀態', ja: 'ステータス' },

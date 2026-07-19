@@ -236,6 +236,23 @@ export function getMatchupsByPotType(potType: PotType): PositionMatchup[] {
   return MATCHUPS.filter(m => m.potType === potType);
 }
 
+/** Preflop action order (blinds act last preflop, first postflop). */
+const PREFLOP_ORDER: Position[] = ['UTG', 'MP', 'CO', 'BTN', 'SB', 'BB'];
+
+/**
+ * Who opened the pot and who responded.
+ *
+ * In every matchup the earlier-acting position opens; the later one calls
+ * (SRP) or 3-bets (3BET). This is NOT the same as ip/oop: preflop the blinds
+ * act last, postflop they act first, so the opener is frequently OOP —
+ * e.g. "UTG vs BTN" has UTG opening while BTN is the one in position.
+ */
+export function preflopRoles(m: PositionMatchup): { opener: Position; responder: Position } {
+  return PREFLOP_ORDER.indexOf(m.ip) < PREFLOP_ORDER.indexOf(m.oop)
+    ? { opener: m.ip, responder: m.oop }
+    : { opener: m.oop, responder: m.ip };
+}
+
 /** Count how many combos are in a range (weighted by frequency) */
 export function countRangeCombos(rangeStr: string): number {
   const parsed = parseRange(rangeStr);

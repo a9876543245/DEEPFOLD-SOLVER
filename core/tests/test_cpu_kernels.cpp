@@ -27,6 +27,7 @@
 
 #include "cpu_simd.h"
 #include "fold_blocker.h"
+#include "hand_evaluator.h"
 #include "showdown_rank_blocker.h"
 
 #include <algorithm>
@@ -910,6 +911,207 @@ static void test_showdown_rank_blocker_dense() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Iso-board (multi-original) rank-blocker vs the dense showdown terminal.
+//
+// The shipped rank-blocker only ran on singleton-iso boards. Generalizing it
+// rests on one fact that is invisible at the call site: a canonical bucket is
+// an orbit of the suit permutations fixing the board, and hand evaluation is
+// invariant under a global suit relabel, so RANK IS CONSTANT WITHIN A BUCKET.
+// That is what makes compute_matchup_for_board's ev_val exactly -1/0/+1 and its
+// category thresholding (solver.h:1734-1736) lossless -- otherwise the dense
+// cell would be a majority vote that no per-original sweep could reproduce.
+//
+// So this asserts BOTH halves, on real evaluated ranks (synthetic ranks would
+// silently break the orbit invariant and make the comparison meaningless):
+//   1. rank is constant within every canonical bucket;
+//   2. the iso sweep reproduces the dense terminal (eval_kernel.cu:376-400).
+// On a singleton board it must additionally match the shipped singleton path.
+// ---------------------------------------------------------------------------
+static void test_showdown_rank_blocker_iso() {
+    struct Case { const char* board; float win_p, lose_p, tie_p; };
+    // pot=100 -> half=50; raked cases use rake=2.5.
+    const Case cases[] = {
+        {"AsKd7c",   50.0f, -50.0f,  0.0f},    // singleton: shipped-path regression
+        {"AsKsQs",   47.5f, -50.0f, -1.25f},   // monotone flop: heaviest iso
+        {"AsKsQs",  -50.0f,  47.5f, -1.25f},   // same, IP perspective (payoffs swap)
+        {"AhKh7h2c", 47.5f, -50.0f, -1.25f},   // turn, three hearts
+        {"8s8h3h",   50.0f, -50.0f,  0.0f},    // paired two-tone, zero rake
+    };
+
+    auto& evaluator = get_evaluator();
+    if (!evaluator.is_initialized()) evaluator.initialize();
+    const auto& combo_table = get_combo_table();
+
+    for (const auto& cs : cases) {
+        const auto board = parse_board(cs.board);
+        const uint8_t bs = static_cast<uint8_t>(board.size());
+        const IsomorphismMapping iso = compute_isomorphism(board.data(), bs);
+        const uint16_t nc = iso.num_canonical;
+        const CardMask board_mask = board_to_mask(board.data(), bs);
+
+        // Real ranks for this board (mirrors compute_matchup_for_board).
+        std::vector<uint16_t> ranks(NUM_COMBOS, UINT16_MAX);
+        for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+            if (combo_table[i].conflicts_with(board_mask)) continue;
+            const Card h0 = combo_table[i].cards[0];
+            const Card h1 = combo_table[i].cards[1];
+            if (bs == 4) {
+                const Card six[6] = {h0, h1, board[0], board[1], board[2], board[3]};
+                uint16_t best = UINT16_MAX;
+                for (int skip = 0; skip < 6; ++skip) {
+                    Card f[5]; int k = 0;
+                    for (int j = 0; j < 6; ++j) if (j != skip) f[k++] = six[j];
+                    best = std::min(best, evaluator.evaluate5(f[0], f[1], f[2], f[3], f[4]));
+                }
+                ranks[i] = best;
+            } else {
+                ranks[i] = evaluator.evaluate5(h0, h1, board[0], board[1], board[2]);
+            }
+        }
+
+        // (1) The premise: rank constant within each orbit.
+        for (uint16_t c = 0; c < nc; ++c) {
+            uint16_t ref = UINT16_MAX;
+            for (uint16_t oi : iso.canonical_to_originals[c]) {
+                if (ranks[oi] == UINT16_MAX) continue;
+                if (ref == UINT16_MAX) { ref = ranks[oi]; continue; }
+                if (ranks[oi] != ref) {
+                    std::ostringstream oss;
+                    oss << "orbit rank not constant on " << cs.board
+                        << " (canonical " << c << ": " << ranks[oi]
+                        << " vs " << ref << ") -- the iso rank-blocker's"
+                           " equivalence to dense does not hold";
+                    fail(oss.str());
+                }
+            }
+        }
+
+        // Dense ev/valid, exactly as compute_matchup_for_board builds them.
+        std::vector<float> ev(static_cast<std::size_t>(nc) * nc, 0.0f);
+        std::vector<float> valid(static_cast<std::size_t>(nc) * nc, 0.0f);
+        for (uint16_t ci = 0; ci < nc; ++ci) {
+            const auto& oi_list = iso.canonical_to_originals[ci];
+            for (uint16_t cj = 0; cj < nc; ++cj) {
+                const auto& oj_list = iso.canonical_to_originals[cj];
+                int oop_wins = 0, ip_wins = 0, valid_pairs = 0;
+                for (uint16_t oi : oi_list) {
+                    if (ranks[oi] == UINT16_MAX) continue;
+                    const CardMask mi = card_to_mask(combo_table[oi].cards[0])
+                                      | card_to_mask(combo_table[oi].cards[1]);
+                    for (uint16_t oj : oj_list) {
+                        if (ranks[oj] == UINT16_MAX) continue;
+                        const CardMask mj = card_to_mask(combo_table[oj].cards[0])
+                                          | card_to_mask(combo_table[oj].cards[1]);
+                        if (mi & mj) continue;
+                        ++valid_pairs;
+                        if (ranks[oi] < ranks[oj]) ++oop_wins;
+                        else if (ranks[oi] > ranks[oj]) ++ip_wins;
+                    }
+                }
+                if (valid_pairs == 0) continue;
+                const std::size_t idx = static_cast<std::size_t>(ci) * nc + cj;
+                ev[idx] = static_cast<float>(oop_wins - ip_wins) / valid_pairs;
+                valid[idx] = static_cast<float>(valid_pairs)
+                    / std::max(1u, static_cast<unsigned>(
+                        oi_list.size() * oj_list.size()));
+            }
+        }
+
+        // Raw canonical reach, with holes so blocker corrections are exercised.
+        std::vector<float> reach(nc, 0.0f), reach_w(nc, 0.0f);
+        for (uint16_t c = 0; c < nc; ++c) {
+            reach[c] = (c % 17u == 0u)
+                ? 0.0f
+                : static_cast<float>((c * 31u) % 97u) / 97.0f;
+            reach_w[c] = reach[c]
+                * static_cast<float>(iso.canonical_weights[c]);
+        }
+
+        // Reference: eval_kernel.cu:376-387 (perspective 0).
+        std::vector<float> ref(nc, 0.0f);
+        for (uint16_t c = 0; c < nc; ++c) {
+            float val = 0.0f;
+            for (uint16_t cj = 0; cj < nc; ++cj) {
+                const std::size_t idx = static_cast<std::size_t>(c) * nc + cj;
+                if (valid[idx] <= 0.0f) continue;
+                const float e = ev[idx];
+                const float payoff = (e > 0.5f) ? cs.win_p
+                                   : (e < -0.5f ? cs.lose_p : cs.tie_p);
+                val += reach[cj] * valid[idx]
+                     * static_cast<float>(iso.canonical_weights[cj]) * payoff;
+            }
+            ref[c] = val;
+        }
+
+        const auto meta = showdown_rank_blocker::build_metadata(iso, ranks);
+        if (!meta.valid) fail(std::string("iso metadata invalid for ") + cs.board);
+
+        showdown_rank_blocker::Scratch scratch;
+        std::vector<float> got(nc, 0.0f);
+        showdown_rank_blocker::showdown_dense_iso_precomputed(
+            meta, reach.data(), nullptr, got.data(), nc,
+            cs.win_p, cs.lose_p, cs.tie_p, scratch);
+
+        // (2) Scale-relative, matching the dense-vs-rb acceptance metric: these
+        // values cancel heavily, so a per-element relative bound is meaningless.
+        float scale = 0.0f;
+        for (uint16_t c = 0; c < nc; ++c) scale = std::max(scale, std::fabs(ref[c]));
+        if (scale == 0.0f) scale = 1.0f;
+        for (uint16_t c = 0; c < nc; ++c) {
+            const float rel = std::fabs(got[c] - ref[c]) / scale;
+            if (rel > 1e-5f) {
+                std::ostringstream oss;
+                oss << "iso rank-blocker vs dense on " << cs.board
+                    << " at c=" << c << ": got=" << got[c] << " ref=" << ref[c]
+                    << " rel=" << rel << " (scale=" << scale << ")";
+                fail(oss.str());
+            }
+        }
+
+        // Singleton boards: the generalized path must reproduce the shipped one
+        // (denom == 1 and weighted reach == raw reach make them identical).
+        if (meta.singleton) {
+            std::vector<float> shipped(nc, 0.0f);
+            showdown_rank_blocker::Scratch s2;
+            showdown_rank_blocker::showdown_dense_singleton_precomputed(
+                meta, reach_w.data(), nullptr, shipped.data(), nc,
+                cs.win_p, cs.lose_p, cs.tie_p, s2);
+            for (uint16_t c = 0; c < nc; ++c) {
+                if (shipped[c] != got[c]) {
+                    std::ostringstream oss;
+                    oss << "iso path diverged from the shipped singleton path on "
+                        << cs.board << " at c=" << c << ": iso=" << got[c]
+                        << " singleton=" << shipped[c];
+                    fail(oss.str());
+                }
+            }
+        }
+
+        // The sparse entry point must agree with the dense-iso one.
+        std::vector<uint16_t> self_active, opp_active;
+        for (uint16_t c = 0; c < nc; ++c) {
+            self_active.push_back(c);
+            if (reach[c] != 0.0f) opp_active.push_back(c);
+        }
+        std::vector<float> active_got(nc, 0.0f);
+        showdown_rank_blocker::Scratch s3;
+        showdown_rank_blocker::showdown_active_iso_precomputed(
+            meta, reach.data(), self_active.data(), self_active.size(),
+            opp_active.data(), opp_active.size(), true,
+            active_got.data(), nc, cs.win_p, cs.lose_p, cs.tie_p, s3);
+        for (uint16_t c = 0; c < nc; ++c) {
+            if (active_got[c] != got[c]) {
+                std::ostringstream oss;
+                oss << "iso active vs dense entry point on " << cs.board
+                    << " at c=" << c << ": active=" << active_got[c]
+                    << " dense=" << got[c];
+                fail(oss.str());
+            }
+        }
+    }
+}
+
 // v1.8.2 A2: helper to compute the pre-thresholded category byte from an
 // (ev, valid) pair, mirroring precompute_matchups()'s bucketing rules:
 //   valid == 0           → 0 (invalid)
@@ -1781,6 +1983,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
     RUN_TEST(test_fold_ip_step);
     RUN_TEST(test_fold_blocker_dense);
     RUN_TEST(test_showdown_rank_blocker_dense);
+    RUN_TEST(test_showdown_rank_blocker_iso);
     RUN_TEST(test_showdown_oop_full);
     RUN_TEST(test_showdown_ip_full);
     RUN_TEST(test_showdown_signed_count_weighted_formula);

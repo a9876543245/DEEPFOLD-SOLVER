@@ -22,6 +22,19 @@ export interface SolverProgress {
   elapsed: number;
   phase: string;
   pct: number; // 0-100
+  /** Present while an Exact (runout decomposition) run is in its decompose
+   *  phase. iteration/total then carry subgame counts for the current pass,
+   *  not CFR iterations — StrategyPanel swaps the tile label accordingly. */
+  decompose?: DecomposeProgressInfo;
+}
+
+/** Mirrors the Rust `DecomposeProgress` event payload (camelCased). */
+export interface DecomposeProgressInfo {
+  phase: 'sweep' | 'final' | 'finalize';
+  sweep: number;      // 1-based; 0 outside the sweep phase
+  sweepTotal: number;
+  leaf: number;
+  leafTotal: number;
 }
 
 // ============================================================================
@@ -379,13 +392,21 @@ export function useSolver() {
     // run. We keep a small JS-side ticker for "elapsed" so the UI doesn't
     // feel frozen between engine ticks, but the iter count is real.
     let progressUnlisten: (() => void) | null = null;
+    let decomposeUnlisten: (() => void) | null = null;
     let lastIter = 0;
     let lastExploit = 0;
+    // Exact mode: once the engine's decompose phase emits per-subgame
+    // progress, it owns the bar. The monolithic pre-solve's [Iter] stream has
+    // ended by then (decompose runs strictly after it), so the bar visibly
+    // resets from ~99% into "Exact: sweep 1/N" — that phase boundary is real,
+    // and the SolveEtaBanner above already told the user the Exact ETA.
+    let decompProgress: SolverProgress | null = null;
     if (isTauri()) {
       const { listen } = await import('@tauri-apps/api/event');
       progressUnlisten = await listen<{ iteration: number; exploitability_pct: number; elapsed_ms: number }>(
         'engine-progress',
         (e) => {
+          if (decompProgress) return; // decompose phase owns progress now
           lastIter = e.payload.iteration;
           lastExploit = e.payload.exploitability_pct;
           const total = request.iterations ?? 300;
@@ -400,6 +421,55 @@ export function useSolver() {
           });
         },
       );
+      decomposeUnlisten = await listen<{
+        phase: 'sweep' | 'final' | 'finalize';
+        sweep: number; sweep_total: number; leaf: number; leaf_total: number;
+      }>(
+        'engine-progress-decompose',
+        (e) => {
+          const p = e.payload;
+          const info: DecomposeProgressInfo = {
+            phase: p.phase, sweep: p.sweep, sweepTotal: p.sweep_total,
+            leaf: p.leaf, leafTotal: p.leaf_total,
+          };
+          // Work model: each sweep = L leaf-units; the final consistent-BR
+          // pass ≈ 3× a sweep leaf (1.73× want_br solve + nav extraction —
+          // see the calibrated ETA constants in solver_decomposed.h).
+          const FINAL_W = 3;
+          const L = Math.max(1, p.leaf_total);
+          const sweeps = Math.max(1, p.sweep_total);
+          const totalWork = sweeps * L + FINAL_W * L;
+          let pct: number;
+          let phase: string;
+          let leafShown = p.leaf;
+          let leafTotalShown = p.leaf_total;
+          if (p.phase === 'sweep') {
+            const done = (Math.max(1, p.sweep) - 1) * L + p.leaf;
+            pct = Math.min(99, (done / totalWork) * 100);
+            phase = `Exact: sweep ${p.sweep}/${p.sweep_total} · subgame ${p.leaf}/${p.leaf_total}`;
+          } else if (p.phase === 'final') {
+            const done = sweeps * L + FINAL_W * p.leaf;
+            pct = Math.min(99, (done / totalWork) * 100);
+            phase = `Exact: final pass · subgame ${p.leaf}/${p.leaf_total}`;
+          } else {
+            // finalize: subgames done; EV/BR traversals + nav stitch + JSON
+            // remain. Keep the completed final-pass counts on the tile.
+            pct = 99;
+            phase = 'Exact: finalizing...';
+            leafShown = decompProgress?.decompose?.leafTotal ?? 0;
+            leafTotalShown = decompProgress?.decompose?.leafTotal ?? 0;
+          }
+          decompProgress = {
+            iteration: leafShown,
+            total: leafTotalShown,
+            elapsed: Date.now() - start,
+            phase,
+            pct,
+            decompose: info,
+          };
+          setProgress(decompProgress);
+        },
+      );
     }
 
     // Lightweight elapsed-only ticker so the UI doesn't appear frozen
@@ -410,6 +480,11 @@ export function useSolver() {
       const now = Date.now();
       const total = request.iterations ?? 300;
       const elapsedMs = now - start;
+      if (decompProgress) {
+        // Decompose phase owns the bar — only refresh the elapsed clock.
+        setProgress({ ...decompProgress, elapsed: elapsedMs });
+        return;
+      }
       const pct = Math.min(99, (lastIter / total) * 100);
       const phase = lastIter > 0
         ? `Solving iteration ${lastIter}/${total}...`
@@ -481,6 +556,7 @@ export function useSolver() {
     } finally {
       if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
       if (progressUnlisten) { progressUnlisten(); progressUnlisten = null; }
+      if (decomposeUnlisten) { decomposeUnlisten(); decomposeUnlisten = null; }
       setLoading(false);
     }
   }, []);

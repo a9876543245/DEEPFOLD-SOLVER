@@ -12,10 +12,14 @@
  * (gpu_backend.cu), which uses these plus the terminal kernels from eval_kernel.cu.
  *
  * Memory layout conventions (matches gpu_backend.cu):
- *   strategy / regrets  → [N][action][combo]   stride = MAX_ACTIONS * nc
- *   reach               → [N][combo]           stride = nc
- *   node_values         → [N][combo]           stride = nc
- *   action_values       → [N][action][combo]   stride = MAX_ACTIONS * nc
+ *   strategy / regrets / action_values → COMPACT [slot][combo], stride = nc.
+ *     slot = node_offset[node] + action. node_offset is a per-node prefix sum
+ *     of num_children over PLAYER nodes only (B1a); chance/terminal nodes own
+ *     NO slots — their table entry is a 0 sentinel that must never be
+ *     dereferenced, so every state-touching kernel returns on non-player
+ *     nodes BEFORE computing its base.
+ *   reach               → [N][combo]           stride = nc (full tree)
+ *   node_values         → [N][combo]           stride = nc (full tree)
  */
 
 #include "util.cuh"
@@ -36,13 +40,13 @@ constexpr uint8_t NT_TERMINAL   = 3;
 // ============================================================================
 
 __global__ void compute_strategy_kernel(
-    const float* __restrict__ regrets,         // [N * A * nc]
-    float*       __restrict__ current_strategy,// [N * A * nc]
+    const float* __restrict__ regrets,         // [total_slots * nc] compact
+    float*       __restrict__ current_strategy,// [total_slots * nc] compact
     const uint8_t*  __restrict__ num_children,
     const uint8_t*  __restrict__ node_types,
+    const uint32_t* __restrict__ node_offset,  // [N] per-node slot index
     uint32_t num_nodes,
-    uint16_t num_canonical,
-    uint8_t  max_actions)
+    uint16_t num_canonical)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = static_cast<int>(num_nodes) * num_canonical;
@@ -57,7 +61,7 @@ __global__ void compute_strategy_kernel(
     uint8_t na = num_children[node];
     if (na == 0) return;
 
-    size_t base = (static_cast<size_t>(node) * max_actions) * num_canonical
+    size_t base = static_cast<size_t>(node_offset[node]) * num_canonical
                 + static_cast<size_t>(combo);
     size_t stride = num_canonical;
 
@@ -102,10 +106,10 @@ __global__ void propagate_reach_forward_kernel(
     const uint8_t*  __restrict__ num_children,
     const uint32_t* __restrict__ children_offset,
     const uint32_t* __restrict__ children,
+    const uint32_t* __restrict__ node_offset,   // [N] per-node slot index
     const uint32_t* __restrict__ level_node_indices,
     uint32_t num_level_nodes,
-    const float* __restrict__ current_strategy,
-    uint8_t max_actions,
+    const float* __restrict__ current_strategy, // compact [slot * nc]
     float* __restrict__ reach_oop,  // [N * nc]   read parent + write children
     float* __restrict__ reach_ip,   // [N * nc]
     uint16_t num_canonical)
@@ -146,7 +150,7 @@ __global__ void propagate_reach_forward_kernel(
 
     // Player decision: scale acting player's reach by their strategy per action
     uint8_t acting = active_player[n];
-    size_t strat_base = (static_cast<size_t>(n) * max_actions) * num_canonical
+    size_t strat_base = static_cast<size_t>(node_offset[n]) * num_canonical
                       + static_cast<size_t>(combo);
     size_t strat_stride = num_canonical;
 
@@ -186,12 +190,12 @@ __global__ void aggregate_node_values_kernel(
     const uint32_t* __restrict__ children_offset,
     const uint32_t* __restrict__ children,
     const uint8_t*  __restrict__ runout_weight,  // Phase 2: per-child orbit size
+    const uint32_t* __restrict__ node_offset,    // [N] per-node slot index
     const uint32_t* __restrict__ level_node_indices,
     uint32_t num_level_nodes,
-    const float* __restrict__ current_strategy,
-    uint8_t max_actions,
-    const float* __restrict__ action_values,  // [N * A * nc]
-    float* __restrict__ node_values,          // [N * nc]
+    const float* __restrict__ current_strategy,  // compact [slot * nc]
+    const float* __restrict__ action_values,     // compact [slot * nc]
+    float* __restrict__ node_values,             // [N * nc]
     uint16_t num_canonical,
     int traverser)
 {
@@ -246,7 +250,7 @@ __global__ void aggregate_node_values_kernel(
 
     // Player decision node
     int acting = active_player[n];
-    size_t av_base = (static_cast<size_t>(n) * max_actions) * num_canonical
+    size_t av_base = static_cast<size_t>(node_offset[n]) * num_canonical
                    + static_cast<size_t>(combo);
     size_t strat_base = av_base;
     size_t stride = num_canonical;
@@ -304,11 +308,11 @@ __global__ void lift_child_values_kernel(
     const uint8_t*  __restrict__ num_children,
     const uint32_t* __restrict__ children_offset,
     const uint32_t* __restrict__ children,
+    const uint32_t* __restrict__ node_offset,   // [N] per-node slot index
     const uint32_t* __restrict__ level_node_indices,
     uint32_t num_level_nodes,
     const float* __restrict__ node_values,      // [N * nc]
-    float*       __restrict__ action_values,    // [N * A * nc]
-    uint8_t max_actions,
+    float*       __restrict__ action_values,    // compact [slot * nc]
     uint16_t num_canonical)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -321,12 +325,19 @@ __global__ void lift_child_values_kernel(
 
     uint8_t nt = node_types[n];
     if (nt == NT_TERMINAL) return;
+    // B1a correctness guard: chance nodes own NO state slot under the compact
+    // layout. Pre-B1a this fall-through was a harmless dead write into the
+    // chance node's (never-read) action_values row; now it would clobber
+    // whichever player node owns slot node_offset[n]==0. The aggregate
+    // kernel's chance branch reads child node_values directly, so skipping
+    // the lift here changes nothing it consumes.
+    if (nt == NT_CHANCE) return;
 
     uint8_t na = num_children[n];
     if (na == 0) return;
 
     uint32_t offset = children_offset[n];
-    size_t av_base = (static_cast<size_t>(n) * max_actions) * num_canonical
+    size_t av_base = static_cast<size_t>(node_offset[n]) * num_canonical
                    + static_cast<size_t>(combo);
     size_t stride = num_canonical;
 
@@ -350,15 +361,15 @@ __global__ void lift_child_values_kernel(
  * Positive/negative regrets discounted separately with alpha / beta.
  */
 __global__ void update_regrets_kernel(
-    float*       __restrict__ regrets,         // [N * A * nc]
-    const float* __restrict__ action_values,   // [N * A * nc]
+    float*       __restrict__ regrets,         // compact [slot * nc]
+    const float* __restrict__ action_values,   // compact [slot * nc]
     const float* __restrict__ node_values,     // [N * nc]
     const uint8_t* __restrict__ node_types,
     const uint8_t* __restrict__ active_player,
     const uint8_t* __restrict__ num_children,
+    const uint32_t* __restrict__ node_offset,  // [N] per-node slot index
     uint32_t num_nodes,
     uint16_t num_canonical,
-    uint8_t max_actions,
     int traverser,
     float pos_disc,
     float neg_disc)
@@ -379,7 +390,7 @@ __global__ void update_regrets_kernel(
 
     float nv = node_values[static_cast<size_t>(node) * num_canonical + combo];
 
-    size_t reg_base = (static_cast<size_t>(node) * max_actions) * num_canonical
+    size_t reg_base = static_cast<size_t>(node_offset[node]) * num_canonical
                     + static_cast<size_t>(combo);
     size_t av_base = reg_base;
     size_t stride = num_canonical;
@@ -404,15 +415,15 @@ __global__ void update_regrets_kernel(
  * correct DCFR averaging formula.
  */
 __global__ void update_strategy_sum_kernel(
-    float*       __restrict__ strategy_sum,     // [N * A * nc]
-    const float* __restrict__ current_strategy, // [N * A * nc]
+    float*       __restrict__ strategy_sum,     // compact [slot * nc]
+    const float* __restrict__ current_strategy, // compact [slot * nc]
     const float* __restrict__ reach_own,        // [N * nc] — traverser's reach
     const uint8_t* __restrict__ node_types,
     const uint8_t* __restrict__ active_player,
     const uint8_t* __restrict__ num_children,
+    const uint32_t* __restrict__ node_offset,   // [N] per-node slot index
     uint32_t num_nodes,
     uint16_t num_canonical,
-    uint8_t max_actions,
     int traverser,
     float strat_weight,    // STANDARD: ((t+1)/(t+2))^gamma; POSTFLOP: (t'/(t'+1))^3
     int decay_and_add)     // 0 = standard accumulative; 1 = postflop decay-and-add
@@ -431,7 +442,7 @@ __global__ void update_strategy_sum_kernel(
     uint8_t na = num_children[node];
     if (na == 0) return;
 
-    size_t base = (static_cast<size_t>(node) * max_actions) * num_canonical
+    size_t base = static_cast<size_t>(node_offset[node]) * num_canonical
                 + static_cast<size_t>(combo);
     size_t stride = num_canonical;
 
@@ -465,14 +476,15 @@ static constexpr int DEFAULT_BLOCK_SIZE = 256;
 void launch_compute_strategy(
     const float* d_regrets, float* d_current_strategy,
     const uint8_t* d_num_children, const uint8_t* d_node_types,
-    uint32_t num_nodes, uint16_t nc, uint8_t max_actions)
+    const uint32_t* d_node_offset,
+    uint32_t num_nodes, uint16_t nc)
 {
     int total = static_cast<int>(num_nodes) * nc;
     int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
     compute_strategy_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_regrets, d_current_strategy,
-        d_num_children, d_node_types,
-        num_nodes, nc, max_actions);
+        d_num_children, d_node_types, d_node_offset,
+        num_nodes, nc);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -480,17 +492,18 @@ void launch_propagate_reach(
     const uint8_t* d_node_types, const uint8_t* d_active_player,
     const uint8_t* d_num_children,
     const uint32_t* d_children_offset, const uint32_t* d_children,
+    const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
-    const float* d_current_strategy, uint8_t max_actions,
+    const float* d_current_strategy,
     float* d_reach_oop, float* d_reach_ip, uint16_t nc)
 {
     int total = static_cast<int>(num_level_nodes) * nc;
     int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
     propagate_reach_forward_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_node_types, d_active_player, d_num_children,
-        d_children_offset, d_children,
+        d_children_offset, d_children, d_node_offset,
         d_level_indices, num_level_nodes,
-        d_current_strategy, max_actions,
+        d_current_strategy,
         d_reach_oop, d_reach_ip, nc);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -500,8 +513,9 @@ void launch_aggregate_node_values(
     const uint8_t* d_num_children,
     const uint32_t* d_children_offset, const uint32_t* d_children,
     const uint8_t*  d_runout_weight,
+    const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
-    const float* d_current_strategy, uint8_t max_actions,
+    const float* d_current_strategy,
     const float* d_action_values, float* d_node_values,
     uint16_t nc, int traverser)
 {
@@ -509,9 +523,9 @@ void launch_aggregate_node_values(
     int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
     aggregate_node_values_kernel<false><<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_node_types, d_active_player, d_num_children,
-        d_children_offset, d_children, d_runout_weight,
+        d_children_offset, d_children, d_runout_weight, d_node_offset,
         d_level_indices, num_level_nodes,
-        d_current_strategy, max_actions,
+        d_current_strategy,
         d_action_values, d_node_values, nc, traverser);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -524,8 +538,9 @@ void launch_aggregate_node_values_br(
     const uint8_t* d_num_children,
     const uint32_t* d_children_offset, const uint32_t* d_children,
     const uint8_t*  d_runout_weight,
+    const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
-    const float* d_current_strategy, uint8_t max_actions,
+    const float* d_current_strategy,
     const float* d_action_values, float* d_node_values,
     uint16_t nc, int traverser)
 {
@@ -533,9 +548,9 @@ void launch_aggregate_node_values_br(
     int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
     aggregate_node_values_kernel<true><<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_node_types, d_active_player, d_num_children,
-        d_children_offset, d_children, d_runout_weight,
+        d_children_offset, d_children, d_runout_weight, d_node_offset,
         d_level_indices, num_level_nodes,
-        d_current_strategy, max_actions,
+        d_current_strategy,
         d_action_values, d_node_values, nc, traverser);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -543,17 +558,18 @@ void launch_aggregate_node_values_br(
 void launch_lift_child_values(
     const uint8_t* d_node_types, const uint8_t* d_num_children,
     const uint32_t* d_children_offset, const uint32_t* d_children,
+    const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
     const float* d_node_values, float* d_action_values,
-    uint8_t max_actions, uint16_t nc)
+    uint16_t nc)
 {
     int total = static_cast<int>(num_level_nodes) * nc;
     int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
     lift_child_values_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_node_types, d_num_children,
-        d_children_offset, d_children,
+        d_children_offset, d_children, d_node_offset,
         d_level_indices, num_level_nodes,
-        d_node_values, d_action_values, max_actions, nc);
+        d_node_values, d_action_values, nc);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -562,15 +578,16 @@ void launch_update_regrets(
     const float* d_action_values, const float* d_node_values,
     const uint8_t* d_node_types, const uint8_t* d_active_player,
     const uint8_t* d_num_children,
-    uint32_t num_nodes, uint16_t nc, uint8_t max_actions,
+    const uint32_t* d_node_offset,
+    uint32_t num_nodes, uint16_t nc,
     int traverser, float pos_disc, float neg_disc)
 {
     int total = static_cast<int>(num_nodes) * nc;
     int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
     update_regrets_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_regrets, d_action_values, d_node_values,
-        d_node_types, d_active_player, d_num_children,
-        num_nodes, nc, max_actions,
+        d_node_types, d_active_player, d_num_children, d_node_offset,
+        num_nodes, nc,
         traverser, pos_disc, neg_disc);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -580,15 +597,16 @@ void launch_update_strategy_sum(
     const float* d_reach_own,
     const uint8_t* d_node_types, const uint8_t* d_active_player,
     const uint8_t* d_num_children,
-    uint32_t num_nodes, uint16_t nc, uint8_t max_actions,
+    const uint32_t* d_node_offset,
+    uint32_t num_nodes, uint16_t nc,
     int traverser, float strat_weight, int decay_and_add)
 {
     int total = static_cast<int>(num_nodes) * nc;
     int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
     update_strategy_sum_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_strategy_sum, d_current_strategy, d_reach_own,
-        d_node_types, d_active_player, d_num_children,
-        num_nodes, nc, max_actions,
+        d_node_types, d_active_player, d_num_children, d_node_offset,
+        num_nodes, nc,
         traverser, strat_weight, decay_and_add);
     CUDA_CHECK(cudaGetLastError());
 }
