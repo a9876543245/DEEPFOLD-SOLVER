@@ -12,7 +12,7 @@
  * (gpu_backend.cu), which uses these plus the terminal kernels from eval_kernel.cu.
  *
  * Memory layout conventions (matches gpu_backend.cu):
- *   strategy / regrets / action_values → COMPACT [slot][combo], stride = nc.
+ *   strategy / regrets → COMPACT [slot][combo], stride = nc.
  *     slot = node_offset[node] + action. node_offset is a per-node prefix sum
  *     of num_children over PLAYER nodes only (B1a); chance/terminal nodes own
  *     NO slots — their table entry is a 0 sentinel that must never be
@@ -20,6 +20,15 @@
  *     nodes BEFORE computing its base.
  *   reach               → [N][combo]           stride = nc (full tree)
  *   node_values         → [N][combo]           stride = nc (full tree)
+ *
+ * B1a increment 2: there is NO action_values buffer. A parent's per-action
+ * value IS its child's node_values row — node_values is written exactly once
+ * per node per backward pass (at the node's own level) and never overwritten
+ * within the pass, so both aggregate (same level, children already done) and
+ * update_regrets (after the whole pass) gather node_values[child] directly.
+ * The old lift kernel materialized exactly those reads into a 4th
+ * strat-shaped buffer; fusing removed the buffer and the extra global-memory
+ * round trip without changing any float op or its order.
  */
 
 #include "util.cuh"
@@ -173,11 +182,12 @@ __global__ void propagate_reach_forward_kernel(
 // ============================================================================
 
 /**
- * At each player decision node, compute:
+ * At each player decision node, compute (action value a = the a-th child's
+ * node_values row, gathered directly — B1a inc 2, no action_values buffer):
  *   - If acting == traverser:
- *       node_val[c] = Σ_a strat[a][c] * action_val[a][c]
+ *       node_val[c] = Σ_a strat[a][c] * node_val[child_a][c]
  *   - Else (opponent acting):
- *       node_val[c] = Σ_a action_val[a][c]   (opp strat already in reach)
+ *       node_val[c] = Σ_a node_val[child_a][c]   (opp strat already in reach)
  *
  * For chance nodes: copy first child's node_value.
  * For terminals: node_value is set separately by terminal kernels (eval_kernel.cu).
@@ -194,7 +204,6 @@ __global__ void aggregate_node_values_kernel(
     const uint32_t* __restrict__ level_node_indices,
     uint32_t num_level_nodes,
     const float* __restrict__ current_strategy,  // compact [slot * nc]
-    const float* __restrict__ action_values,     // compact [slot * nc]
     float* __restrict__ node_values,             // [N * nc]
     uint16_t num_canonical,
     int traverser)
@@ -248,12 +257,19 @@ __global__ void aggregate_node_values_kernel(
         return;
     }
 
-    // Player decision node
+    // Player decision node. Per-action value = the a-th child's node_values
+    // row: children are at deeper levels, already aggregated this pass, and
+    // node_values is written once per node per pass — so the gather reads
+    // exactly what the old lift kernel used to copy into action_values.
     int acting = active_player[n];
-    size_t av_base = static_cast<size_t>(node_offset[n]) * num_canonical
-                   + static_cast<size_t>(combo);
-    size_t strat_base = av_base;
+    size_t strat_base = static_cast<size_t>(node_offset[n]) * num_canonical
+                      + static_cast<size_t>(combo);
     size_t stride = num_canonical;
+
+    auto child_value = [&](int a) -> float {
+        uint32_t child = children[offset + a];
+        return node_values[static_cast<size_t>(child) * num_canonical + combo];
+    };
 
     if (acting == traverser) {
         // Traverser-acting branch differs by mode:
@@ -262,26 +278,24 @@ __global__ void aggregate_node_values_kernel(
         //   EV / CFR:        weighted SUM by current_strategy (= averaged strategy
         //                    after finalize, or regret-matched strategy mid-CFR).
         if constexpr (BestResponse) {
-            float best = action_values[av_base];
+            float best = child_value(0);
             for (int a = 1; a < na; ++a) {
-                float av = action_values[av_base + a * stride];
-                best = fmaxf(best, av);
+                best = fmaxf(best, child_value(a));
             }
             node_values[node_idx] = best;
         } else {
             float sum = 0.0f;
             for (int a = 0; a < na; ++a) {
                 float s  = current_strategy[strat_base + a * stride];
-                float av = action_values   [av_base    + a * stride];
-                sum += s * av;
+                sum += s * child_value(a);
             }
             node_values[node_idx] = sum;
         }
     } else {
-        // Opponent's strategy absorbed into reach; just SUM action values
+        // Opponent's strategy absorbed into reach; just SUM the child values
         float sum = 0.0f;
         for (int a = 0; a < na; ++a) {
-            sum += action_values[av_base + a * stride];
+            sum += child_value(a);
         }
         node_values[node_idx] = sum;
     }
@@ -292,81 +306,29 @@ __global__ void aggregate_node_values_kernel(
 // instantiation is needed.
 
 // ============================================================================
-// Kernel 4: Copy children's node_values into parent's action_values slots
-// ============================================================================
-
-/**
- * At each decision node n at this level, for each action a:
- *   action_values[n][a][c] = node_values[child(n,a)][c]
- *
- * Used during backward pass: after processing a deeper level to fill
- * node_values, this kernel lifts those into the parent's action_values
- * so aggregate_node_values_kernel can consume them.
- */
-__global__ void lift_child_values_kernel(
-    const uint8_t*  __restrict__ node_types,
-    const uint8_t*  __restrict__ num_children,
-    const uint32_t* __restrict__ children_offset,
-    const uint32_t* __restrict__ children,
-    const uint32_t* __restrict__ node_offset,   // [N] per-node slot index
-    const uint32_t* __restrict__ level_node_indices,
-    uint32_t num_level_nodes,
-    const float* __restrict__ node_values,      // [N * nc]
-    float*       __restrict__ action_values,    // compact [slot * nc]
-    uint16_t num_canonical)
-{
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = static_cast<int>(num_level_nodes) * num_canonical;
-    if (tid >= total) return;
-
-    int local_idx = tid / num_canonical;
-    int combo     = tid % num_canonical;
-    uint32_t n    = level_node_indices[local_idx];
-
-    uint8_t nt = node_types[n];
-    if (nt == NT_TERMINAL) return;
-    // B1a correctness guard: chance nodes own NO state slot under the compact
-    // layout. Pre-B1a this fall-through was a harmless dead write into the
-    // chance node's (never-read) action_values row; now it would clobber
-    // whichever player node owns slot node_offset[n]==0. The aggregate
-    // kernel's chance branch reads child node_values directly, so skipping
-    // the lift here changes nothing it consumes.
-    if (nt == NT_CHANCE) return;
-
-    uint8_t na = num_children[n];
-    if (na == 0) return;
-
-    uint32_t offset = children_offset[n];
-    size_t av_base = static_cast<size_t>(node_offset[n]) * num_canonical
-                   + static_cast<size_t>(combo);
-    size_t stride = num_canonical;
-
-    for (int a = 0; a < na; ++a) {
-        uint32_t child = children[offset + a];
-        size_t child_idx = static_cast<size_t>(child) * num_canonical + combo;
-        action_values[av_base + a * stride] = node_values[child_idx];
-    }
-}
-
-// ============================================================================
 // Kernel 5: Regret Update — accumulate instantaneous regret + DCFR discount
 // ============================================================================
 
 /**
  * At each traverser node (acting == traverser), for each action and combo:
- *   instant = action_value[a][c] - node_value[c]
+ *   instant = node_value[child(n,a)][c] - node_value[c]
  *   regret[a][c] = (regret * discount) + instant
+ *
+ * Runs AFTER the full backward pass, and node_values is written exactly once
+ * per node per pass — so node_values[child] still holds the per-action value
+ * the old lift kernel materialized into action_values (B1a inc 2 fusion).
  *
  * Discount applied to EXISTING regret before adding new (standard DCFR).
  * Positive/negative regrets discounted separately with alpha / beta.
  */
 __global__ void update_regrets_kernel(
     float*       __restrict__ regrets,         // compact [slot * nc]
-    const float* __restrict__ action_values,   // compact [slot * nc]
     const float* __restrict__ node_values,     // [N * nc]
     const uint8_t* __restrict__ node_types,
     const uint8_t* __restrict__ active_player,
     const uint8_t* __restrict__ num_children,
+    const uint32_t* __restrict__ children_offset,
+    const uint32_t* __restrict__ children,
     const uint32_t* __restrict__ node_offset,  // [N] per-node slot index
     uint32_t num_nodes,
     uint16_t num_canonical,
@@ -392,11 +354,12 @@ __global__ void update_regrets_kernel(
 
     size_t reg_base = static_cast<size_t>(node_offset[node]) * num_canonical
                     + static_cast<size_t>(combo);
-    size_t av_base = reg_base;
     size_t stride = num_canonical;
+    uint32_t offset = children_offset[node];
 
     for (int a = 0; a < na; ++a) {
-        float av = action_values[av_base + a * stride];
+        uint32_t child = children[offset + a];
+        float av = node_values[static_cast<size_t>(child) * num_canonical + combo];
         float instant = av - nv;
         float r = regrets[reg_base + a * stride];
         r *= (r > 0.0f) ? pos_disc : neg_disc;
@@ -516,7 +479,7 @@ void launch_aggregate_node_values(
     const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
     const float* d_current_strategy,
-    const float* d_action_values, float* d_node_values,
+    float* d_node_values,
     uint16_t nc, int traverser)
 {
     int total = static_cast<int>(num_level_nodes) * nc;
@@ -526,7 +489,7 @@ void launch_aggregate_node_values(
         d_children_offset, d_children, d_runout_weight, d_node_offset,
         d_level_indices, num_level_nodes,
         d_current_strategy,
-        d_action_values, d_node_values, nc, traverser);
+        d_node_values, nc, traverser);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -541,7 +504,7 @@ void launch_aggregate_node_values_br(
     const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
     const float* d_current_strategy,
-    const float* d_action_values, float* d_node_values,
+    float* d_node_values,
     uint16_t nc, int traverser)
 {
     int total = static_cast<int>(num_level_nodes) * nc;
@@ -551,33 +514,16 @@ void launch_aggregate_node_values_br(
         d_children_offset, d_children, d_runout_weight, d_node_offset,
         d_level_indices, num_level_nodes,
         d_current_strategy,
-        d_action_values, d_node_values, nc, traverser);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void launch_lift_child_values(
-    const uint8_t* d_node_types, const uint8_t* d_num_children,
-    const uint32_t* d_children_offset, const uint32_t* d_children,
-    const uint32_t* d_node_offset,
-    const uint32_t* d_level_indices, uint32_t num_level_nodes,
-    const float* d_node_values, float* d_action_values,
-    uint16_t nc)
-{
-    int total = static_cast<int>(num_level_nodes) * nc;
-    int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
-    lift_child_values_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
-        d_node_types, d_num_children,
-        d_children_offset, d_children, d_node_offset,
-        d_level_indices, num_level_nodes,
-        d_node_values, d_action_values, nc);
+        d_node_values, nc, traverser);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_update_regrets(
     float* d_regrets,
-    const float* d_action_values, const float* d_node_values,
+    const float* d_node_values,
     const uint8_t* d_node_types, const uint8_t* d_active_player,
     const uint8_t* d_num_children,
+    const uint32_t* d_children_offset, const uint32_t* d_children,
     const uint32_t* d_node_offset,
     uint32_t num_nodes, uint16_t nc,
     int traverser, float pos_disc, float neg_disc)
@@ -585,8 +531,9 @@ void launch_update_regrets(
     int total = static_cast<int>(num_nodes) * nc;
     int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
     update_regrets_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
-        d_regrets, d_action_values, d_node_values,
-        d_node_types, d_active_player, d_num_children, d_node_offset,
+        d_regrets, d_node_values,
+        d_node_types, d_active_player, d_num_children,
+        d_children_offset, d_children, d_node_offset,
         num_nodes, nc,
         traverser, pos_disc, neg_disc);
     CUDA_CHECK(cudaGetLastError());

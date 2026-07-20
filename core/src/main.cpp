@@ -1728,11 +1728,16 @@ int main(int argc, char* argv[]) {
                 // Would "auto" engage? Builder-level collapse is the common
                 // Exact trigger (rainbow/huge boards) and is exact at
                 // estimate time. On top, mirror the ① state gate with the
-                // quantities the estimate has: enumerated state (exact) +
-                // matchup proxy (over-counts on iso boards — deliberately
-                // biases toward predicting "engages": a false "will
-                // decompose" shows a scary ETA that turns out fast; a false
-                // "won't" means an unwarned 90-minute wait).
+                // quantities the estimate has — since the compact-formula
+                // recalibration both terms are near-exact: gpu_state uses
+                // the same B1a compact formula as the gate, and the matchup
+                // count is the same dedup rule precompute_matchups applies
+                // (the old chance-child proxy over-counted ~30× on iso
+                // boards). Residual bias stays conservative: host
+                // bytes-per-cell (EV+valid+category ≥9 B) over the GPU's
+                // uploaded 8 B/cell. A false "will decompose" shows a scary
+                // ETA that turns out fast; a false "won't" would mean an
+                // unwarned 90-minute wait.
                 bool engage_via_collapse = r.runout_approximated;
                 if (!engage_via_collapse) {
                     const bool gpu_planned =
@@ -1780,6 +1785,7 @@ int main(int argc, char* argv[]) {
                           << "    \"trunk_iters_per_sweep\": " << dopts.trunk_iterations_per_sweep << ",\n"
                           << "    \"warm_start\": " << json_bool(dopts.warm_start_subgames) << ",\n"
                           << "    \"per_sweep_seconds\": " << jsafe(de.per_sweep_seconds) << ",\n"
+                          << "    \"pinned_leaves_predicted\": " << de.pinned_leaves_predicted << ",\n"
                           << "    \"total_seconds\": " << jsafe(de.total_seconds) << ",\n"
                           << "    \"spr\": " << jsafe(de.spr) << ",\n"
                           << "    \"quality_tier\": \"" << escape_json(de.quality_tier) << "\",\n"

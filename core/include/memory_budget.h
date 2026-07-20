@@ -81,9 +81,10 @@ constexpr uint64_t kMatchupBytesPerCell = kBaseMatchupBytesPerCell;
 /// transient Phase-1 buffers, plus a small slack.
 constexpr uint64_t kCpuStateArraysPerNode = 3;
 
-/// GPU backend keeps regrets, strategy_sum, current_strategy, action_values
-/// (4 N×A×nc), reach_scratch_oop, reach_scratch_ip (2 N×nc), node_values
-/// (N×nc). We sum these explicitly in `gpu_state_bytes`.
+/// GPU backend keeps regrets, strategy_sum, current_strategy (3 compact
+/// strat-shaped buffers of Σ-player-actions × nc; B1a inc 2 dropped
+/// action_values), plus reach_scratch_oop, reach_scratch_ip and node_values
+/// (3 full-tree N×nc buffers). Summed in `bytes_for_gpu_state_compact`.
 
 } // namespace memory_budget
 
@@ -179,15 +180,29 @@ inline uint64_t bytes_for_levelized_cpu_extra(uint64_t total_nodes, uint64_t nc)
     return total_nodes * nc * 3ULL * sizeof(float);
 }
 
-/// Bytes for the GPU CFR state. Lives in VRAM. Includes:
-///   - regrets, strategy_sum, current_strategy, action_values: each N×A×nc floats
-///   - reach_scratch_oop, reach_scratch_ip: each N×nc floats
-///   - node_values: N×nc floats
-/// Total = (4·A + 3) · N · nc · sizeof(float)
-inline uint64_t bytes_for_gpu_state(uint64_t total_nodes, uint64_t max_actions,
-                                     uint64_t nc) {
-    const uint64_t per_node = (4ULL * max_actions + 3ULL) * nc;
-    return per_node * total_nodes * sizeof(float);
+/// Bytes for the GPU CFR state. Lives in VRAM. Mirrors the COMPACT layout
+/// GpuBackend's alloc_solver_state() actually allocates (B1a increments 1+2):
+///   - regrets, strategy_sum, current_strategy: each
+///     [player_action_slots × nc] floats, where player_action_slots =
+///     Σ num_children over PLAYER nodes (the per-node slot table; chance and
+///     terminal nodes own no strat-shaped rows). Increment 2 dropped the
+///     4th buffer (action_values) — aggregate/update_regrets gather child
+///     node_values directly. Keep this factor in sync with
+///     alloc_solver_state's own pre-flight.
+///   - reach_scratch_oop, reach_scratch_ip, node_values: each N×nc floats
+///   - node_offset slot table: N uint32
+/// Total = (3·slots + 3·N) · nc · sizeof(float) + N · sizeof(uint32)
+///
+/// The pre-B1a dense formula ((4·MAX_ACTIONS + 3) · N · nc) over-counted
+/// enumerated monotone trees ~2.9× (7,453 MB estimated vs 2,587 MB measured
+/// on Ah9h4h) which made the ① collapse gate reject boards that actually
+/// fit. Renamed (not just re-derived) so any caller still passing
+/// MAX_ACTIONS fails to compile instead of silently mis-estimating.
+inline uint64_t bytes_for_gpu_state_compact(uint64_t total_nodes,
+                                            uint64_t player_action_slots,
+                                            uint64_t nc) {
+    return (3ULL * player_action_slots + 3ULL * total_nodes) * nc * sizeof(float)
+         + total_nodes * sizeof(uint32_t);
 }
 
 /// Bytes for the strategy-tree EV cache. The current implementation

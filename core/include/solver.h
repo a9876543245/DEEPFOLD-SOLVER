@@ -775,9 +775,13 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         const uint64_t total_n = tree_.total_nodes;
         const uint64_t tables  = std::max<uint64_t>(matchup_ev_per_runout_.size(), 1);
         uint64_t player_n = 0;
+        uint64_t player_slots = 0;  // Σ num_children over player nodes (B1a compact)
         for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
             auto t = static_cast<NodeType>(tree_.node_types[n]);
-            if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) ++player_n;
+            if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) {
+                ++player_n;
+                player_slots += tree_.num_children[n];
+            }
         }
 
         // Which backend would this solve actually run on? Same call the
@@ -793,12 +797,19 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         const char* budget_label = "";
         if (planned == BackendType::GPU) {
             // Device footprint = CFR state + uploaded matchup tables (EV +
-            // valid float matrices per runout). Budget: explicit
+            // valid float matrices per runout). State uses the COMPACT
+            // formula mirroring alloc_solver_state() (B1a) — the dense
+            // (4A+3)·N·nc formula over-counted ~2.9× and collapsed boards
+            // that fit. The dense matchup term is exact for every tree this
+            // gate sees: enumerated flop trees are always iso-engaged
+            // (singleton/rainbow boards collapse at the builder's matchup
+            // cap), so the GPU rank-blocker cannot activate and the dense
+            // EV/valid upload really happens. Budget: explicit
             // --gpu-memory-mb, else probe free VRAM with the same 0.80
             // headroom factor GpuBackend's prepare pre-flight applies.
             // Probe returning 0 (no device / driver failure) skips the gate
             // — the existing prepare/create error paths handle that case.
-            state_needed = bytes_for_gpu_state(total_n, MAX_ACTIONS, nc)
+            state_needed = bytes_for_gpu_state_compact(total_n, player_slots, nc)
                          + tables * nc * nc * 2ULL * sizeof(float);
             state_budget = config_.memory_budget.gpu_bytes > 0
                 ? config_.memory_budget.gpu_bytes
@@ -876,9 +887,13 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     {
         const uint64_t nc      = iso_.num_canonical;
         const uint64_t total_n = tree_.total_nodes;
+        uint64_t gate_player_slots = 0;  // Σ num_children over player nodes
         for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
             auto t = static_cast<NodeType>(tree_.node_types[n]);
-            if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) ++gate_player_nodes;
+            if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) {
+                ++gate_player_nodes;
+                gate_player_slots += tree_.num_children[n];
+            }
         }
         gate_est.matchup_tables_bytes   = bytes_for_matchup_tables(
             matchup_ev_per_runout_.size(),
@@ -893,7 +908,8 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
             gate_est.cpu_state_bytes   += bytes_for_levelized_cpu_extra(total_n, nc);
         }
-        gate_est.gpu_state_bytes        = bytes_for_gpu_state(total_n, MAX_ACTIONS, nc);
+        gate_est.gpu_state_bytes        = bytes_for_gpu_state_compact(
+            total_n, gate_player_slots, nc);
 
         // P1-1: EV cache estimate must use the SAME cap as build_strategy_tree
         // applies in VISIBLE mode. Without this, the estimate uses
@@ -1487,28 +1503,52 @@ inline SolveResources Solver::estimate_only() {
     r.canonical_combos = iso_.num_canonical;
 
     uint32_t player_nodes = 0;
-    uint32_t chance_child_count = 0;
+    uint64_t player_slots = 0;   // Σ num_children over player nodes (B1a compact)
     for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
         auto t = static_cast<NodeType>(tree_.node_types[n]);
-        if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) ++player_nodes;
-        if (t == NodeType::CHANCE) {
-            // Each chance child with a real dealt card maps to one matchup
-            // table in precompute_matchups — count them as the proxy.
-            uint8_t nch = tree_.num_children[n];
-            uint32_t off = tree_.children_offset[n];
-            for (uint8_t k = 0; k < nch; ++k) {
-                uint32_t child = tree_.children[off + k];
-                uint8_t dc = (child < tree_.dealt_card.size())
-                    ? tree_.dealt_card[child] : 0xFFu;
-                if (dc != 0xFFu) ++chance_child_count;
-            }
+        if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) {
+            ++player_nodes;
+            player_slots += tree_.num_children[n];
         }
     }
     r.player_nodes = player_nodes;
 
+    // Count DISTINCT matchup tables exactly the way precompute_matchups()
+    // dedups them: one per unique sorted (config board ∪ accumulated runout
+    // cards) signature. Every non-root signature first appears at a node
+    // whose incoming edge dealt a card, so registering those nodes (runouts
+    // recovered by walking the parent chain) plus the root covers the set.
+    // The previous proxy counted every dealt chance CHILD once per betting
+    // line, over-counting ~30× on iso-engaged boards — which made the
+    // estimated matchup bytes (and main.cpp's --estimate-only decompose
+    // would_engage mirror of the ① state gate) wildly pessimistic on
+    // exactly the monotone boards that gate governs. Pure tree walk, no
+    // table computation: ~ms even on 100k-node enumerated trees.
+    uint64_t matchup_tables_exact = 1;  // the root board's own table
+    {
+        std::set<std::vector<uint8_t>> sigs;
+        for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
+            if (n >= tree_.dealt_card.size() || tree_.dealt_card[n] == 0xFFu) {
+                continue;
+            }
+            std::vector<uint8_t> sig;
+            sig.reserve(static_cast<size_t>(config_.board_size) + 2);
+            for (uint8_t i = 0; i < config_.board_size; ++i) {
+                sig.push_back(config_.board[i]);
+            }
+            for (uint32_t a = n; a != 0u; a = tree_.parent_indices[a]) {
+                uint8_t dc = tree_.dealt_card[a];
+                if (dc != 0xFFu) sig.push_back(dc);
+            }
+            std::sort(sig.begin(), sig.end());
+            sigs.insert(std::move(sig));
+        }
+        matchup_tables_exact += static_cast<uint64_t>(sigs.size());
+    }
+
     const uint64_t nc      = iso_.num_canonical;
     const uint64_t total_n = tree_.total_nodes;
-    const uint64_t matchup_count_est = std::max<uint64_t>(chance_child_count, 1);
+    const uint64_t matchup_count_est = matchup_tables_exact;
 
     r.estimated_matchup_bytes        = bytes_for_matchup_tables(
         matchup_count_est,
@@ -1521,7 +1561,8 @@ inline SolveResources Solver::estimate_only() {
     if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
         r.estimated_cpu_state_bytes += bytes_for_levelized_cpu_extra(total_n, nc);
     }
-    r.estimated_gpu_state_bytes      = bytes_for_gpu_state(total_n, MAX_ACTIONS, nc);
+    r.estimated_gpu_state_bytes      = bytes_for_gpu_state_compact(
+        total_n, player_slots, nc);
 
     const uint64_t ev_cache_cap = config_.memory_budget.strategy_tree_max_nodes > 0
         ? std::min<uint64_t>(player_nodes, config_.memory_budget.strategy_tree_max_nodes)

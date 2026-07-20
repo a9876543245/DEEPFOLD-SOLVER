@@ -38,9 +38,10 @@
 namespace deepsolver {
 namespace gpu {
 
-// B1a: strat-shaped state (regrets / strategy_sum / current_strategy /
-// action_values) is COMPACT — indexed by d_node_offset[node] slot table,
-// player nodes only, stride nc. See cfr_kernel.cu header comment.
+// B1a: strat-shaped state (regrets / strategy_sum / current_strategy) is
+// COMPACT — indexed by d_node_offset[node] slot table, player nodes only,
+// stride nc. Increment 2: no action_values buffer — aggregate and
+// update_regrets gather child node_values directly. See cfr_kernel.cu header.
 void launch_compute_strategy(
     const float* d_regrets, float* d_current_strategy,
     const uint8_t* d_num_children, const uint8_t* d_node_types,
@@ -64,7 +65,7 @@ void launch_aggregate_node_values(
     const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
     const float* d_current_strategy,
-    const float* d_action_values, float* d_node_values,
+    float* d_node_values,
     uint16_t nc, int traverser);
 
 // Postsolve variant: max-over-actions at traverser-acting nodes.
@@ -77,22 +78,15 @@ void launch_aggregate_node_values_br(
     const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
     const float* d_current_strategy,
-    const float* d_action_values, float* d_node_values,
+    float* d_node_values,
     uint16_t nc, int traverser);
-
-void launch_lift_child_values(
-    const uint8_t* d_node_types, const uint8_t* d_num_children,
-    const uint32_t* d_children_offset, const uint32_t* d_children,
-    const uint32_t* d_node_offset,
-    const uint32_t* d_level_indices, uint32_t num_level_nodes,
-    const float* d_node_values, float* d_action_values,
-    uint16_t nc);
 
 void launch_update_regrets(
     float* d_regrets,
-    const float* d_action_values, const float* d_node_values,
+    const float* d_node_values,
     const uint8_t* d_node_types, const uint8_t* d_active_player,
     const uint8_t* d_num_children,
+    const uint32_t* d_children_offset, const uint32_t* d_children,
     const uint32_t* d_node_offset,
     uint32_t num_nodes, uint16_t nc,
     int traverser, float pos_disc, float neg_disc);
@@ -237,13 +231,16 @@ struct DeviceNodeLocks {
 
 /// Per-iteration solver state, on device. Allocated once in prepare.
 ///
-/// B1a compact layout: the four strat-shaped buffers hold state ONLY for
+/// B1a compact layout: the strat-shaped buffers hold state ONLY for
 /// player-node actions that exist — [total_slots * nc] where total_slots =
 /// Σ num_children over player nodes and node_offset[n] is each player node's
 /// first slot (prefix sum; 0 sentinel for chance/terminal, never
 /// dereferenced). Down from [N * MAX_ACTIONS * nc], which paid 6 action
 /// rows for every node including chance/terminal — the measured 76 GB on
 /// multi-sizing monotone flops.
+///
+/// Increment 2: action_values is GONE — a parent's per-action value is its
+/// child's node_values row, gathered in-kernel by aggregate/update_regrets.
 struct DeviceSolverState {
     float* regrets           = nullptr;  // [total_slots * nc] compact
     float* strategy_sum      = nullptr;  // [total_slots * nc] compact
@@ -252,7 +249,6 @@ struct DeviceSolverState {
     float* reach_scratch_oop = nullptr;  // [N * nc]   per-node reach for OOP
     float* reach_scratch_ip  = nullptr;  // [N * nc]   per-node reach for IP
     float* node_values       = nullptr;  // [N * nc]
-    float* action_values     = nullptr;  // [total_slots * nc] compact
 
     uint32_t* node_offset    = nullptr;  // [N] device slot table
     size_t    total_slots    = 0;        // Σ na over player nodes
@@ -740,12 +736,13 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
     // OOM pre-flight: state buffers dominate device memory on multi-bet-size
     // monotone-flop trees. Fail with a structured message before cudaMalloc
     // returns OOM, so engine.rs's CPU-fallback detector can trigger.
-    //   strat-shaped buffers (regrets, strategy_sum, current_strategy,
-    //   action_values) = 4 buffers of total_slots*nc floats (compact)
+    //   strat-shaped buffers (regrets, strategy_sum, current_strategy)
+    //     = 3 buffers of total_slots*nc floats (compact; inc 2 dropped
+    //       action_values — keep bytes_for_gpu_state_compact in sync)
     //   reach + node_values = 3 buffers of N*nc floats (full tree)
     size_t bytes_strat = strat_stride * sizeof(float);
     size_t bytes_reach = N * nc * sizeof(float);
-    size_t state_bytes_required = bytes_strat * 4 + bytes_reach * 3;
+    size_t state_bytes_required = bytes_strat * 3 + bytes_reach * 3;
     {
         size_t free_dev = 0, total_dev = 0;
         if (cudaMemGetInfo(&free_dev, &total_dev) == cudaSuccess) {
@@ -769,7 +766,6 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
     ds.reach_scratch_oop  = alloc_device_zero<float>(N * nc);
     ds.reach_scratch_ip   = alloc_device_zero<float>(N * nc);
     ds.node_values        = alloc_device_zero<float>(N * nc);
-    ds.action_values      = alloc_device_zero<float>(strat_stride);
     ds.node_offset        = upload_vector(ds.host_node_offset);
 
     // Initialize current_strategy to uniform 1/num_children per player node.
@@ -805,7 +801,6 @@ static void free_solver_state(DeviceSolverState& ds) {
     free_device(ds.reach_scratch_oop);
     free_device(ds.reach_scratch_ip);
     free_device(ds.node_values);
-    free_device(ds.action_values);
     free_device(ds.node_offset);
     ds.host_node_offset.clear();
     ds.total_slots = 0;
@@ -851,8 +846,8 @@ struct GpuBackend::Impl {
     bool prepared = false;
     bool finalized = false;  // true once finalize() has populated current_strategy with averaged
 
-    // The postsolve scratch buffers (reach_scratch_*, node_values,
-    // action_values) are shared across run_postsolve_pass invocations. The
+    // The postsolve scratch buffers (reach_scratch_*, node_values) are
+    // shared across run_postsolve_pass invocations. The
     // Solver's parallel-postsolve mode runs compute_combo_evs and
     // compute_exploitability concurrently, which means up to 3 passes can
     // contend for the same device memory. This mutex serializes them — the
@@ -1262,13 +1257,6 @@ void GpuBackend::iterate(int iteration) {
                 }
             }
 
-            launch_lift_child_values(
-                I.tree.node_types, I.tree.num_children,
-                I.tree.children_offset, I.tree.children,
-                I.state.node_offset,
-                d_level, count,
-                I.state.node_values, I.state.action_values,
-                nc);
             launch_aggregate_node_values(
                 I.tree.node_types, I.tree.active_player, I.tree.num_children,
                 I.tree.children_offset, I.tree.children,
@@ -1276,14 +1264,16 @@ void GpuBackend::iterate(int iteration) {
                 I.state.node_offset,
                 d_level, count,
                 I.state.current_strategy,
-                I.state.action_values, I.state.node_values,
+                I.state.node_values,
                 nc, traverser);
         }
 
-        // Regret update (at traverser's own nodes)
+        // Regret update (at traverser's own nodes). Reads per-action values
+        // straight from the children's node_values rows (inc 2 — no lift).
         launch_update_regrets(
-            I.state.regrets, I.state.action_values, I.state.node_values,
+            I.state.regrets, I.state.node_values,
             I.tree.node_types, I.tree.active_player, I.tree.num_children,
+            I.tree.children_offset, I.tree.children,
             I.state.node_offset,
             N, nc, traverser, pos_disc, neg_disc);
 
@@ -1374,11 +1364,10 @@ void GpuBackend::iterate(int iteration) {
     auto dump_traverser_hashes = [&](const char* tag) {
         const size_t nvspan = static_cast<size_t>(N) * nc;
         std::fprintf(stderr,
-                     "[ih] it=%d %s nv=%016llx av=%016llx reg=%016llx "
+                     "[ih] it=%d %s nv=%016llx reg=%016llx "
                      "ss=%016llx\n",
                      iteration, tag,
                      hash_dev(I.state.node_values, nvspan),
-                     hash_dev(I.state.action_values, I.state.state_stride),
                      hash_dev(I.state.regrets, I.state.state_stride),
                      hash_dev(I.state.strategy_sum, I.state.state_stride));
     };
@@ -1548,8 +1537,8 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
 
     // 3) Backward value pass: leaves → root.
     //    L==0: terminal kernel writes node_values for terminals at this level.
-    //    Every level: lift children's node_values into parent action_values,
-    //                 then aggregate (sum-mode for EV, max-at-traverser for BR).
+    //    Every level: aggregate gathers children's node_values directly
+    //    (sum-mode for EV, max-at-traverser for BR) — inc 2, no lift.
     float* reach_opp_base = (traverser == 0) ? state.reach_scratch_ip
                                               : state.reach_scratch_oop;
     const uint32_t num_levels = levels.num_levels;
@@ -1593,14 +1582,6 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
             }
         }
 
-        launch_lift_child_values(
-            tree.node_types, tree.num_children,
-            tree.children_offset, tree.children,
-            state.node_offset,
-            d_level, count,
-            state.node_values, state.action_values,
-            nc);
-
         if (best_response) {
             launch_aggregate_node_values_br(
                 tree.node_types, tree.active_player, tree.num_children,
@@ -1609,7 +1590,7 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
                 state.node_offset,
                 d_level, count,
                 state.current_strategy,
-                state.action_values, state.node_values,
+                state.node_values,
                 nc, traverser);
         } else {
             launch_aggregate_node_values(
@@ -1619,7 +1600,7 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
                 state.node_offset,
                 d_level, count,
                 state.current_strategy,
-                state.action_values, state.node_values,
+                state.node_values,
                 nc, traverser);
         }
     }

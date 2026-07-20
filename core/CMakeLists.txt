@@ -435,6 +435,46 @@ if(BUILD_TESTS)
         LABELS "smoke;memory" TIMEOUT 60
         PASS_REGULAR_EXPRESSION "\"inner\": 450")
 
+    # 2026-07-20 honesty gate: a QUICK preset on a LARGE spot cannot promise
+    # convergence. The desktop e2e measured 101.21% exploitability on a
+    # standard-sizing 637-leaf spot whose banded ceiling said 90%, so the
+    # copy is downgraded to the navigation tier when a starved inner budget
+    # meets a big leaf count. This fixture (SPR 3.55 → base tier "medium",
+    # 441 leaves) fires that rule; the paired test below pins that a normal
+    # inner budget on the SAME spot still reads "medium", so the downgrade
+    # can't quietly swallow every Exact estimate.
+    add_test(NAME CliExactPreflightQuickTierDowngrade
+        COMMAND deepsolver_core
+            --pot 220 --stack 780 --board AsKd2c
+            --flop-sizes 0.33,0.75 --turn-sizes 0.33,0.75
+            --river-sizes 0.33,0.75
+            --estimate-only --decompose-runouts auto
+            --decompose-outer 2 --decompose-inner 150)
+    set_tests_properties(CliExactPreflightQuickTierDowngrade PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "\"quality_tier\": \"navigation\"")
+
+    add_test(NAME CliExactPreflightStandardTierKept
+        COMMAND deepsolver_core
+            --pot 220 --stack 780 --board AsKd2c
+            --flop-sizes 0.33,0.75 --turn-sizes 0.33,0.75
+            --river-sizes 0.33,0.75
+            --estimate-only --decompose-runouts auto
+            --decompose-outer 2 --decompose-inner 450)
+    set_tests_properties(CliExactPreflightStandardTierKept PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 60
+        PASS_REGULAR_EXPRESSION "\"quality_tier\": \"medium\"")
+
+    # 2026-07-20: the stitched Exact nav must keep one root entry per turn
+    # card even under a tight node cap, or the Runout Report goes blank.
+    # Needs real key counting, so it runs as a script (see the file header).
+    add_test(NAME CliStitchedNavRoots
+        COMMAND ${CMAKE_COMMAND}
+            -DEXE=$<TARGET_FILE:deepsolver_core>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_stitched_nav_roots.cmake)
+    set_tests_properties(CliStitchedNavRoots PROPERTIES
+        LABELS "smoke;decomposition" TIMEOUT 120)
+
     # Sprint 1 (resource policy guide): pre-backend budget gates.
     # CPU host gate: matchup fits but total host estimate exceeds budget.
     add_test(NAME CliCpuHostBudgetReject
@@ -565,6 +605,23 @@ if(BUILD_TESTS)
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_enumerated_parity.cmake)
         set_tests_properties(CliEnumeratedGpuParity PROPERTIES
             LABELS "smoke;gpu;parity" TIMEOUT 300)
+
+        # 2026-07-20 ETA honesty: the Exact estimate must predict how many
+        # turn subgames the adaptive VRAM pin will hold, because the leaves
+        # past that point are rebuilt + re-uploaded on every revisit and the
+        # flat per-leaf rate alone under-predicted a real run by 55%
+        # (93 min actual vs 60 min modelled at 40 pinned of 637). A zero here
+        # on a machine that HAS a device means the pin predictor silently
+        # stopped running and the surcharge went with it. GPU-only: the CPU
+        # subgame route legitimately reports 0.
+        add_test(NAME CliExactPreflightPinPrediction
+            COMMAND deepsolver_core
+                --pot 100 --stack 500 --board Ah9h4h
+                --backend cpu --host-memory-mb 2900
+                --estimate-only --decompose-runouts auto)
+        set_tests_properties(CliExactPreflightPinPrediction PROPERTIES
+            LABELS "smoke;gpu" TIMEOUT 60
+            PASS_REGULAR_EXPRESSION "\"pinned_leaves_predicted\": [1-9]")
 
         # ----------------------------------------------------------------
         # Stage 3: GPU subgame streaming validation. SAME source as the CPU

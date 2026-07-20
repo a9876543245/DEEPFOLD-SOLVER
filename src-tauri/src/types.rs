@@ -334,6 +334,11 @@ pub struct DecomposeEstimate {
     pub warm_start: bool,
     #[serde(default)]
     pub per_sweep_seconds: f64,
+    /// GPU route: predicted VRAM-resident subgame count (0 = CPU route).
+    /// Leaves beyond this stream and pay a per-revisit rebuild surcharge
+    /// already folded into total_seconds.
+    #[serde(default)]
+    pub pinned_leaves_predicted: i32,
     #[serde(default)]
     pub total_seconds: f64,
     #[serde(default)]

@@ -1328,8 +1328,21 @@ inline void TrunkDecomposition::build_nav_tree(DecomposedResult& r) {
     auto merge_leaf = [&](int li, const std::string& base_key, uint8_t turn_card,
                           const std::vector<Solver::RunoutOption>& turn_opts) {
         if (li < 0 || li >= static_cast<int>(leaf_nav_.size())) return;
+        // The subgame ROOT entry (empty subgame path — sorts first in the
+        // map) is ALWAYS admitted, cap or not: the Runout Report needs
+        // exactly one entry per (line, turn card) at key base_key /
+        // base_key#card to exist. First-come truncation used to spend the
+        // whole cap inside the first turn subgame's deep entries on
+        // standard sizing, leaving every later turn card "n/a" in the
+        // report. Overshoot is bounded by one entry per leaf; the cap
+        // still bounds all deeper entries.
+        bool root_entry = true;
         for (auto& kv : leaf_nav_[li]) {
-            if (cap > 0 && out.size() >= cap) { truncated = true; break; }
+            if (!root_entry && cap > 0 && out.size() >= cap) {
+                truncated = true;
+                break;
+            }
+            root_entry = false;
             std::string key = join(base_key, kv.first);
             if (out.count(key)) continue;
             Solver::StrategyTreeEntry e = std::move(kv.second);
@@ -1377,7 +1390,10 @@ inline void TrunkDecomposition::build_nav_tree(DecomposedResult& r) {
                                                   : (path + "#" + card_token(dcard));
                 merge_leaf(leaf_idx_[child], base_key, dcard, opts);
                 is_lex_min = false;
-                if (cap > 0 && out.size() >= cap) { truncated = true; break; }
+                // No cap break here: even past the cap, every remaining turn
+                // child must still merge its (always-admitted) root entry or
+                // the Runout Report loses those cards entirely. merge_leaf
+                // itself stops at the cap after that one entry.
             }
             return;
         }
@@ -1629,6 +1645,15 @@ struct DecompositionEstimate {
     float    expected_exploit_lo_pct = 0.0f;
     float    expected_exploit_hi_pct = 0.0f;
     std::string backend_label;   ///< backend the pricing assumed
+    /// GPU route only: how many turn subgames the adaptive VRAM pin is
+    /// predicted to keep resident (mirror of compute_adaptive_K with an
+    /// analytic per-leaf VRAM figure). Leaves past this stream — rebuilt
+    /// and re-uploaded on every revisit — which the ETA prices per
+    /// streamed visit. 0 on the CPU route.
+    int      pinned_leaves_predicted = 0;
+    /// Streamed-leaf rebuild surcharge already folded into total_seconds
+    /// (kept separately so the debug line / calibration can see it).
+    double   total_seconds_pin_extra = 0.0;
 };
 
 namespace decomp_estimate_detail {
@@ -1660,6 +1685,19 @@ constexpr double kFinalPassSweepEquivalents = 1.73;
 /// by nc/1176. This is the "§B nav-extraction parallelization" backlog
 /// cost, priced honestly until it's optimized.
 constexpr double kNavExtractSecondsPerLeafAtNc1176 = 2.5;
+/// A STREAMED (non-pinned) leaf pays a full rebuild — Solver ctor + tree +
+/// host matchup precompute + device upload — on every revisit after its
+/// first, where a pinned leaf's resolve_keep_board skips all of it.
+/// kGpuSecondsPerLeafOverhead was calibrated on mostly-pinned runs, so the
+/// streamed surcharge is priced separately. Anchor (2026-07-18 desktop
+/// e2e, AsKd2c standard, 637 leaves, K=40 pinned, outer=2): 93 min real
+/// vs 60 min modeled ⇒ 33 min over 597 streamed leaves × 2 revisits
+/// (sweep 2 + final) ≈ 1.66 s/visit at nc=1176.
+constexpr double kStreamedRevisitSecondsPerLeaf = 1.66;
+/// Analytic per-leaf VRAM slack on top of state+matchup: CUDA context
+/// share, tree/levels/reach uploads, allocator fragmentation. Rough — the
+/// pin predictor only needs K to the right order, not ±10%.
+constexpr uint64_t kPinPredictSlackBytesPerLeaf = 96ull << 20;
 // CPU subgames ARE compute-bound, so the CPU path prices from the sampled
 // sub-tree ops model (player_nodes × A × nc²) at the 1-thread rate, with a
 // fitted shape correction (the sampled trees over-state real work: they
@@ -1740,11 +1778,111 @@ inline DecompositionEstimate estimate_decomposition(const SolverConfig& cfg,
     const int inner = std::max(1, opts.inner_iterations);
     if (gpu) {
         // Launch-bound flat rate — subgame size doesn't move the needle
-        // (see constants above), so no sub-tree sampling needed.
+        // for the COMPUTE term (see constants above), so no sub-tree
+        // sampling needed for pricing a visit.
         const double per_leaf =
             decomp_estimate_detail::kGpuSecondsPerLeafOverhead
             + inner * decomp_estimate_detail::kGpuSecondsPerSubgameIter;
         for (auto& g : groups) g.per_leaf_seconds = per_leaf;
+
+        // ⑤ Pin-ratio term (2026-07-20). The flat rate assumes every leaf
+        // resolves like a pinned one; in reality only K leaves stay VRAM-
+        // resident (adaptive pin) and the other L−K are rebuilt+re-uploaded
+        // on every revisit — the dominant miss on the 2026-07-18 e2e run
+        // (93 min real vs 60 min modeled at K=40/637). Mirror
+        // compute_adaptive_K with an ANALYTIC per-leaf VRAM figure:
+        //   state   = compact GPU state of a representative subgame tree
+        //             (deepest-SPR line — conservative: bigger per ⇒ fewer
+        //             predicted pins ⇒ longer, safer ETA)
+        //   matchup = 0 when the parent iso is singleton (subgames are
+        //             FORCED into the parent iso, so the rank-blocker
+        //             activates and the dense upload is skipped); else
+        //             dense tables × nc² × 8 B
+        //   slack   = context/tree/fragmentation constant
+        {
+            const Group* deepest = nullptr;
+            double best_spr = -1.0;
+            for (const auto& g : groups) {
+                const double gspr = g.stack / std::max(g.pot, 1e-3f);
+                if (gspr > best_spr) { best_spr = gspr; deepest = &g; }
+            }
+            uint64_t per_bytes = 0;
+            if (deepest) {
+                SolverConfig sub = cfg;
+                sub.board[cfg.board_size] = trunk.dealt_card[deepest->rep_leaf];
+                sub.board_size = static_cast<uint8_t>(cfg.board_size + 1);
+                sub.pot = deepest->pot;
+                sub.effective_stack = deepest->stack;
+                sub.oop_has_initiative = true;
+
+                GameTreeBuilder sb(sub);
+                sb.set_memory_policy(nc, sub.memory_budget,
+                                     matchup_bytes_per_cell(sub, iso));
+                FlatGameTree st = sb.build();
+
+                uint64_t sub_slots = 0;
+                bool seen[64] = {};
+                uint64_t tables = 1;
+                for (uint32_t n2 = 0; n2 < st.total_nodes; ++n2) {
+                    auto t2 = static_cast<NodeType>(st.node_types[n2]);
+                    if (t2 == NodeType::PLAYER_OOP || t2 == NodeType::PLAYER_IP) {
+                        sub_slots += st.num_children[n2];
+                    }
+                    if (n2 < st.dealt_card.size()) {
+                        const uint8_t dc = st.dealt_card[n2];
+                        if (dc != 0xFFu && dc < 64 && !seen[dc]) {
+                            seen[dc] = true;
+                            ++tables;
+                        }
+                    }
+                }
+                per_bytes = bytes_for_gpu_state_compact(st.total_nodes, sub_slots, nc)
+                          + decomp_estimate_detail::kPinPredictSlackBytesPerLeaf;
+                if (!showdown_rank_blocker::supports_singleton_iso(iso)) {
+                    per_bytes += tables * nc * nc * 2ULL * sizeof(float);
+                }
+            }
+
+            const uint64_t free_now = gpu_free_bytes();
+            const int L = static_cast<int>(e.leaf_count);
+            int K;
+            if (free_now == 0 || per_bytes == 0) {
+                K = std::min(L, 8);          // no probe → same floor the solver uses
+            } else {
+                uint64_t avail = free_now;
+                if (const char* env = std::getenv("DEEPSOLVER_DECOMP_VRAM_MB")) {
+                    uint64_t capb = (static_cast<uint64_t>(
+                                         std::max(0, std::atoi(env)))) << 20;
+                    avail = std::min(avail, capb);
+                }
+                const uint64_t headroom = std::max<uint64_t>(
+                    static_cast<uint64_t>(static_cast<double>(avail) * 0.25),
+                    3ull << 30);
+                const uint64_t usable = (avail > headroom) ? (avail - headroom) : 0;
+                K = static_cast<int>(usable / per_bytes);
+                if (K < 1) K = 1;
+                if (K > L) K = L;
+            }
+            e.pinned_leaves_predicted = K;
+
+            // Each streamed leaf pays the rebuild surcharge on every revisit
+            // after its first: sweeps 2..outer plus the delivery pass =
+            // `outer` visits.
+            const int streamed = L - K;
+            if (streamed > 0) {
+                e.total_seconds_pin_extra =
+                    static_cast<double>(streamed)
+                    * static_cast<double>(std::max(1, opts.outer_iterations))
+                    * decomp_estimate_detail::kStreamedRevisitSecondsPerLeaf;
+            }
+            if (std::getenv("DEEPSOLVER_DECOMP_EST_DEBUG")) {
+                std::cerr << "[decomp-est] pin predict: per_bytes="
+                          << (per_bytes >> 20) << "MB free="
+                          << (free_now >> 20) << "MB K=" << K
+                          << "/" << L << " streamed_extra_s="
+                          << e.total_seconds_pin_extra << "\n";
+            }
+        }
     } else {
         // CPU: price one representative subgame per betting line for the
         // deepest remaining-SPR lines (they own the biggest subtrees and
@@ -1844,6 +1982,9 @@ inline DecompositionEstimate estimate_decomposition(const SolverConfig& cfg,
     e.total_seconds =
         (std::max(1, opts.outer_iterations)
          + decomp_estimate_detail::kFinalPassSweepEquivalents) * sweep_total;
+    // ⑤ streamed-leaf rebuild surcharge (GPU route; 0 elsewhere) — computed
+    // above where the pin count was predicted.
+    e.total_seconds += e.total_seconds_pin_extra;
     if (opts.build_nav) {
         e.total_seconds += static_cast<double>(e.leaf_count)
             * decomp_estimate_detail::kNavExtractSecondsPerLeafAtNc1176
@@ -1870,6 +2011,18 @@ inline DecompositionEstimate estimate_decomposition(const SolverConfig& cfg,
     // honest.
     if (opts.inner_iterations <= 150 && e.spr > 3.0f) {
         e.expected_exploit_hi_pct *= 1.5f;
+        // 2026-07-18 desktop e2e: on a LARGE spot even the widened band
+        // busts — standard-sizing 637-leaf AsKd2c quick converged to
+        // 101.21% vs the medium×1.5 ceiling of 90%. The 245-leaf quick
+        // datum (81.9%) still fits. Quick × big tree cannot honestly
+        // promise convergence, so downgrade the copy to navigation-only
+        // (its 100–300 band brackets the measurement). Threshold sits
+        // between the two data points.
+        if (e.leaf_count >= 400) {
+            e.quality_tier = "navigation";
+            e.expected_exploit_lo_pct = 100.0f;
+            e.expected_exploit_hi_pct = 300.0f;
+        }
     }
 
     e.ok = true;

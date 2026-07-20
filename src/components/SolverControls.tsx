@@ -280,8 +280,11 @@ export function SolverControls({
           </div>
         ) : (() => {
           // Roadmap ④: honest SPR-gated positioning. Prefer the engine's
-          // tier from the pre-flight; fall back to the same thresholds
-          // computed locally (mirrors solver_decomposed.h: ≤3 / ≤6 / above).
+          // tier from the pre-flight — it knows things this fallback cannot,
+          // notably the quick-preset-on-a-large-spot downgrade (a starved
+          // inner budget over many leaves reads navigation, not medium).
+          // The local fallback only runs when the estimate failed, and is
+          // SPR-only (≤3 / ≤6 / above), so the two can legitimately differ.
           const de = exactPreflight?.decompose;
           const tier = de?.ok
             ? de.quality_tier

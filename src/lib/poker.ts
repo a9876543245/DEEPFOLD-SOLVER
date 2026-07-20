@@ -343,14 +343,19 @@ export interface EstimateResponse {
 export interface DecomposeEstimate {
   ok: boolean;
   /** Whether 'auto' decomposition is predicted to actually engage on this
-   *  spot (builder collapse — exact — plus a state-vs-budget mirror that
-   *  deliberately over-predicts on iso boards: a false "will decompose"
-   *  shows a scary ETA that turns out fast; a false "won't" means an
-   *  unwarned 90-minute wait). */
+   *  spot: builder collapse (exact) plus a state-vs-budget mirror of the
+   *  engine's ① collapse gate. Since the compact-formula recalibration the
+   *  mirror uses the same compact state bytes and the same matchup-table
+   *  dedup rule as the real gate, so the prediction tracks real routing;
+   *  the residual bias stays mildly conservative (host bytes/cell ≥ the
+   *  GPU's uploaded 8 B/cell). */
   would_engage: boolean;
   leaves: number;
   lines: number;
   trunk_nodes: number;
+  /** GPU route: predicted VRAM-resident subgame count (0 = CPU route).
+   *  Absent on engines older than the pin-ratio ETA term. */
+  pinned_leaves_predicted?: number;
   sweeps: number;
   outer: number;
   inner: number;
