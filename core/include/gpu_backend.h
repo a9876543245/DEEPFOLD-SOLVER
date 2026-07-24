@@ -70,6 +70,14 @@ public:
     std::vector<float> compute_combo_evs_gpu() override;
     std::vector<float> compute_best_response_gpu(int player) override;
 
+    // Measured device-memory telemetry (benchmark-truth PR-1): exact
+    // compact-layout state bytes, total prepare() cudaMemGetInfo delta, and
+    // the free-VRAM high-water mark. Implemented in gpu_backend.cu because
+    // the samples live in the pimpl.
+    uint64_t allocated_state_bytes() const override;
+    uint64_t allocated_device_total_bytes() const override;
+    uint64_t measured_peak_vram_bytes() const override;
+
 private:
     // pimpl hides CUDA types from this header
     struct Impl;

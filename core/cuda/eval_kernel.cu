@@ -342,12 +342,14 @@ __global__ void terminal_level_kernel(
     float rake_cap,
     float* __restrict__ node_values)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = static_cast<int>(num_level_nodes) * num_canonical;
+    // 64-bit launch index: level_nodes × nc can exceed INT32_MAX on the
+    // 4.65M-node roadmap target (see cfr_kernel.cu).
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(num_level_nodes) * num_canonical;
     if (tid >= total) return;
 
-    int local_idx = tid / num_canonical;
-    int c = tid % num_canonical;
+    const uint32_t local_idx = static_cast<uint32_t>(tid / num_canonical);
+    const uint32_t c = static_cast<uint32_t>(tid % num_canonical);
     uint32_t n = level_node_indices[local_idx];
     if (node_types[n] != NT_TERMINAL) return;
 
@@ -680,9 +682,10 @@ void launch_terminal_level(
     float rake_cap,
     float* d_node_values)
 {
-    int block = 256;
-    int total = static_cast<int>(num_level_nodes) * nc;
-    int grid = (total + block - 1) / block;
+    const int block = 256;
+    const size_t total = static_cast<size_t>(num_level_nodes) * nc;
+    const int grid = static_cast<int>(
+        (total + block - 1) / static_cast<size_t>(block));
     if (grid == 0) return;
 
     terminal_level_kernel<<<grid, block>>>(

@@ -33,7 +33,42 @@
 #include <map>
 #include <stdexcept>
 
+#ifdef _WIN32
+// PSAPI_VERSION 2 maps GetProcessMemoryInfo → K32GetProcessMemoryInfo
+// (kernel32), so no psapi.lib link dependency.
+#define PSAPI_VERSION 2
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <sys/resource.h>
+#endif
+
 using namespace deepsolver;
+
+/// OS-reported peak working set (resident) of this process, in bytes.
+/// Measured, not estimated — the ground truth every memory estimate in the
+/// benchmark JSON is audited against. 0 if the query fails.
+static uint64_t query_peak_rss_bytes() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return static_cast<uint64_t>(pmc.PeakWorkingSetSize);
+    }
+    return 0;
+#else
+    struct rusage ru {};
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        return static_cast<uint64_t>(ru.ru_maxrss) * 1024ULL;  // KB → bytes
+    }
+    return 0;
+#endif
+}
 
 // ============================================================================
 // Argument Parsing
@@ -64,6 +99,12 @@ struct CLIArgs {
     // calls this before kicking off the real solve so the UI can show
     // "Estimated 12 minutes on CPU" before the user commits.
     bool estimate_only = false;
+
+    /// Quiet benchmark mode (P2 review): suppress the per-iteration stderr
+    /// progress callback on NORMAL solves. --benchmark presets already run
+    /// silent (the logging sits inside the timed loop and measurably
+    /// depressed short fixtures); harness fixtures pass this explicitly.
+    bool no_progress = false;
 
     // Backend selection: "auto" | "cpu" | "gpu"
     std::string backend = "auto";
@@ -201,6 +242,8 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.postsolve = argv[++i];
         } else if (arg == "--fast-postsolve") {
             args.postsolve = "none";
+        } else if (arg == "--no-progress") {
+            args.no_progress = true;
         } else if (arg == "--single-thread-postsolve") {
             args.parallel_postsolve = false;
         } else if (arg == "--parallel-postsolve") {
@@ -332,6 +375,9 @@ Arguments:
   --backend <string>       Execution backend: auto | cpu | gpu (default: auto)
   --postsolve <string>     Reporting pass: full | ev | exploitability | none
   --fast-postsolve         Alias for --postsolve none
+  --no-progress            Suppress per-iteration stderr progress (quiet
+                           benchmark mode; the logging sits inside the timed
+                           loop and depresses short-fixture iteration rates)
   --single-thread-postsolve Disable parallel postsolve passes
   --postsolve-threads <int> CPU postsolve worker cap (0 = auto)
   --force-cpu-postsolve    Skip the GPU postsolve fast path (CPU traversal)
@@ -730,6 +776,11 @@ std::string result_to_json(
 
     json << "{\n";
     json << "  \"status\": \"success\",\n";
+    // Bumped to 2 when phase_backward_* keys gained the _cpu_ms suffix and
+    // the measured-memory block landed (2026-07). Consumers should key on
+    // this instead of sniffing field names.
+    json << "  \"schema_version\": 2,\n";
+    json << "  \"tree_mode\": \"" << escape_json(result.resources.tree_mode) << "\",\n";
     json << "  \"backend\": \"" << escape_json(backend_name) << "\",\n";
     json << "  \"postsolve_mode\": \"" << escape_json(args.postsolve) << "\",\n";
     json << "  \"parallel_postsolve\": "
@@ -773,10 +824,12 @@ std::string result_to_json(
          << result.timing.phase_backward_pass_oop_ms << ",\n";
     json << "    \"phase_backward_pass_ip_ms\": "
          << result.timing.phase_backward_pass_ip_ms << ",\n";
-    json << "    \"phase_backward_showdown_ms\": "
-         << result.timing.phase_backward_showdown_ms << ",\n";
-    json << "    \"phase_backward_fold_ms\": "
-         << result.timing.phase_backward_fold_ms << ",\n";
+    // _cpu_ms: CPU-time summed across worker threads, NOT wall time — can
+    // exceed iterations_ms on multi-threaded solves.
+    json << "    \"phase_backward_showdown_cpu_ms\": "
+         << result.timing.phase_backward_showdown_cpu_ms << ",\n";
+    json << "    \"phase_backward_fold_cpu_ms\": "
+         << result.timing.phase_backward_fold_cpu_ms << ",\n";
     json << "    \"finalize_ms\": " << result.timing.finalize_ms << ",\n";
     json << "    \"combo_evs_ms\": " << result.timing.combo_evs_ms << ",\n";
     json << "    \"exploitability_ms\": " << result.timing.exploitability_ms << ",\n";
@@ -804,8 +857,25 @@ std::string result_to_json(
         json << "    \"estimated_matchup_bytes\": " << r.estimated_matchup_bytes << ",\n";
         json << "    \"estimated_cpu_state_bytes\": " << r.estimated_cpu_state_bytes << ",\n";
         json << "    \"estimated_gpu_state_bytes\": " << r.estimated_gpu_state_bytes << ",\n";
+        json << "    \"estimated_gpu_matchup_bytes\": " << r.estimated_gpu_matchup_bytes << ",\n";
         json << "    \"estimated_strategy_tree_bytes\": " << r.estimated_strategy_tree_bytes << ",\n";
         json << "    \"estimated_json_bytes\": " << r.estimated_json_bytes << ",\n";
+        json << "    \"estimated_peak_host_bytes\": " << r.estimated_peak_host_bytes << ",\n";
+        json << "    \"estimated_device_total_bytes\": " << r.estimated_device_total_bytes << ",\n";
+        json << "    \"estimated_overhead_bytes\": " << r.estimated_overhead_bytes << ",\n";
+        // Decomposed runs keep the monolithic PREFIX solve's timing/resources
+        // (aggregation unbuilt) — consumers must not read these numbers as
+        // describing the decomposition.
+        json << "    \"telemetry_scope\": \""
+             << (r.tree_mode == "decomposed" ? "monolithic_prefix" : "solve")
+             << "\",\n";
+        json << "    \"measured_peak_rss_bytes\": " << r.measured_peak_rss_bytes << ",\n";
+        json << "    \"measured_rss_after_prepare_bytes\": " << r.measured_rss_after_prepare_bytes << ",\n";
+        json << "    \"measured_rss_after_iterations_bytes\": " << r.measured_rss_after_iterations_bytes << ",\n";
+        json << "    \"measured_rss_after_finalize_bytes\": " << r.measured_rss_after_finalize_bytes << ",\n";
+        json << "    \"measured_peak_vram_bytes\": " << r.measured_peak_vram_bytes << ",\n";
+        json << "    \"allocated_state_bytes\": " << r.allocated_state_bytes << ",\n";
+        json << "    \"allocated_device_total_bytes\": " << r.allocated_device_total_bytes << ",\n";
         json << "    \"host_budget_bytes\": " << r.host_budget_bytes << ",\n";
         json << "    \"gpu_budget_bytes\": " << r.gpu_budget_bytes << ",\n";
         json << "    \"strategy_tree_max_nodes\": " << r.strategy_tree_max_nodes << ",\n";
@@ -1213,10 +1283,10 @@ void run_benchmark_matrix(std::ostream& out, bool include_scalar) {
                 << res.timing.phase_backward_pass_oop_ms << ",\n";
             out << "        \"phase_backward_pass_ip\": "
                 << res.timing.phase_backward_pass_ip_ms << ",\n";
-            out << "        \"phase_backward_showdown\": "
-                << res.timing.phase_backward_showdown_ms << ",\n";
-            out << "        \"phase_backward_fold\": "
-                << res.timing.phase_backward_fold_ms << ",\n";
+            out << "        \"phase_backward_showdown_cpu\": "
+                << res.timing.phase_backward_showdown_cpu_ms << ",\n";
+            out << "        \"phase_backward_fold_cpu\": "
+                << res.timing.phase_backward_fold_cpu_ms << ",\n";
             out << "        \"total\": "              << res.timing.total_ms << "\n";
             out << "      },\n";
             out << "      \"iterations_per_sec\": "   << iter_per_sec << ",\n";
@@ -1563,6 +1633,9 @@ int main(int argc, char* argv[]) {
         config.bet_sizing.turn_sizes = args.turn_sizes;
         config.bet_sizing.river_sizes = args.river_sizes;
         config.oop_has_initiative = (args.oop_has_initiative != 0);
+        // Output plan (review round 2): the memory gates only price the
+        // navigation cache + full JSON when we will actually emit them.
+        config.emit_strategy_tree = args.emit_strategy_tree;
         config.allow_donk_bet = (args.allow_donk_bet != 0);
         config.parallel_postsolve = args.parallel_postsolve;
         config.postsolve_threads = args.postsolve_threads;
@@ -1688,6 +1761,10 @@ int main(int argc, char* argv[]) {
         BackendType backend_type = parse_backend_type(args.backend);
 
         Solver solver(config, backend_type);
+        // P1-1 phase-lifetime telemetry: let the solver sample peak RSS at
+        // phase boundaries (prepare / iterations / finalize) without the
+        // header ever touching OS APIs.
+        solver.set_rss_probe(&query_peak_rss_bytes);
 
         // v1.2.2: --estimate-only — build tree + estimate, emit JSON, exit.
         // Used by frontend to show ETA banner before committing to the
@@ -1696,12 +1773,17 @@ int main(int argc, char* argv[]) {
             SolveResources r = solver.estimate_only();
             std::cout << "{\n"
                       << "  \"status\": \"estimate\",\n"
+                      << "  \"schema_version\": 2,\n"
                       << "  \"resources\": {\n"
                       << "    \"canonical_combos\": " << r.canonical_combos << ",\n"
                       << "    \"player_nodes\": " << r.player_nodes << ",\n"
                       << "    \"estimated_matchup_bytes\": " << r.estimated_matchup_bytes << ",\n"
                       << "    \"estimated_cpu_state_bytes\": " << r.estimated_cpu_state_bytes << ",\n"
                       << "    \"estimated_gpu_state_bytes\": " << r.estimated_gpu_state_bytes << ",\n"
+                      << "    \"estimated_gpu_matchup_bytes\": " << r.estimated_gpu_matchup_bytes << ",\n"
+                      << "    \"estimated_peak_host_bytes\": " << r.estimated_peak_host_bytes << ",\n"
+                      << "    \"estimated_device_total_bytes\": " << r.estimated_device_total_bytes << ",\n"
+                      << "    \"estimated_overhead_bytes\": " << r.estimated_overhead_bytes << ",\n"
                       << "    \"estimated_strategy_tree_bytes\": " << r.estimated_strategy_tree_bytes << ",\n"
                       << "    \"estimated_json_bytes\": " << r.estimated_json_bytes << ",\n"
                       << "    \"host_budget_bytes\": " << r.host_budget_bytes << ",\n"
@@ -1729,15 +1811,14 @@ int main(int argc, char* argv[]) {
                 // Exact trigger (rainbow/huge boards) and is exact at
                 // estimate time. On top, mirror the ① state gate with the
                 // quantities the estimate has — since the compact-formula
-                // recalibration both terms are near-exact: gpu_state uses
-                // the same B1a compact formula as the gate, and the matchup
+                // recalibration both terms are exact matches of the gate:
+                // gpu_state uses the same B1a compact formula, the matchup
                 // count is the same dedup rule precompute_matchups applies
                 // (the old chance-child proxy over-counted ~30× on iso
-                // boards). Residual bias stays conservative: host
-                // bytes-per-cell (EV+valid+category ≥9 B) over the GPU's
-                // uploaded 8 B/cell. A false "will decompose" shows a scary
-                // ETA that turns out fast; a false "won't" would mean an
-                // unwarned 90-minute wait.
+                // boards), and the GPU term now uses the device-upload
+                // bytes-per-cell (estimated_gpu_matchup_bytes, 8 B/cell)
+                // rather than the host 9 B/cell that used to bias this
+                // toward false "will decompose" banners.
                 bool engage_via_collapse = r.runout_approximated;
                 if (!engage_via_collapse) {
                     const bool gpu_planned =
@@ -1747,13 +1828,21 @@ int main(int argc, char* argv[]) {
                             ? r.gpu_budget_bytes
                             : static_cast<uint64_t>(
                                   static_cast<double>(gpu_free_bytes()) * 0.80);
+                        // Same device-TOTAL formula as the ① state gate
+                        // (review round 2 P1-3) — the two must not disagree.
                         engage_via_collapse = budget > 0 &&
-                            (r.estimated_gpu_state_bytes +
-                             r.estimated_matchup_bytes) > budget;
+                            r.estimated_device_total_bytes > budget;
                     } else {
+                        // Mirror the state gate's CPU expression exactly:
+                        // peak-host minus the output caches (tree/JSON) IS
+                        // matchup + CPU state + 2× final strategy + process
+                        // overhead, by construction in estimate_only().
+                        const uint64_t gate_view =
+                            r.estimated_peak_host_bytes
+                          - r.estimated_strategy_tree_bytes
+                          - r.estimated_json_bytes;
                         engage_via_collapse = r.host_budget_bytes > 0 &&
-                            (r.estimated_matchup_bytes +
-                             r.estimated_cpu_state_bytes) > r.host_budget_bytes;
+                            gate_view > r.host_budget_bytes;
                     }
                 }
                 const bool would_engage =
@@ -1806,7 +1895,8 @@ int main(int argc, char* argv[]) {
         bool monolithic_ok = true;
         std::string monolithic_err;
         try {
-            result = solver.solve(benchmark_mode ? ProgressCallback{} : progress);
+            result = solver.solve((benchmark_mode || args.no_progress)
+                                      ? ProgressCallback{} : progress);
         } catch (const std::exception& e) {
             // Roadmap ① (post-v1.9.0): a backend OOM on an enumerated tree
             // used to kill the whole run before --decompose-runouts could
@@ -2000,6 +2090,16 @@ int main(int argc, char* argv[]) {
             result.resources.strategy_tree_truncated = tree_truncated;
         }
 
+        // Benchmark-truth PR-1: capture the OS-reported peak working set once,
+        // right before serialization — every allocation phase (tree, matchup,
+        // backend state, strategy tree) has already happened by now.
+        result.resources.measured_peak_rss_bytes = query_peak_rss_bytes();
+        // Benchmark contract: tree provenance as one enum-like string, so
+        // no consumer ever has to reconstruct it from two booleans.
+        result.resources.tree_mode = decomposed
+            ? "decomposed"
+            : (result.runout_approximated ? "collapsed" : "enumerated");
+
         // Polish #2: in --benchmark mode, replace the standard JSON output
         // with a compact benchmark report so callers can grep perf metrics
         // without parsing the full 24 MB strategy tree blob.
@@ -2012,17 +2112,45 @@ int main(int argc, char* argv[]) {
             const double nodes_per_sec = iter_ms > 0
                 ? (static_cast<double>(tree_nodes) * static_cast<double>(result.iterations_run) / (iter_ms / 1000.0))
                 : 0.0;
-            // Sum the estimated memory components for a single "what does this
-            // solve cost" number. Matchup tables dominate on iso-engaged trees;
-            // CPU state dominates on rainbow flops.
-            const uint64_t total_est_bytes =
-                result.resources.estimated_matchup_bytes +
-                result.resources.estimated_cpu_state_bytes +
-                result.resources.estimated_strategy_tree_bytes +
-                result.resources.estimated_json_bytes;
-            const double mem_est_mb = static_cast<double>(total_est_bytes) / (1024.0 * 1024.0);
+            // Backend-specific memory accounting (benchmark-truth PR-1).
+            // Pre-change, this sum always charged estimated_cpu_state_bytes —
+            // GPU benchmarks reported CPU state they never allocate and no
+            // VRAM cost at all. Split by what the executing backend touches:
+            //   CPU: host matchup + CPU state (incl. levelized extra) + output
+            //   GPU: device state + device matchup upload (VRAM), plus the
+            //        host-side matchup tables (still materialized by
+            //        precompute_matchups — A4-host) + output (host aux).
+            const auto& rr = result.resources;
+            // GPT Phase-0 review P1-2: "decomposed-gpu"/"decomposed-cpu" do
+            // NOT start with "CUDA" — classify decomposed runs as their own
+            // backend_class instead of silently binning them as cpu. Their
+            // timing/resources still describe the monolithic PREFIX solve
+            // (the decomposition route only overwrites strategy/exploit/
+            // iterations), so the memory block is flagged, not trusted.
+            const bool is_gpu_backend = backend_name.rfind("CUDA", 0) == 0;
+            const std::string backend_class = decomposed
+                ? backend_name  // "decomposed-gpu" | "decomposed-cpu"
+                : (is_gpu_backend ? "gpu" : "cpu");
+            const uint64_t output_bytes =
+                rr.estimated_strategy_tree_bytes + rr.estimated_json_bytes;
+            // Device TOTAL (state + matchup upload + tree/levels + reserve)
+            // — same number the VRAM ceiling gates on.
+            const uint64_t est_vram_bytes = is_gpu_backend
+                ? (rr.estimated_device_total_bytes > 0
+                       ? rr.estimated_device_total_bytes
+                       : rr.estimated_gpu_state_bytes + rr.estimated_gpu_matchup_bytes)
+                : 0;
+            const uint64_t est_host_bytes = is_gpu_backend
+                ? (rr.estimated_matchup_bytes + output_bytes)
+                : (rr.estimated_matchup_bytes + rr.estimated_cpu_state_bytes
+                   + output_bytes);
+            const double to_mb = 1.0 / (1024.0 * 1024.0);
+            const double mem_est_mb =
+                static_cast<double>(est_host_bytes + est_vram_bytes) * to_mb;
+            const uint64_t peak_rss_bytes = rr.measured_peak_rss_bytes;
 
             std::cout << "{\n"
+                      << "  \"schema_version\": 2,\n"
                       << "  \"benchmark\": \"" << escape_json(args.benchmark) << "\",\n"
                       << "  \"board\": \"" << escape_json(args.board_str) << "\",\n"
                       << "  \"backend\": \"" << escape_json(backend_name) << "\",\n"
@@ -2031,6 +2159,61 @@ int main(int argc, char* argv[]) {
                       << "  \"iterations_per_sec\": " << iters_per_sec << ",\n"
                       << "  \"nodes_per_sec\": " << nodes_per_sec << ",\n"
                       << "  \"memory_estimate_mb\": " << mem_est_mb << ",\n"
+                      // Tree-state provenance (benchmark contract): a collapsed
+                      // or decomposed run must never be read as an enumerated
+                      // baseline.
+                      << "  \"tree_mode\": \"" << escape_json(rr.tree_mode) << "\",\n"
+                      << "  \"runout_approximated\": "
+                      << (result.runout_approximated ? "true" : "false") << ",\n"
+                      << "  \"decomposed\": " << (decomposed ? "true" : "false") << ",\n"
+                      << "  \"canonical_combos\": " << rr.canonical_combos << ",\n"
+                      << "  \"player_nodes\": " << rr.player_nodes << ",\n"
+                      << "  \"threads_requested\": " << args.cpu_threads << ",\n"
+                      << "  \"memory\": {\n"
+                      << "    \"backend_class\": \"" << escape_json(backend_class) << "\",\n"
+                      // On decomposed runs every number below describes the
+                      // monolithic prefix solve, NOT the decomposition.
+                      << "    \"telemetry_scope\": \""
+                      << (decomposed ? "monolithic_prefix" : "solve") << "\",\n"
+                      << "    \"estimated_host_mb\": "
+                      << static_cast<double>(est_host_bytes) * to_mb << ",\n"
+                      << "    \"estimated_peak_host_mb\": "
+                      << static_cast<double>(rr.estimated_peak_host_bytes) * to_mb << ",\n"
+                      << "    \"estimated_vram_mb\": "
+                      << static_cast<double>(est_vram_bytes) * to_mb << ",\n"
+                      << "    \"estimated\": {\n"
+                      << "      \"matchup_host_mb\": "
+                      << static_cast<double>(rr.estimated_matchup_bytes) * to_mb << ",\n"
+                      << "      \"cpu_state_mb\": "
+                      << static_cast<double>(rr.estimated_cpu_state_bytes) * to_mb << ",\n"
+                      << "      \"gpu_state_mb\": "
+                      << static_cast<double>(rr.estimated_gpu_state_bytes) * to_mb << ",\n"
+                      << "      \"gpu_matchup_mb\": "
+                      << static_cast<double>(rr.estimated_gpu_matchup_bytes) * to_mb << ",\n"
+                      << "      \"device_total_mb\": "
+                      << static_cast<double>(rr.estimated_device_total_bytes) * to_mb << ",\n"
+                      << "      \"overhead_mb\": "
+                      << static_cast<double>(rr.estimated_overhead_bytes) * to_mb << ",\n"
+                      << "      \"output_mb\": "
+                      << static_cast<double>(output_bytes) * to_mb << "\n"
+                      << "    },\n"
+                      << "    \"measured\": {\n"
+                      << "      \"peak_rss_mb\": "
+                      << static_cast<double>(peak_rss_bytes) * to_mb << ",\n"
+                      << "      \"rss_after_prepare_mb\": "
+                      << static_cast<double>(rr.measured_rss_after_prepare_bytes) * to_mb << ",\n"
+                      << "      \"rss_after_iterations_mb\": "
+                      << static_cast<double>(rr.measured_rss_after_iterations_bytes) * to_mb << ",\n"
+                      << "      \"rss_after_finalize_mb\": "
+                      << static_cast<double>(rr.measured_rss_after_finalize_bytes) * to_mb << ",\n"
+                      << "      \"peak_vram_mb\": "
+                      << static_cast<double>(rr.measured_peak_vram_bytes) * to_mb << ",\n"
+                      << "      \"backend_state_mb\": "
+                      << static_cast<double>(rr.allocated_state_bytes) * to_mb << ",\n"
+                      << "      \"device_total_mb\": "
+                      << static_cast<double>(rr.allocated_device_total_bytes) * to_mb << "\n"
+                      << "    }\n"
+                      << "  },\n"
                       << "  \"tree_nodes\": " << tree_nodes << ",\n"
                       << "  \"cpu\": {\n"
                       << "    \"simd\": \"" << escape_json(result.resources.cpu_simd) << "\",\n"
@@ -2056,17 +2239,39 @@ int main(int argc, char* argv[]) {
                       << result.timing.phase_backward_pass_oop_ms << ",\n"
                       << "    \"phase_backward_pass_ip_ms\": "
                       << result.timing.phase_backward_pass_ip_ms << ",\n"
-                      << "    \"phase_backward_showdown_ms\": "
-                      << result.timing.phase_backward_showdown_ms << ",\n"
-                      << "    \"phase_backward_fold_ms\": "
-                      << result.timing.phase_backward_fold_ms << ",\n"
+                      << "    \"phase_backward_showdown_cpu_ms\": "
+                      << result.timing.phase_backward_showdown_cpu_ms << ",\n"
+                      << "    \"phase_backward_fold_cpu_ms\": "
+                      << result.timing.phase_backward_fold_cpu_ms << ",\n"
                       << "    \"finalize_ms\": " << result.timing.finalize_ms << ",\n"
                       << "    \"postsolve_ms\": " << result.timing.postsolve_ms << "\n"
                       << "  }\n"
                       << "}\n";
         } else {
             // Output JSON to stdout (with the strategy tree appended).
-            std::cout << result_to_json(result, args, backend_name, strategy_tree_ptr);
+            std::string out_json =
+                result_to_json(result, args, backend_name, strategy_tree_ptr);
+            // Review round 2: serializing a large strategy tree into the
+            // ostringstream above IS a real host-memory phase — re-sample
+            // the peak after building the string and patch the token so
+            // measured_peak_rss covers serialization too. The token is our
+            // own fixed format, so first-occurrence replace is exact.
+            const uint64_t rss_final = query_peak_rss_bytes();
+            if (rss_final > result.resources.measured_peak_rss_bytes) {
+                char oldtok[64], newtok[64];
+                snprintf(oldtok, sizeof(oldtok),
+                         "\"measured_peak_rss_bytes\": %llu",
+                         static_cast<unsigned long long>(
+                             result.resources.measured_peak_rss_bytes));
+                snprintf(newtok, sizeof(newtok),
+                         "\"measured_peak_rss_bytes\": %llu",
+                         static_cast<unsigned long long>(rss_final));
+                const std::size_t pos = out_json.find(oldtok);
+                if (pos != std::string::npos) {
+                    out_json.replace(pos, std::strlen(oldtok), newtok);
+                }
+            }
+            std::cout << out_json;
         }
 
     } catch (const std::exception& e) {

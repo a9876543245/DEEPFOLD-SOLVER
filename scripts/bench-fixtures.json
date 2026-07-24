@@ -1,0 +1,86 @@
+{
+  "comment": [
+    "Benchmark fixture manifest (FABLE_SOLVER_OPTIMIZATION_REPORT §12 / PR-1).",
+    "Run via: node scripts/bench-matrix.mjs [--exe <path>] [--runs 5] [--only <name,...>]",
+    "Every fixture is a full CLI solve (NOT --benchmark presets) so the JSON",
+    "carries resources.measured_* and tree_mode provenance.",
+    "Contract (GPT Phase-0 review P1-3/P1-5): every fixture DECLARES",
+    "expected_tree_mode and (if capped) expected_threads; the harness",
+    "hard-fails the fixture when the solve's tree_mode differs or the",
+    "effective thread count is silently clamped below the request — a",
+    "collapsed run must never be quoted as an enumerated baseline, and an",
+    "8-thread run must never be quoted as 16T.",
+    "Correctness micros live in ctest (smoke|parity labels), not here.",
+    "The 4.65M-node memory-unlock spots (m0_b6/m0_b7 full app menus) cannot",
+    "run under CLI-default menus — add them once inc3+B3 land and the full",
+    "menu flags are scripted."
+  ],
+  "fixtures": [
+    {
+      "name": "std_gpu",
+      "family": "performance",
+      "expected_tree_mode": "collapsed",
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKd7c",
+               "--iterations", "100", "--exploitability", "0",
+               "--backend", "gpu", "--postsolve", "none",
+               "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "std_cpu8",
+      "family": "performance",
+      "expected_tree_mode": "collapsed",
+      "expected_threads": 8,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKd7c",
+               "--iterations", "100", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "mono_gpu",
+      "family": "performance",
+      "expected_tree_mode": "enumerated",
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKsQs",
+               "--iterations", "20", "--exploitability", "0",
+               "--backend", "gpu", "--postsolve", "none",
+               "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "mono_cpu8",
+      "family": "performance",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 8,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKsQs",
+               "--iterations", "20", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "mono_cpu16",
+      "family": "performance",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 16,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKsQs",
+               "--iterations", "20", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "16",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "turn_gpu",
+      "family": "performance",
+      "expected_tree_mode": "enumerated",
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKd7c2h",
+               "--iterations", "100", "--exploitability", "0",
+               "--backend", "gpu", "--postsolve", "none",
+               "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "mono_gate_fits_cpu",
+      "family": "memory",
+      "expected_tree_mode": "enumerated",
+      "args": ["--pot", "100", "--stack", "500", "--board", "Ah9h4h",
+               "--iterations", "5", "--exploitability", "0",
+               "--backend", "cpu", "--postsolve", "none",
+               "--host-memory-mb", "2900", "--no-strategy-tree", "--no-progress"]
+    }
+  ]
+}

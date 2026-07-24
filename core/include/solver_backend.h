@@ -259,11 +259,32 @@ public:
     virtual double phase_forward_pass_ms()      const { return 0.0; }
     virtual double phase_backward_pass_oop_ms() const { return 0.0; }
     virtual double phase_backward_pass_ip_ms()  const { return 0.0; }
-    // CPU-seconds (sum across threads) inside terminal evaluation, split by
-    // terminal type. Diagnostic only — used to decide whether to attack
-    // showdown matrix kernels or fold accumulation next.
-    virtual double phase_backward_showdown_ms() const { return 0.0; }
-    virtual double phase_backward_fold_ms()     const { return 0.0; }
+    // CPU-milliseconds (sum across threads) inside terminal evaluation,
+    // split by terminal type. NOT wall time — can exceed iteration wall time
+    // on multi-threaded runs, hence the `_cpu_ms` suffix. Diagnostic only —
+    // used to decide whether to attack showdown matrix kernels or fold
+    // accumulation next.
+    virtual double phase_backward_showdown_cpu_ms() const { return 0.0; }
+    virtual double phase_backward_fold_cpu_ms()     const { return 0.0; }
+
+    /// Bytes of backing store this backend actually allocated for solver
+    /// STATE (regrets / strategy accumulation / reach / values) — exact
+    /// buffer sizes on both CPU (vector sums) and GPU (computed from the
+    /// compact layout at prepare). 0 = not instrumented. Lets callers audit
+    /// estimator-vs-allocation drift without a profiler attached.
+    virtual uint64_t allocated_state_bytes() const { return 0; }
+
+    /// GPU only: TOTAL device bytes this backend's prepare() claimed
+    /// (state + matchup upload + tree metadata + levels + locks, including
+    /// allocator granularity), measured via cudaMemGetInfo delta. 0 on CPU
+    /// backends. Kept separate from allocated_state_bytes so state-level
+    /// estimator audits are never polluted by non-state uploads.
+    virtual uint64_t allocated_device_total_bytes() const { return 0; }
+
+    /// Peak device-memory usage in bytes, measured (not estimated) via
+    /// cudaMemGetInfo deltas across prepare/finalize/postsolve. 0 for CPU
+    /// backends or when the probe is unavailable.
+    virtual uint64_t measured_peak_vram_bytes() const { return 0; }
 
     // CPU-only sparse traversal / terminal gate diagnostics. GPU backends and
     // backends that do not expose these choices return an unavailable block.

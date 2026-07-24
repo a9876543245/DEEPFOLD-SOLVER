@@ -33,7 +33,17 @@ foreach(run 1 2)
   if(NOT rc_${run} EQUAL 0)
     message(FATAL_ERROR "run ${run} failed (rc=${rc_${run}}): ${err_${run}}")
   endif()
+  # Strip timing (_ms) lines AND measured telemetry (peak/phase RSS, peak
+  # VRAM, backend allocations) — all legitimately run-varying. Three
+  # separate single-literal passes on purpose: CMake's backtracking regex
+  # engine handles `[^\n]*literal[^\n]*\n` fine on the ~2.7 MB stdout, but
+  # an alternation group `(a|b|c)` in the same shape degrades past the test
+  # timeout. Do not "simplify" these back into one alternation. The
+  # `measured_`/`allocated_` prefixes intentionally cover every current and
+  # future field in those families.
   string(REGEX REPLACE "[^\n]*_ms[^\n]*\n" "" out_${run} "${out_${run}}")
+  string(REGEX REPLACE "[^\n]*measured_[^\n]*\n" "" out_${run} "${out_${run}}")
+  string(REGEX REPLACE "[^\n]*allocated_[^\n]*\n" "" out_${run} "${out_${run}}")
   if(out_${run} STREQUAL "")
     message(FATAL_ERROR "run ${run} produced no JSON output")
   endif()

@@ -75,11 +75,38 @@ constexpr uint64_t kSignedCountMatchupBytesPerCell =
     kBaseMatchupBytesPerCell + sizeof(int8_t);
 constexpr uint64_t kMatchupBytesPerCell = kBaseMatchupBytesPerCell;
 
-/// CPU backend keeps three float arrays per (player_node × max_actions × nc):
-/// regrets, strategy_sum, current_strategy. The accumulating action_values
-/// is a fourth, but we pessimistically count three for the steady-state,
-/// transient Phase-1 buffers, plus a small slack.
+/// CPU backend keeps three strategy-shaped float arrays: regrets,
+/// strategy_sum, current_strategy. Sized by ACTUAL per-node action slots
+/// (Σ num_children over player nodes), not MAX_ACTIONS — see
+/// bytes_for_cpu_state_compact.
 constexpr uint64_t kCpuStateArraysPerNode = 3;
+
+/// LevelizedCpuBackend pads every nc-wide row up to a SIMD lane multiple
+/// (action_stride_ = round_up_to_lane(nc)). MUST stay equal to
+/// LevelizedCpuBackend::kActionLane — the estimator mirrors the backend's
+/// real allocation, and a drift here silently re-opens the estimate ≠
+/// allocation gap this constant exists to close.
+constexpr uint64_t kCpuActionLaneFloats = 8;
+
+/// Peak-host lifetime model constants (GPT Phase-0 review P1-1). The state
+/// estimator being byte-exact is NOT the same as the solve's host PEAK:
+/// finalize materializes the averaged strategy TWICE (backend nested copy +
+/// Solver::strategy_ deep copy at solver.h `strategy_ = backend_->strategy()`;
+/// on GPU the flat download staging overlaps the nested repack at the same
+/// size). Model validated 2026-07-21 against measured peak RSS:
+///   mono CPU  .528 matchup + 1.470 state + 2×.236 strategy + base ≈ 2.52 GB
+///             vs 2.433 GB measured   (+3.6%)
+///   mono GPU  .528 + 2×.236 + context ≈ 1.16 GB vs 1.166 GB measured
+///   std  GPU  .012 + .007 + context ≈ .138 GB vs .144 GB measured
+/// Process baseline (CRT, tree arrays, iso tables, code) — small but real.
+constexpr uint64_t kHostProcessOverheadBytes = 96ULL * 1024ULL * 1024ULL;
+/// CUDA runtime/context host-side RSS (driver pools, pinned staging).
+/// Measured 125–140 MB on CUDA 13.2 / Win11 / RTX 5090; padded slightly.
+constexpr uint64_t kGpuHostContextBytes = 160ULL * 1024ULL * 1024ULL;
+/// Result JSON floor when the navigation strategy tree is NOT emitted
+/// (--no-strategy-tree): root strategies + diagnostics + resources, no
+/// per-node cache. Measured ~0.3–2.7 MB depending on nc.
+constexpr uint64_t kNoTreeJsonFloorBytes = 4ULL * 1024ULL * 1024ULL;
 
 /// GPU backend keeps regrets, strategy_sum, current_strategy (3 compact
 /// strat-shaped buffers of Σ-player-actions × nc; B1a inc 2 dropped
@@ -117,14 +144,30 @@ struct SolveFootprintEstimate {
     uint64_t matchup_tables_bytes      = 0;
     uint64_t cpu_state_bytes           = 0;
     uint64_t gpu_state_bytes           = 0;
+    /// Device TOTAL a GPU solve would claim (state + matchup upload + tree
+    /// metadata + levels + reserve). This — not gpu_state_bytes — is what
+    /// the VRAM ceiling compares (review round 2 P1-3: a dense turn solve
+    /// measurably exceeded the user's --gpu-memory-mb while the state-only
+    /// check said "ok"). 0 on CPU-final footprints.
+    uint64_t device_total_bytes        = 0;
+    /// Peak-host lifetime terms (P1-1): 2× the materialized final strategy
+    /// (backend nested copy + Solver deep copy, both alive after finalize)
+    /// plus process/CUDA-context overhead. Without these the host gate
+    /// passed solves whose finalize then blew the budget (measured: mono
+    /// CPU est 2.00 GB vs 2.43 GB actual peak).
+    uint64_t final_strategy_bytes      = 0;   ///< ONE copy; total charges 2×.
+    uint64_t process_overhead_bytes    = 0;
     uint64_t strategy_tree_ev_bytes    = 0;
     uint64_t json_response_bytes       = 0;
 
-    /// Sum of all host-side estimates (matchup + CPU state + strategy-tree
-    /// EV cache + JSON). We exclude GPU state — that lives in VRAM.
+    /// Peak host-side estimate across the whole solve lifetime (prepare →
+    /// iterate → finalize → serialize). Excludes GPU state — that lives in
+    /// VRAM.
     uint64_t total_host_bytes() const {
         return matchup_tables_bytes
              + cpu_state_bytes
+             + 2ULL * final_strategy_bytes
+             + process_overhead_bytes
              + strategy_tree_ev_bytes
              + json_response_bytes;
     }
@@ -152,14 +195,45 @@ inline uint64_t bytes_for_matchup_tables(
          * bytes_per_cell;
 }
 
-/// Bytes for the CPU CFR state. Counts regrets + strategy_sum + current_strategy
-/// (three arrays). action_values is a transient stack-allocated vector in
-/// CPU traversal, not heap.
-inline uint64_t bytes_for_cpu_state(uint64_t player_nodes, uint64_t max_actions,
-                                     uint64_t nc) {
-    return player_nodes * max_actions * nc
+/// Lane-rounded row width the levelized CPU backend actually allocates for
+/// every nc-wide row (mirrors LevelizedCpuBackend::round_up_to_lane).
+inline uint64_t cpu_lane_stride(uint64_t nc) {
+    return (nc + memory_budget::kCpuActionLaneFloats - 1)
+         & ~(memory_budget::kCpuActionLaneFloats - 1);
+}
+
+/// Bytes for the CPU CFR state. Counts regrets + strategy_sum +
+/// current_strategy (three arrays), each `player_action_slots ×
+/// lane-rounded nc` floats, where player_action_slots = Σ num_children over
+/// PLAYER nodes. This mirrors LevelizedCpuBackend::prepare()'s compact
+/// allocation exactly (node_state_offset_ prefix sum over actual action
+/// counts). The reference recursive backend allocates the same slot count as
+/// per-node vectors (un-padded), so this is a ≤1% overestimate there.
+///
+/// Renamed (not just re-derived) from bytes_for_cpu_state(player_nodes,
+/// MAX_ACTIONS, nc): the old formula priced every player node at MAX_ACTIONS
+/// (6) instead of its real action count — a ~77% overestimate on the
+/// enumerated monotone fixture (2.61 GB reported vs 1.47 GB allocated) that
+/// caused false host-gate collapses. Any caller still passing MAX_ACTIONS
+/// now fails to compile instead of silently mis-estimating.
+inline uint64_t bytes_for_cpu_state_compact(uint64_t player_action_slots,
+                                            uint64_t nc) {
+    return player_action_slots * cpu_lane_stride(nc)
          * memory_budget::kCpuStateArraysPerNode
          * sizeof(float);
+}
+
+/// Host bytes for ONE materialized final-strategy copy: every player node's
+/// na × nc row as an UN-padded nested vector (LevelizedCpuBackend::finalize
+/// writes na × nc, not na × stride; GPU finalize repacks to the same shape).
+/// Plus per-row vector headers, which stop being noise at 100k+ nodes.
+/// The peak-host model charges TWO of these (backend copy + Solver copy —
+/// both alive after `strategy_ = backend_->strategy()`).
+inline uint64_t bytes_for_final_strategy(uint64_t player_action_slots,
+                                         uint64_t nc,
+                                         uint64_t player_nodes) {
+    return player_action_slots * nc * sizeof(float)
+         + player_nodes * 32ULL;  // vector header + allocator slack per row
 }
 
 /// v1.7.0: extra heap held by the levelized CPU backend on top of the
@@ -167,7 +241,7 @@ inline uint64_t bytes_for_cpu_state(uint64_t player_nodes, uint64_t max_actions,
 /// buffers — `reach_oop_`, `reach_ip_`, and `value_` — that the recursive
 /// reference backend doesn't need (it carries reach on the call stack).
 ///
-///   total = 3 × total_nodes × nc × sizeof(float)
+///   total = 3 × total_nodes × lane-rounded nc × sizeof(float)
 ///
 /// On a 200k-node tree with nc=1326 that lands at ~3.2 GB, easily enough to
 /// blow a tight host-RAM budget. Add this to `cpu_state_bytes` whenever the
@@ -175,9 +249,11 @@ inline uint64_t bytes_for_cpu_state(uint64_t player_nodes, uint64_t max_actions,
 /// before LevelizedCpuBackend::prepare() heap-allocates.
 ///
 /// `total_nodes` is `tree.total_nodes` (every node, not just player nodes —
-/// reach is propagated through chance nodes too). `nc` is iso.num_canonical.
+/// reach is propagated through chance nodes too). `nc` is iso.num_canonical;
+/// the backend pads each row to row_stride_ = round_up_to_lane(nc), so the
+/// estimator uses the same lane-rounded width.
 inline uint64_t bytes_for_levelized_cpu_extra(uint64_t total_nodes, uint64_t nc) {
-    return total_nodes * nc * 3ULL * sizeof(float);
+    return total_nodes * cpu_lane_stride(nc) * 3ULL * sizeof(float);
 }
 
 /// Bytes for the GPU CFR state. Lives in VRAM. Mirrors the COMPACT layout
@@ -203,6 +279,34 @@ inline uint64_t bytes_for_gpu_state_compact(uint64_t total_nodes,
                                             uint64_t nc) {
     return (3ULL * player_action_slots + 3ULL * total_nodes) * nc * sizeof(float)
          + total_nodes * sizeof(uint32_t);
+}
+
+/// Device-side TOTAL for a GPU solve (review round 2, P1-3): the VRAM
+/// ceiling must compare what prepare() actually claims, not just solver
+/// state. Components mirror GpuBackend::prepare():
+///   - solver state (compact, bytes_for_gpu_state_compact)
+///   - dense matchup upload (EV+valid floats; the rank-blocker skip on
+///     singleton boards makes this an upper bound there)
+///   - tree metadata uploads (upload_tree: ~24 B/node + 5 B/edge)
+///   - level schedule (~4 B/node)
+///   - allocator-granularity + small-buffer reserve (reach/locks/rank
+///     tables): 8 MiB + ~3% of the two big terms.
+/// Validated against measured cudaMemGetInfo prepare deltas:
+///   mono AsKsQs  est ~1875 MiB vs 1822 MiB measured  (+2.9%)
+///   dense turn   est ~70 MiB  vs 70 MiB measured
+inline uint64_t bytes_for_gpu_device_total(uint64_t total_nodes,
+                                           uint64_t total_edges,
+                                           uint64_t player_action_slots,
+                                           uint64_t matchup_tables,
+                                           uint64_t nc) {
+    const uint64_t state   = bytes_for_gpu_state_compact(
+        total_nodes, player_action_slots, nc);
+    const uint64_t matchup = bytes_for_matchup_tables(
+        matchup_tables, nc, 2ULL * sizeof(float));
+    const uint64_t tree    = 24ULL * total_nodes + 5ULL * total_edges;
+    const uint64_t levels  = 4ULL * total_nodes + 4096ULL;
+    const uint64_t reserve = 8ULL * 1024ULL * 1024ULL + (state + matchup) / 32ULL;
+    return state + matchup + tree + levels + reserve;
 }
 
 /// Bytes for the strategy-tree EV cache. The current implementation
@@ -393,7 +497,12 @@ inline const char* budget_decision_str(BudgetDecision d) {
 /// caller's error message points at the actual blocker.
 inline BudgetDecision evaluate_budget(const SolveFootprintEstimate& est,
                                        const MemoryBudget& budget) {
-    if (budget.gpu_bytes > 0 && est.gpu_state_bytes > budget.gpu_bytes) {
+    // Device check uses the TOTAL device claim when the footprint carries
+    // one (review round 2 P1-3); state-only is the legacy fallback for
+    // callers that haven't priced the full upload.
+    const uint64_t device_needed = est.device_total_bytes > 0
+        ? est.device_total_bytes : est.gpu_state_bytes;
+    if (budget.gpu_bytes > 0 && device_needed > budget.gpu_bytes) {
         return BudgetDecision::GPU_OOM_LIKELY;
     }
     if (budget.host_bytes > 0 && est.matchup_tables_bytes > budget.host_bytes) {

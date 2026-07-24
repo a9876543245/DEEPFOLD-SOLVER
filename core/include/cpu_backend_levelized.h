@@ -114,15 +114,29 @@ public:
     double phase_forward_pass_ms()      const { return phase_forward_pass_ms_;      }
     double phase_backward_pass_oop_ms() const { return phase_backward_pass_oop_ms_; }
     double phase_backward_pass_ip_ms()  const { return phase_backward_pass_ip_ms_;  }
-    double phase_backward_showdown_ms() const {
+    double phase_backward_showdown_cpu_ms() const override {
         double s = 0.0;
         for (double v : showdown_acc_per_thread_) s += v;
         return s * 1000.0;
     }
-    double phase_backward_fold_ms() const {
+    double phase_backward_fold_cpu_ms() const override {
         double s = 0.0;
         for (double v : fold_acc_per_thread_) s += v;
         return s * 1000.0;
+    }
+
+    // Actual heap held by the six dominant state buffers: the 3 compact
+    // strategy-shaped arrays + the 3 full-tree [N × row_stride_] flats.
+    // Scratch vectors (per-thread terminal buffers, pos-sum rows) are
+    // excluded — they are KB-scale next to these. This is the number the
+    // estimator (bytes_for_cpu_state_compact + bytes_for_levelized_cpu_extra)
+    // must land within 5% of.
+    uint64_t allocated_state_bytes() const override {
+        return static_cast<uint64_t>(
+                   regrets_.size() + strategy_sum_.size() +
+                   current_strategy_.size() +
+                   reach_oop_.size() + reach_ip_.size() + value_.size())
+             * sizeof(float);
     }
 
     CpuBackendDiagnostics cpu_diagnostics() const override {

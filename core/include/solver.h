@@ -435,6 +435,12 @@ public:
     /// default) restores the normal "compute iso from my own board" behavior.
     void set_forced_iso(const IsomorphismMapping* iso) { forced_iso_ = iso; }
 
+    /// Install a peak-RSS probe (bytes) for per-phase host-memory telemetry.
+    /// The CLI passes its OS-specific query; unset ⇒ phase RSS fields stay 0.
+    void set_rss_probe(std::function<uint64_t()> probe) {
+        rss_probe_ = std::move(probe);
+    }
+
     /// Post-solve per-combo counterfactual root value for `perspective`
     /// (0 = OOP, 1 = IP), seeded with this solve's entering reach. This is the
     /// raw "EV-out-of-subgame" primitive the decomposition feeds back into the
@@ -548,6 +554,14 @@ private:
     const IsomorphismMapping* forced_iso_ = nullptr;
     bool solved_ = false;
     int actual_iterations_run_ = 0;
+
+    /// Optional peak-RSS probe installed by the CLI (P1-1 phase-lifetime
+    /// telemetry). Lives here as a callback so this header never includes
+    /// windows.h/psapi. Unset ⇒ the per-phase RSS fields stay 0.
+    std::function<uint64_t()> rss_probe_;
+    uint64_t rss_after_prepare_bytes_    = 0;
+    uint64_t rss_after_iterations_bytes_ = 0;
+    uint64_t rss_after_finalize_bytes_   = 0;
 
     // Final results (populated after solve)
     std::vector<std::vector<float>> strategy_;
@@ -809,23 +823,31 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             // headroom factor GpuBackend's prepare pre-flight applies.
             // Probe returning 0 (no device / driver failure) skips the gate
             // — the existing prepare/create error paths handle that case.
-            state_needed = bytes_for_gpu_state_compact(total_n, player_slots, nc)
-                         + tables * nc * nc * 2ULL * sizeof(float);
+            // Device TOTAL, not state+matchup alone: tree metadata, level
+            // schedule and allocator granularity are real VRAM the prepare
+            // claims (review round 2 P1-3 — same formula as the pre-backend
+            // VRAM ceiling, so the two gates cannot disagree).
+            state_needed = bytes_for_gpu_device_total(
+                total_n, tree_.total_edges, player_slots, tables, nc);
             state_budget = config_.memory_budget.gpu_bytes > 0
                 ? config_.memory_budget.gpu_bytes
                 : static_cast<uint64_t>(
                       static_cast<double>(gpu_free_bytes()) * 0.80);
             budget_label = "VRAM";
         } else {
-            // Host footprint: matchup tables + CPU CFR state — the two
-            // unbounded terms. The strategy-tree/JSON caches are excluded
-            // on purpose: they are bounded and auto-reducible, and leaving
-            // them out keeps this gate strictly no-more-eager than the
-            // pre-backend host gate (borderline boards keep today's reject
-            // path rather than newly collapsing).
+            // Host PEAK footprint over the whole solve lifetime (P1-1):
+            // matchup tables + CPU CFR state + 2× the finalized strategy
+            // (backend nested copy + Solver's deep copy are both alive
+            // after finalize) + process overhead. The strategy-tree/JSON
+            // caches remain excluded: bounded and auto-reducible.
+            // Validated: mono fixture model 2.52 GB vs 2.43 GB measured
+            // peak RSS — without the 2× term the gate passed solves whose
+            // finalize then busted the budget.
             state_needed = bytes_for_matchup_tables(
                                tables, nc, matchup_bytes_per_cell(config_, iso_))
-                         + bytes_for_cpu_state(player_n, MAX_ACTIONS, nc);
+                         + bytes_for_cpu_state_compact(player_slots, nc)
+                         + 2ULL * bytes_for_final_strategy(player_slots, nc, player_n)
+                         + memory_budget::kHostProcessOverheadBytes;
             if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
                 state_needed += bytes_for_levelized_cpu_extra(total_n, nc);
             }
@@ -884,6 +906,12 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     // ----------------------------------------------------------------
     SolveFootprintEstimate gate_est;
     uint32_t gate_player_nodes = 0;  // reused below for the JSON-cap auto-action
+    // Raw footprint components, backend-independent. The final footprint is
+    // assembled by build_footprint() below AFTER backend resolution and all
+    // fallbacks (review round 2 P1-2).
+    uint64_t comp_matchup = 0, comp_cpu_state = 0, comp_gpu_state = 0;
+    uint64_t comp_device_total = 0, comp_final_strategy = 0;
+    uint64_t comp_tree_ev = 0, comp_json = 0;
     {
         const uint64_t nc      = iso_.num_canonical;
         const uint64_t total_n = tree_.total_nodes;
@@ -895,37 +923,70 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
                 gate_player_slots += tree_.num_children[n];
             }
         }
-        gate_est.matchup_tables_bytes   = bytes_for_matchup_tables(
+        comp_matchup = bytes_for_matchup_tables(
             matchup_ev_per_runout_.size(),
             nc,
             matchup_bytes_per_cell(config_, iso_));
-        gate_est.cpu_state_bytes        = bytes_for_cpu_state(gate_player_nodes, MAX_ACTIONS, nc);
-        // v1.7.0: levelized backend pre-allocates 3 × total_nodes × nc floats
-        // (reach_oop_, reach_ip_, value_) on top of the reference state.
-        // Only count it when the user actually selected levelized — otherwise
-        // GPU and reference solves would be told they need more host RAM
-        // than they really do.
+        comp_cpu_state = bytes_for_cpu_state_compact(gate_player_slots, nc);
+        // v1.7.0: levelized backend pre-allocates 3 × total_nodes × nc
+        // floats (reach_oop_, reach_ip_, value_) on top of the reference
+        // state. Only counted into the final footprint on CPU backends.
         if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
-            gate_est.cpu_state_bytes   += bytes_for_levelized_cpu_extra(total_n, nc);
+            comp_cpu_state += bytes_for_levelized_cpu_extra(total_n, nc);
         }
-        gate_est.gpu_state_bytes        = bytes_for_gpu_state_compact(
+        comp_gpu_state = bytes_for_gpu_state_compact(
             total_n, gate_player_slots, nc);
+        // Review round 2 P1-3: the VRAM ceiling gates on the device TOTAL
+        // (state + matchup upload + tree metadata + levels + reserve), not
+        // state alone — a dense turn solve measurably exceeded the user's
+        // --gpu-memory-mb while the state-only check said "ok".
+        comp_device_total = bytes_for_gpu_device_total(
+            total_n, tree_.total_edges, gate_player_slots,
+            matchup_ev_per_runout_.size(), nc);
+        // Peak-host lifetime terms (P1-1): finalize holds TWO materialized
+        // strategy copies on every backend.
+        comp_final_strategy = bytes_for_final_strategy(
+            gate_player_slots, nc, gate_player_nodes);
 
-        // P1-1: EV cache estimate must use the SAME cap as build_strategy_tree
-        // applies in VISIBLE mode. Without this, the estimate uses
-        // gate_player_nodes (the full tree) and the host budget gate either
-        // over-rejects in tight budgets or, worse, under-counts the actual
-        // cap effect when the budget is loose. Mirror the cap-resolution
-        // logic that build_strategy_tree() uses (cap=0 means "use full count").
-        const uint64_t ev_cache_cap = config_.memory_budget.strategy_tree_max_nodes > 0
-            ? std::min<uint64_t>(gate_player_nodes,
-                                 config_.memory_budget.strategy_tree_max_nodes)
-            : gate_player_nodes;
-        gate_est.strategy_tree_ev_bytes = bytes_for_strategy_tree_ev_cache(ev_cache_cap, nc);
-        gate_est.json_response_bytes    = bytes_for_json_response(
-            std::min<uint64_t>(gate_player_nodes,
-                               config_.memory_budget.strategy_tree_max_nodes));
+        // Output plan (review round 2): only price the navigation cache +
+        // full JSON when the caller will emit them. A --no-strategy-tree
+        // solve still produces a small result JSON — floor it instead.
+        if (config_.emit_strategy_tree) {
+            // EV cache estimate must use the SAME cap as build_strategy_tree
+            // applies in VISIBLE mode (cap=0 means "use full count").
+            const uint64_t ev_cache_cap =
+                config_.memory_budget.strategy_tree_max_nodes > 0
+                    ? std::min<uint64_t>(gate_player_nodes,
+                                         config_.memory_budget.strategy_tree_max_nodes)
+                    : gate_player_nodes;
+            comp_tree_ev = bytes_for_strategy_tree_ev_cache(ev_cache_cap, nc);
+            comp_json    = bytes_for_json_response(
+                std::min<uint64_t>(gate_player_nodes,
+                                   config_.memory_budget.strategy_tree_max_nodes));
+        } else {
+            comp_json = memory_budget::kNoTreeJsonFloorBytes;
+        }
     }
+
+    // Assemble the footprint for a given EXECUTING backend. Review round 2
+    // P1-2: the footprint must be (re)built from the FINAL backend after
+    // AUTO resolution and every fallback — pricing against a predicted
+    // backend that later changed left a downgraded CPU solve gated (and
+    // reported) with cpu_state = 0 and budget_decision = "gpu_oom_likely".
+    auto build_footprint = [&](BackendType final_be) {
+        SolveFootprintEstimate e;
+        e.matchup_tables_bytes   = comp_matchup;
+        e.cpu_state_bytes        = (final_be == BackendType::GPU) ? 0 : comp_cpu_state;
+        e.gpu_state_bytes        = (final_be == BackendType::GPU) ? comp_gpu_state : 0;
+        e.device_total_bytes     = (final_be == BackendType::GPU) ? comp_device_total : 0;
+        e.final_strategy_bytes   = comp_final_strategy;
+        e.process_overhead_bytes = memory_budget::kHostProcessOverheadBytes
+            + (final_be == BackendType::GPU
+                   ? memory_budget::kGpuHostContextBytes : 0);
+        e.strategy_tree_ev_bytes = comp_tree_ev;
+        e.json_response_bytes    = comp_json;
+        return e;
+    };
 
     std::string fallback_reason;  // surfaced into result.resources below.
 
@@ -945,8 +1006,9 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     //   useless. If the budget can't even fit 50 nodes the existing gate
     //   will reject anyway with a clear "JSON budget too small" diagnostic.
     std::string auto_reduce_diag;
-    if (config_.memory_budget.json_bytes > 0 &&
-        gate_est.json_response_bytes > config_.memory_budget.json_bytes) {
+    if (config_.emit_strategy_tree &&
+        config_.memory_budget.json_bytes > 0 &&
+        comp_json > config_.memory_budget.json_bytes) {
         constexpr uint64_t kPerNodeBytes = 256 + 169 * 32 + 169 * 32 * 2;  // ≈ 16,480
         constexpr double   kSafetyFactor = 0.75;
         const uint64_t safe_nodes_64 = static_cast<uint64_t>(
@@ -960,9 +1022,13 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         if (new_cap < old_cap) {
             config_.memory_budget.strategy_tree_max_nodes = new_cap;
             config_.strategy_tree_max_nodes               = new_cap;
-            // Re-estimate so the budget check + resources block see the new value.
-            gate_est.json_response_bytes = bytes_for_json_response(
+            // Re-estimate BOTH output terms so the budget check + resources
+            // block see the reduced cap.
+            comp_json = bytes_for_json_response(
                 std::min<uint64_t>(gate_player_nodes, new_cap));
+            comp_tree_ev = bytes_for_strategy_tree_ev_cache(
+                std::min<uint64_t>(gate_player_nodes, new_cap),
+                iso_.num_canonical);
 
             char buf[256];
             snprintf(buf, sizeof(buf),
@@ -1000,20 +1066,24 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
 
     // GPU budget check. `gpu_bytes == 0` means "let backend probe at
     // runtime" — we don't reject in that case (host can't predict free
-    // VRAM accurately for arbitrary devices). When a budget IS set:
+    // VRAM accurately for arbitrary devices). When a budget IS set, the
+    // ceiling compares the device TOTAL (state + matchup upload + tree
+    // metadata + levels + reserve — review round 2 P1-3; the old
+    // state-only check let dense turn solves exceed the user's ceiling):
     //   - Explicit `--backend gpu` + over budget → reject hard.
     //   - AUTO + over budget → downgrade to CPU, record reason.
     if (selected_backend == BackendType::GPU &&
         config_.memory_budget.gpu_bytes > 0 &&
-        gate_est.gpu_state_bytes > config_.memory_budget.gpu_bytes) {
-        char msg[384];
+        comp_device_total > config_.memory_budget.gpu_bytes) {
+        char msg[448];
         snprintf(msg, sizeof(msg),
-            "GPU state estimate %.2f GB exceeds VRAM budget %.2f GB "
-            "(N=%u nodes, A=%u actions, nc=%u canonical). ",
-            static_cast<double>(gate_est.gpu_state_bytes) / (1024.0 * 1024.0 * 1024.0),
+            "GPU device-total estimate %.2f GB exceeds VRAM budget %.2f GB "
+            "(state=%.1f MB, matchup upload=%.1f MB, N=%u nodes, nc=%u). ",
+            static_cast<double>(comp_device_total) / (1024.0 * 1024.0 * 1024.0),
             static_cast<double>(config_.memory_budget.gpu_bytes) / (1024.0 * 1024.0 * 1024.0),
-            tree_.total_nodes, static_cast<unsigned>(MAX_ACTIONS),
-            static_cast<unsigned>(iso_.num_canonical));
+            static_cast<double>(comp_gpu_state) / (1024.0 * 1024.0),
+            static_cast<double>(comp_device_total - comp_gpu_state) / (1024.0 * 1024.0),
+            tree_.total_nodes, static_cast<unsigned>(iso_.num_canonical));
 
         if (backend_type_ == BackendType::AUTO) {
             // Downgrade. Don't fail the solve.
@@ -1026,74 +1096,41 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         }
     }
 
-    // P1-2 (v1.2.1): split the host budget gate into two layers.
-    //
-    //   1. COMMON host check (always applies): matchup_tables + strategy_tree
-    //      EV cache + JSON response. These three buffers live in host RAM
-    //      regardless of whether DCFR runs on CPU or GPU. Skipping this
-    //      check on the GPU path was a real hole — large matchup tables on
-    //      iso-engaged trees could blow host RAM during a "GPU solve" with
-    //      no diagnostic.
-    //
-    //   2. CPU-specific add (only on CPU backend): cpu_state_bytes is the
-    //      regrets / strategy / strategy_sum buffers DCFR needs on host
-    //      when the backend is CPU. GPU keeps these in VRAM (counted in
-    //      gpu_state_bytes against the GPU budget above).
-    //
-    // Order matters: do the common check BEFORE backend prepare(), so we
-    // don't pay for matchup table allocation only to reject moments later.
-    // (Matchup tables actually allocated earlier in precompute_matchups —
-    // already the first line of defence — so this gate catches the
-    // strategy_tree_ev + json layer that didn't have a budget check before.)
-    if (config_.memory_budget.host_bytes > 0) {
-        const uint64_t common_host =
-              gate_est.matchup_tables_bytes
-            + gate_est.strategy_tree_ev_bytes
-            + gate_est.json_response_bytes;
-        if (common_host > config_.memory_budget.host_bytes) {
-            char msg[640];
-            snprintf(msg, sizeof(msg),
-                "Common host RAM estimate %.2f GB exceeds budget %.2f GB "
-                "(matchup=%.1f MB, strategy_tree_ev=%.1f MB, json=%.1f MB). "
-                "These buffers are host-side regardless of backend - switching "
-                "to --backend gpu will NOT help. Raise --host-memory-mb, "
-                "reduce bet sizes, lower --strategy-tree-max-nodes, or use "
-                "--strategy-tree-evs none.",
-                static_cast<double>(common_host) / (1024.0 * 1024.0 * 1024.0),
-                static_cast<double>(config_.memory_budget.host_bytes) / (1024.0 * 1024.0 * 1024.0),
-                static_cast<double>(gate_est.matchup_tables_bytes) / (1024.0 * 1024.0),
-                static_cast<double>(gate_est.strategy_tree_ev_bytes) / (1024.0 * 1024.0),
-                static_cast<double>(gate_est.json_response_bytes) / (1024.0 * 1024.0));
-            throw std::runtime_error(msg);
-        }
-    }
+    // Backend is FINAL from here — assemble the execution footprint from it
+    // (review round 2 P1-2: any earlier footprint priced a PREDICTED
+    // backend; after an AUTO downgrade that left the CPU solve gated with
+    // cpu_state=0 and reported budget_decision="gpu_oom_likely").
+    gate_est = build_footprint(selected_backend);
 
-    // CPU-specific: cpu_state on top of the common host buffers. AUTO mode
-    // doesn't help here either — if cpu_state alone busts the budget we'd
-    // need to GPU-it, and selected_backend is already finalised by this point.
-    if (selected_backend == BackendType::CPU &&
-        config_.memory_budget.host_bytes > 0) {
-        const uint64_t total_host =
-              gate_est.matchup_tables_bytes
-            + gate_est.cpu_state_bytes
-            + gate_est.strategy_tree_ev_bytes
-            + gate_est.json_response_bytes;
-        if (total_host > config_.memory_budget.host_bytes) {
-            char msg[640];
-            snprintf(msg, sizeof(msg),
-                "CPU total host RAM estimate %.2f GB exceeds budget %.2f GB "
-                "(matchup=%.1f MB, cpu_state=%.1f MB, strategy_tree_ev=%.1f MB, "
-                "json=%.1f MB). cpu_state is the dominant term - try "
-                "--backend gpu to move regrets/strategy buffers to VRAM, raise "
-                "--host-memory-mb, or reduce bet sizes.",
-                static_cast<double>(total_host) / (1024.0 * 1024.0 * 1024.0),
-                static_cast<double>(config_.memory_budget.host_bytes) / (1024.0 * 1024.0 * 1024.0),
-                static_cast<double>(gate_est.matchup_tables_bytes) / (1024.0 * 1024.0),
-                static_cast<double>(gate_est.cpu_state_bytes) / (1024.0 * 1024.0),
-                static_cast<double>(gate_est.strategy_tree_ev_bytes) / (1024.0 * 1024.0),
-                static_cast<double>(gate_est.json_response_bytes) / (1024.0 * 1024.0));
-            throw std::runtime_error(msg);
-        }
+    // Host PEAK hard gate (review round 2 P1-1: the peak model previously
+    // fed only the post-hoc budget_decision diagnostic while the actual
+    // throw summed old subtotals — a solve could exceed its host budget and
+    // still exit 0/success). One check, on the full lifetime peak:
+    // matchup + CPU state (CPU backends) + 2× finalized strategy + process/
+    // CUDA-context overhead + output caches.
+    if (config_.memory_budget.host_bytes > 0 &&
+        gate_est.total_host_bytes() > config_.memory_budget.host_bytes) {
+        const bool gpu_final = (selected_backend == BackendType::GPU);
+        char msg[768];
+        snprintf(msg, sizeof(msg),
+            "Estimated peak host RAM %.2f GB exceeds budget %.2f GB "
+            "(matchup=%.1f MB, cpu_state=%.1f MB, final_strategy=2x%.1f MB, "
+            "overhead=%.1f MB, strategy_tree_ev=%.1f MB, json=%.1f MB). %s",
+            static_cast<double>(gate_est.total_host_bytes()) / (1024.0 * 1024.0 * 1024.0),
+            static_cast<double>(config_.memory_budget.host_bytes) / (1024.0 * 1024.0 * 1024.0),
+            static_cast<double>(gate_est.matchup_tables_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(gate_est.cpu_state_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(gate_est.final_strategy_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(gate_est.process_overhead_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(gate_est.strategy_tree_ev_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(gate_est.json_response_bytes) / (1024.0 * 1024.0),
+            gpu_final
+                ? "These buffers are host-side even on a GPU solve - raise "
+                  "--host-memory-mb, reduce bet sizes, or lower "
+                  "--strategy-tree-max-nodes."
+                : "Try --backend gpu to move CFR state to VRAM, raise "
+                  "--host-memory-mb, or reduce bet sizes.");
+        throw std::runtime_error(msg);
     }
 
     backend_ = create_backend(selected_backend);
@@ -1118,6 +1155,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     backend_->prepare(ctx);
     stage_end = Clock::now();
     timing.backend_prepare_ms = elapsed_since(stage_start, stage_end);
+    if (rss_probe_) rss_after_prepare_bytes_ = rss_probe_();
 
     // Step 5: run DCFR iterations through backend
     //
@@ -1258,6 +1296,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     }
     stage_end = Clock::now();
     timing.iterations_ms = elapsed_since(stage_start, stage_end);
+    if (rss_probe_) rss_after_iterations_bytes_ = rss_probe_();
 
     // v1.8.1+: pull per-phase timing from the backend (defaults to 0.0
     // on backends that don't instrument). Useful for "where does the
@@ -1273,10 +1312,10 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         static_cast<float>(backend_->phase_backward_pass_oop_ms());
     timing.phase_backward_pass_ip_ms    =
         static_cast<float>(backend_->phase_backward_pass_ip_ms());
-    timing.phase_backward_showdown_ms   =
-        static_cast<float>(backend_->phase_backward_showdown_ms());
-    timing.phase_backward_fold_ms       =
-        static_cast<float>(backend_->phase_backward_fold_ms());
+    timing.phase_backward_showdown_cpu_ms =
+        static_cast<float>(backend_->phase_backward_showdown_cpu_ms());
+    timing.phase_backward_fold_cpu_ms     =
+        static_cast<float>(backend_->phase_backward_fold_cpu_ms());
     CpuBackendDiagnostics cpu_diag = backend_->cpu_diagnostics();
 
     // Step 6: finalize (normalize strategy_sum → strategy)
@@ -1287,6 +1326,9 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     solved_ = true;
     stage_end = Clock::now();
     timing.finalize_ms = elapsed_since(stage_start, stage_end);
+    // Peak-host model checkpoint: both strategy copies (backend + ours) are
+    // alive here — this is the sample the 2× final-strategy term must cover.
+    if (rss_probe_) rss_after_finalize_bytes_ = rss_probe_();
 
     // When the solve early-stopped on the exploitability target, the final
     // interim probe already computed the exact best-response exploitability on
@@ -1382,8 +1424,28 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         r.estimated_matchup_bytes        = gate_est.matchup_tables_bytes;
         r.estimated_cpu_state_bytes      = gate_est.cpu_state_bytes;
         r.estimated_gpu_state_bytes      = gate_est.gpu_state_bytes;
+        // Device-side dense matchup upload (EV + valid float matrices) —
+        // 8 bytes/cell, vs matchup_bytes_per_cell() which prices the host
+        // copy (adds the category byte and, under signed compression, the
+        // int8 count matrix).
+        r.estimated_gpu_matchup_bytes    = bytes_for_matchup_tables(
+            matchup_ev_per_runout_.size(), iso_.num_canonical,
+            2ULL * sizeof(float));
         r.estimated_strategy_tree_bytes  = gate_est.strategy_tree_ev_bytes;
         r.estimated_json_bytes           = gate_est.json_response_bytes;
+        r.estimated_peak_host_bytes      = gate_est.total_host_bytes();
+        r.estimated_device_total_bytes   = gate_est.device_total_bytes;
+        r.estimated_overhead_bytes       = gate_est.process_overhead_bytes;
+        // Measured (not estimated) numbers from the backend that actually
+        // ran. 0 when the backend doesn't instrument them.
+        if (backend_ != nullptr) {
+            r.allocated_state_bytes        = backend_->allocated_state_bytes();
+            r.allocated_device_total_bytes = backend_->allocated_device_total_bytes();
+            r.measured_peak_vram_bytes     = backend_->measured_peak_vram_bytes();
+        }
+        r.measured_rss_after_prepare_bytes    = rss_after_prepare_bytes_;
+        r.measured_rss_after_iterations_bytes = rss_after_iterations_bytes_;
+        r.measured_rss_after_finalize_bytes   = rss_after_finalize_bytes_;
 
         r.host_budget_bytes        = config_.memory_budget.host_bytes;
         r.gpu_budget_bytes         = config_.memory_budget.gpu_bytes;
@@ -1554,7 +1616,7 @@ inline SolveResources Solver::estimate_only() {
         matchup_count_est,
         nc,
         matchup_bytes_per_cell(config_, iso_));
-    r.estimated_cpu_state_bytes      = bytes_for_cpu_state(player_nodes, MAX_ACTIONS, nc);
+    r.estimated_cpu_state_bytes      = bytes_for_cpu_state_compact(player_slots, nc);
     // v1.7.0: include the levelized backend's extra reach/value buffers in
     // the pre-solve estimate too, so the UI's ETA banner doesn't say "this
     // fits in 4 GB" right before the host gate rejects on the real solve.
@@ -1563,14 +1625,25 @@ inline SolveResources Solver::estimate_only() {
     }
     r.estimated_gpu_state_bytes      = bytes_for_gpu_state_compact(
         total_n, player_slots, nc);
+    r.estimated_gpu_matchup_bytes    = bytes_for_matchup_tables(
+        matchup_count_est, nc, 2ULL * sizeof(float));
+    r.estimated_device_total_bytes   = bytes_for_gpu_device_total(
+        total_n, tree_.total_edges, player_slots, matchup_count_est, nc);
 
-    const uint64_t ev_cache_cap = config_.memory_budget.strategy_tree_max_nodes > 0
-        ? std::min<uint64_t>(player_nodes, config_.memory_budget.strategy_tree_max_nodes)
-        : player_nodes;
-    r.estimated_strategy_tree_bytes  = bytes_for_strategy_tree_ev_cache(ev_cache_cap, nc);
-    r.estimated_json_bytes           = bytes_for_json_response(
-        std::min<uint64_t>(player_nodes,
-                           config_.memory_budget.strategy_tree_max_nodes));
+    // Output plan (review round 2): only price the navigation cache + full
+    // JSON when the caller will emit them.
+    if (config_.emit_strategy_tree) {
+        const uint64_t ev_cache_cap = config_.memory_budget.strategy_tree_max_nodes > 0
+            ? std::min<uint64_t>(player_nodes, config_.memory_budget.strategy_tree_max_nodes)
+            : player_nodes;
+        r.estimated_strategy_tree_bytes  = bytes_for_strategy_tree_ev_cache(ev_cache_cap, nc);
+        r.estimated_json_bytes           = bytes_for_json_response(
+            std::min<uint64_t>(player_nodes,
+                               config_.memory_budget.strategy_tree_max_nodes));
+    } else {
+        r.estimated_strategy_tree_bytes  = 0;
+        r.estimated_json_bytes           = memory_budget::kNoTreeJsonFloorBytes;
+    }
 
     r.host_budget_bytes        = config_.memory_budget.host_bytes;
     r.gpu_budget_bytes         = config_.memory_budget.gpu_bytes;
@@ -1585,6 +1658,18 @@ inline SolveResources Solver::estimate_only() {
             std::string why = cuda_gpu_reject_reason();
             if (!why.empty()) r.fallback_reason = std::move(why);
         }
+    }
+    // Mirror solve()'s VRAM-ceiling downgrade (review round 2 P1-2): AUTO
+    // over an explicit GPU budget lands on CPU — the estimate must predict
+    // the backend that will actually run, or ETA/threads/labels all lie.
+    if (predicted_backend == BackendType::GPU &&
+        backend_type_ == BackendType::AUTO &&
+        config_.memory_budget.gpu_bytes > 0 &&
+        r.estimated_device_total_bytes > config_.memory_budget.gpu_bytes) {
+        predicted_backend = BackendType::CPU;
+        r.fallback_reason =
+            "GPU device-total estimate exceeds VRAM budget; "
+            "auto-downgrades to CPU.";
     }
 
     // Backend label without actually allocating the backend — synthesize.
@@ -1644,13 +1729,26 @@ inline SolveResources Solver::estimate_only() {
     r.runout_approximated = tree_.runout_approximated;
 
     // Lightweight budget-decision label so the UI can flag "this will fail
-    // the gate" before the user commits.
+    // the gate" before the user commits. Mirrors solve()'s pre-backend gate
+    // exactly: the footprint describes the FINAL predicted backend (after
+    // the AUTO VRAM downgrade above), is backend-aware (GPU solves allocate
+    // no CPU CFR state on the host; CPU solves claim no device memory) and
+    // peak-lifetime-aware (2× final strategy + process/context overhead) —
+    // estimate and gate must never answer differently.
+    const bool gpu_final = (predicted_backend == BackendType::GPU);
     SolveFootprintEstimate gate_est;
     gate_est.matchup_tables_bytes   = r.estimated_matchup_bytes;
-    gate_est.cpu_state_bytes        = r.estimated_cpu_state_bytes;
-    gate_est.gpu_state_bytes        = r.estimated_gpu_state_bytes;
+    gate_est.cpu_state_bytes        = gpu_final ? 0 : r.estimated_cpu_state_bytes;
+    gate_est.gpu_state_bytes        = gpu_final ? r.estimated_gpu_state_bytes : 0;
+    gate_est.device_total_bytes     = gpu_final ? r.estimated_device_total_bytes : 0;
+    gate_est.final_strategy_bytes   = bytes_for_final_strategy(
+        player_slots, nc, player_nodes);
+    gate_est.process_overhead_bytes = memory_budget::kHostProcessOverheadBytes
+        + (gpu_final ? memory_budget::kGpuHostContextBytes : 0);
     gate_est.strategy_tree_ev_bytes = r.estimated_strategy_tree_bytes;
     gate_est.json_response_bytes    = r.estimated_json_bytes;
+    r.estimated_peak_host_bytes     = gate_est.total_host_bytes();
+    r.estimated_overhead_bytes      = gate_est.process_overhead_bytes;
     BudgetDecision d = evaluate_budget(gate_est, config_.memory_budget);
     r.budget_decision = budget_decision_str(d);
     if (d != BudgetDecision::OK) {

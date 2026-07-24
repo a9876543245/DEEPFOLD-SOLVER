@@ -76,10 +76,28 @@ if(HAVE_CUDA)
     #   80: Ampere A100
     #   86: Ampere     (RTX 30-series)
     #   89: Ada        (RTX 40-series)
-    #   90: Hopper     (H100); also serves as PTX-JIT source for Blackwell
-    # Build size grows ~5× (one SASS per arch), but each device gets a
-    # native binary instead of paying a JIT cost on first launch.
-    set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
+    #   90: Hopper     (H100)
+    #  120: Blackwell  (RTX 50-series) — native SASS, appended only when the
+    #       toolkit can emit it (CUDA 12.8+); previously served by PTX-JIT
+    #       from compute_90, which added a first-launch JIT cost and codegen
+    #       nondeterminism on the primary dev/benchmark GPU (RTX 5090).
+    # Build size grows (one SASS per arch), but each device gets a native
+    # binary instead of paying a JIT cost on first launch.
+    #
+    # Override hook (P2 review): -DDEEPSOLVER_CUDA_ARCHS=... wins outright —
+    # the default list below is a project default, not a mandate.
+    if(DEFINED DEEPSOLVER_CUDA_ARCHS)
+        set(CMAKE_CUDA_ARCHITECTURES "${DEEPSOLVER_CUDA_ARCHS}")
+    else()
+        set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
+        if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
+            list(APPEND CMAKE_CUDA_ARCHITECTURES "120")
+        else()
+            message(STATUS "CUDA ${CMAKE_CUDA_COMPILER_VERSION} < 12.8 — "
+                           "skipping native sm_120 (Blackwell runs via "
+                           "compute_90 PTX-JIT)")
+        endif()
+    endif()
 
     if(CUDA_FAST_MATH)
         add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
@@ -391,32 +409,48 @@ if(BUILD_TESTS)
         # inf/nan token in a JSON value position, quoted or bare.
         FAIL_REGULAR_EXPRESSION "\": *\"?-?(inf|nan)")
 
-    # Roadmap ① (post-v1.9.0): state-aware collapse gate. Monotone Ah9h4h at
-    # 2.83 GB host: the builder's worst-case matchup projection (~1.4 GB)
-    # passes the host/2 cap so the tree fully enumerates (~185k nodes), but
-    # the REAL footprint (446 deduped tables + CPU state ≈ 2.92 GB) busts
-    # the budget — pre-fix the CPU host gate REJECTED this solve. The state
-    # gate must instead rebuild collapsed and complete with
-    # runout_approximated=true. Deterministic on any machine: CPU branch,
-    # no hardware probe.
-    add_test(NAME CliMonoStateGateCollapse
+    # Estimator-truth PR-2: the compact CPU estimator ended the false
+    # collapse this fixture used to pin. Monotone Ah9h4h at 2.83 GiB host:
+    # the old MAX_ACTIONS formula priced the enumerated tree at ~2.92 GB and
+    # the state gate collapsed it; the compact formula (Σ actual action
+    # slots × lane-rounded nc) prices it at 2.00 GB — and the MEASURED
+    # footprint agrees (allocated_state_bytes == estimate exactly; peak RSS
+    # 2.43 GB < budget). The board must now ENUMERATE at this budget.
+    # Fails on the pre-fix binary (which collapses it) — that asymmetry is
+    # the regression pin. Deterministic on any machine: CPU branch, no
+    # hardware probe. The collapse gate itself is still exercised by
+    # CliMonoStateGateCollapse below (GPU branch, pinned VRAM budget).
+    add_test(NAME CliMonoStateGateFits
         COMMAND deepsolver_core
             --pot 100 --stack 500 --board Ah9h4h
             --iterations 5 --backend cpu --postsolve none
-            --host-memory-mb 2900)
-    set_tests_properties(CliMonoStateGateCollapse PROPERTIES
-        LABELS "smoke;memory" TIMEOUT 60
-        # Emitted only when the gate fired AND the collapsed rebuild solved.
-        PASS_REGULAR_EXPRESSION "Enumerated runout tree needs")
+            --host-memory-mb 2900 --no-strategy-tree)
+    set_tests_properties(CliMonoStateGateFits PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 120
+        PASS_REGULAR_EXPRESSION "\"runout_approximated\": false")
+
+    # Review round 2 PR-0R3: the peak-host model must drive the HARD gate,
+    # not just the post-hoc budget_decision diagnostic (a 48 MiB-budget solve
+    # used to exit 0/success while writing "host_oom_likely").
+    add_test(NAME CliBudgetHostRejectCpu
+        COMMAND ${CMAKE_COMMAND}
+            -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=host_reject_cpu
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+    set_tests_properties(CliBudgetHostRejectCpu PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 60)
 
     # Roadmap ④ (post-v1.9.0): Exact-mode feasibility pre-flight. With
     # --decompose-runouts, --estimate-only must emit the "decompose" block
-    # and predict engagement on a board whose enumerated state busts the
-    # budget (same spot as the state-gate test — deterministic CPU branch).
+    # and predict engagement. At 1.5 GB host the BUILDER's runout gate
+    # (matchup projection > host/2) collapses the tree at build time — the
+    # common Exact trigger — so runout_approximated=true drives the
+    # prediction. (The old 2.9 GB budget relied on the inflated MAX_ACTIONS
+    # state estimate to bust; the honest compact estimate fits there, so
+    # that fixture no longer engages — see CliMonoStateGateFits.)
     add_test(NAME CliExactPreflightEstimate
         COMMAND deepsolver_core
             --pot 100 --stack 500 --board Ah9h4h
-            --backend cpu --host-memory-mb 2900
+            --backend cpu --host-memory-mb 1500
             --estimate-only --decompose-runouts auto)
     set_tests_properties(CliExactPreflightEstimate PROPERTIES
         LABELS "smoke;memory" TIMEOUT 60
@@ -483,10 +517,10 @@ if(BUILD_TESTS)
             --iterations 5 --backend cpu --host-memory-mb 30)
     set_tests_properties(CliCpuHostBudgetReject PROPERTIES
         LABELS "smoke;memory" TIMEOUT 60
-        # P1-2 (v1.2.1): regex matches both legacy "Host RAM estimate" and
-        # new split forms ("Common host RAM estimate", "CPU total host RAM
-        # estimate"). Lowercase 'h' is the common substring.
-        PASS_REGULAR_EXPRESSION "host RAM estimate")
+        # Review round 2: the two-layer manual gate ("Common host RAM
+        # estimate" / "CPU total host RAM estimate") was replaced by ONE
+        # peak-lifetime hard gate — its message is the new contract.
+        PASS_REGULAR_EXPRESSION "peak host RAM")
 
     # GPU explicit: insufficient VRAM budget rejects without backend alloc.
     add_test(NAME CliGpuVramBudgetReject
@@ -495,7 +529,9 @@ if(BUILD_TESTS)
             --iterations 5 --backend gpu --gpu-memory-mb 1)
     set_tests_properties(CliGpuVramBudgetReject PROPERTIES
         LABELS "smoke;memory;gpu" TIMEOUT 60
-        PASS_REGULAR_EXPRESSION "GPU state estimate")
+        # Review round 2: the ceiling now compares the device TOTAL (state +
+        # matchup upload + tree metadata + reserve), not state alone.
+        PASS_REGULAR_EXPRESSION "GPU device-total estimate")
 
     # AUTO fallback: insufficient VRAM should downgrade to CPU and
     # populate fallback_reason in the resources block.
@@ -531,16 +567,12 @@ if(BUILD_TESTS)
         # excludes the regression. Trailing comma closes the JSON line.
         PASS_REGULAR_EXPRESSION "\"estimated_strategy_tree_bytes\": [0-9][0-9]?[0-9]?[0-9]?[0-9]?,")
 
-    # P1-2 (v1.2.1): GPU backend must NOT bypass the host budget gate for
-    # buffers that live on host regardless of backend (matchup tables,
-    # strategy_tree EV cache, JSON response).
-    #
-    # Scenario chosen to thread two needles: matchup small enough to pass
-    # precompute_matchups (host_bytes/2 cap), but matchup+ev+json large
-    # enough to fail the new common-host gate. AsKsQs at 5 MB host budget
-    # produces matchup ≈ 0.9 MB (passes precompute's 2.5 MB cap) and common
-    # ≈ 5.4 MB (fails the common-host gate at 5 MB). Pre-P1-2 this would
-    # silently allocate ~5 MB on host during a "GPU solve".
+    # P1-2 (v1.2.1), re-anchored review round 2: GPU backend must NOT bypass
+    # the host budget gate for buffers that live on host regardless of
+    # backend (matchup tables, 2× finalized strategy, CUDA context, output
+    # caches). The old two-layer "Common host RAM" gate was folded into the
+    # single peak-lifetime hard gate — a 5 MB host budget on a GPU solve is
+    # below even the process floor and must reject upfront.
     add_test(NAME CliGpuCommonHostBudgetReject
         COMMAND deepsolver_core
             --pot 100 --stack 500 --board AsKsQs
@@ -549,7 +581,7 @@ if(BUILD_TESTS)
             --strategy-tree-evs visible)
     set_tests_properties(CliGpuCommonHostBudgetReject PROPERTIES
         LABELS "smoke;memory;gpu" TIMEOUT 60
-        PASS_REGULAR_EXPRESSION "Common host RAM estimate")
+        PASS_REGULAR_EXPRESSION "peak host RAM")
 
     # GPU postsolve parity test — only when CUDA is available, since the test
     # exercises the GPU backend path directly. Skip-marker inside the test
@@ -617,11 +649,49 @@ if(BUILD_TESTS)
         add_test(NAME CliExactPreflightPinPrediction
             COMMAND deepsolver_core
                 --pot 100 --stack 500 --board Ah9h4h
-                --backend cpu --host-memory-mb 2900
+                --backend cpu --host-memory-mb 1500
                 --estimate-only --decompose-runouts auto)
         set_tests_properties(CliExactPreflightPinPrediction PROPERTIES
             LABELS "smoke;gpu" TIMEOUT 60
             PASS_REGULAR_EXPRESSION "\"pinned_leaves_predicted\": [1-9]")
+
+        # Estimator-truth PR-2 companion to CliMonoStateGateFits: the state
+        # gate still COLLAPSES when the budget genuinely cannot hold the
+        # enumerated tree. GPU branch with a pinned VRAM budget: compact
+        # state (1.47 GB) + dense EV/valid upload (0.42 GB) = 1.89 GB > 1.5
+        # GB → gate rebuilds collapsed and the solve completes approximated.
+        # Deterministic: explicit --gpu-memory-mb, no free-VRAM probe.
+        add_test(NAME CliMonoStateGateCollapse
+            COMMAND deepsolver_core
+                --pot 100 --stack 500 --board Ah9h4h
+                --iterations 5 --backend gpu --postsolve none
+                --gpu-memory-mb 1500 --no-strategy-tree)
+        set_tests_properties(CliMonoStateGateCollapse PROPERTIES
+            LABELS "smoke;gpu;memory" TIMEOUT 60
+            # Emitted only when the gate fired AND the collapsed rebuild solved.
+            PASS_REGULAR_EXPRESSION "Enumerated runout tree needs")
+
+        # Review round 2 PR-0R3: the three budget-gate regressions that need
+        # a CUDA build (host gate covering GPU solves; AUTO downgrade
+        # footprint rebuild; VRAM ceiling on device TOTAL, not state).
+        add_test(NAME CliBudgetHostRejectGpu
+            COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=host_reject_gpu
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+        set_tests_properties(CliBudgetHostRejectGpu PROPERTIES
+            LABELS "smoke;gpu;memory" TIMEOUT 60)
+        add_test(NAME CliBudgetAutoDowngradeRefit
+            COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=auto_downgrade_refit
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+        set_tests_properties(CliBudgetAutoDowngradeRefit PROPERTIES
+            LABELS "smoke;gpu;memory" TIMEOUT 120)
+        add_test(NAME CliBudgetGpuDeviceTotalReject
+            COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=gpu_device_total_reject
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+        set_tests_properties(CliBudgetGpuDeviceTotalReject PROPERTIES
+            LABELS "smoke;gpu;memory" TIMEOUT 60)
 
         # ----------------------------------------------------------------
         # Stage 3: GPU subgame streaming validation. SAME source as the CPU

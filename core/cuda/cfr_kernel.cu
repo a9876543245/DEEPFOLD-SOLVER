@@ -57,12 +57,15 @@ __global__ void compute_strategy_kernel(
     uint32_t num_nodes,
     uint16_t num_canonical)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = static_cast<int>(num_nodes) * num_canonical;
+    // 64-bit launch index: N × nc reaches 1.6e9 (75% of INT32_MAX) on the
+    // 4.65M-node roadmap target — int math would go negative right when the
+    // memory levers finally let those trees enumerate.
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(num_nodes) * num_canonical;
     if (tid >= total) return;
 
-    int node = tid / num_canonical;
-    int combo = tid % num_canonical;
+    const uint32_t node  = static_cast<uint32_t>(tid / num_canonical);
+    const uint32_t combo = static_cast<uint32_t>(tid % num_canonical);
 
     uint8_t nt = node_types[node];
     if (nt != NT_PLAYER_OOP && nt != NT_PLAYER_IP) return;
@@ -123,12 +126,13 @@ __global__ void propagate_reach_forward_kernel(
     float* __restrict__ reach_ip,   // [N * nc]
     uint16_t num_canonical)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = static_cast<int>(num_level_nodes) * num_canonical;
+    // 64-bit launch index — see compute_strategy_kernel.
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(num_level_nodes) * num_canonical;
     if (tid >= total) return;
 
-    int local_idx = tid / num_canonical;
-    int combo     = tid % num_canonical;
+    const uint32_t local_idx = static_cast<uint32_t>(tid / num_canonical);
+    const uint32_t combo     = static_cast<uint32_t>(tid % num_canonical);
     uint32_t n    = level_node_indices[local_idx];
 
     uint8_t nt = node_types[n];
@@ -208,12 +212,13 @@ __global__ void aggregate_node_values_kernel(
     uint16_t num_canonical,
     int traverser)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = static_cast<int>(num_level_nodes) * num_canonical;
+    // 64-bit launch index — see compute_strategy_kernel.
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(num_level_nodes) * num_canonical;
     if (tid >= total) return;
 
-    int local_idx = tid / num_canonical;
-    int combo     = tid % num_canonical;
+    const uint32_t local_idx = static_cast<uint32_t>(tid / num_canonical);
+    const uint32_t combo     = static_cast<uint32_t>(tid % num_canonical);
     uint32_t n    = level_node_indices[local_idx];
 
     uint8_t nt = node_types[n];
@@ -336,12 +341,13 @@ __global__ void update_regrets_kernel(
     float pos_disc,
     float neg_disc)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = static_cast<int>(num_nodes) * num_canonical;
+    // 64-bit launch index — see compute_strategy_kernel.
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(num_nodes) * num_canonical;
     if (tid >= total) return;
 
-    int node  = tid / num_canonical;
-    int combo = tid % num_canonical;
+    const uint32_t node  = static_cast<uint32_t>(tid / num_canonical);
+    const uint32_t combo = static_cast<uint32_t>(tid % num_canonical);
 
     uint8_t nt = node_types[node];
     if (nt != NT_PLAYER_OOP && nt != NT_PLAYER_IP) return;
@@ -391,12 +397,13 @@ __global__ void update_strategy_sum_kernel(
     float strat_weight,    // STANDARD: ((t+1)/(t+2))^gamma; POSTFLOP: (t'/(t'+1))^3
     int decay_and_add)     // 0 = standard accumulative; 1 = postflop decay-and-add
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = static_cast<int>(num_nodes) * num_canonical;
+    // 64-bit launch index — see compute_strategy_kernel.
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(num_nodes) * num_canonical;
     if (tid >= total) return;
 
-    int node  = tid / num_canonical;
-    int combo = tid % num_canonical;
+    const uint32_t node  = static_cast<uint32_t>(tid / num_canonical);
+    const uint32_t combo = static_cast<uint32_t>(tid % num_canonical);
 
     uint8_t nt = node_types[node];
     if (nt != NT_PLAYER_OOP && nt != NT_PLAYER_IP) return;
@@ -442,8 +449,9 @@ void launch_compute_strategy(
     const uint32_t* d_node_offset,
     uint32_t num_nodes, uint16_t nc)
 {
-    int total = static_cast<int>(num_nodes) * nc;
-    int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+    const size_t total = static_cast<size_t>(num_nodes) * nc;
+    const int grid = static_cast<int>(
+        (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
     compute_strategy_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_regrets, d_current_strategy,
         d_num_children, d_node_types, d_node_offset,
@@ -460,8 +468,9 @@ void launch_propagate_reach(
     const float* d_current_strategy,
     float* d_reach_oop, float* d_reach_ip, uint16_t nc)
 {
-    int total = static_cast<int>(num_level_nodes) * nc;
-    int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+    const size_t total = static_cast<size_t>(num_level_nodes) * nc;
+    const int grid = static_cast<int>(
+        (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
     propagate_reach_forward_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_node_types, d_active_player, d_num_children,
         d_children_offset, d_children, d_node_offset,
@@ -482,8 +491,9 @@ void launch_aggregate_node_values(
     float* d_node_values,
     uint16_t nc, int traverser)
 {
-    int total = static_cast<int>(num_level_nodes) * nc;
-    int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+    const size_t total = static_cast<size_t>(num_level_nodes) * nc;
+    const int grid = static_cast<int>(
+        (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
     aggregate_node_values_kernel<false><<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_node_types, d_active_player, d_num_children,
         d_children_offset, d_children, d_runout_weight, d_node_offset,
@@ -507,8 +517,9 @@ void launch_aggregate_node_values_br(
     float* d_node_values,
     uint16_t nc, int traverser)
 {
-    int total = static_cast<int>(num_level_nodes) * nc;
-    int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+    const size_t total = static_cast<size_t>(num_level_nodes) * nc;
+    const int grid = static_cast<int>(
+        (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
     aggregate_node_values_kernel<true><<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_node_types, d_active_player, d_num_children,
         d_children_offset, d_children, d_runout_weight, d_node_offset,
@@ -528,8 +539,9 @@ void launch_update_regrets(
     uint32_t num_nodes, uint16_t nc,
     int traverser, float pos_disc, float neg_disc)
 {
-    int total = static_cast<int>(num_nodes) * nc;
-    int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+    const size_t total = static_cast<size_t>(num_nodes) * nc;
+    const int grid = static_cast<int>(
+        (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
     update_regrets_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_regrets, d_node_values,
         d_node_types, d_active_player, d_num_children,
@@ -548,8 +560,9 @@ void launch_update_strategy_sum(
     uint32_t num_nodes, uint16_t nc,
     int traverser, float strat_weight, int decay_and_add)
 {
-    int total = static_cast<int>(num_nodes) * nc;
-    int grid = (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+    const size_t total = static_cast<size_t>(num_nodes) * nc;
+    const int grid = static_cast<int>(
+        (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
     update_strategy_sum_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
         d_strategy_sum, d_current_strategy, d_reach_own,
         d_node_types, d_active_player, d_num_children, d_node_offset,

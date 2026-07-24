@@ -856,6 +856,37 @@ struct GpuBackend::Impl {
     // serialization becomes the bottleneck.)
     std::mutex postsolve_mutex;
 
+    // ---- Measured VRAM telemetry (benchmark-truth PR-1) ----
+    // Free-VRAM samples via cudaMemGetInfo. Baseline is taken at the start
+    // of each full prepare() AFTER prior allocations are released, so
+    // baseline − min_free = this solve's device high-water mark, including
+    // allocator granularity. Concurrent device users would inflate it; on a
+    // benchmark box the solver is the only allocator, so the delta is truth.
+    size_t vram_free_baseline    = 0;         // 0 = no sample yet
+    size_t vram_min_free         = SIZE_MAX;
+    uint64_t device_prepare_delta = 0;        // baseline − free after prepare()
+    // Exact device SOLVER-STATE bytes, computed from the compact layout at
+    // prepare (3 strat-shaped + 3 full-tree + node_offset). Distinct from
+    // device_prepare_delta, which also swallows matchup/tree/levels/locks
+    // and allocator granularity.
+    uint64_t device_state_bytes_exact = 0;
+
+    void sample_vram(bool reset_baseline = false) {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
+        if (reset_baseline || vram_free_baseline == 0) {
+            vram_free_baseline = free_b;
+            vram_min_free      = free_b;
+            return;
+        }
+        if (free_b < vram_min_free) vram_min_free = free_b;
+    }
+    uint64_t peak_vram_used() const {
+        if (vram_free_baseline == 0 || vram_min_free == SIZE_MAX) return 0;
+        return (vram_free_baseline > vram_min_free)
+            ? static_cast<uint64_t>(vram_free_baseline - vram_min_free) : 0;
+    }
+
     ~Impl() {
         free_solver_state(state);
         free_locks(locks);
@@ -888,6 +919,18 @@ GpuBackend::GpuBackend()
 
 GpuBackend::~GpuBackend() = default;
 
+uint64_t GpuBackend::allocated_state_bytes() const {
+    return impl_->device_state_bytes_exact;
+}
+
+uint64_t GpuBackend::allocated_device_total_bytes() const {
+    return impl_->device_prepare_delta;
+}
+
+uint64_t GpuBackend::measured_peak_vram_bytes() const {
+    return impl_->peak_vram_used();
+}
+
 void GpuBackend::prepare(const SolverContext& ctx) {
     if (!ctx.tree || !ctx.iso || !ctx.config ||
         !ctx.matchup_ev || !ctx.matchup_valid ||
@@ -912,6 +955,10 @@ void GpuBackend::prepare(const SolverContext& ctx) {
     impl_->host_tree = ctx.tree;
     impl_->iso       = ctx.iso;
     impl_->config    = ctx.config;
+
+    // Baseline free-VRAM sample AFTER the frees above: peak/delta then
+    // measure THIS solve's footprint, not leftovers from a prior prepare.
+    impl_->sample_vram(/*reset_baseline=*/true);
 
     // Maturity Phase 4: previously CUDA_CHECK exit'd the process on cudaMalloc
     // failure, leaking everything we'd already allocated. Now CUDA_CHECK throws,
@@ -991,6 +1038,24 @@ void GpuBackend::prepare(const SolverContext& ctx) {
                                            MAX_ACTIONS,
                                            ctx.iso->num_canonical,
                                            *ctx.tree);
+        {
+            const uint64_t nc64 = ctx.iso->num_canonical;
+            const uint64_t n64  = ctx.tree->total_nodes;
+            impl_->device_state_bytes_exact =
+                3ULL * impl_->state.state_stride * sizeof(float)   // compact ×3
+              + 3ULL * n64 * nc64 * sizeof(float)                  // full-tree ×3
+              + n64 * sizeof(uint32_t);                            // node_offset
+        }
+
+        // Post-allocation sample: prepare() holds every buffer the CFR loop
+        // uses, so baseline − now = the device bytes this solve allocated.
+        impl_->sample_vram();
+        if (impl_->vram_free_baseline > 0 &&
+            impl_->vram_min_free != SIZE_MAX &&
+            impl_->vram_free_baseline > impl_->vram_min_free) {
+            impl_->device_prepare_delta = static_cast<uint64_t>(
+                impl_->vram_free_baseline - impl_->vram_min_free);
+        }
 
         impl_->prepared = true;
     } catch (...) {
@@ -1047,6 +1112,8 @@ void GpuBackend::reprepare_keep_board(const SolverContext& ctx) {
                                           MAX_ACTIONS,
                                           impl_->iso->num_canonical,
                                           *impl_->host_tree);
+        impl_->sample_vram();  // keep-board path: track min-free vs the
+                               // original prepare()'s baseline
         impl_->prepared = true;
     } catch (...) {
         free_solver_state(impl_->state);
@@ -1395,12 +1462,14 @@ __global__ void normalize_strategy_kernel(
     const uint32_t* __restrict__ node_offset, // [N] per-node slot index
     uint32_t num_nodes, uint16_t num_canonical)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = static_cast<int>(num_nodes) * num_canonical;
+    // 64-bit launch index: N × nc exceeds INT32_MAX headroom on the roadmap
+    // target tree (see cfr_kernel.cu).
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(num_nodes) * num_canonical;
     if (tid >= total) return;
 
-    int node  = tid / num_canonical;
-    int combo = tid % num_canonical;
+    const uint32_t node  = static_cast<uint32_t>(tid / num_canonical);
+    const uint32_t combo = static_cast<uint32_t>(tid % num_canonical);
 
     uint8_t nt = node_types[node];
     uint8_t na = num_children[node];
@@ -1441,9 +1510,10 @@ void GpuBackend::finalize() {
 
     // Reuse current_strategy buffer as target for normalized averaged strategy
     {
-        int total = static_cast<int>(N) * nc;
-        int block = 256;
-        int grid  = (total + block - 1) / block;
+        const size_t total = static_cast<size_t>(N) * nc;
+        const int block = 256;
+        const int grid  = static_cast<int>(
+            (total + block - 1) / static_cast<size_t>(block));
         normalize_strategy_kernel<<<grid, block>>>(
             I.state.strategy_sum, I.state.current_strategy,
             I.tree.num_children, I.tree.node_types,
@@ -1460,6 +1530,11 @@ void GpuBackend::finalize() {
                                cudaMemcpyDeviceToHost));
     }
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Peak-VRAM honesty (P2 review): finalize allocates nothing device-side
+    // today, but sample anyway so the high-water mark provably covers the
+    // whole finalize path, not just prepare.
+    impl_->sample_vram();
 
     // Build strategy_ in same per-node format as CpuBackend. A player node's
     // na action rows are contiguous at slot host_node_offset[n], already in
@@ -1613,6 +1688,9 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
                           state.node_values,
                           static_cast<size_t>(nc) * sizeof(float),
                           cudaMemcpyDeviceToHost));
+    // Peak-VRAM honesty (P2 review): cover the postsolve path in the
+    // high-water mark, not just prepare.
+    sample_vram();
     return root_values;
 }
 

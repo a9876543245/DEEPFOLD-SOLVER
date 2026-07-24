@@ -213,6 +213,13 @@ struct SolverConfig {
     int max_iterations = 500;
     float target_exploitability = 0.005f;   ///< 0.5%
     int exploitability_check_interval = 50;
+
+    /// Output plan (review round 2): whether the caller will emit the
+    /// navigation strategy tree. The memory gates price the strategy-tree
+    /// EV cache + JSON response only when this is true — pricing them on a
+    /// --no-strategy-tree solve made small-solve peak estimates ~2.6×
+    /// measured. The CLI sets this from its output flags.
+    bool emit_strategy_tree = true;
     /// v1.3.0: hard wall-clock cap on the iteration phase. The loop stops
     /// at min(time_budget, max_iter, exploit_target). Default 0 = no time
     /// cap (legacy behavior). UI presets:
@@ -399,12 +406,15 @@ struct SolverTiming {
 
     /// POST_OPTIMIZATION_REVIEW Sec 4.2: split terminal evaluation into
     /// showdown vs fold buckets so the next optimization pass knows which
-    /// branch dominates. CPU-seconds (sum across threads) so the absolute
-    /// number maps to total work, not wall time. Both buckets together cover
-    /// all of evaluate_terminal(); the levelized backward phases above include
-    /// player-node work plus terminal work, so showdown+fold < oop+ip.
-    float phase_backward_showdown_ms   = 0.0f;
-    float phase_backward_fold_ms       = 0.0f;
+    /// branch dominates. CPU-milliseconds (sum across threads) so the
+    /// absolute number maps to total work — it can legitimately EXCEED the
+    /// iteration wall time on multi-threaded runs, which is why the field
+    /// (and its JSON key) carries the `_cpu_ms` suffix: the plain `_ms`
+    /// name kept being read as wall time. Both buckets together cover all
+    /// of evaluate_terminal(); the levelized backward wall phases above
+    /// include player-node work plus terminal work.
+    float phase_backward_showdown_cpu_ms = 0.0f;
+    float phase_backward_fold_cpu_ms     = 0.0f;
 
     uint32_t tree_nodes = 0;
     uint32_t tree_edges = 0;
@@ -581,8 +591,58 @@ struct SolveResources {
     uint64_t estimated_matchup_bytes   = 0;
     uint64_t estimated_cpu_state_bytes = 0;
     uint64_t estimated_gpu_state_bytes = 0;
+    /// Dense matchup upload the GPU backend would push to the device
+    /// (tables × nc² × 2 float matrices — EV + valid). Distinct from
+    /// `estimated_matchup_bytes`, which prices the HOST-side tables (EV +
+    /// valid + category byte per cell). Singleton-iso boards skip this
+    /// upload entirely (A4-GPU rank-blocker path); the estimate stays the
+    /// dense formula — compare against `measured_peak_vram_bytes` for truth.
+    uint64_t estimated_gpu_matchup_bytes = 0;
     uint64_t estimated_strategy_tree_bytes = 0;
     uint64_t estimated_json_bytes      = 0;
+    /// Peak host bytes across the whole solve lifetime (prepare → iterate →
+    /// finalize → serialize): matchup + CPU state + 2× materialized final
+    /// strategy + process/CUDA-context overhead + output caches. This is
+    /// the number the host HARD gate compares against the budget (review
+    /// round 2 P1-1: previously the hard gate summed old subtotals and this
+    /// model was diagnostic-only). Describes the FINAL executing backend —
+    /// rebuilt after any AUTO downgrade.
+    uint64_t estimated_peak_host_bytes = 0;
+    /// Device TOTAL a GPU solve claims (state + matchup upload + tree
+    /// metadata + levels + reserve) — what the VRAM ceiling gates on.
+    /// 0 on CPU-final solves.
+    uint64_t estimated_device_total_bytes = 0;
+    /// The safety-reserve portion of estimated_peak_host_bytes (process
+    /// baseline + CUDA context when GPU) — split out so telemetry can
+    /// separate "estimated allocation" from "reserve" (review round 2).
+    uint64_t estimated_overhead_bytes  = 0;
+    // ---- Measured (not estimated) memory. 0 = not measured. ----
+    /// OS-reported peak working set of THIS process, captured by the CLI
+    /// right before serializing output. Covers everything: state, matchup,
+    /// tree, allocator slack — the number to trust over any estimate.
+    uint64_t measured_peak_rss_bytes   = 0;
+    /// Phase-lifetime RSS checkpoints (peak-so-far at each boundary), 0 when
+    /// no probe installed. Lets estimator drift be localized to the phase
+    /// that caused it instead of showing up as one end-of-run surprise.
+    uint64_t measured_rss_after_prepare_bytes    = 0;
+    uint64_t measured_rss_after_iterations_bytes = 0;
+    uint64_t measured_rss_after_finalize_bytes   = 0;
+    /// GPU device-memory high-water mark measured via cudaMemGetInfo deltas
+    /// (free-at-prepare-start minus min-free-seen). Includes allocator
+    /// granularity and any concurrent device users; 0 on CPU backends.
+    uint64_t measured_peak_vram_bytes  = 0;
+    /// Backend-reported bytes actually allocated for SOLVER STATE — uniform
+    /// semantics across backends (P2 review fix): levelized CPU = exact sum
+    /// of the 3 compact strategy-shaped buffers + 3 full-tree reach/value
+    /// buffers; GPU = exact 3 compact + 3 full-tree + node_offset device
+    /// buffers. Compare with estimated_*_state_bytes to audit the estimator
+    /// (target ≤5% error).
+    uint64_t allocated_state_bytes     = 0;
+    /// GPU only: TOTAL device-memory delta across prepare() — state PLUS
+    /// matchup upload, tree metadata, levels, locks, and allocator
+    /// granularity. This is what `allocated_state_bytes` used to (mis)hold;
+    /// split out so state-vs-estimate audits stay apples-to-apples.
+    uint64_t allocated_device_total_bytes = 0;
     uint64_t host_budget_bytes         = 0;
     uint64_t gpu_budget_bytes          = 0;
     uint32_t strategy_tree_max_nodes   = 0;
@@ -600,6 +660,12 @@ struct SolveResources {
     /// (The post-precompute state gate is NOT mirrored here; the estimate's
     /// decompose pre-flight adds a state-bytes check on top.)
     bool runout_approximated           = false;
+    /// Benchmark-contract tree provenance: "enumerated" | "collapsed" |
+    /// "decomposed". Filled by the CLI at output time (it knows whether the
+    /// decomposition route replaced the monolithic result). Fixtures declare
+    /// an expected_tree_mode and the harness hard-fails on mismatch so
+    /// iteration rates from different tree shapes can never be compared.
+    std::string tree_mode;
 
     // ---- v1.2.2: pre-iteration solve-time estimate ----
     // Populated post-gate, pre-iteration so the UI can show users an ETA
