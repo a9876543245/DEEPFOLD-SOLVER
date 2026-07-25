@@ -439,6 +439,26 @@ if(BUILD_TESTS)
     set_tests_properties(CliBudgetHostRejectCpu PROPERTIES
         LABELS "smoke;memory" TIMEOUT 60)
 
+    # PR-4 TerminalRepresentationPlan: the device-total estimate must follow
+    # the plan (no dense-upload charge on singleton-iso boards). Fails on
+    # pre-plan binaries (593 MB vs 98 MB measured on this board).
+    add_test(NAME CliTerminalPlanSingletonEstimate
+        COMMAND ${CMAKE_COMMAND}
+            -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=singleton_device_estimate
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+    set_tests_properties(CliTerminalPlanSingletonEstimate PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 60)
+
+    # A4-host inc 1: flag-gated blocker postsolve must match the dense
+    # postsolve within 0.05 pct exploitability (numeric-equivalence class —
+    # summation order differs). Arbiter for the port's sign conventions.
+    add_test(NAME CliPostsolveRbSelfcheck
+        COMMAND ${CMAKE_COMMAND}
+            -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=postsolve_rb_selfcheck
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+    set_tests_properties(CliPostsolveRbSelfcheck PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 120)
+
     # Roadmap ④ (post-v1.9.0): Exact-mode feasibility pre-flight. With
     # --decompose-runouts, --estimate-only must emit the "decompose" block
     # and predict engagement. At 1.5 GB host the BUILDER's runout gate

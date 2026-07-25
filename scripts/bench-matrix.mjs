@@ -120,6 +120,7 @@ for (const fx of manifest.fixtures) {
     failed,
     backend: last?.backend ?? null,
     tree_mode: last?.tree_mode ?? last?.resources?.tree_mode ?? null,
+    terminal_representation: last?.resources?.terminal_representation ?? null,
     threads_requested: reqThreadsIdx >= 0
       ? parseInt(fx.args[reqThreadsIdx + 1], 10) : null,
     threads_effective: last?.resources?.cpu_threads_effective ?? null,

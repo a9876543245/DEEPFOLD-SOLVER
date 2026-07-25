@@ -130,6 +130,100 @@ elseif(CASE STREQUAL "gpu_device_total_reject")
   endif()
   message(STATUS "gpu_device_total_reject: VRAM ceiling gates on device total")
 
+elseif(CASE STREQUAL "singleton_device_estimate")
+  # PR-4 TerminalRepresentationPlan: on a singleton-iso board the rank-
+  # blocker serves every terminal and NO dense matchup uploads — the
+  # device-total estimate must say so. Pre-plan binaries charged the dense
+  # upload unconditionally: AsKd7c2h estimated 593 MB device total vs 98 MB
+  # measured (6×), which could falsely downgrade AUTO solves under tight
+  # VRAM budgets. Honest bound: device_total ≤ 1.5 × state (tree metadata +
+  # reserve only on top). Also pins the plan label in the telemetry.
+  execute_process(
+    COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c2h
+            --backend gpu --estimate-only
+    OUTPUT_VARIABLE out RESULT_VARIABLE rc ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "estimate-only failed rc=${rc}: ${err}")
+  endif()
+  string(JSON rep GET "${out}" resources terminal_representation)
+  if(NOT rep STREQUAL "rank_blocker_only")
+    message(FATAL_ERROR
+      "expected terminal_representation rank_blocker_only on the singleton "
+      "turn, got \"${rep}\"")
+  endif()
+  string(JSON dev GET "${out}" resources estimated_device_total_bytes)
+  string(JSON gstate GET "${out}" resources estimated_gpu_state_bytes)
+  math(EXPR bound "(${gstate} * 3) / 2")
+  if(dev GREATER ${bound})
+    message(FATAL_ERROR
+      "device-total estimate ${dev} still prices the dense upload the "
+      "rank-blocker skips (state ${gstate}, honest bound ${bound})")
+  endif()
+  string(JSON gmatch GET "${out}" resources estimated_gpu_matchup_bytes)
+  if(NOT gmatch EQUAL 0)
+    message(FATAL_ERROR
+      "estimated_gpu_matchup_bytes must be 0 under rank_blocker_only, "
+      "got ${gmatch}")
+  endif()
+  message(STATUS "singleton_device_estimate: plan-aware device estimate OK")
+
+elseif(CASE STREQUAL "postsolve_rb_selfcheck")
+  # A4-host inc 1+2: the blocker postsolve must reproduce the dense
+  # postsolve numerically. Float summation order differs, so this is a
+  # tolerance check, not a bit-exact diff — it is the arbiter for the
+  # perspective-sign and payoff conventions of the port. The singleton
+  # rainbow flop exercises showdown + both fold types through both BR
+  # sweeps (exploitability engages OOP and IP traversers); the EV sweep
+  # runs too (default postsolve) so a crash there would fail the run.
+  # Increment 2 flipped the default: the PLAN drives the blocker path, so
+  # the dense side of this A/B is now the DEEPSOLVER_POSTSOLVE_DENSE=1
+  # escape hatch and the blocker side is the plain default.
+  set(ARGS --pot 100 --stack 500 --board AsKd2c --iterations 60
+      --exploitability 0 --backend cpu --no-strategy-tree --no-progress)
+  set(ENV{DEEPSOLVER_POSTSOLVE_DENSE} "1")
+  execute_process(
+    COMMAND ${EXE} ${ARGS}
+    OUTPUT_VARIABLE off_out RESULT_VARIABLE off_rc ERROR_VARIABLE off_err)
+  unset(ENV{DEEPSOLVER_POSTSOLVE_DENSE})
+  if(NOT off_rc EQUAL 0)
+    message(FATAL_ERROR "dense postsolve run failed rc=${off_rc}: ${off_err}")
+  endif()
+  execute_process(
+    COMMAND ${EXE} ${ARGS}
+    OUTPUT_VARIABLE on_out RESULT_VARIABLE on_rc ERROR_VARIABLE on_err)
+  if(NOT on_rc EQUAL 0)
+    message(FATAL_ERROR "blocker postsolve run failed rc=${on_rc}: ${on_err}")
+  endif()
+
+  string(JSON off_exp GET "${off_out}" exploitability_pct)
+  string(JSON on_exp  GET "${on_out}"  exploitability_pct)
+
+  # |on - off| <= 0.05 pct. CMake math() is integer-only, so compare in
+  # 1e-4 "micro-pct" units (the JSON prints fixed decimals, no exponents).
+  function(to_micro out val)
+    string(REGEX MATCH "^([0-9]+)" _ "${val}")
+    set(int_part "${CMAKE_MATCH_1}")
+    string(REGEX MATCH "\\.([0-9]+)" _ "${val}")
+    set(frac "${CMAKE_MATCH_1}0000")
+    string(SUBSTRING "${frac}" 0 4 frac)
+    math(EXPR u "${int_part} * 10000 + ${frac}")
+    set(${out} ${u} PARENT_SCOPE)
+  endfunction()
+  to_micro(off_u "${off_exp}")
+  to_micro(on_u  "${on_exp}")
+  math(EXPR diff_u "${on_u} - ${off_u}")
+  if(diff_u LESS 0)
+    math(EXPR diff_u "0 - ${diff_u}")
+  endif()
+  if(diff_u GREATER 500)
+    message(FATAL_ERROR
+      "blocker postsolve diverges from dense: dense=${off_exp} "
+      "blocker=${on_exp} (|diff| ${diff_u} micro-pct > 500)")
+  endif()
+  message(STATUS
+    "postsolve_rb_selfcheck: dense=${off_exp} blocker=${on_exp} "
+    "(diff ${diff_u} micro-pct <= 500)")
+
 else()
   message(FATAL_ERROR "unknown CASE: ${CASE}")
 endif()

@@ -27,6 +27,8 @@
 #include "cpu_backend.h"
 #include "cpu_backend_levelized.h"
 #include "showdown_rank_blocker.h"
+#include "fold_blocker.h"
+#include "terminal_plan.h"
 
 #ifdef _OPENMP
 #  include <omp.h>
@@ -215,22 +217,22 @@ inline bool should_auto_select_gpu(
     return work >= kGpuAutoMinWork;
 }
 
+// PR-4: both of these now DELEGATE to the shared terminal plan — they are
+// kept as call-site conveniences, but the decision lives in terminal_plan.h
+// so builder, gates, estimators, precompute and backends cannot disagree.
 inline bool should_build_signed_showdown_coeff(
     const SolverConfig& config,
     const IsomorphismMapping& iso)
 {
-    return config.rake_rate == 0.0f
-        && config.rake_cap == 0.0f
-        && !showdown_rank_blocker::supports_singleton_iso(iso);
+    return plan_terminal_representation(config, iso).representation
+        == TerminalRepresentation::SignedCount;
 }
 
 inline uint64_t matchup_bytes_per_cell(
     const SolverConfig& config,
     const IsomorphismMapping& iso)
 {
-    return should_build_signed_showdown_coeff(config, iso)
-        ? memory_budget::kSignedCountMatchupBytesPerCell
-        : memory_budget::kBaseMatchupBytesPerCell;
+    return plan_terminal_representation(config, iso).host_bytes_per_cell;
 }
 
 // ============================================================================
@@ -607,6 +609,12 @@ private:
     std::vector<CardMask> matchup_board_masks_;
     std::map<std::pair<uint32_t, uint16_t>, std::vector<float>> resolved_locks_;
 
+    /// PR-4: the ONE terminal-representation decision for this solve.
+    /// Static plan at construction/estimate time; refined with the real
+    /// per-runout rank tables right after precompute_matchups(). Gates,
+    /// estimators, resources telemetry and make_context() all read THIS.
+    TerminalRepresentationPlan terminal_plan_;
+
     // Backend (CPU or GPU) handles DCFR iteration
     std::unique_ptr<ISolverBackend> backend_;
 
@@ -624,6 +632,44 @@ private:
     std::vector<float> cpu_best_response_traverse(uint32_t node_idx, int player,
                                                    std::vector<float>& reach_oop,
                                                    std::vector<float>& reach_ip) const;
+
+    /// A4-host increments 1+2: postsolve terminal evaluation via the
+    /// rank/fold blockers instead of the dense nc² tables.
+    ///
+    /// Increment 2 made the PLAN the default driver: any refined
+    /// RankBlockerOnly solve takes the blocker postsolve (measured ~19×
+    /// faster, exploitability diff 0 micro-pct on the selfcheck fixture,
+    /// ≤ tolerance everywhere — singleton iso means every canonical weight
+    /// is 1 so the blockers' reach conventions coincide with the dense
+    /// loops up to float summation order). Escape hatches:
+    ///   DEEPSOLVER_POSTSOLVE_DENSE=1 — force the legacy dense sweeps
+    ///     (debug oracle; also the "off" side of CliPostsolveRbSelfcheck).
+    ///   DEEPSOLVER_POSTSOLVE_RB — increment-1 opt-in, now redundant
+    ///     (kept accepted so existing scripts don't break; it never widens
+    ///     the gate beyond the plan).
+    /// This is the port that lets A4-host later stop materializing the
+    /// dense host tables at all.
+    bool postsolve_blocker_enabled() const {
+        static const bool env_force_dense =
+            (std::getenv("DEEPSOLVER_POSTSOLVE_DENSE") != nullptr);
+        return !env_force_dense
+            && terminal_plan_.refined_with_ranks
+            && terminal_plan_.representation ==
+                   TerminalRepresentation::RankBlockerOnly
+            && !matchup_original_ranks_per_runout_.empty()
+            && !matchup_board_masks_.empty();
+    }
+
+    /// Blocker-path terminal evaluation shared by the BR and EV sweeps
+    /// (their dense terminal blocks are line-for-line identical). Returns
+    /// false when this runout lacks blocker inputs — caller falls back to
+    /// the dense path.
+    bool postsolve_terminal_blocker(uint32_t node_idx, int self_player,
+                                    TerminalType tt, float half_pot,
+                                    int32_t mi,
+                                    const std::vector<float>& reach_oop,
+                                    const std::vector<float>& reach_ip,
+                                    std::vector<float>& values) const;
     std::vector<float> cpu_ev_traverse(uint32_t node_idx, int perspective,
                                         std::vector<float>& reach_oop,
                                         std::vector<float>& reach_ip,
@@ -715,6 +761,10 @@ inline SolverContext Solver::make_context() {
     ctx.ip_reach                   = &ip_reach_;
     ctx.oop_reach                  = &oop_reach_;
     ctx.resolved_locks             = &resolved_locks_;
+    // PR-4: hand backends the refined terminal plan. solve() refines it
+    // right after precompute_matchups(), before any make_context() caller
+    // reaches a backend prepare.
+    ctx.terminal_plan              = &terminal_plan_;
     return ctx;
 }
 
@@ -763,6 +813,14 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     // Step 3: precompute matchup matrix + reach probs + node locks
     stage_start = Clock::now();
     precompute_matchups();
+
+    // PR-4: refine the terminal plan with the REAL per-runout rank tables.
+    // Every consumer below — the ① state gate, the pre-backend footprint,
+    // make_context() and the resources telemetry — reads this one decision.
+    terminal_plan_ = refine_terminal_plan(
+        plan_terminal_representation(config_, iso_),
+        iso_, matchup_original_ranks_per_runout_,
+        static_cast<uint32_t>(matchup_ev_per_runout_.size()));
 
     // ── Post-v1.9.0 roadmap ①: state-aware collapse gate ─────────────────
     // The builder's runout gate models MATCHUP bytes only. A monotone flop's
@@ -826,9 +884,13 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             // Device TOTAL, not state+matchup alone: tree metadata, level
             // schedule and allocator granularity are real VRAM the prepare
             // claims (review round 2 P1-3 — same formula as the pre-backend
-            // VRAM ceiling, so the two gates cannot disagree).
+            // VRAM ceiling, so the two gates cannot disagree). PR-4: the
+            // dense-upload term follows the refined terminal plan — on
+            // singleton-iso boards the rank-blocker skips the upload and
+            // the old dense-always assumption over-charged ~6×.
             state_needed = bytes_for_gpu_device_total(
-                total_n, tree_.total_edges, player_slots, tables, nc);
+                total_n, tree_.total_edges, player_slots, tables, nc,
+                terminal_plan_.device_dense_upload);
             state_budget = config_.memory_budget.gpu_bytes > 0
                 ? config_.memory_budget.gpu_bytes
                 : static_cast<uint64_t>(
@@ -878,6 +940,14 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             timing.tree_nodes = tree_.total_nodes;
             timing.tree_edges = tree_.total_edges;
             precompute_matchups();  // re-key matchup_idx for the new tree
+            // Re-refine the terminal plan against the COLLAPSED tree's
+            // runout tables (the representation can't flip — iso is
+            // board-level — but the blocker-metadata validity term scans
+            // the freshly rebuilt rank tables).
+            terminal_plan_ = refine_terminal_plan(
+                plan_terminal_representation(config_, iso_),
+                iso_, matchup_original_ranks_per_runout_,
+                static_cast<uint32_t>(matchup_ev_per_runout_.size()));
         }
     }
 
@@ -939,10 +1009,13 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         // Review round 2 P1-3: the VRAM ceiling gates on the device TOTAL
         // (state + matchup upload + tree metadata + levels + reserve), not
         // state alone — a dense turn solve measurably exceeded the user's
-        // --gpu-memory-mb while the state-only check said "ok".
+        // --gpu-memory-mb while the state-only check said "ok". PR-4: the
+        // upload term follows the refined terminal plan (singleton-iso
+        // boards skip the dense upload entirely).
         comp_device_total = bytes_for_gpu_device_total(
             total_n, tree_.total_edges, gate_player_slots,
-            matchup_ev_per_runout_.size(), nc);
+            matchup_ev_per_runout_.size(), nc,
+            terminal_plan_.device_dense_upload);
         // Peak-host lifetime terms (P1-1): finalize holds TWO materialized
         // strategy copies on every backend.
         comp_final_strategy = bytes_for_final_strategy(
@@ -1078,7 +1151,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         char msg[448];
         snprintf(msg, sizeof(msg),
             "GPU device-total estimate %.2f GB exceeds VRAM budget %.2f GB "
-            "(state=%.1f MB, matchup upload=%.1f MB, N=%u nodes, nc=%u). ",
+            "(state=%.1f MB, non-state=%.1f MB, N=%u nodes, nc=%u). ",
             static_cast<double>(comp_device_total) / (1024.0 * 1024.0 * 1024.0),
             static_cast<double>(config_.memory_budget.gpu_bytes) / (1024.0 * 1024.0 * 1024.0),
             static_cast<double>(comp_gpu_state) / (1024.0 * 1024.0),
@@ -1427,10 +1500,14 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         // Device-side dense matchup upload (EV + valid float matrices) —
         // 8 bytes/cell, vs matchup_bytes_per_cell() which prices the host
         // copy (adds the category byte and, under signed compression, the
-        // int8 count matrix).
-        r.estimated_gpu_matchup_bytes    = bytes_for_matchup_tables(
-            matchup_ev_per_runout_.size(), iso_.num_canonical,
-            2ULL * sizeof(float));
+        // int8 count matrix). PR-4: zero when the refined plan says the
+        // rank-blocker serves every terminal (no dense upload happens).
+        r.estimated_gpu_matchup_bytes    = terminal_plan_.device_dense_upload
+            ? bytes_for_matchup_tables(
+                  matchup_ev_per_runout_.size(), iso_.num_canonical,
+                  2ULL * sizeof(float))
+            : 0;
+        r.terminal_representation        = terminal_plan_.label();
         r.estimated_strategy_tree_bytes  = gate_est.strategy_tree_ev_bytes;
         r.estimated_json_bytes           = gate_est.json_response_bytes;
         r.estimated_peak_host_bytes      = gate_est.total_host_bytes();
@@ -1623,12 +1700,21 @@ inline SolveResources Solver::estimate_only() {
     if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
         r.estimated_cpu_state_bytes += bytes_for_levelized_cpu_extra(total_n, nc);
     }
+    // PR-4: estimate-time STATIC terminal plan (no rank tables yet — the
+    // solve path refines it after precompute; the static plan can only be
+    // optimistic on the rare no-valid-blocker-metadata edge, which the
+    // backend pre-flight still guards).
+    const TerminalRepresentationPlan est_plan =
+        plan_terminal_representation(config_, iso_);
+    r.terminal_representation        = est_plan.label();
     r.estimated_gpu_state_bytes      = bytes_for_gpu_state_compact(
         total_n, player_slots, nc);
-    r.estimated_gpu_matchup_bytes    = bytes_for_matchup_tables(
-        matchup_count_est, nc, 2ULL * sizeof(float));
+    r.estimated_gpu_matchup_bytes    = est_plan.device_dense_upload
+        ? bytes_for_matchup_tables(matchup_count_est, nc, 2ULL * sizeof(float))
+        : 0;
     r.estimated_device_total_bytes   = bytes_for_gpu_device_total(
-        total_n, tree_.total_edges, player_slots, matchup_count_est, nc);
+        total_n, tree_.total_edges, player_slots, matchup_count_est, nc,
+        est_plan.device_dense_upload);
 
     // Output plan (review round 2): only price the navigation cache + full
     // JSON when the caller will emit them.
@@ -2193,6 +2279,13 @@ inline std::vector<float> Solver::cpu_ev_traverse(
                              !matchup_ev_valid_per_runout_[mi].empty())
             ? matchup_ev_valid_per_runout_[mi].data() : nullptr;
 
+        // A4-host inc 1: blocker path — see cpu_best_response_traverse.
+        if (postsolve_blocker_enabled() &&
+            postsolve_terminal_blocker(node_idx, perspective, tt, half_pot,
+                                       mi, reach_oop, reach_ip, values)) {
+            return record(std::move(values));
+        }
+
         if (tt == TerminalType::SHOWDOWN) {
             if (perspective == 0) {
                 std::vector<float> weighted_ip(nc, 0.0f);
@@ -2426,6 +2519,58 @@ inline void Solver::compute_combo_evs() {
 // Exploitability via per-combo Best Response
 // ============================================================================
 
+inline bool Solver::postsolve_terminal_blocker(
+    uint32_t node_idx, int self_player, TerminalType tt, float half_pot,
+    int32_t mi,
+    const std::vector<float>& reach_oop, const std::vector<float>& reach_ip,
+    std::vector<float>& values) const
+{
+    const uint16_t nc = iso_.num_canonical;
+    if (mi < 0) return false;
+    const std::size_t m = static_cast<std::size_t>(mi);
+    if (m >= matchup_original_ranks_per_runout_.size() ||
+        m >= matchup_board_masks_.size()) {
+        return false;
+    }
+
+    // Weighted opponent reach — mirrors the dense loops verbatim. Under the
+    // RankBlockerOnly gate every canonical weight is 1, so this equals the
+    // raw reach; keeping the multiply makes the replaced expression obvious.
+    const auto& opp = (self_player == 0) ? reach_ip : reach_oop;
+    std::vector<float> opp_w(nc);
+    for (uint16_t j = 0; j < nc; ++j) {
+        opp_w[j] = opp[j] * static_cast<float>(iso_.canonical_weights[j]);
+    }
+
+    if (tt == TerminalType::SHOWDOWN) {
+        // Postsolve showdown is UNRAKED: win/lose = ±half_pot, tie = 0, for
+        // BOTH perspectives. The dense IP branch negates an OOP-oriented ev
+        // matrix; the blocker scores SELF-vs-opponent by rank directly,
+        // which absorbs that sign — validated by the flag-on-vs-off
+        // self-check regression, not by inspection alone.
+        static thread_local showdown_rank_blocker::Scratch scratch;
+        showdown_rank_blocker::showdown_dense_singleton(
+            iso_, matchup_original_ranks_per_runout_[m], opp_w.data(),
+            /*skip_mask=*/nullptr, values.data(), nc,
+            /*win_p=*/half_pot, /*lose_p=*/-half_pot, /*tie_p=*/0.0f,
+            scratch);
+        return true;
+    }
+
+    // Fold: values[c] = sign · gain · Σ_j opp_w[j] · valid[c,j], where valid
+    // is pure card-compatibility — exactly fold_blocker's contract.
+    const uint32_t parent = tree_.parent_indices[node_idx];
+    const float unmatched_bet =
+        (parent < tree_.total_nodes) ? tree_.bet_into[parent] : 0.0f;
+    const float gain = (tree_.pots[node_idx] - unmatched_bet) * 0.5f;
+    const float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
+    const float sign = (self_player == 0) ? sign_oop : -sign_oop;
+    fold_blocker::fold_dense(
+        iso_, matchup_board_masks_[m], opp_w.data(), /*skip_mask=*/nullptr,
+        /*self_payoff=*/sign * gain, values.data(), nc);
+    return true;
+}
+
 inline std::vector<float> Solver::cpu_best_response_traverse(
     uint32_t node_idx, int player,
     std::vector<float>& reach_oop, std::vector<float>& reach_ip) const
@@ -2452,6 +2597,15 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
                              static_cast<size_t>(mi) < matchup_ev_valid_per_runout_.size() &&
                              !matchup_ev_valid_per_runout_[mi].empty())
             ? matchup_ev_valid_per_runout_[mi].data() : nullptr;
+
+        // A4-host inc 1: blocker path (flag-gated, RankBlockerOnly plans
+        // only). Falls through to the dense loops when disabled or when
+        // this runout lacks blocker inputs.
+        if (postsolve_blocker_enabled() &&
+            postsolve_terminal_blocker(node_idx, player, tt, half_pot, mi,
+                                       reach_oop, reach_ip, values)) {
+            return values;
+        }
 
         if (tt == TerminalType::SHOWDOWN) {
             if (player == 0) {

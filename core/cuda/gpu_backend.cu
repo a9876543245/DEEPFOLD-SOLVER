@@ -17,6 +17,7 @@
 #include "isomorphism.h"
 #include "card.h"
 #include "showdown_rank_blocker.h"
+#include "terminal_plan.h"
 
 #include "util.cuh"
 #include <cuda_runtime.h>
@@ -975,8 +976,6 @@ void GpuBackend::prepare(const SolverContext& ctx) {
         // The self-check needs both tables resident to diff them, so it forces
         // dense on. Must be decided BEFORE upload_matchup; rank_blocker_activatable
         // mirrors upload_rank_blocker's gate so the prediction can't disagree.
-        static const bool kRbSelfCheckUpload =
-            (std::getenv("DEEPSOLVER_RB_SELFCHECK") != nullptr);
         if (ctx.matchup_ev_per_runout && !ctx.matchup_ev_per_runout->empty() &&
             ctx.matchup_valid_per_runout && !ctx.matchup_valid_per_runout->empty()) {
             const uint32_t num_runouts =
@@ -985,7 +984,26 @@ void GpuBackend::prepare(const SolverContext& ctx) {
                 ctx.matchup_original_ranks_per_runout &&
                 rank_blocker_activatable(
                     *ctx.iso, *ctx.matchup_original_ranks_per_runout, num_runouts);
-            const bool materialize_dense = kRbSelfCheckUpload || !rb_activatable;
+            const bool local_dense =
+                terminal_selfcheck_forced() || !rb_activatable;
+            // PR-4: the shared TerminalRepresentationPlan is the decision of
+            // record — the memory gates already priced THIS choice. The local
+            // derivation is kept as a hard consistency check: if plan and
+            // backend ever disagree, the gate charged the wrong footprint, so
+            // fail loudly instead of running past the user's budget.
+            bool materialize_dense = local_dense;
+            if (ctx.terminal_plan && ctx.terminal_plan->refined_with_ranks) {
+                materialize_dense = ctx.terminal_plan->device_dense_upload;
+                if (materialize_dense != local_dense) {
+                    throw std::runtime_error(
+                        "TerminalRepresentationPlan disagrees with GPU dense-"
+                        "upload derivation (plan says " +
+                        std::string(materialize_dense ? "dense" : "skip") +
+                        ", backend derived " +
+                        std::string(local_dense ? "dense" : "skip") +
+                        ") - the memory gates priced the wrong footprint.");
+                }
+            }
             impl_->matchup = upload_matchup(
                 *ctx.matchup_ev_per_runout, *ctx.matchup_valid_per_runout,
                 ctx.iso->canonical_weights, materialize_dense);

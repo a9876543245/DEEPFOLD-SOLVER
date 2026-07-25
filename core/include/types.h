@@ -616,6 +616,12 @@ struct SolveResources {
     /// baseline + CUDA context when GPU) — split out so telemetry can
     /// separate "estimated allocation" from "reserve" (review round 2).
     uint64_t estimated_overhead_bytes  = 0;
+    /// PR-4: the shared TerminalRepresentationPlan's decision for this
+    /// solve/estimate ("rank_blocker_only" | "signed_count" |
+    /// "dense_category_valid" | "debug_dense_selfcheck"). Report §12
+    /// requires every benchmark record to carry it; the estimators' dense-
+    /// upload terms follow it.
+    std::string terminal_representation;
     // ---- Measured (not estimated) memory. 0 = not measured. ----
     /// OS-reported peak working set of THIS process, captured by the CLI
     /// right before serializing output. Covers everything: state, matchup,

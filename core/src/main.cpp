@@ -863,6 +863,8 @@ std::string result_to_json(
         json << "    \"estimated_peak_host_bytes\": " << r.estimated_peak_host_bytes << ",\n";
         json << "    \"estimated_device_total_bytes\": " << r.estimated_device_total_bytes << ",\n";
         json << "    \"estimated_overhead_bytes\": " << r.estimated_overhead_bytes << ",\n";
+        json << "    \"terminal_representation\": \""
+             << escape_json(r.terminal_representation) << "\",\n";
         // Decomposed runs keep the monolithic PREFIX solve's timing/resources
         // (aggregation unbuilt) — consumers must not read these numbers as
         // describing the decomposition.
@@ -1784,6 +1786,8 @@ int main(int argc, char* argv[]) {
                       << "    \"estimated_peak_host_bytes\": " << r.estimated_peak_host_bytes << ",\n"
                       << "    \"estimated_device_total_bytes\": " << r.estimated_device_total_bytes << ",\n"
                       << "    \"estimated_overhead_bytes\": " << r.estimated_overhead_bytes << ",\n"
+                      << "    \"terminal_representation\": \""
+                      << escape_json(r.terminal_representation) << "\",\n"
                       << "    \"estimated_strategy_tree_bytes\": " << r.estimated_strategy_tree_bytes << ",\n"
                       << "    \"estimated_json_bytes\": " << r.estimated_json_bytes << ",\n"
                       << "    \"host_budget_bytes\": " << r.host_budget_bytes << ",\n"
@@ -2166,6 +2170,8 @@ int main(int argc, char* argv[]) {
                       << "  \"runout_approximated\": "
                       << (result.runout_approximated ? "true" : "false") << ",\n"
                       << "  \"decomposed\": " << (decomposed ? "true" : "false") << ",\n"
+                      << "  \"terminal_representation\": \""
+                      << escape_json(rr.terminal_representation) << "\",\n"
                       << "  \"canonical_combos\": " << rr.canonical_combos << ",\n"
                       << "  \"player_nodes\": " << rr.player_nodes << ",\n"
                       << "  \"threads_requested\": " << args.cpu_threads << ",\n"

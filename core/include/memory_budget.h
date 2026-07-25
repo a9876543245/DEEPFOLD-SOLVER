@@ -285,24 +285,31 @@ inline uint64_t bytes_for_gpu_state_compact(uint64_t total_nodes,
 /// ceiling must compare what prepare() actually claims, not just solver
 /// state. Components mirror GpuBackend::prepare():
 ///   - solver state (compact, bytes_for_gpu_state_compact)
-///   - dense matchup upload (EV+valid floats; the rank-blocker skip on
-///     singleton boards makes this an upper bound there)
+///   - dense matchup upload (EV+valid floats) — ONLY when the
+///     TerminalRepresentationPlan says the dense tables actually upload
+///     (`device_dense_upload`). PR-4 made this plan-aware: the
+///     dense-always assumption was a ~6× over-estimate on singleton-iso
+///     boards (AsKd7c2h: 593 MB est vs 98 MB measured) because the
+///     rank-blocker skips the upload there.
 ///   - tree metadata uploads (upload_tree: ~24 B/node + 5 B/edge)
 ///   - level schedule (~4 B/node)
 ///   - allocator-granularity + small-buffer reserve (reach/locks/rank
 ///     tables): 8 MiB + ~3% of the two big terms.
 /// Validated against measured cudaMemGetInfo prepare deltas:
-///   mono AsKsQs  est ~1875 MiB vs 1822 MiB measured  (+2.9%)
-///   dense turn   est ~70 MiB  vs 70 MiB measured
+///   mono AsKsQs  (dense)      est ~1875 MiB vs 1822 MiB measured (+2.9%)
+///   dense turn   (Ah9h4h2c)   est 183.6 MiB vs 182 MiB measured  (+0.9%)
+///   singleton turn (AsKd7c2h, no upload) — re-validate after PR-4 wiring.
 inline uint64_t bytes_for_gpu_device_total(uint64_t total_nodes,
                                            uint64_t total_edges,
                                            uint64_t player_action_slots,
                                            uint64_t matchup_tables,
-                                           uint64_t nc) {
+                                           uint64_t nc,
+                                           bool device_dense_upload) {
     const uint64_t state   = bytes_for_gpu_state_compact(
         total_nodes, player_action_slots, nc);
-    const uint64_t matchup = bytes_for_matchup_tables(
-        matchup_tables, nc, 2ULL * sizeof(float));
+    const uint64_t matchup = device_dense_upload
+        ? bytes_for_matchup_tables(matchup_tables, nc, 2ULL * sizeof(float))
+        : 0ULL;
     const uint64_t tree    = 24ULL * total_nodes + 5ULL * total_edges;
     const uint64_t levels  = 4ULL * total_nodes + 4096ULL;
     const uint64_t reserve = 8ULL * 1024ULL * 1024ULL + (state + matchup) / 32ULL;

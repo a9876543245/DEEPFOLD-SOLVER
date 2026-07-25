@@ -112,6 +112,14 @@ struct SolverContext {
     const IsomorphismMapping*    iso           = nullptr;
     const SolverConfig*          config        = nullptr;
 
+    /// PR-4: the ONE terminal-representation decision (refined with rank
+    /// tables by the time any backend sees it). Backends consume this
+    /// instead of re-deriving the choice — GpuBackend hard-checks it
+    /// against its local computation so plan and behavior cannot drift.
+    /// Nullable for legacy/diagnostic callers; backends then fall back to
+    /// their own (identical) derivation.
+    const struct TerminalRepresentationPlan* terminal_plan = nullptr;
+
     /// Precomputed showdown matchup matrix for the ROOT board. Indexed
     /// [ci * nc + cj]. Kept for backward-compat / shortcut when no chance
     /// node is in the tree (e.g. solving a river spot).
