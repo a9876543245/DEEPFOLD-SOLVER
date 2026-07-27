@@ -45,7 +45,79 @@ constexpr uint8_t NT_CHANCE     = 2;
 constexpr uint8_t NT_TERMINAL   = 3;
 
 // ============================================================================
+// B1a increment 3: strategy sources
+//
+// The regret-matched strategy used to live in its own [total_slots * nc]
+// buffer — a third strat-shaped array on top of regrets and strategy_sum,
+// i.e. a third of the state footprint for a value that is a pure function of
+// regrets. Consumers now derive it on the fly instead. All three sources have
+// IDENTICAL layout, so a consumer takes one pointer plus a compile-time mode:
+//
+//   MATERIALIZED — read the buffer verbatim (node-locked solves, where the
+//                  lock override is written into it before the readers run)
+//   REGRETS      — regret matching, byte-for-byte compute_strategy_kernel
+//   SUM          — normalized average, byte-for-byte normalize_strategy_kernel
+//                  (the postsolve passes' "averaged strategy")
+//
+// Cost is neutral: a consumer reads na values from the source either way; it
+// just also sums them first. What disappears is a full-buffer write + read per
+// iteration and, more importantly, the allocation.
+// ============================================================================
+
+enum : int {
+    STRAT_SRC_MATERIALIZED = 0,
+    STRAT_SRC_REGRETS      = 1,
+    STRAT_SRC_SUM          = 2,
+};
+
+template <int SRC>
+struct StrategyRow {
+    const float* __restrict__ p;
+    size_t base;
+    size_t stride;
+    float  inv       = 0.0f;
+    float  uniform   = 0.0f;
+    bool   degenerate = false;
+
+    __device__ StrategyRow(const float* __restrict__ p_, size_t base_,
+                           size_t stride_, int na)
+        : p(p_), base(base_), stride(stride_)
+    {
+        if (SRC == STRAT_SRC_MATERIALIZED) return;
+        float sum = 0.0f;
+        for (int a = 0; a < na; ++a) {
+            const float v = p[base + a * stride];
+            if (SRC == STRAT_SRC_REGRETS) {
+                if (v > 0.0f) sum += v;
+            } else {
+                sum += v;
+            }
+        }
+        // Thresholds mirror the kernels this replaces: regret matching falls
+        // back to uniform on pos_sum <= 0, normalization on total <= 1e-7.
+        const float thresh = (SRC == STRAT_SRC_REGRETS) ? 0.0f : 1e-7f;
+        if (sum > thresh) {
+            inv = 1.0f / sum;
+        } else {
+            degenerate = true;
+            uniform = 1.0f / static_cast<float>(na);
+        }
+    }
+
+    __device__ float operator()(int a) const {
+        if (SRC == STRAT_SRC_MATERIALIZED) return p[base + a * stride];
+        if (degenerate) return uniform;
+        const float v = p[base + a * stride];
+        if (SRC == STRAT_SRC_REGRETS) return (v > 0.0f) ? v * inv : 0.0f;
+        return v * inv;
+    }
+};
+
+// ============================================================================
 // Kernel 1: Regret Matching — current_strategy ← positive regrets normalized
+//
+// Only launched for node-locked solves now (B1a inc 3): the lock override is
+// a write into the materialized buffer, so those solves keep one.
 // ============================================================================
 
 __global__ void compute_strategy_kernel(
@@ -112,6 +184,7 @@ __global__ void compute_strategy_kernel(
  * The kernel writes children's reach[child][combo]. One parent writes each
  * child exactly once (tree structure). No atomics needed.
  */
+template <int SRC>
 __global__ void propagate_reach_forward_kernel(
     const uint8_t*  __restrict__ node_types,
     const uint8_t*  __restrict__ active_player,
@@ -121,7 +194,7 @@ __global__ void propagate_reach_forward_kernel(
     const uint32_t* __restrict__ node_offset,   // [N] per-node slot index
     const uint32_t* __restrict__ level_node_indices,
     uint32_t num_level_nodes,
-    const float* __restrict__ current_strategy, // compact [slot * nc]
+    const float* __restrict__ strat_src,        // compact [slot * nc]; see StrategyRow
     float* __restrict__ reach_oop,  // [N * nc]   read parent + write children
     float* __restrict__ reach_ip,   // [N * nc]
     uint16_t num_canonical)
@@ -166,11 +239,12 @@ __global__ void propagate_reach_forward_kernel(
     size_t strat_base = static_cast<size_t>(node_offset[n]) * num_canonical
                       + static_cast<size_t>(combo);
     size_t strat_stride = num_canonical;
+    StrategyRow<SRC> strat(strat_src, strat_base, strat_stride, na);
 
     for (int a = 0; a < na; ++a) {
         uint32_t child = children[offset + a];
         size_t child_idx = static_cast<size_t>(child) * num_canonical + combo;
-        float s = current_strategy[strat_base + a * strat_stride];
+        float s = strat(a);
         if (acting == NT_PLAYER_OOP) {
             reach_oop[child_idx] = r_oop * s;
             reach_ip [child_idx] = r_ip;
@@ -196,7 +270,7 @@ __global__ void propagate_reach_forward_kernel(
  * For chance nodes: copy first child's node_value.
  * For terminals: node_value is set separately by terminal kernels (eval_kernel.cu).
  */
-template <bool BestResponse>
+template <bool BestResponse, int SRC>
 __global__ void aggregate_node_values_kernel(
     const uint8_t*  __restrict__ node_types,
     const uint8_t*  __restrict__ active_player,
@@ -207,7 +281,7 @@ __global__ void aggregate_node_values_kernel(
     const uint32_t* __restrict__ node_offset,    // [N] per-node slot index
     const uint32_t* __restrict__ level_node_indices,
     uint32_t num_level_nodes,
-    const float* __restrict__ current_strategy,  // compact [slot * nc]
+    const float* __restrict__ strat_src,         // compact [slot * nc]; see StrategyRow
     float* __restrict__ node_values,             // [N * nc]
     uint16_t num_canonical,
     int traverser)
@@ -289,9 +363,10 @@ __global__ void aggregate_node_values_kernel(
             }
             node_values[node_idx] = best;
         } else {
+            StrategyRow<SRC> strat(strat_src, strat_base, stride, na);
             float sum = 0.0f;
             for (int a = 0; a < na; ++a) {
-                float s  = current_strategy[strat_base + a * stride];
+                float s  = strat(a);
                 sum += s * child_value(a);
             }
             node_values[node_idx] = sum;
@@ -383,9 +458,10 @@ __global__ void update_regrets_kernel(
  * Uses per-node reach (from forward pass) — NOT root reach. This is the
  * correct DCFR averaging formula.
  */
+template <int SRC>
 __global__ void update_strategy_sum_kernel(
     float*       __restrict__ strategy_sum,     // compact [slot * nc]
-    const float* __restrict__ current_strategy, // compact [slot * nc]
+    const float* __restrict__ strat_src,        // compact [slot * nc]; see StrategyRow
     const float* __restrict__ reach_own,        // [N * nc] — traverser's reach
     const uint8_t* __restrict__ node_types,
     const uint8_t* __restrict__ active_player,
@@ -416,13 +492,20 @@ __global__ void update_strategy_sum_kernel(
                 + static_cast<size_t>(combo);
     size_t stride = num_canonical;
 
+    // NOTE (B1a inc 3): under SRC == REGRETS this reads the regrets THIS
+    // iteration's update_regrets has not written yet — the launcher order in
+    // gpu_backend.cu puts strategy_sum before regrets for exactly that reason.
+    // The materialized buffer used to make the ordering irrelevant because it
+    // was a snapshot taken at the top of the iteration.
+    StrategyRow<SRC> strat(strat_src, base, stride, na);
+
     if (decay_and_add) {
         // POSTFLOP: strategy_sum = strategy_sum * gamma_t + current_strategy
         // No reach weighting (matches postflop-solver). Epoch-reset gamma_t
         // (passed in as strat_weight) makes this an "average over recent
         // iterations of the current epoch."
         for (int a = 0; a < na; ++a) {
-            float s = current_strategy[base + a * stride];
+            float s = strat(a);
             float old = strategy_sum[base + a * stride];
             strategy_sum[base + a * stride] = old * strat_weight + s;
         }
@@ -431,7 +514,7 @@ __global__ void update_strategy_sum_kernel(
         // Textbook DCFR reach-weighted accumulative average.
         float reach = reach_own[static_cast<size_t>(node) * num_canonical + combo];
         for (int a = 0; a < na; ++a) {
-            float s = current_strategy[base + a * stride];
+            float s = strat(a);
             strategy_sum[base + a * stride] += strat_weight * reach * s;
         }
     }
@@ -459,25 +542,40 @@ void launch_compute_strategy(
     CUDA_CHECK(cudaGetLastError());
 }
 
+// B1a inc 3: `strat_src_mode` selects how the strategy is derived from
+// `d_strat_src` (see StrategyRow). One switch per launch — the mode is
+// grid-uniform, so nothing branches inside the kernel.
+#define DEEPSOLVER_DISPATCH_STRAT_SRC(mode, KERNEL_CALL)                     \
+    do {                                                                     \
+        switch (mode) {                                                      \
+            case STRAT_SRC_REGRETS: KERNEL_CALL(STRAT_SRC_REGRETS); break;   \
+            case STRAT_SRC_SUM:     KERNEL_CALL(STRAT_SRC_SUM);     break;   \
+            default:                KERNEL_CALL(STRAT_SRC_MATERIALIZED);     \
+        }                                                                    \
+        CUDA_CHECK(cudaGetLastError());                                      \
+    } while (0)
+
 void launch_propagate_reach(
     const uint8_t* d_node_types, const uint8_t* d_active_player,
     const uint8_t* d_num_children,
     const uint32_t* d_children_offset, const uint32_t* d_children,
     const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
-    const float* d_current_strategy,
+    const float* d_strat_src, int strat_src_mode,
     float* d_reach_oop, float* d_reach_ip, uint16_t nc)
 {
     const size_t total = static_cast<size_t>(num_level_nodes) * nc;
     const int grid = static_cast<int>(
         (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
-    propagate_reach_forward_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
-        d_node_types, d_active_player, d_num_children,
-        d_children_offset, d_children, d_node_offset,
-        d_level_indices, num_level_nodes,
-        d_current_strategy,
-        d_reach_oop, d_reach_ip, nc);
-    CUDA_CHECK(cudaGetLastError());
+#define DEEPSOLVER_LAUNCH_PROPAGATE(SRC)                                     \
+    propagate_reach_forward_kernel<SRC><<<grid, DEFAULT_BLOCK_SIZE>>>(       \
+        d_node_types, d_active_player, d_num_children,                       \
+        d_children_offset, d_children, d_node_offset,                        \
+        d_level_indices, num_level_nodes,                                    \
+        d_strat_src,                                                         \
+        d_reach_oop, d_reach_ip, nc)
+    DEEPSOLVER_DISPATCH_STRAT_SRC(strat_src_mode, DEEPSOLVER_LAUNCH_PROPAGATE);
+#undef DEEPSOLVER_LAUNCH_PROPAGATE
 }
 
 void launch_aggregate_node_values(
@@ -487,20 +585,22 @@ void launch_aggregate_node_values(
     const uint8_t*  d_runout_weight,
     const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
-    const float* d_current_strategy,
+    const float* d_strat_src, int strat_src_mode,
     float* d_node_values,
     uint16_t nc, int traverser)
 {
     const size_t total = static_cast<size_t>(num_level_nodes) * nc;
     const int grid = static_cast<int>(
         (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
-    aggregate_node_values_kernel<false><<<grid, DEFAULT_BLOCK_SIZE>>>(
-        d_node_types, d_active_player, d_num_children,
-        d_children_offset, d_children, d_runout_weight, d_node_offset,
-        d_level_indices, num_level_nodes,
-        d_current_strategy,
-        d_node_values, nc, traverser);
-    CUDA_CHECK(cudaGetLastError());
+#define DEEPSOLVER_LAUNCH_AGG_EV(SRC)                                        \
+    aggregate_node_values_kernel<false, SRC><<<grid, DEFAULT_BLOCK_SIZE>>>(  \
+        d_node_types, d_active_player, d_num_children,                       \
+        d_children_offset, d_children, d_runout_weight, d_node_offset,       \
+        d_level_indices, num_level_nodes,                                    \
+        d_strat_src,                                                         \
+        d_node_values, nc, traverser)
+    DEEPSOLVER_DISPATCH_STRAT_SRC(strat_src_mode, DEEPSOLVER_LAUNCH_AGG_EV);
+#undef DEEPSOLVER_LAUNCH_AGG_EV
 }
 
 // Postsolve variant: at traverser's own decision nodes, take max over actions
@@ -513,20 +613,22 @@ void launch_aggregate_node_values_br(
     const uint8_t*  d_runout_weight,
     const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
-    const float* d_current_strategy,
+    const float* d_strat_src, int strat_src_mode,
     float* d_node_values,
     uint16_t nc, int traverser)
 {
     const size_t total = static_cast<size_t>(num_level_nodes) * nc;
     const int grid = static_cast<int>(
         (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
-    aggregate_node_values_kernel<true><<<grid, DEFAULT_BLOCK_SIZE>>>(
-        d_node_types, d_active_player, d_num_children,
-        d_children_offset, d_children, d_runout_weight, d_node_offset,
-        d_level_indices, num_level_nodes,
-        d_current_strategy,
-        d_node_values, nc, traverser);
-    CUDA_CHECK(cudaGetLastError());
+#define DEEPSOLVER_LAUNCH_AGG_BR(SRC)                                        \
+    aggregate_node_values_kernel<true, SRC><<<grid, DEFAULT_BLOCK_SIZE>>>(   \
+        d_node_types, d_active_player, d_num_children,                       \
+        d_children_offset, d_children, d_runout_weight, d_node_offset,       \
+        d_level_indices, num_level_nodes,                                    \
+        d_strat_src,                                                         \
+        d_node_values, nc, traverser)
+    DEEPSOLVER_DISPATCH_STRAT_SRC(strat_src_mode, DEEPSOLVER_LAUNCH_AGG_BR);
+#undef DEEPSOLVER_LAUNCH_AGG_BR
 }
 
 void launch_update_regrets(
@@ -552,7 +654,7 @@ void launch_update_regrets(
 }
 
 void launch_update_strategy_sum(
-    float* d_strategy_sum, const float* d_current_strategy,
+    float* d_strategy_sum, const float* d_strat_src, int strat_src_mode,
     const float* d_reach_own,
     const uint8_t* d_node_types, const uint8_t* d_active_player,
     const uint8_t* d_num_children,
@@ -563,12 +665,14 @@ void launch_update_strategy_sum(
     const size_t total = static_cast<size_t>(num_nodes) * nc;
     const int grid = static_cast<int>(
         (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
-    update_strategy_sum_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
-        d_strategy_sum, d_current_strategy, d_reach_own,
-        d_node_types, d_active_player, d_num_children, d_node_offset,
-        num_nodes, nc,
-        traverser, strat_weight, decay_and_add);
-    CUDA_CHECK(cudaGetLastError());
+#define DEEPSOLVER_LAUNCH_SUM(SRC)                                           \
+    update_strategy_sum_kernel<SRC><<<grid, DEFAULT_BLOCK_SIZE>>>(           \
+        d_strategy_sum, d_strat_src, d_reach_own,                            \
+        d_node_types, d_active_player, d_num_children, d_node_offset,        \
+        num_nodes, nc,                                                       \
+        traverser, strat_weight, decay_and_add)
+    DEEPSOLVER_DISPATCH_STRAT_SRC(strat_src_mode, DEEPSOLVER_LAUNCH_SUM);
+#undef DEEPSOLVER_LAUNCH_SUM
 }
 
 } // namespace gpu

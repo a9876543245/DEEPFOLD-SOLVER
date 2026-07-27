@@ -415,7 +415,11 @@ inline void TrunkDecomposition::build_trunk() {
     compute_matchup_for_board(dummy, iso_, base_cfg_.board.data(),
                               base_cfg_.board_size,
                               eval_for(base_cfg_.board.data(), base_cfg_.board_size),
-                              mev_, mvalid_, cat, coeff, cnt, false, ranks);
+                              mev_, mvalid_, cat, coeff, cnt, false, ranks,
+                              // The trunk's own dense flop matchup: this
+                              // consumer reads mev_/mvalid_ directly, so it is
+                              // never eligible for the A4 inc-3 skip.
+                              /*build_dense=*/true);
 
     // Identify leaves (turn-card children of truncated chance nodes).
     leaf_idx_.assign(trunk_.total_nodes, -1);
@@ -1836,7 +1840,12 @@ inline DecompositionEstimate estimate_decomposition(const SolverConfig& cfg,
                         }
                     }
                 }
-                per_bytes = bytes_for_gpu_state_compact(st.total_nodes, sub_slots, nc)
+                // B1a inc 3: subgame solves inherit the trunk config's locks;
+                // `cfg.node_locks` is what GpuBackend keys its materialized
+                // strategy buffer off (via the resolved subset).
+                per_bytes = bytes_for_gpu_state_compact(
+                                st.total_nodes, sub_slots, nc,
+                                /*materialize_strategy=*/!cfg.node_locks.empty())
                           + decomp_estimate_detail::kPinPredictSlackBytesPerLeaf;
                 if (!showdown_rank_blocker::supports_singleton_iso(iso)) {
                     per_bytes += tables * nc * nc * 2ULL * sizeof(float);

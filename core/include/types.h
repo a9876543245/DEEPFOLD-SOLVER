@@ -622,6 +622,13 @@ struct SolveResources {
     /// requires every benchmark record to carry it; the estimators' dense-
     /// upload terms follow it.
     std::string terminal_representation;
+    /// A4-host inc 3: did the HOST materialize the dense nc² EV/valid/
+    /// category tables? False ⇒ only the per-runout rank tables + board masks
+    /// exist and `estimated_matchup_bytes` prices those instead. Distinct
+    /// from `terminal_representation`: a RankBlockerOnly solve still keeps
+    /// the dense tables when a player's range is narrow enough to engage the
+    /// CPU backends' active-list terminal kernels (no blocker route there).
+    bool host_dense_matchup = true;
     // ---- Measured (not estimated) memory. 0 = not measured. ----
     /// OS-reported peak working set of THIS process, captured by the CLI
     /// right before serializing output. Covers everything: state, matchup,

@@ -731,13 +731,22 @@ int main(int argc, char** argv) {
     }
 
     // ======================================================================
-    // Stage 5 (rainbow headline) — the texture the project is about. On a
-    // RAINBOW flop the monolithic build COLLAPSES the turn to one equity-blind
-    // child (runout_approximated = true; full enumeration is ~76 GB). The
+    // Stage 5 (rainbow headline) — the texture the project is about. When the
+    // monolithic build cannot afford the enumerated tree it COLLAPSES the turn
+    // to one equity-blind child (runout_approximated = true). The
     // decomposition route with build_nav instead enumerates the REAL turn cards
     // on the GPU under BOUNDED VRAM and stitches a navigable strategy tree —
     // exactly what the sidecar's --decompose-runouts auto path delivers. Small
     // iters: this asserts STRUCTURE + bounded residency, not convergence.
+    //
+    // A4-host inc 4 (2026-07-27) changed WHY a board collapses. The old
+    // "rainbow always collapses" premise came from the builder charging dense
+    // nc² matchup tables (~76 GB projected here) that the rank/fold blockers
+    // never build; a low-SPR rainbow spot this size now enumerates happily at
+    // the default budget. What still forces the collapse — and what the
+    // decomposition route exists for — is the CFR STATE not fitting, so the
+    // monolithic probe below pins that with an explicit tight host budget
+    // instead of relying on a gate that no longer fires.
     // ======================================================================
     printf("\n=== Stage 5 (rainbow): stitched nav under bounded VRAM ===\n");
     {
@@ -757,7 +766,11 @@ int main(int argc, char** argv) {
         rb.oop_range_weights.fill(1.0f);
 
         // (1) Monolithic build collapses (the bug this feature fixes).
+        // 256 MB sits between the collapsed tree's host need (~110 MB) and the
+        // enumerated tree's (~340 MB at 7098 nodes), so the ① state gate is
+        // what collapses it — the same path a real over-budget spot takes.
         SolverConfig mc = rb;
+        mc.memory_budget.host_bytes = 256ULL * 1024ULL * 1024ULL;
         mc.max_iterations = 1;
         mc.compute_exploitability = false;
         mc.compute_combo_evs = false;
@@ -767,7 +780,8 @@ int main(int argc, char** argv) {
                rbmr.timing.tree_nodes,
                rbmr.runout_approximated ? "TRUE (collapsed, equity-blind)" : "false");
         if (!rbmr.runout_approximated) {
-            printf("FAIL: rainbow did not collapse — fixture no longer exercises the gate.\n");
+            printf("FAIL: rainbow did not collapse at a 256 MB host budget — "
+                   "fixture no longer exercises the equity-blind path.\n");
             return 1;
         }
 

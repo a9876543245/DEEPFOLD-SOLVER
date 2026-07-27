@@ -47,12 +47,14 @@
 #include "cpu_simd.h"
 #include "fold_blocker.h"
 #include "showdown_rank_blocker.h"
+#include "terminal_plan.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -211,9 +213,15 @@ public:
             || use_signed_coeff_showdown_for_traverser(1);
         d.sparse_terminal_no_full_clear_enabled =
             kSparseTerminalNoFullClearEnabled;
-        populate_matchup_category_diagnostics(
-            d, ctx_.matchup_category_per_runout,
-            ctx_.matchup_category, nc);
+        // A4-host inc 3: the category histogram is a DENSE-table diagnostic
+        // with no blocker equivalent. When the tables were skipped, report
+        // zero tables rather than scanning empty vectors — the honest answer
+        // is "there was nothing to measure".
+        if (ctx_.matchup_dense_materialized) {
+            populate_matchup_category_diagnostics(
+                d, ctx_.matchup_category_per_runout,
+                ctx_.matchup_category, nc);
+        }
         return d;
     }
 
@@ -1121,7 +1129,10 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     ip_use_terminal_output_skip_ =
         (static_cast<uint32_t>(ip_out_of_range_count) * 8u
          >= static_cast<uint32_t>(nc) * 7u);
-    constexpr uint32_t kActiveListDensityDen = 4u; // active <= 25%
+    // Shared with the A4-host inc-3 predictor (terminal_plan.h): precompute
+    // decides whether the dense tables exist by mirroring THIS threshold, so
+    // the constant must not fork.
+    constexpr uint32_t kActiveListDensityDen = kTerminalActiveListDensityDen;
     oop_use_terminal_active_list_ =
         (static_cast<uint32_t>(oop_terminal_active_indices_.size())
             * kActiveListDensityDen
@@ -1171,6 +1182,32 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
         && (static_cast<uint32_t>(ip_terminal_active_indices_.size())
             * kSparseTraversalDensityDen
             <= static_cast<uint32_t>(nc));
+
+    // A4-host inc 3: when precompute skipped the dense nc² tables, every
+    // terminal MUST take a blocker route. The predictor in terminal_plan.h is
+    // deliberately conservative (it assumes the reference backend's looser
+    // active-list threshold), so this is unreachable by construction — but
+    // reading an absent table is silent corruption, and the gates already
+    // priced this decision, so fail loudly like the GPU plan check does.
+    if (!ctx.matchup_dense_materialized) {
+        for (int t = 0; t < 2; ++t) {
+            const bool showdown_dense =
+                !use_rank_blocker_showdown_for_traverser(t)
+                && !use_active_rank_blocker_showdown_for_traverser(t);
+            const bool fold_dense = use_sparse_traversal_for_player(t)
+                && use_terminal_active_list_for_player(t);
+            if (showdown_dense || fold_dense) {
+                throw std::runtime_error(
+                    std::string("LevelizedCpuBackend: dense matchup tables were "
+                                "not materialized but traverser ")
+                    + (t == 0 ? "OOP" : "IP")
+                    + " routes terminals through the dense kernels ("
+                    + (showdown_dense ? "showdown" : "fold")
+                    + "). The A4-host materialization predictor and the backend "
+                      "kernel gates have drifted.");
+            }
+        }
+    }
 
     build_level_schedule();
 

@@ -39,10 +39,18 @@
 namespace deepsolver {
 namespace gpu {
 
-// B1a: strat-shaped state (regrets / strategy_sum / current_strategy) is
-// COMPACT — indexed by d_node_offset[node] slot table, player nodes only,
-// stride nc. Increment 2: no action_values buffer — aggregate and
-// update_regrets gather child node_values directly. See cfr_kernel.cu header.
+// B1a inc 3: strategy-source modes, mirroring cfr_kernel.cu's enum. Kept as
+// named constants here so the call sites read as intent, not magic ints.
+constexpr int kStratSrcMaterialized = 0;
+constexpr int kStratSrcRegrets      = 1;
+constexpr int kStratSrcSum          = 2;
+
+// B1a: strat-shaped state is COMPACT — indexed by d_node_offset[node] slot
+// table, player nodes only, stride nc. Increment 2: no action_values buffer —
+// aggregate and update_regrets gather child node_values directly. Increment 3:
+// no current_strategy buffer either — the readers take a source pointer plus a
+// mode (0 = materialized buffer, 1 = regret-match on the fly, 2 = normalize
+// strategy_sum on the fly). See cfr_kernel.cu's StrategyRow.
 void launch_compute_strategy(
     const float* d_regrets, float* d_current_strategy,
     const uint8_t* d_num_children, const uint8_t* d_node_types,
@@ -55,7 +63,7 @@ void launch_propagate_reach(
     const uint32_t* d_children_offset, const uint32_t* d_children,
     const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
-    const float* d_current_strategy,
+    const float* d_strat_src, int strat_src_mode,
     float* d_reach_oop, float* d_reach_ip, uint16_t nc);
 
 void launch_aggregate_node_values(
@@ -65,7 +73,7 @@ void launch_aggregate_node_values(
     const uint8_t*  d_runout_weight,
     const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
-    const float* d_current_strategy,
+    const float* d_strat_src, int strat_src_mode,
     float* d_node_values,
     uint16_t nc, int traverser);
 
@@ -78,7 +86,7 @@ void launch_aggregate_node_values_br(
     const uint8_t*  d_runout_weight,
     const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
-    const float* d_current_strategy,
+    const float* d_strat_src, int strat_src_mode,
     float* d_node_values,
     uint16_t nc, int traverser);
 
@@ -93,7 +101,7 @@ void launch_update_regrets(
     int traverser, float pos_disc, float neg_disc);
 
 void launch_update_strategy_sum(
-    float* d_strategy_sum, const float* d_current_strategy,
+    float* d_strategy_sum, const float* d_strat_src, int strat_src_mode,
     const float* d_reach_own,
     const uint8_t* d_node_types, const uint8_t* d_active_player,
     const uint8_t* d_num_children,
@@ -707,10 +715,16 @@ static void free_levels(DeviceLevels& dl) {
 
 // ---- Solver state allocation ----
 
+/// `materialize_strategy` (B1a inc 3): allocate the current_strategy buffer.
+/// Only node-locked solves need it — the lock override is a WRITE into a
+/// materialized strategy. Everything else derives the strategy from regrets
+/// (mid-CFR) or strategy_sum (postsolve) on the fly, so the third
+/// strat-shaped buffer simply does not exist.
 static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
                                               uint8_t max_actions,
                                               uint16_t num_canonical,
-                                              const FlatGameTree& tree)
+                                              const FlatGameTree& tree,
+                                              bool materialize_strategy)
 {
     DeviceSolverState ds;
     size_t N  = num_nodes;
@@ -737,13 +751,15 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
     // OOM pre-flight: state buffers dominate device memory on multi-bet-size
     // monotone-flop trees. Fail with a structured message before cudaMalloc
     // returns OOM, so engine.rs's CPU-fallback detector can trigger.
-    //   strat-shaped buffers (regrets, strategy_sum, current_strategy)
-    //     = 3 buffers of total_slots*nc floats (compact; inc 2 dropped
-    //       action_values — keep bytes_for_gpu_state_compact in sync)
+    //   strat-shaped buffers (regrets, strategy_sum, + current_strategy only
+    //     on node-locked solves) = 2 or 3 buffers of total_slots*nc floats
+    //     (compact; inc 2 dropped action_values, inc 3 dropped
+    //     current_strategy — keep bytes_for_gpu_state_compact in sync)
     //   reach + node_values = 3 buffers of N*nc floats (full tree)
+    const size_t strat_buffers = materialize_strategy ? 3u : 2u;
     size_t bytes_strat = strat_stride * sizeof(float);
     size_t bytes_reach = N * nc * sizeof(float);
-    size_t state_bytes_required = bytes_strat * 3 + bytes_reach * 3;
+    size_t state_bytes_required = bytes_strat * strat_buffers + bytes_reach * 3;
     {
         size_t free_dev = 0, total_dev = 0;
         if (cudaMemGetInfo(&free_dev, &total_dev) == cudaSuccess) {
@@ -763,7 +779,8 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
     ds.state_stride       = strat_stride;
     ds.regrets            = alloc_device_zero<float>(strat_stride);
     ds.strategy_sum       = alloc_device_zero<float>(strat_stride);
-    ds.current_strategy   = alloc_device_zero<float>(strat_stride);
+    ds.current_strategy   = materialize_strategy
+        ? alloc_device_zero<float>(strat_stride) : nullptr;
     ds.reach_scratch_oop  = alloc_device_zero<float>(N * nc);
     ds.reach_scratch_ip   = alloc_device_zero<float>(N * nc);
     ds.node_values        = alloc_device_zero<float>(N * nc);
@@ -773,7 +790,7 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
     // This mirrors CpuBackend::prepare(). We build on host then upload.
     // Compact layout: a player node's na action rows are contiguous starting
     // at slot host_node_offset[n], so the fill is one contiguous run.
-    if (strat_stride > 0) {
+    if (materialize_strategy && strat_stride > 0) {
         std::vector<float> host_strat(strat_stride, 0.0f);
         for (uint32_t n = 0; n < num_nodes; ++n) {
             uint8_t na = tree.num_children[n];
@@ -871,6 +888,10 @@ struct GpuBackend::Impl {
     // device_prepare_delta, which also swallows matchup/tree/levels/locks
     // and allocator granularity.
     uint64_t device_state_bytes_exact = 0;
+    /// B1a inc 3: does this solve keep a materialized current_strategy?
+    /// True only for node-locked solves. Mirrors state.current_strategy !=
+    /// nullptr; kept as a named flag so the intent is greppable.
+    bool     materialize_strategy = false;
 
     void sample_vram(bool reset_baseline = false) {
         size_t free_b = 0, total_b = 0;
@@ -992,6 +1013,16 @@ void GpuBackend::prepare(const SolverContext& ctx) {
             // backend ever disagree, the gate charged the wrong footprint, so
             // fail loudly instead of running past the user's budget.
             bool materialize_dense = local_dense;
+            // A4-host inc 3: the host may have skipped building the dense
+            // tables entirely. Uploading from them would read empty vectors —
+            // catch it here, where the message can still name the cause.
+            if (!ctx.matchup_dense_materialized && local_dense) {
+                throw std::runtime_error(
+                    "GpuBackend: dense matchup upload required but the host "
+                    "skipped materializing the dense tables (A4-host inc 3 "
+                    "predictor disagrees with the backend's rank-blocker "
+                    "activation).");
+            }
             if (ctx.terminal_plan && ctx.terminal_plan->refined_with_ranks) {
                 materialize_dense = ctx.terminal_plan->device_dense_upload;
                 if (materialize_dense != local_dense) {
@@ -1043,6 +1074,53 @@ void GpuBackend::prepare(const SolverContext& ctx) {
             std::vector<uint32_t> cursor(offsets);
             for (uint32_t n = 0; n < N; ++n) order[cursor[depth[n]]++] = n;
 
+            // DEEPSOLVER_LEVEL_HISTOGRAM=1 — structural instrument for GPU B3
+            // (full-tree buffer lifetimes). The two full-tree buffer families
+            // (reach_scratch_*, node_values) are N×nc because the CURRENT level
+            // schedule keys on HEIGHT (depth[i] = 1 + max child height), under which
+            // a node's children can sit ANY number of levels below it, so neither
+            // buffer has a bounded live window. Keying on DEPTH-from-root instead
+            // makes every child exactly one level below its parent — which is what
+            // would let both buffers become 2-level rolling windows. What that costs
+            // is max_level_width × nc instead of N × nc, so the width distribution
+            // below IS the B3 design input. Prints both schedules; costs nothing
+            // when the env var is unset.
+            if (std::getenv("DEEPSOLVER_LEVEL_HISTOGRAM") != nullptr) {
+                std::vector<uint32_t> depth_from_root(N, 0);
+                for (uint32_t n = 0; n < N; ++n) {
+                    uint8_t na = ctx.tree->num_children[n];
+                    for (uint8_t a = 0; a < na; ++a) {
+                        uint32_t child = ctx.tree->children[ctx.tree->children_offset[n] + a];
+                        if (child < N) depth_from_root[child] = depth_from_root[n] + 1;
+                    }
+                }
+                uint32_t max_dfr = 0;
+                for (uint32_t d : depth_from_root) if (d > max_dfr) max_dfr = d;
+                std::vector<uint32_t> dfr_count(max_dfr + 1, 0);
+                for (uint32_t d : depth_from_root) dfr_count[d]++;
+                uint32_t n_term = 0, n_player = 0, n_chance = 0;
+                for (uint32_t n = 0; n < N; ++n) {
+                    auto nt = static_cast<NodeType>(ctx.tree->node_types[n]);
+                    if (nt == NodeType::TERMINAL) ++n_term;
+                    else if (nt == NodeType::CHANCE) ++n_chance;
+                    else ++n_player;
+                }
+                uint32_t widest_h = 0, widest_d = 0;
+                for (uint32_t L = 0; L < num_levels; ++L) widest_h = std::max(widest_h, count[L]);
+                for (uint32_t d = 0; d <= max_dfr; ++d) widest_d = std::max(widest_d, dfr_count[d]);
+                std::fprintf(stderr,
+                    "[levels] N=%u player=%u chance=%u terminal=%u | height-levels=%u "
+                    "widest=%u (%.1f%% of N) | depth-levels=%u widest=%u (%.1f%% of N)\n",
+                    N, n_player, n_chance, n_term, num_levels, widest_h,
+                    100.0 * widest_h / static_cast<double>(N),
+                    max_dfr + 1, widest_d, 100.0 * widest_d / static_cast<double>(N));
+                std::fprintf(stderr, "[levels] height widths:");
+                for (uint32_t L = 0; L < num_levels; ++L) std::fprintf(stderr, " %u", count[L]);
+                std::fprintf(stderr, "\n[levels] depth  widths:");
+                for (uint32_t d = 0; d <= max_dfr; ++d) std::fprintf(stderr, " %u", dfr_count[d]);
+                std::fprintf(stderr, "\n");
+            }
+
             impl_->host_node_order    = order;
             impl_->host_level_offsets = offsets;
             impl_->levels.node_order    = upload_vector(order);
@@ -1051,16 +1129,21 @@ void GpuBackend::prepare(const SolverContext& ctx) {
             impl_->levels.num_levels    = num_levels;
         }
 
-        // Allocate per-iteration state
+        // Allocate per-iteration state. B1a inc 3: the current_strategy
+        // buffer exists only when node locks do (they override it); the locks
+        // are already uploaded above, so this is the authoritative answer.
+        impl_->materialize_strategy = (impl_->locks.num_locks > 0);
         impl_->state = alloc_solver_state(ctx.tree->total_nodes,
                                            MAX_ACTIONS,
                                            ctx.iso->num_canonical,
-                                           *ctx.tree);
+                                           *ctx.tree,
+                                           impl_->materialize_strategy);
         {
             const uint64_t nc64 = ctx.iso->num_canonical;
             const uint64_t n64  = ctx.tree->total_nodes;
+            const uint64_t strat_buffers = impl_->materialize_strategy ? 3ULL : 2ULL;
             impl_->device_state_bytes_exact =
-                3ULL * impl_->state.state_stride * sizeof(float)   // compact ×3
+                strat_buffers * impl_->state.state_stride * sizeof(float)
               + 3ULL * n64 * nc64 * sizeof(float)                  // full-tree ×3
               + n64 * sizeof(uint32_t);                            // node_offset
         }
@@ -1126,10 +1209,12 @@ void GpuBackend::reprepare_keep_board(const SolverContext& ctx) {
     try {
         impl_->reach = upload_reach(*ctx.ip_reach, *ctx.oop_reach);
         impl_->locks = upload_locks(*ctx.resolved_locks);
+        impl_->materialize_strategy = (impl_->locks.num_locks > 0);
         impl_->state = alloc_solver_state(impl_->host_tree->total_nodes,
                                           MAX_ACTIONS,
                                           impl_->iso->num_canonical,
-                                          *impl_->host_tree);
+                                          *impl_->host_tree,
+                                          impl_->materialize_strategy);
         impl_->sample_vram();  // keep-board path: track min-free vs the
                                // original prepare()'s baseline
         impl_->prepared = true;
@@ -1155,12 +1240,20 @@ void GpuBackend::reprepare_keep_state(const SolverContext& ctx) {
         reprepare_keep_board(ctx);
         return;
     }
+    // B1a inc 3: whether a current_strategy buffer exists is decided at
+    // ALLOCATION time from the lock set. If this re-solve's locks disagree
+    // with the resident state's, keeping that state would either write locks
+    // into a null buffer or read a stale one — reallocate instead.
+    if ((!ctx.resolved_locks->empty()) != impl_->materialize_strategy) {
+        reprepare_keep_board(ctx);
+        return;
+    }
 
     // Keep board-fixed device data (tree, matchup, levels) AND the solver
-    // state (regrets, strategy_sum). current_strategy is recomputed from
-    // regrets by every iterate(), and finalize() only overwrites it with the
-    // normalized average — so neither needs restoring here. Refresh only the
-    // range-dependent uploads.
+    // state (regrets, strategy_sum). The regret-matched strategy is derived
+    // per iteration (inc 3) and finalize() normalizes on the host, so no
+    // strategy state needs restoring here. Refresh only the range-dependent
+    // uploads.
     free_locks(impl_->locks);
     free_reach(impl_->reach);
     impl_->finalized = false;
@@ -1229,12 +1322,22 @@ void GpuBackend::iterate(int iteration) {
         return h;
     };
 
-    // 1) Regret matching → current_strategy
-    launch_compute_strategy(
-        I.state.regrets, I.state.current_strategy,
-        I.tree.num_children, I.tree.node_types,
-        I.state.node_offset,
-        N, nc);
+    // 1) Strategy source for this iteration (B1a inc 3).
+    //    Locked solves materialize it (regret matching + the lock override
+    //    written on top); everything else regret-matches inside each reader,
+    //    which removes the third strat-shaped buffer entirely.
+    const int   strat_src_mode = I.materialize_strategy
+        ? kStratSrcMaterialized : kStratSrcRegrets;
+    const float* strat_src = I.materialize_strategy
+        ? I.state.current_strategy : I.state.regrets;
+
+    if (I.materialize_strategy) {
+        launch_compute_strategy(
+            I.state.regrets, I.state.current_strategy,
+            I.tree.num_children, I.tree.node_types,
+            I.state.node_offset,
+            N, nc);
+    }
 
     // 1b) Apply node locks: override current_strategy at locked (node, combo) pairs.
     //     Matches CpuBackend::compute_strategy which inlines the lock check.
@@ -1250,8 +1353,12 @@ void GpuBackend::iterate(int iteration) {
         CUDA_CHECK(cudaGetLastError());
     }
     if (kIterHash) {
-        std::fprintf(stderr, "[ih] it=%d cs=%016llx\n", iteration,
-                     hash_dev(I.state.current_strategy, I.state.state_stride));
+        // inc 3: hash the SOURCE the readers will use (mode 0 = materialized
+        // buffer, 1 = regrets). Hashing a now-nullptr current_strategy would
+        // have silently reported 0 on every default-path solve.
+        std::fprintf(stderr, "[ih] it=%d strat_src(mode=%d)=%016llx\n",
+                     iteration, strat_src_mode,
+                     hash_dev(strat_src, I.state.state_stride));
     }
 
     // 2) Forward reach propagation.
@@ -1279,7 +1386,7 @@ void GpuBackend::iterate(int iteration) {
             I.tree.children_offset, I.tree.children,
             I.state.node_offset,
             d_level, count,
-            I.state.current_strategy,
+            strat_src, strat_src_mode,
             I.state.reach_scratch_oop, I.state.reach_scratch_ip, nc);
     }
     if (kIterHash) {
@@ -1348,10 +1455,28 @@ void GpuBackend::iterate(int iteration) {
                 I.tree.runout_weight,
                 I.state.node_offset,
                 d_level, count,
-                I.state.current_strategy,
+                strat_src, strat_src_mode,
                 I.state.node_values,
                 nc, traverser);
         }
+
+        // Strategy_sum update — branch on schedule (decay-and-add for
+        // POSTFLOP, accumulative reach-weighted for STANDARD).
+        //
+        // ORDER MATTERS since B1a inc 3: this reads the ITERATION-START
+        // strategy. With the materialized buffer that was a snapshot and the
+        // order was free; deriving it from regrets makes "before
+        // update_regrets" the only correct position. Swapping the two launches
+        // is otherwise inert — update_regrets reads node_values and writes
+        // regrets, update_strategy_sum reads reach + regrets and writes
+        // strategy_sum.
+        const float* reach_own = (traverser == 0) ? I.state.reach_scratch_oop
+                                                  : I.state.reach_scratch_ip;
+        launch_update_strategy_sum(
+            I.state.strategy_sum, strat_src, strat_src_mode, reach_own,
+            I.tree.node_types, I.tree.active_player, I.tree.num_children,
+            I.state.node_offset,
+            N, nc, traverser, strat_weight, decay_and_add ? 1 : 0);
 
         // Regret update (at traverser's own nodes). Reads per-action values
         // straight from the children's node_values rows (inc 2 — no lift).
@@ -1361,16 +1486,6 @@ void GpuBackend::iterate(int iteration) {
             I.tree.children_offset, I.tree.children,
             I.state.node_offset,
             N, nc, traverser, pos_disc, neg_disc);
-
-        // Strategy_sum update — branch on schedule (decay-and-add for
-        // POSTFLOP, accumulative reach-weighted for STANDARD)
-        const float* reach_own = (traverser == 0) ? I.state.reach_scratch_oop
-                                                  : I.state.reach_scratch_ip;
-        launch_update_strategy_sum(
-            I.state.strategy_sum, I.state.current_strategy, reach_own,
-            I.tree.node_types, I.tree.active_player, I.tree.num_children,
-            I.state.node_offset,
-            N, nc, traverser, strat_weight, decay_and_add ? 1 : 0);
     };
 
     // Deterministic kernel-vs-kernel self-check (env DEEPSOLVER_RB_SELFCHECK).
@@ -1472,49 +1587,10 @@ void GpuBackend::iterate(int iteration) {
 
 namespace {
 
-__global__ void normalize_strategy_kernel(
-    const float* __restrict__ strategy_sum,   // compact [slot * nc]
-    float*       __restrict__ strategy_out,   // compact [slot * nc]
-    const uint8_t* __restrict__ num_children,
-    const uint8_t* __restrict__ node_types,
-    const uint32_t* __restrict__ node_offset, // [N] per-node slot index
-    uint32_t num_nodes, uint16_t num_canonical)
-{
-    // 64-bit launch index: N × nc exceeds INT32_MAX headroom on the roadmap
-    // target tree (see cfr_kernel.cu).
-    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t total = static_cast<size_t>(num_nodes) * num_canonical;
-    if (tid >= total) return;
-
-    const uint32_t node  = static_cast<uint32_t>(tid / num_canonical);
-    const uint32_t combo = static_cast<uint32_t>(tid % num_canonical);
-
-    uint8_t nt = node_types[node];
-    uint8_t na = num_children[node];
-
-    // B1a: non-player nodes own no state slot — return WITHOUT writing.
-    // (Pre-B1a this branch zero-filled the node's dense action rows, which
-    // was defensive-only: nothing reads a non-player node's strategy. Under
-    // the compact layout that write would land in sentinel slot 0.)
-    if ((nt != 0 /*OOP*/ && nt != 1 /*IP*/) || na == 0) return;
-
-    size_t base = static_cast<size_t>(node_offset[node]) * num_canonical
-                + static_cast<size_t>(combo);
-    size_t stride = num_canonical;
-
-    float total_sum = 0.0f;
-    for (int a = 0; a < na; ++a) total_sum += strategy_sum[base + a * stride];
-
-    if (total_sum > 1e-7f) {
-        float inv = 1.0f / total_sum;
-        for (int a = 0; a < na; ++a) {
-            strategy_out[base + a * stride] = strategy_sum[base + a * stride] * inv;
-        }
-    } else {
-        float u = 1.0f / static_cast<float>(na);
-        for (int a = 0; a < na; ++a) strategy_out[base + a * stride] = u;
-    }
-}
+// B1a inc 3: normalize_strategy_kernel is gone — finalize() normalizes the
+// downloaded strategy_sum on the host (it needs the values host-side anyway)
+// and the postsolve passes derive the same average on the fly via
+// StrategyRow<STRAT_SRC_SUM>. Neither needs a device buffer to write into.
 
 } // anonymous namespace
 
@@ -1526,28 +1602,44 @@ void GpuBackend::finalize() {
     uint16_t nc = I.iso->num_canonical;
     uint32_t N  = I.tree.num_nodes;
 
-    // Reuse current_strategy buffer as target for normalized averaged strategy
-    {
-        const size_t total = static_cast<size_t>(N) * nc;
-        const int block = 256;
-        const int grid  = static_cast<int>(
-            (total + block - 1) / static_cast<size_t>(block));
-        normalize_strategy_kernel<<<grid, block>>>(
-            I.state.strategy_sum, I.state.current_strategy,
-            I.tree.num_children, I.tree.node_types,
-            I.state.node_offset, N, nc);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // Download to host: compact [slot * nc] buffer, repacked per node below.
+    // B1a inc 3: download strategy_sum and normalize on the HOST. The device
+    // buffer this used to normalize into is gone, and allocating a scratch one
+    // here would put the peak straight back (finalize can be called mid-loop
+    // for the exploitability probe, so regrets and strategy_sum must both stay
+    // live). The arithmetic below is normalize_strategy_kernel line for line —
+    // same summation order over actions, same 1e-7 threshold, same
+    // multiply-by-reciprocal — so the result is bit-identical.
     std::vector<float> host_strat(I.state.state_stride, 0.0f);
     if (!host_strat.empty()) {
         CUDA_CHECK(cudaMemcpy(host_strat.data(),
-                               I.state.current_strategy,
+                               I.state.strategy_sum,
                                host_strat.size() * sizeof(float),
                                cudaMemcpyDeviceToHost));
     }
     CUDA_CHECK(cudaDeviceSynchronize());
+    for (uint32_t n = 0; n < N; ++n) {
+        auto nt = static_cast<NodeType>(I.host_tree->node_types[n]);
+        const uint8_t na = I.host_tree->num_children[n];
+        if ((nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) || na == 0) {
+            continue;
+        }
+        const size_t base = static_cast<size_t>(I.state.host_node_offset[n]) * nc;
+        const size_t stride = nc;
+        for (uint16_t combo = 0; combo < nc; ++combo) {
+            const size_t b = base + combo;
+            float total_sum = 0.0f;
+            for (int a = 0; a < na; ++a) total_sum += host_strat[b + a * stride];
+            if (total_sum > 1e-7f) {
+                const float inv = 1.0f / total_sum;
+                for (int a = 0; a < na; ++a) {
+                    host_strat[b + a * stride] = host_strat[b + a * stride] * inv;
+                }
+            } else {
+                const float u = 1.0f / static_cast<float>(na);
+                for (int a = 0; a < na; ++a) host_strat[b + a * stride] = u;
+            }
+        }
+    }
 
     // Peak-VRAM honesty (P2 review): finalize allocates nothing device-side
     // today, but sample anyway so the high-water mark provably covers the
@@ -1608,6 +1700,14 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
                           static_cast<size_t>(nc) * sizeof(float),
                           cudaMemcpyDeviceToDevice));
 
+    // B1a inc 3: the averaged strategy is normalized out of strategy_sum on
+    // the fly — same arithmetic normalize_strategy_kernel used to write into
+    // current_strategy, minus the buffer. Node locks make no difference here:
+    // finalize never re-applied them either (they are already baked into
+    // strategy_sum by the iterations that ran under them).
+    const int    ps_src_mode = kStratSrcSum;
+    const float* ps_src      = state.strategy_sum;
+
     // 2) Forward reach propagation, root → leaves, using averaged strategy.
     //    The kernel only multiplies the acting player's reach by their
     //    strategy, so opponent-of-traverser reach absorbs the population
@@ -1624,7 +1724,7 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
             tree.children_offset, tree.children,
             state.node_offset,
             d_level, count,
-            state.current_strategy,
+            ps_src, ps_src_mode,
             state.reach_scratch_oop, state.reach_scratch_ip, nc);
     }
 
@@ -1682,7 +1782,7 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
                 tree.runout_weight,
                 state.node_offset,
                 d_level, count,
-                state.current_strategy,
+                ps_src, ps_src_mode,
                 state.node_values,
                 nc, traverser);
         } else {
@@ -1692,7 +1792,7 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
                 tree.runout_weight,
                 state.node_offset,
                 d_level, count,
-                state.current_strategy,
+                ps_src, ps_src_mode,
                 state.node_values,
                 nc, traverser);
         }

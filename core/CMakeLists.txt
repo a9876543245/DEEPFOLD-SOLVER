@@ -373,10 +373,18 @@ if(BUILD_TESTS)
     # expected error text. (CTest evaluates regex against stderr by default
     # for FAIL_REGULAR_EXPRESSION; we use the inverse so that "would
     # allocate ... GB" being absent fails the test.)
+    #
+    # Board/budget changed by A4-host inc 3: this used to pin AsKd7c at 8 MB,
+    # where the single 12.4 MB rainbow table alone busted the cap. That board
+    # is RankBlockerOnly and no longer builds dense tables at all (it is now
+    # rejected by the peak-host gate instead — an intended routing change), so
+    # the cap is pinned on a DENSE-plan board: AsKsQs keeps a 1.07 MB
+    # signed-count table, over the 1 MB half-budget. Same mechanism, same
+    # diagnostic, and it still fires identically on the v2.4.0 binary.
     add_test(NAME CliMemoryBudgetReject
         COMMAND deepsolver_core
-            --pot 100 --stack 500 --board AsKd7c
-            --iterations 5 --backend cpu --host-memory-mb 8)
+            --pot 100 --stack 500 --board AsKsQs
+            --iterations 5 --backend cpu --host-memory-mb 2)
     set_tests_properties(CliMemoryBudgetReject PROPERTIES
         LABELS "smoke;memory" TIMEOUT 60
         PASS_REGULAR_EXPRESSION "precompute_matchups would allocate"
@@ -420,6 +428,10 @@ if(BUILD_TESTS)
     # the regression pin. Deterministic on any machine: CPU branch, no
     # hardware probe. The collapse gate itself is still exercised by
     # CliMonoStateGateCollapse below (GPU branch, pinned VRAM budget).
+    # 2026-07-27: this fixture runs --postsolve none, so the newly-priced
+    # fused ev·valid table (211 MB on a full postsolve) does not apply and
+    # the margin here is unchanged. With postsolve on, the same board now
+    # estimates 2.70 GB against a 2.76 GB measured peak.
     add_test(NAME CliMonoStateGateFits
         COMMAND deepsolver_core
             --pot 100 --stack 500 --board Ah9h4h
@@ -457,6 +469,38 @@ if(BUILD_TESTS)
             -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=postsolve_rb_selfcheck
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
     set_tests_properties(CliPostsolveRbSelfcheck PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 120)
+
+    # A4-host inc 3: RankBlockerOnly solves must not build the dense host
+    # matchup tables (535 MB → 0.12 MB on the singleton turn), AND narrow-
+    # range solves must still build them (their active-list terminal kernels
+    # have no blocker route). Red on v2.4.0: the field does not exist there.
+    add_test(NAME CliHostDenseMatchupSkip
+        COMMAND ${CMAKE_COMMAND}
+            -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=host_dense_matchup_skip
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+    set_tests_properties(CliHostDenseMatchupSkip PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 120)
+
+    # A4-host inc 4: the builder's runout gate must price the tables the
+    # solve really builds (rank tables on a blocker board), so a rainbow flop
+    # enumerates when its CFR STATE fits and still collapses when it does
+    # not. Red on v2.4.0, which collapses it at every budget.
+    add_test(NAME CliRainbowGateEnumerates
+        COMMAND ${CMAKE_COMMAND}
+            -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=rainbow_gate_enumerates
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+    set_tests_properties(CliRainbowGateEnumerates PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 120)
+
+    # Peak-host model recalibration: the fused ev/valid postsolve table must
+    # be priced, and a GPU solve must not be charged a finalized-strategy
+    # copy it never holds. Red on v2.4.0 on both counts.
+    add_test(NAME CliPeakHostModel
+        COMMAND ${CMAKE_COMMAND}
+            -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=peak_host_model
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+    set_tests_properties(CliPeakHostModel PROPERTIES
         LABELS "smoke;memory" TIMEOUT 120)
 
     # Roadmap ④ (post-v1.9.0): Exact-mode feasibility pre-flight. With
@@ -651,6 +695,17 @@ if(BUILD_TESTS)
         # (the lift/normalize chance-row overflow corrupted every enumerated
         # GPU solve while collapsed trees stayed bit-exact — see
         # tests/cli_enumerated_parity.cmake for the full story).
+        # B1a inc 3: an unlocked GPU solve must allocate one strat-shaped
+        # buffer LESS than a locked one (which still materializes the strategy
+        # its lock override writes into). Red on v2.4.0, where both allocate
+        # three. GPU-gated: reads allocated_state_bytes from a real prepare.
+        add_test(NAME CliGpuStratBuffer
+            COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=gpu_strat_buffer
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+        set_tests_properties(CliGpuStratBuffer PROPERTIES
+            LABELS "smoke;gpu;memory" TIMEOUT 120)
+
         add_test(NAME CliEnumeratedGpuParity
             COMMAND ${CMAKE_COMMAND}
                 -DEXE=$<TARGET_FILE:deepsolver_core>

@@ -865,6 +865,10 @@ std::string result_to_json(
         json << "    \"estimated_overhead_bytes\": " << r.estimated_overhead_bytes << ",\n";
         json << "    \"terminal_representation\": \""
              << escape_json(r.terminal_representation) << "\",\n";
+        // A4-host inc 3: false ⇒ the dense nc² tables were never built and
+        // estimated_matchup_bytes prices the rank tables instead.
+        json << "    \"host_dense_matchup\": "
+             << json_bool(r.host_dense_matchup) << ",\n";
         // Decomposed runs keep the monolithic PREFIX solve's timing/resources
         // (aggregation unbuilt) — consumers must not read these numbers as
         // describing the decomposition.
@@ -1788,6 +1792,8 @@ int main(int argc, char* argv[]) {
                       << "    \"estimated_overhead_bytes\": " << r.estimated_overhead_bytes << ",\n"
                       << "    \"terminal_representation\": \""
                       << escape_json(r.terminal_representation) << "\",\n"
+                      << "    \"host_dense_matchup\": "
+                      << json_bool(r.host_dense_matchup) << ",\n"
                       << "    \"estimated_strategy_tree_bytes\": " << r.estimated_strategy_tree_bytes << ",\n"
                       << "    \"estimated_json_bytes\": " << r.estimated_json_bytes << ",\n"
                       << "    \"host_budget_bytes\": " << r.host_budget_bytes << ",\n"
@@ -2172,6 +2178,8 @@ int main(int argc, char* argv[]) {
                       << "  \"decomposed\": " << (decomposed ? "true" : "false") << ",\n"
                       << "  \"terminal_representation\": \""
                       << escape_json(rr.terminal_representation) << "\",\n"
+                      << "  \"host_dense_matchup\": "
+                      << (rr.host_dense_matchup ? "true" : "false") << ",\n"
                       << "  \"canonical_combos\": " << rr.canonical_combos << ",\n"
                       << "  \"player_nodes\": " << rr.player_nodes << ",\n"
                       << "  \"threads_requested\": " << args.cpu_threads << ",\n"

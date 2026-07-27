@@ -103,6 +103,44 @@ constexpr uint64_t kHostProcessOverheadBytes = 96ULL * 1024ULL * 1024ULL;
 /// CUDA runtime/context host-side RSS (driver pools, pinned staging).
 /// Measured 125–140 MB on CUDA 13.2 / Win11 / RTX 5090; padded slightly.
 constexpr uint64_t kGpuHostContextBytes = 160ULL * 1024ULL * 1024ULL;
+/// A4-host inc 4: the CUDA context cost is NOT flat — on Windows/WDDM the
+/// driver keeps a host-side backing store for device allocations (VRAM is
+/// pageable), so host RSS grows with the device footprint. Measured after
+/// prepare(), host RSS minus process baseline and matchup tables, on CUDA
+/// 13.2 / Win11 / RTX 5090:
+///     device   98 MB →   34 MB   (fixed context dominates)
+///     device 1.82 GB →  477 MB   (26%)
+///     device 16.3 GB → 2.73 GB   (17%)
+/// 16% of device total, ON TOP of the flat context above, stays on the
+/// conservative side of all three. It only started to matter when inc 4 let
+/// multi-GB enumerated trees reach the GPU: at 16 GB of VRAM the missing
+/// term was 2.7 GB of real host RAM the gate never charged.
+constexpr double kGpuDeviceHostMirrorFraction = 0.16;
+inline uint64_t bytes_for_gpu_host_overhead(uint64_t device_total_bytes) {
+    return kGpuHostContextBytes
+         + static_cast<uint64_t>(
+               static_cast<double>(device_total_bytes)
+               * kGpuDeviceHostMirrorFraction);
+}
+
+/// How many copies of the finalized strategy are alive at peak. Measured as
+/// (finalize RSS delta ÷ one copy) across turn/mono/rainbow spots, 2026-07-27:
+///     CPU  2.05  2.09  2.11  2.13   — the backend's nested copy and
+///                                     Solver::strategy_ both stay live
+///     GPU  1.24  1.28  1.36         — the flat device download is released
+///                                     as the nested repack forms
+/// The flat 2× was calibrated on CPU and over-charged GPU solves by a full
+/// copy: 1.3 GB on the enumerated rainbow, which is the difference between
+/// "enumerate" and "collapse" at a 8 GB budget. 1.5 stays above every GPU
+/// measurement without charging a copy that never exists.
+constexpr double kFinalStrategyCopiesCpu = 2.0;
+constexpr double kFinalStrategyCopiesGpu = 1.5;
+inline uint64_t bytes_for_live_final_strategy(uint64_t one_copy_bytes,
+                                              bool gpu_backend) {
+    return static_cast<uint64_t>(
+        static_cast<double>(one_copy_bytes)
+        * (gpu_backend ? kFinalStrategyCopiesGpu : kFinalStrategyCopiesCpu));
+}
 /// Result JSON floor when the navigation strategy tree is NOT emitted
 /// (--no-strategy-tree): root strategies + diagnostics + resources, no
 /// per-node cache. Measured ~0.3–2.7 MB depending on nc.
@@ -155,7 +193,7 @@ struct SolveFootprintEstimate {
     /// plus process/CUDA-context overhead. Without these the host gate
     /// passed solves whose finalize then blew the budget (measured: mono
     /// CPU est 2.00 GB vs 2.43 GB actual peak).
-    uint64_t final_strategy_bytes      = 0;   ///< ONE copy; total charges 2×.
+    uint64_t final_strategy_bytes      = 0;   ///< ONE copy; see gpu_backend.
     uint64_t process_overhead_bytes    = 0;
     uint64_t strategy_tree_ev_bytes    = 0;
     uint64_t json_response_bytes       = 0;
@@ -163,10 +201,17 @@ struct SolveFootprintEstimate {
     /// Peak host-side estimate across the whole solve lifetime (prepare →
     /// iterate → finalize → serialize). Excludes GPU state — that lives in
     /// VRAM.
+    /// True when this footprint describes a GPU-executing solve. Only affects
+    /// how many finalized-strategy copies are charged (see
+    /// kFinalStrategyCopies*) — the device terms above already say which
+    /// backend this is, but they can legitimately be 0, so it is explicit.
+    bool gpu_backend = false;
+
     uint64_t total_host_bytes() const {
         return matchup_tables_bytes
              + cpu_state_bytes
-             + 2ULL * final_strategy_bytes
+             + memory_budget::bytes_for_live_final_strategy(
+                   final_strategy_bytes, gpu_backend)
              + process_overhead_bytes
              + strategy_tree_ev_bytes
              + json_response_bytes;
@@ -274,10 +319,19 @@ inline uint64_t bytes_for_levelized_cpu_extra(uint64_t total_nodes, uint64_t nc)
 /// on Ah9h4h) which made the ① collapse gate reject boards that actually
 /// fit. Renamed (not just re-derived) so any caller still passing
 /// MAX_ACTIONS fails to compile instead of silently mis-estimating.
+/// B1a inc 3: `materialize_strategy` = does this solve keep a device-side
+/// current_strategy? Only node-locked solves do (the lock override is a write
+/// into it); everything else derives the strategy from regrets or
+/// strategy_sum inside each consumer, so the strat-shaped term is 2 buffers,
+/// not 3. Passed explicitly rather than defaulted so a caller that has not
+/// thought about locks fails to compile.
 inline uint64_t bytes_for_gpu_state_compact(uint64_t total_nodes,
                                             uint64_t player_action_slots,
-                                            uint64_t nc) {
-    return (3ULL * player_action_slots + 3ULL * total_nodes) * nc * sizeof(float)
+                                            uint64_t nc,
+                                            bool materialize_strategy) {
+    const uint64_t strat_buffers = materialize_strategy ? 3ULL : 2ULL;
+    return (strat_buffers * player_action_slots + 3ULL * total_nodes)
+             * nc * sizeof(float)
          + total_nodes * sizeof(uint32_t);
 }
 
@@ -304,9 +358,10 @@ inline uint64_t bytes_for_gpu_device_total(uint64_t total_nodes,
                                            uint64_t player_action_slots,
                                            uint64_t matchup_tables,
                                            uint64_t nc,
-                                           bool device_dense_upload) {
+                                           bool device_dense_upload,
+                                           bool materialize_strategy) {
     const uint64_t state   = bytes_for_gpu_state_compact(
-        total_nodes, player_action_slots, nc);
+        total_nodes, player_action_slots, nc, materialize_strategy);
     const uint64_t matchup = device_dense_upload
         ? bytes_for_matchup_tables(matchup_tables, nc, 2ULL * sizeof(float))
         : 0ULL;

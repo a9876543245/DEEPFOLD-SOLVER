@@ -224,6 +224,217 @@ elseif(CASE STREQUAL "postsolve_rb_selfcheck")
     "postsolve_rb_selfcheck: dense=${off_exp} blocker=${on_exp} "
     "(diff ${diff_u} micro-pct <= 500)")
 
+elseif(CASE STREQUAL "host_dense_matchup_skip")
+  # A4-host increment 3: on a RankBlockerOnly solve the host must not build
+  # the dense nc² EV/valid/category tables at all — nothing reads them, and
+  # they are the ~30 GB term on big spots. AsKd7c2h (singleton turn, 49
+  # runout tables) priced 535 MB of host matchup tables on v2.4.0 and
+  # measured ~1.02 GB peak RSS; after the skip it is 0.12 MB / ~235 MB.
+  #
+  # The SECOND half of this test is the one that keeps the first honest: the
+  # skip is NOT valid whenever a player's range is narrow enough to engage
+  # the CPU backends' active-list terminal kernels, which have no blocker
+  # route. The medium_sparse preset (169 combos/player on the same rainbow
+  # board family) must therefore still report the dense tables as built. A
+  # test that only checked the skip would pass just as happily on a build
+  # that skipped them unconditionally — and that build reads empty tables.
+  execute_process(
+    COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c2h
+            --iterations 5 --exploitability 0 --backend cpu
+            --no-strategy-tree --no-progress
+    OUTPUT_VARIABLE wide_out RESULT_VARIABLE wide_rc ERROR_VARIABLE wide_err)
+  if(NOT wide_rc EQUAL 0)
+    message(FATAL_ERROR "wide-range turn solve failed rc=${wide_rc}: ${wide_err}")
+  endif()
+  string(JSON rep GET "${wide_out}" resources terminal_representation)
+  if(NOT rep STREQUAL "rank_blocker_only")
+    message(FATAL_ERROR
+      "fixture no longer exercises the blocker plan (got \"${rep}\")")
+  endif()
+  string(JSON dense GET "${wide_out}" resources host_dense_matchup)
+  if(dense)
+    message(FATAL_ERROR
+      "dense host matchup tables were still materialized on a "
+      "rank_blocker_only solve (A4-host inc 3 skip did not engage)")
+  endif()
+  string(JSON mbytes GET "${wide_out}" resources estimated_matchup_bytes)
+  # 49 tables × nc² × 9 B is half a gigabyte; the rank tables are ~130 KB.
+  # Anything above 1 MiB means the estimate still prices the dense tables.
+  if(mbytes GREATER 1048576)
+    message(FATAL_ERROR
+      "estimated_matchup_bytes ${mbytes} still prices dense tables the "
+      "solve no longer builds")
+  endif()
+
+  execute_process(
+    COMMAND ${EXE} --benchmark medium_sparse --no-progress
+    OUTPUT_VARIABLE narrow_out RESULT_VARIABLE narrow_rc ERROR_VARIABLE narrow_err)
+  if(NOT narrow_rc EQUAL 0)
+    message(FATAL_ERROR "narrow-range preset failed rc=${narrow_rc}: ${narrow_err}")
+  endif()
+  string(JSON narrow_rep GET "${narrow_out}" terminal_representation)
+  string(JSON narrow_dense GET "${narrow_out}" host_dense_matchup)
+  if(NOT narrow_rep STREQUAL "rank_blocker_only")
+    message(FATAL_ERROR
+      "medium_sparse no longer runs a blocker-plan board (got "
+      "\"${narrow_rep}\") - it can no longer prove the narrow-range guard")
+  endif()
+  if(NOT narrow_dense)
+    message(FATAL_ERROR
+      "narrow-range solve skipped the dense tables, but its active-list "
+      "terminal kernels have no blocker route - they would read empty "
+      "tables")
+  endif()
+  message(STATUS
+    "host_dense_matchup_skip: wide=skipped (${mbytes} B), narrow=kept")
+
+elseif(CASE STREQUAL "rainbow_gate_enumerates")
+  # A4-host increment 4: the tree builder's runout gate used to charge the
+  # DENSE matchup price on every board. On a rainbow flop that is 2303
+  # projected leaves × 1176² × 9 B ≈ 28.6 GB, so the gate collapsed the tree
+  # at ANY sane budget — even though the solve (rank/fold blockers, inc 3)
+  # really needs 6.2 MB of rank tables there. Now the gate prices what
+  # precompute will build, and the enumerated tree is decided by the CFR
+  # state instead: solver.h's ① check, mirrored here by --estimate-only.
+  #
+  # Both directions are pinned, because a build that simply never collapses
+  # would pass a one-sided test and then OOM:
+  #   24 GB budget → enumerates (state 16.3 GB + 2× strategy fits)
+  #    6 GB budget → still collapses (it does not)
+  # On v2.4.0 BOTH report the collapsed tree's 216 player nodes.
+  execute_process(
+    COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c --iterations 200
+            --estimate-only --backend cpu --host-memory-mb 24000
+    OUTPUT_VARIABLE big_out RESULT_VARIABLE big_rc ERROR_VARIABLE big_err)
+  if(NOT big_rc EQUAL 0)
+    message(FATAL_ERROR "estimate at 24 GB failed rc=${big_rc}: ${big_err}")
+  endif()
+  string(JSON big_nodes GET "${big_out}" resources player_nodes)
+  if(big_nodes LESS 10000)
+    message(FATAL_ERROR
+      "rainbow flop still collapses at a 24 GB budget (player_nodes "
+      "${big_nodes}) - the builder is still charging the dense matchup "
+      "price the blockers never pay")
+  endif()
+
+  execute_process(
+    COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c --iterations 200
+            --estimate-only --backend cpu --host-memory-mb 6000
+    OUTPUT_VARIABLE small_out RESULT_VARIABLE small_rc ERROR_VARIABLE small_err)
+  if(NOT small_rc EQUAL 0)
+    message(FATAL_ERROR "estimate at 6 GB failed rc=${small_rc}: ${small_err}")
+  endif()
+  string(JSON small_nodes GET "${small_out}" resources player_nodes)
+  if(small_nodes GREATER 10000)
+    message(FATAL_ERROR
+      "rainbow flop enumerated at a 6 GB budget (player_nodes "
+      "${small_nodes}) - its CFR state needs ~21 GB, so the state gate is "
+      "not holding")
+  endif()
+  message(STATUS
+    "rainbow_gate_enumerates: 24 GB -> ${big_nodes} player nodes, "
+    "6 GB -> ${small_nodes}")
+
+elseif(CASE STREQUAL "peak_host_model")
+  # Peak-host model recalibration (2026-07-27). Two measured corrections,
+  # one assertion each.
+  #
+  # (a) The fused ev·valid postsolve matrix (tables × nc² × 4 B) is real host
+  #     memory precompute builds on every dense-plan solve that will run a
+  #     postsolve, and the model never charged it. On AsKsQs that is 211 MB
+  #     on top of 503 MB of matchup tables — the whole of that board's -9.6%
+  #     under-estimate. v2.4.0 reports ~503 MB here.
+  execute_process(
+    COMMAND ${EXE} --pot 100 --stack 500 --board AsKsQs --iterations 3
+            --exploitability 0 --backend cpu --no-strategy-tree --no-progress
+    OUTPUT_VARIABLE dense_out RESULT_VARIABLE dense_rc ERROR_VARIABLE dense_err)
+  if(NOT dense_rc EQUAL 0)
+    message(FATAL_ERROR "dense-board solve failed rc=${dense_rc}: ${dense_err}")
+  endif()
+  string(JSON dense_matchup GET "${dense_out}" resources estimated_matchup_bytes)
+  # dense tables alone = 446 × 344² × 10 B = 528 MB; + fused = 739 MB.
+  if(dense_matchup LESS 629145600)   # 600 MiB
+    message(FATAL_ERROR
+      "estimated_matchup_bytes ${dense_matchup} does not include the fused "
+      "ev/valid postsolve table the solve really builds")
+  endif()
+
+  # (b) The finalized strategy is charged 2× on CPU but only ~1.25-1.36× on
+  #     GPU (the flat download is released as the nested repack forms). With
+  #     the flat 2× the enumerated rainbow priced 8.27 GB and got collapsed
+  #     at an 8 GB budget; the honest 1.5× prices 6.96 GB against a 6.19 GB
+  #     measured peak, so it must ENUMERATE there.
+  execute_process(
+    COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c --iterations 200
+            --estimate-only --backend gpu --host-memory-mb 8000
+    OUTPUT_VARIABLE gpu_out RESULT_VARIABLE gpu_rc ERROR_VARIABLE gpu_err)
+  if(NOT gpu_rc EQUAL 0)
+    message(FATAL_ERROR "gpu estimate failed rc=${gpu_rc}: ${gpu_err}")
+  endif()
+  string(JSON gpu_nodes GET "${gpu_out}" resources player_nodes)
+  if(gpu_nodes LESS 10000)
+    message(FATAL_ERROR
+      "rainbow flop collapses on GPU at an 8 GB budget (player_nodes "
+      "${gpu_nodes}) - the host model is still charging a finalized-strategy "
+      "copy that a GPU solve never holds")
+  endif()
+  message(STATUS
+    "peak_host_model: matchup ${dense_matchup} B incl. fused, GPU 8 GB "
+    "budget enumerates ${gpu_nodes} player nodes")
+
+elseif(CASE STREQUAL "gpu_strat_buffer")
+  # B1a increment 3: the GPU keeps regrets + strategy_sum and derives the
+  # regret-matched / averaged strategy inside each consumer, so a normal solve
+  # allocates TWO strat-shaped buffers, not three. Node-LOCKED solves still
+  # allocate the third — the lock override is a write into a materialized
+  # strategy — so both directions are pinned here; a build that dropped the
+  # buffer unconditionally would write locks into a null pointer.
+  #
+  # Uses allocated_state_bytes (backend truth, not an estimate). On AsKd7c2h
+  # the strat term is ~5 MB/buffer against ~62 MB of full-tree buffers:
+  # v2.4.0 allocates 91.9 MB, the unlocked solve now takes 76.9 MB.
+  execute_process(
+    COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c2h --iterations 3
+            --exploitability 0 --backend gpu --postsolve none
+            --no-strategy-tree --no-progress
+    OUTPUT_VARIABLE free_out RESULT_VARIABLE free_rc ERROR_VARIABLE free_err)
+  if(NOT free_rc EQUAL 0)
+    message(FATAL_ERROR "unlocked GPU solve failed rc=${free_rc}: ${free_err}")
+  endif()
+  string(JSON free_state GET "${free_out}" resources allocated_state_bytes)
+
+  execute_process(
+    COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c2h --iterations 3
+            --exploitability 0 --backend gpu --postsolve none
+            --no-strategy-tree --no-progress
+            --node-locks "[{\"history\":\"\",\"combo\":\"AhKh\",\"strategy\":[1,0,0,0]}]"
+    OUTPUT_VARIABLE lock_out RESULT_VARIABLE lock_rc ERROR_VARIABLE lock_err)
+  if(NOT lock_rc EQUAL 0)
+    message(FATAL_ERROR "locked GPU solve failed rc=${lock_rc}: ${lock_err}")
+  endif()
+  string(JSON lock_state GET "${lock_out}" resources allocated_state_bytes)
+
+  if(NOT lock_state GREATER free_state)
+    message(FATAL_ERROR
+      "locked solve (${lock_state} B) does not allocate more device state "
+      "than the unlocked one (${free_state} B) - either the unlocked solve "
+      "still keeps a current_strategy buffer, or the locked one lost the "
+      "buffer its override writes into")
+  endif()
+  # One strat-shaped buffer is the difference. Anything larger means the two
+  # solves differ in more than the strategy buffer and this stopped being a
+  # test of increment 3.
+  math(EXPR delta "${lock_state} - ${free_state}")
+  math(EXPR bound "${free_state} / 4")
+  if(delta GREATER ${bound})
+    message(FATAL_ERROR
+      "locked-vs-unlocked device state differs by ${delta} B, more than the "
+      "single strat buffer this test is about (state ${free_state} B)")
+  endif()
+  message(STATUS
+    "gpu_strat_buffer: unlocked ${free_state} B, locked ${lock_state} B "
+    "(+${delta} B = the materialized strategy)")
+
 else()
   message(FATAL_ERROR "unknown CASE: ${CASE}")
 endif()

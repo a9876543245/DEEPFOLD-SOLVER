@@ -100,11 +100,85 @@ struct TerminalRepresentationPlan {
     }
 };
 
+/// A4-host inc 3: what one "matchup table" costs the HOST when the rank/fold
+/// blockers serve every terminal — the per-original rank vector plus the board
+/// mask, instead of the nc² EV/valid/category matrices. Independent of nc and
+/// ~500× smaller on a rainbow board (2.7 KB vs 12.4 MB at nc = 1176).
+constexpr uint64_t kMatchupRankTableBytes =
+    static_cast<uint64_t>(NUM_COMBOS) * sizeof(uint16_t) + sizeof(CardMask);
+
+inline uint64_t bytes_for_matchup_rank_tables(uint64_t runout_tables) {
+    return runout_tables * kMatchupRankTableBytes;
+}
+
 /// The DEEPSOLVER_RB_SELFCHECK escape hatch, read once. Kept here so every
 /// consumer sees the same answer (GpuBackend used to read it privately).
 inline bool terminal_selfcheck_forced() {
     static const bool forced = (std::getenv("DEEPSOLVER_RB_SELFCHECK") != nullptr);
     return forced;
+}
+
+/// The two debug escape hatches that route terminal evaluation back through
+/// the dense matrices — DEEPSOLVER_FORCE_DENSE (CFR kernels, both CPU
+/// backends) and DEEPSOLVER_POSTSOLVE_DENSE (postsolve BR/EV sweeps). Either
+/// one means the host tables must exist no matter what the plan says.
+inline bool terminal_dense_forced() {
+    static const bool forced =
+        (std::getenv("DEEPSOLVER_FORCE_DENSE") != nullptr) ||
+        (std::getenv("DEEPSOLVER_POSTSOLVE_DENSE") != nullptr);
+    return forced;
+}
+
+/// Active-list density denominator shared by both CPU backends' terminal
+/// kernels: a player whose live canonical count is ≤ nc/this takes the
+/// active-index kernels. Defined here (rather than privately per backend)
+/// because A4-host inc 3 has to PREDICT that routing before precompute
+/// decides whether to build the dense tables at all.
+constexpr uint32_t kTerminalActiveListDensityDen = 4;
+
+/// Does this player's root reach engage the active-list terminal kernels?
+/// Missing/short reach ⇒ the backends treat every combo as live, so no.
+inline bool terminal_active_list_engaged(
+    uint16_t nc, const std::vector<float>& reach)
+{
+    if (nc == 0 || reach.size() < nc) return false;
+    uint32_t live = 0;
+    for (uint16_t c = 0; c < nc; ++c) {
+        if (reach[c] != 0.0f) ++live;
+    }
+    return live * kTerminalActiveListDensityDen <= static_cast<uint32_t>(nc);
+}
+
+/// A4-host inc 3: must the HOST still materialize the dense nc² EV / valid /
+/// category tables for this solve?
+///
+/// "The plan says RankBlockerOnly" is necessary but NOT sufficient. The plan
+/// governs which SHOWDOWN REPRESENTATION the board needs; the CPU backends
+/// additionally pick per-traverser terminal kernels by RANGE DENSITY, and
+/// their narrow-range kernels have no blocker route:
+///
+///   - LevelizedCpuBackend: the rank-blocker showdown and the fold-blocker
+///     shortcut are both disabled under sparse traversal (live ≤ nc/8), which
+///     drops those terminals onto the dense category/valid kernels.
+///   - CpuBackend (reference): the rank-blocker is disabled as soon as the
+///     active-list path engages (live ≤ nc/4).
+///
+/// So the predicate uses the LOOSER of the two thresholds for both backends —
+/// conservative by one density band on the levelized path, and immune to a
+/// backend-kind mis-prediction (which is decided after precompute) or to a
+/// later AUTO GPU→CPU downgrade. Both backends hard-check this at prepare(),
+/// so a wrong answer fails loudly instead of reading absent tables.
+inline bool host_dense_matchup_required(
+    const TerminalRepresentationPlan& plan,
+    const IsomorphismMapping& iso,
+    const std::vector<float>& oop_reach,
+    const std::vector<float>& ip_reach)
+{
+    if (plan.representation != TerminalRepresentation::RankBlockerOnly) return true;
+    if (terminal_dense_forced()) return true;
+    const uint16_t nc = iso.num_canonical;
+    return terminal_active_list_engaged(nc, oop_reach)
+        || terminal_active_list_engaged(nc, ip_reach);
 }
 
 /// STATIC plan — estimate-time decision from config + iso alone. Decision

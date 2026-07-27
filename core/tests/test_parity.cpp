@@ -363,6 +363,14 @@ static void test_parity_flop_limited_sizing() {
         // 3-card so they're not in the tree anyway). Smaller branching →
         // strategy converges faster, tolerance can tighten.
         sc.bet_sizing.flop_sizes = {0.75f};
+        // A4-host inc 4 (2026-07-27): the builder no longer collapses a
+        // rainbow flop on a dense-matchup projection the blockers never pay,
+        // so this fixture started ENUMERATING its runouts — same parity
+        // result, 3× the runtime (124 s), which pushed the extended suite past
+        // its ctest timeout. Pin the collapsed topology this case was written
+        // for; enumerated reference-vs-levelized parity is covered by
+        // test_parity_iso_rank_blocker_enumerated (51,981 nodes, 446 tables).
+        sc.memory_budget.host_bytes = 256ULL * 1024ULL * 1024ULL;
         return sc;
     };
 

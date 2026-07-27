@@ -615,6 +615,13 @@ private:
     /// estimators, resources telemetry and make_context() all read THIS.
     TerminalRepresentationPlan terminal_plan_;
 
+    /// A4-host inc 3: did precompute_matchups() actually build the dense nc²
+    /// EV/valid/category tables? False ⇒ the per-runout outer vectors are
+    /// sized (table count is still meaningful) but every inner table is
+    /// empty, and only the rank tables + board masks exist. Mirrored into
+    /// SolverContext so the backends can hard-check it.
+    bool matchup_dense_materialized_ = true;
+
     // Backend (CPU or GPU) handles DCFR iteration
     std::unique_ptr<ISolverBackend> backend_;
 
@@ -622,7 +629,10 @@ private:
     void initialize_reach_probs();
     void resolve_node_locks();
     void apply_node_locks();
-    void precompute_matchups();
+    /// Build the per-runout matchup tables. `force_dense` overrides the A4
+    /// inc-3 skip decision — solve() uses it on the rare path where the plan
+    /// demotes to dense AFTER precompute already skipped the tables.
+    void precompute_matchups(bool force_dense = false);
     /// Assemble the borrowed-pointer SolverContext for backend prepare().
     /// Shared by solve() and resolve() so the two never drift.
     SolverContext make_context();
@@ -658,6 +668,75 @@ private:
                    TerminalRepresentation::RankBlockerOnly
             && !matchup_original_ranks_per_runout_.empty()
             && !matchup_board_masks_.empty();
+    }
+
+    /// Result of the "does the ENUMERATED tree fit?" question.
+    struct EnumeratedFit {
+        bool        fits   = true;
+        uint64_t    needed = 0;    ///< the binding requirement
+        uint64_t    budget = 0;
+        const char* label  = "";   ///< "VRAM" | "host RAM"
+    };
+
+    /// The ONE formula behind solve()'s ① collapse gate and
+    /// estimate_only()'s preview. A4-host inc 4 made sharing it mandatory:
+    /// the builder no longer collapses rainbow flops on its matchup
+    /// projection, so this check is what decides them — and if the estimate
+    /// answered differently from the solve, the UI would price a tree the
+    /// solve never builds.
+    ///
+    /// Charges the host PEAK core (matchup + CPU state on CPU backends + 2×
+    /// finalized strategy + process/CUDA overhead) and, on GPU, the device
+    /// total. Output caches stay out: they are bounded and auto-reducible,
+    /// and excluding them keeps this from collapsing a tree the pre-backend
+    /// hard gate would have accepted.
+    EnumeratedFit check_enumerated_fit(
+        BackendType planned, uint64_t tables, uint64_t player_nodes,
+        uint64_t player_slots, uint64_t host_matchup,
+        bool device_dense_upload) const;
+
+    /// B1a inc 3: does a GPU solve of this config keep a materialized
+    /// current_strategy buffer? Only node-locked solves do — GpuBackend
+    /// decides from the RESOLVED locks, which are a subset of the configured
+    /// ones, so keying the estimate off the config is conservative (it can
+    /// over-charge a solve whose locks all resolve away, never under-charge).
+    bool gpu_materializes_strategy() const {
+        return !config_.node_locks.empty();
+    }
+
+    /// Same accounting as host_matchup_bytes() but for a PREDICTED table
+    /// count / materialization decision (estimate_only, which never runs
+    /// precompute). One body so the preview and the solve price the matchup
+    /// family identically.
+    uint64_t estimated_host_matchup_bytes(uint64_t tables,
+                                          bool host_dense) const {
+        const uint64_t nc = iso_.num_canonical;
+        if (!host_dense) return bytes_for_matchup_rank_tables(tables);
+        const uint64_t dense = bytes_for_matchup_tables(
+            tables, nc, matchup_bytes_per_cell(config_, iso_));
+        const bool postsolve_will_run =
+            config_.compute_exploitability || config_.compute_combo_evs;
+        if (!postsolve_will_run || tables == 0) return dense;
+        const uint64_t fused = tables * nc * nc * sizeof(float);
+        const uint64_t cap = (config_.memory_budget.host_bytes > 0)
+            ? (config_.memory_budget.host_bytes / 2ULL)
+            : (3ULL * 1024 * 1024 * 1024);
+        return (dense + fused <= cap) ? (dense + fused) : dense;
+    }
+
+    /// Host bytes the matchup family ACTUALLY costs this solve: the dense
+    /// nc² tables (or, on a blocker solve, just the per-runout rank vectors
+    /// + board masks) PLUS the fused ev·valid postsolve matrix when
+    /// precompute will build it.
+    ///
+    /// The fused table was invisible to the model until 2026-07-27 and it is
+    /// not small — 446 tables × 344² × 4 B = 211 MB on AsKsQs, which is the
+    /// whole of that spot's −9.6% under-estimate. Its build condition is
+    /// mirrored from precompute_matchups(): dense tables, a postsolve pass,
+    /// and both fitting the same half-host cap.
+    uint64_t host_matchup_bytes() const {
+        return estimated_host_matchup_bytes(matchup_ev_per_runout_.size(),
+                                            matchup_dense_materialized_);
     }
 
     /// Blocker-path terminal evaluation shared by the BR and EV sweeps
@@ -745,6 +824,7 @@ inline SolverContext Solver::make_context() {
     ctx.tree                       = &tree_;
     ctx.iso                        = &iso_;
     ctx.config                     = &config_;
+    ctx.matchup_dense_materialized = matchup_dense_materialized_;
     ctx.matchup_ev                 = &matchup_ev_;
     ctx.matchup_valid              = &matchup_valid_;
     ctx.matchup_original_ranks     = &matchup_original_ranks_;
@@ -772,6 +852,66 @@ inline SolverContext Solver::make_context() {
 // Solve entry point
 // ============================================================================
 
+inline Solver::EnumeratedFit Solver::check_enumerated_fit(
+    BackendType planned, uint64_t tables, uint64_t player_nodes,
+    uint64_t player_slots, uint64_t host_matchup,
+    bool device_dense_upload) const
+{
+    const uint64_t nc      = iso_.num_canonical;
+    const uint64_t total_n = tree_.total_nodes;
+
+    // Host PEAK core (P1-1), charged on BOTH backends: the matchup tables
+    // and the 2× finalized strategy live in host RAM even when CFR runs on
+    // the device. A4-host inc 4 made the host term load-bearing on the GPU
+    // branch too: with the builder's matchup over-charge gone a rainbow flop
+    // enumerates to ~628k nodes, whose 2× finalized strategy alone (~5.9 GB)
+    // busts the 6 GB default host budget. The pre-backend hard gate would
+    // then THROW; collapsing instead keeps the solve alive with approximated
+    // runouts, which is what this gate exists to do.
+    uint64_t host_needed = host_matchup
+        + memory_budget::bytes_for_live_final_strategy(
+              bytes_for_final_strategy(player_slots, nc, player_nodes),
+              planned == BackendType::GPU)
+        + memory_budget::kHostProcessOverheadBytes;
+
+    uint64_t device_needed = 0, device_budget = 0;
+    if (planned == BackendType::GPU) {
+        // Device TOTAL, not state alone: tree metadata, level schedule and
+        // allocator granularity are real VRAM the prepare claims (review
+        // round 2 P1-3 — same formula as the pre-backend VRAM ceiling, so
+        // the two gates cannot disagree). PR-4: the dense-upload term
+        // follows the terminal plan. Budget: explicit --gpu-memory-mb, else
+        // probe free VRAM with the same 0.80 headroom GpuBackend applies; a
+        // 0 probe (no device / driver failure) skips the device check and
+        // leaves it to the existing prepare error paths.
+        device_needed = bytes_for_gpu_device_total(
+            total_n, tree_.total_edges, player_slots, tables, nc,
+            device_dense_upload, gpu_materializes_strategy());
+        device_budget = config_.memory_budget.gpu_bytes > 0
+            ? config_.memory_budget.gpu_bytes
+            : static_cast<uint64_t>(
+                  static_cast<double>(gpu_free_bytes()) * 0.80);
+        host_needed +=
+            memory_budget::bytes_for_gpu_host_overhead(device_needed);
+    } else {
+        host_needed += bytes_for_cpu_state_compact(player_slots, nc);
+        if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
+            host_needed += bytes_for_levelized_cpu_extra(total_n, nc);
+        }
+    }
+
+    const uint64_t host_budget = config_.memory_budget.host_bytes;
+    EnumeratedFit f;
+    if (device_budget > 0 && device_needed > device_budget) {
+        f.fits = false; f.needed = device_needed; f.budget = device_budget;
+        f.label = "VRAM";
+    } else if (host_budget > 0 && host_needed > host_budget) {
+        f.fits = false; f.needed = host_needed; f.budget = host_budget;
+        f.label = "host RAM";
+    }
+    return f;
+}
+
 inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     using Clock = std::chrono::high_resolution_clock;
 
@@ -797,30 +937,72 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     auto stage_end = Clock::now();
     timing.isomorphism_ms = elapsed_since(stage_start, stage_end);
 
-    // Step 1-2: tree (now with memory-budget-aware runout cap)
+    // Step 1: reach probabilities. Runs before the BUILDER (A4-host inc 4)
+    // and therefore before precompute (inc 3): both price the matchup tables,
+    // and whether those tables are dense or rank-only depends on the root
+    // ranges — the CPU backends' narrow-range terminal kernels have no
+    // blocker route. Pure function of iso_ + config_ ranges, so the move is
+    // order-independent.
+    stage_start = Clock::now();
+    initialize_reach_probs();
+    stage_end = Clock::now();
+    timing.reach_init_ms = elapsed_since(stage_start, stage_end);
+
+    // Step 2: tree (now with memory-budget-aware runout cap)
     stage_start = Clock::now();
     GameTreeBuilder builder(config_);
     builder.set_memory_policy(
         iso_.num_canonical,
         config_.memory_budget,
-        matchup_bytes_per_cell(config_, iso_));
+        matchup_bytes_per_cell(config_, iso_),
+        host_dense_matchup_required(
+            plan_terminal_representation(config_, iso_),
+            iso_, oop_reach_, ip_reach_));
     tree_ = builder.build();
     stage_end = Clock::now();
     timing.tree_build_ms = elapsed_since(stage_start, stage_end);
     timing.tree_nodes = tree_.total_nodes;
     timing.tree_edges = tree_.total_edges;
 
-    // Step 3: precompute matchup matrix + reach probs + node locks
+    // Step 3: precompute matchup matrix + node locks
     stage_start = Clock::now();
     precompute_matchups();
 
     // PR-4: refine the terminal plan with the REAL per-runout rank tables.
     // Every consumer below — the ① state gate, the pre-backend footprint,
     // make_context() and the resources telemetry — reads this one decision.
-    terminal_plan_ = refine_terminal_plan(
-        plan_terminal_representation(config_, iso_),
-        iso_, matchup_original_ranks_per_runout_,
-        static_cast<uint32_t>(matchup_ev_per_runout_.size()));
+    // A4-host inc 3 hangs the "were the tables we skipped actually needed?"
+    // re-check off the same call, so the two can never be done separately.
+    auto refine_plan_and_ensure_tables = [&]() {
+        terminal_plan_ = refine_terminal_plan(
+            plan_terminal_representation(config_, iso_),
+            iso_, matchup_original_ranks_per_runout_,
+            static_cast<uint32_t>(matchup_ev_per_runout_.size()));
+        // ORDERING TRAP: precompute had to decide on the STATIC plan because
+        // refinement needs the rank tables it builds. If refinement demoted
+        // RankBlockerOnly → dense (the rare "no runout produced valid blocker
+        // metadata" edge) the skipped tables ARE needed — rebuild them here
+        // rather than run on tables that were never built.
+        if (!matchup_dense_materialized_ &&
+            terminal_plan_.representation !=
+                TerminalRepresentation::RankBlockerOnly) {
+            precompute_matchups(/*force_dense=*/true);
+            terminal_plan_ = refine_terminal_plan(
+                plan_terminal_representation(config_, iso_),
+                iso_, matchup_original_ranks_per_runout_,
+                static_cast<uint32_t>(matchup_ev_per_runout_.size()));
+        }
+        // Invariant: without the dense tables the postsolve sweeps must take
+        // the blocker path (A4 inc 1+2). Fail loudly — a silent fallback here
+        // would read empty tables.
+        if (!matchup_dense_materialized_ && !postsolve_blocker_enabled()) {
+            throw std::runtime_error(
+                std::string("internal: dense matchup tables were skipped but "
+                            "postsolve would read them (terminal plan ") +
+                terminal_plan_.label() + ")");
+        }
+    };
+    refine_plan_and_ensure_tables();
 
     // ── Post-v1.9.0 roadmap ①: state-aware collapse gate ─────────────────
     // The builder's runout gate models MATCHUP bytes only. A monotone flop's
@@ -844,7 +1026,6 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     std::string state_gate_diag;
     if (!tree_.runout_approximated && config_.board_size == 3) {
         const uint64_t nc      = iso_.num_canonical;
-        const uint64_t total_n = tree_.total_nodes;
         const uint64_t tables  = std::max<uint64_t>(matchup_ev_per_runout_.size(), 1);
         uint64_t player_n = 0;
         uint64_t player_slots = 0;  // Σ num_children over player nodes (B1a compact)
@@ -865,76 +1046,33 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
                       ? BackendType::GPU : BackendType::CPU;
         }
 
-        uint64_t state_needed = 0, state_budget = 0;
-        const char* budget_label = "";
-        if (planned == BackendType::GPU) {
-            // Device footprint = CFR state + uploaded matchup tables (EV +
-            // valid float matrices per runout). State uses the COMPACT
-            // formula mirroring alloc_solver_state() (B1a) — the dense
-            // (4A+3)·N·nc formula over-counted ~2.9× and collapsed boards
-            // that fit. The dense matchup term is exact for every tree this
-            // gate sees: enumerated flop trees are always iso-engaged
-            // (singleton/rainbow boards collapse at the builder's matchup
-            // cap), so the GPU rank-blocker cannot activate and the dense
-            // EV/valid upload really happens. Budget: explicit
-            // --gpu-memory-mb, else probe free VRAM with the same 0.80
-            // headroom factor GpuBackend's prepare pre-flight applies.
-            // Probe returning 0 (no device / driver failure) skips the gate
-            // — the existing prepare/create error paths handle that case.
-            // Device TOTAL, not state+matchup alone: tree metadata, level
-            // schedule and allocator granularity are real VRAM the prepare
-            // claims (review round 2 P1-3 — same formula as the pre-backend
-            // VRAM ceiling, so the two gates cannot disagree). PR-4: the
-            // dense-upload term follows the refined terminal plan — on
-            // singleton-iso boards the rank-blocker skips the upload and
-            // the old dense-always assumption over-charged ~6×.
-            state_needed = bytes_for_gpu_device_total(
-                total_n, tree_.total_edges, player_slots, tables, nc,
-                terminal_plan_.device_dense_upload);
-            state_budget = config_.memory_budget.gpu_bytes > 0
-                ? config_.memory_budget.gpu_bytes
-                : static_cast<uint64_t>(
-                      static_cast<double>(gpu_free_bytes()) * 0.80);
-            budget_label = "VRAM";
-        } else {
-            // Host PEAK footprint over the whole solve lifetime (P1-1):
-            // matchup tables + CPU CFR state + 2× the finalized strategy
-            // (backend nested copy + Solver's deep copy are both alive
-            // after finalize) + process overhead. The strategy-tree/JSON
-            // caches remain excluded: bounded and auto-reducible.
-            // Validated: mono fixture model 2.52 GB vs 2.43 GB measured
-            // peak RSS — without the 2× term the gate passed solves whose
-            // finalize then busted the budget.
-            state_needed = bytes_for_matchup_tables(
-                               tables, nc, matchup_bytes_per_cell(config_, iso_))
-                         + bytes_for_cpu_state_compact(player_slots, nc)
-                         + 2ULL * bytes_for_final_strategy(player_slots, nc, player_n)
-                         + memory_budget::kHostProcessOverheadBytes;
-            if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
-                state_needed += bytes_for_levelized_cpu_extra(total_n, nc);
-            }
-            state_budget = config_.memory_budget.host_bytes;
-            budget_label = "host RAM";
-        }
-
-        if (state_budget > 0 && state_needed > state_budget) {
+        const EnumeratedFit fit = check_enumerated_fit(
+            planned, tables, player_n, player_slots, host_matchup_bytes(),
+            terminal_plan_.device_dense_upload);
+        if (!fit.fits) {
+            const uint64_t shown_needed = fit.needed;
+            const uint64_t shown_budget = fit.budget;
+            const char* shown_label = fit.label;
             char buf[320];
             snprintf(buf, sizeof(buf),
                 "Enumerated runout tree needs ~%.2f GB %s "
                 "(N=%u nodes, nc=%u, tables=%u) but only %.2f GB is available - "
                 "collapsed runouts instead (turn/river equity approximated).",
-                static_cast<double>(state_needed) / (1024.0 * 1024.0 * 1024.0),
-                budget_label,
+                static_cast<double>(shown_needed) / (1024.0 * 1024.0 * 1024.0),
+                shown_label,
                 tree_.total_nodes, static_cast<unsigned>(nc),
                 static_cast<unsigned>(tables),
-                static_cast<double>(state_budget) / (1024.0 * 1024.0 * 1024.0));
+                static_cast<double>(shown_budget) / (1024.0 * 1024.0 * 1024.0));
             state_gate_diag = buf;
 
             GameTreeBuilder collapsed_builder(config_);
             collapsed_builder.set_memory_policy(
                 iso_.num_canonical,
                 config_.memory_budget,
-                matchup_bytes_per_cell(config_, iso_));
+                matchup_bytes_per_cell(config_, iso_),
+                host_dense_matchup_required(
+                    plan_terminal_representation(config_, iso_),
+                    iso_, oop_reach_, ip_reach_));
             collapsed_builder.set_force_runout_collapse(true);
             tree_ = collapsed_builder.build();
             timing.tree_nodes = tree_.total_nodes;
@@ -944,21 +1082,13 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             // runout tables (the representation can't flip — iso is
             // board-level — but the blocker-metadata validity term scans
             // the freshly rebuilt rank tables).
-            terminal_plan_ = refine_terminal_plan(
-                plan_terminal_representation(config_, iso_),
-                iso_, matchup_original_ranks_per_runout_,
-                static_cast<uint32_t>(matchup_ev_per_runout_.size()));
+            refine_plan_and_ensure_tables();
         }
     }
 
     stage_end = Clock::now();
     timing.precompute_matchups_ms = elapsed_since(stage_start, stage_end);
     timing.matchup_tables = static_cast<uint32_t>(matchup_ev_per_runout_.size());
-
-    stage_start = Clock::now();
-    initialize_reach_probs();
-    stage_end = Clock::now();
-    timing.reach_init_ms = elapsed_since(stage_start, stage_end);
 
     stage_start = Clock::now();
     resolve_node_locks();
@@ -993,10 +1123,8 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
                 gate_player_slots += tree_.num_children[n];
             }
         }
-        comp_matchup = bytes_for_matchup_tables(
-            matchup_ev_per_runout_.size(),
-            nc,
-            matchup_bytes_per_cell(config_, iso_));
+        // A4-host inc 3: the honest host cost of the tables as built.
+        comp_matchup = host_matchup_bytes();
         comp_cpu_state = bytes_for_cpu_state_compact(gate_player_slots, nc);
         // v1.7.0: levelized backend pre-allocates 3 × total_nodes × nc
         // floats (reach_oop_, reach_ip_, value_) on top of the reference
@@ -1005,7 +1133,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             comp_cpu_state += bytes_for_levelized_cpu_extra(total_n, nc);
         }
         comp_gpu_state = bytes_for_gpu_state_compact(
-            total_n, gate_player_slots, nc);
+            total_n, gate_player_slots, nc, gpu_materializes_strategy());
         // Review round 2 P1-3: the VRAM ceiling gates on the device TOTAL
         // (state + matchup upload + tree metadata + levels + reserve), not
         // state alone — a dense turn solve measurably exceeded the user's
@@ -1015,7 +1143,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         comp_device_total = bytes_for_gpu_device_total(
             total_n, tree_.total_edges, gate_player_slots,
             matchup_ev_per_runout_.size(), nc,
-            terminal_plan_.device_dense_upload);
+            terminal_plan_.device_dense_upload, gpu_materializes_strategy());
         // Peak-host lifetime terms (P1-1): finalize holds TWO materialized
         // strategy copies on every backend.
         comp_final_strategy = bytes_for_final_strategy(
@@ -1053,9 +1181,14 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         e.gpu_state_bytes        = (final_be == BackendType::GPU) ? comp_gpu_state : 0;
         e.device_total_bytes     = (final_be == BackendType::GPU) ? comp_device_total : 0;
         e.final_strategy_bytes   = comp_final_strategy;
+        e.gpu_backend            = (final_be == BackendType::GPU);
+        // A4-host inc 4: the CUDA host overhead scales with the device
+        // footprint (WDDM backing store), so it is derived from the same
+        // device total this footprint carries — not a flat constant.
         e.process_overhead_bytes = memory_budget::kHostProcessOverheadBytes
             + (final_be == BackendType::GPU
-                   ? memory_budget::kGpuHostContextBytes : 0);
+                   ? memory_budget::bytes_for_gpu_host_overhead(comp_device_total)
+                   : 0);
         e.strategy_tree_ev_bytes = comp_tree_ev;
         e.json_response_bytes    = comp_json;
         return e;
@@ -1187,12 +1320,14 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         char msg[768];
         snprintf(msg, sizeof(msg),
             "Estimated peak host RAM %.2f GB exceeds budget %.2f GB "
-            "(matchup=%.1f MB, cpu_state=%.1f MB, final_strategy=2x%.1f MB, "
+            "(matchup=%.1f MB, cpu_state=%.1f MB, final_strategy=%.1fx%.1f MB, "
             "overhead=%.1f MB, strategy_tree_ev=%.1f MB, json=%.1f MB). %s",
             static_cast<double>(gate_est.total_host_bytes()) / (1024.0 * 1024.0 * 1024.0),
             static_cast<double>(config_.memory_budget.host_bytes) / (1024.0 * 1024.0 * 1024.0),
             static_cast<double>(gate_est.matchup_tables_bytes) / (1024.0 * 1024.0),
             static_cast<double>(gate_est.cpu_state_bytes) / (1024.0 * 1024.0),
+            gpu_final ? memory_budget::kFinalStrategyCopiesGpu
+                      : memory_budget::kFinalStrategyCopiesCpu,
             static_cast<double>(gate_est.final_strategy_bytes) / (1024.0 * 1024.0),
             static_cast<double>(gate_est.process_overhead_bytes) / (1024.0 * 1024.0),
             static_cast<double>(gate_est.strategy_tree_ev_bytes) / (1024.0 * 1024.0),
@@ -1508,6 +1643,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
                   2ULL * sizeof(float))
             : 0;
         r.terminal_representation        = terminal_plan_.label();
+        r.host_dense_matchup             = matchup_dense_materialized_;
         r.estimated_strategy_tree_bytes  = gate_est.strategy_tree_ev_bytes;
         r.estimated_json_bytes           = gate_est.json_response_bytes;
         r.estimated_peak_host_bytes      = gate_est.total_host_bytes();
@@ -1631,11 +1767,22 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
 inline SolveResources Solver::estimate_only() {
     iso_ = compute_isomorphism(config_.board.data(), config_.board_size);
 
+    // A4-host inc 3/4: the reaches decide whether the matchup tables are
+    // dense or rank-only, which both the builder's runout gate and the byte
+    // estimate below need. Same order as solve(), so the estimate describes
+    // the tree the solve would actually build.
+    initialize_reach_probs();
+    const TerminalRepresentationPlan est_plan =
+        plan_terminal_representation(config_, iso_);
+    const bool est_host_dense =
+        host_dense_matchup_required(est_plan, iso_, oop_reach_, ip_reach_);
+
     GameTreeBuilder builder(config_);
     builder.set_memory_policy(
         iso_.num_canonical,
         config_.memory_budget,
-        matchup_bytes_per_cell(config_, iso_));
+        matchup_bytes_per_cell(config_, iso_),
+        est_host_dense);
     tree_ = builder.build();
 
     SolveResources r;
@@ -1643,19 +1790,15 @@ inline SolveResources Solver::estimate_only() {
 
     uint32_t player_nodes = 0;
     uint64_t player_slots = 0;   // Σ num_children over player nodes (B1a compact)
-    for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
-        auto t = static_cast<NodeType>(tree_.node_types[n]);
-        if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) {
-            ++player_nodes;
-            player_slots += tree_.num_children[n];
-        }
-    }
-    r.player_nodes = player_nodes;
+    uint64_t matchup_tables_exact = 1;
 
-    // Count DISTINCT matchup tables exactly the way precompute_matchups()
-    // dedups them: one per unique sorted (config board ∪ accumulated runout
-    // cards) signature. Every non-root signature first appears at a node
-    // whose incoming edge dealt a card, so registering those nodes (runouts
+    // Counting is a lambda because the ① mirror below may rebuild the tree
+    // collapsed and everything downstream must describe THAT tree.
+    //
+    // Matchup tables are counted exactly the way precompute_matchups() dedups
+    // them: one per unique sorted (config board ∪ accumulated runout cards)
+    // signature. Every non-root signature first appears at a node whose
+    // incoming edge dealt a card, so registering those nodes (runouts
     // recovered by walking the parent chain) plus the root covers the set.
     // The previous proxy counted every dealt chance CHILD once per betting
     // line, over-counting ~30× on iso-engaged boards — which made the
@@ -1663,8 +1806,17 @@ inline SolveResources Solver::estimate_only() {
     // would_engage mirror of the ① state gate) wildly pessimistic on
     // exactly the monotone boards that gate governs. Pure tree walk, no
     // table computation: ~ms even on 100k-node enumerated trees.
-    uint64_t matchup_tables_exact = 1;  // the root board's own table
-    {
+    auto recount_tree = [&]() {
+        player_nodes = 0;
+        player_slots = 0;
+        for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
+            auto t = static_cast<NodeType>(tree_.node_types[n]);
+            if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) {
+                ++player_nodes;
+                player_slots += tree_.num_children[n];
+            }
+        }
+        matchup_tables_exact = 1;  // the root board's own table
         std::set<std::vector<uint8_t>> sigs;
         for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
             if (n >= tree_.dealt_card.size() || tree_.dealt_card[n] == 0xFFu) {
@@ -1683,16 +1835,51 @@ inline SolveResources Solver::estimate_only() {
             sigs.insert(std::move(sig));
         }
         matchup_tables_exact += static_cast<uint64_t>(sigs.size());
+    };
+    recount_tree();
+
+    // A4-host inc 4: mirror solve()'s ① collapse gate. The builder no longer
+    // collapses a rainbow flop on its matchup projection, so without this the
+    // preview would price a 628k-node enumerated tree that the solve then
+    // collapses — "host_oom_likely" on every rainbow board. Same
+    // check_enumerated_fit() the solve uses, so the two cannot disagree.
+    // No precompute here: the table count comes from the walk above.
+    if (!tree_.runout_approximated && config_.board_size == 3) {
+        BackendType planned = backend_type_;
+        if (planned == BackendType::AUTO) {
+            planned = should_auto_select_gpu(config_, tree_, matchup_tables_exact)
+                      ? BackendType::GPU : BackendType::CPU;
+        }
+        const uint64_t est_matchup_host =
+            estimated_host_matchup_bytes(matchup_tables_exact, est_host_dense);
+        const EnumeratedFit fit = check_enumerated_fit(
+            planned, matchup_tables_exact, player_nodes, player_slots,
+            est_matchup_host, est_plan.device_dense_upload);
+        if (!fit.fits) {
+            GameTreeBuilder collapsed_builder(config_);
+            collapsed_builder.set_memory_policy(
+                iso_.num_canonical,
+                config_.memory_budget,
+                matchup_bytes_per_cell(config_, iso_),
+                est_host_dense);
+            collapsed_builder.set_force_runout_collapse(true);
+            tree_ = collapsed_builder.build();
+            recount_tree();
+        }
     }
+    r.player_nodes = player_nodes;
 
     const uint64_t nc      = iso_.num_canonical;
     const uint64_t total_n = tree_.total_nodes;
     const uint64_t matchup_count_est = matchup_tables_exact;
 
-    r.estimated_matchup_bytes        = bytes_for_matchup_tables(
-        matchup_count_est,
-        nc,
-        matchup_bytes_per_cell(config_, iso_));
+    // PR-4: the estimate-time STATIC terminal plan + the A4 inc-3
+    // materialization decision were both taken above (they gate the builder
+    // too); the static plan can only be optimistic on the rare
+    // no-valid-blocker-metadata edge, which the backend pre-flight guards.
+    r.host_dense_matchup             = est_host_dense;
+    r.estimated_matchup_bytes        =
+        estimated_host_matchup_bytes(matchup_count_est, est_host_dense);
     r.estimated_cpu_state_bytes      = bytes_for_cpu_state_compact(player_slots, nc);
     // v1.7.0: include the levelized backend's extra reach/value buffers in
     // the pre-solve estimate too, so the UI's ETA banner doesn't say "this
@@ -1700,21 +1887,15 @@ inline SolveResources Solver::estimate_only() {
     if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
         r.estimated_cpu_state_bytes += bytes_for_levelized_cpu_extra(total_n, nc);
     }
-    // PR-4: estimate-time STATIC terminal plan (no rank tables yet — the
-    // solve path refines it after precompute; the static plan can only be
-    // optimistic on the rare no-valid-blocker-metadata edge, which the
-    // backend pre-flight still guards).
-    const TerminalRepresentationPlan est_plan =
-        plan_terminal_representation(config_, iso_);
     r.terminal_representation        = est_plan.label();
     r.estimated_gpu_state_bytes      = bytes_for_gpu_state_compact(
-        total_n, player_slots, nc);
+        total_n, player_slots, nc, gpu_materializes_strategy());
     r.estimated_gpu_matchup_bytes    = est_plan.device_dense_upload
         ? bytes_for_matchup_tables(matchup_count_est, nc, 2ULL * sizeof(float))
         : 0;
     r.estimated_device_total_bytes   = bytes_for_gpu_device_total(
         total_n, tree_.total_edges, player_slots, matchup_count_est, nc,
-        est_plan.device_dense_upload);
+        est_plan.device_dense_upload, gpu_materializes_strategy());
 
     // Output plan (review round 2): only price the navigation cache + full
     // JSON when the caller will emit them.
@@ -1829,8 +2010,11 @@ inline SolveResources Solver::estimate_only() {
     gate_est.device_total_bytes     = gpu_final ? r.estimated_device_total_bytes : 0;
     gate_est.final_strategy_bytes   = bytes_for_final_strategy(
         player_slots, nc, player_nodes);
+    gate_est.gpu_backend            = gpu_final;
     gate_est.process_overhead_bytes = memory_budget::kHostProcessOverheadBytes
-        + (gpu_final ? memory_budget::kGpuHostContextBytes : 0);
+        + (gpu_final ? memory_budget::bytes_for_gpu_host_overhead(
+                           gate_est.device_total_bytes)
+                     : 0);
     gate_est.strategy_tree_ev_bytes = r.estimated_strategy_tree_bytes;
     gate_est.json_response_bytes    = r.estimated_json_bytes;
     r.estimated_peak_host_bytes     = gate_est.total_host_bytes();
@@ -1879,20 +2063,34 @@ inline void compute_matchup_for_board(
     std::vector<float>& out_showdown_coeff,
     std::vector<int8_t>& out_showdown_count,
     bool build_showdown_coeff,
-    std::vector<uint16_t>& out_original_ranks)
+    std::vector<uint16_t>& out_original_ranks,
+    bool build_dense)
 {
     (void)solver_unused;
     uint16_t nc = iso.num_canonical;
-    out_ev.assign(static_cast<size_t>(nc) * nc, 0.0f);
-    out_valid.assign(static_cast<size_t>(nc) * nc, 0.0f);
-    // v1.8.2 A2 encoding: pre-thresholded {0=invalid, 1=win, 2=lose, 3=tie}
-    // matrix used by the CPU showdown hot loop. Initialized to 0 (CAT_INVALID)
-    // so any cell we don't touch (no valid pair found) stays invalid.
-    out_category.assign(static_cast<size_t>(nc) * nc, 0u);
-    if (build_showdown_coeff) {
+    if (build_dense) {
+        out_ev.assign(static_cast<size_t>(nc) * nc, 0.0f);
+        out_valid.assign(static_cast<size_t>(nc) * nc, 0.0f);
+        // v1.8.2 A2 encoding: pre-thresholded {0=invalid, 1=win, 2=lose, 3=tie}
+        // matrix used by the CPU showdown hot loop. Initialized to 0 (CAT_INVALID)
+        // so any cell we don't touch (no valid pair found) stays invalid.
+        out_category.assign(static_cast<size_t>(nc) * nc, 0u);
         out_showdown_coeff.clear();
-        out_showdown_count.assign(static_cast<size_t>(nc) * nc, 0);
+        if (build_showdown_coeff) {
+            out_showdown_count.assign(static_cast<size_t>(nc) * nc, 0);
+        } else {
+            out_showdown_count.clear();
+        }
     } else {
+        // A4-host inc 3: RankBlockerOnly solve — nothing reads the nc²
+        // matrices, so neither allocate nor fill them. `ranks` below is the
+        // blockers' only input from this function (the caller keeps the board
+        // mask). Skipping the nc² sweep is also the bulk of precompute's wall
+        // time on multi-table trees. build_showdown_coeff cannot be set here:
+        // SignedCount and RankBlockerOnly are different plan branches.
+        out_ev.clear();
+        out_valid.clear();
+        out_category.clear();
         out_showdown_coeff.clear();
         out_showdown_count.clear();
     }
@@ -1912,6 +2110,7 @@ inline void compute_matchup_for_board(
         ranks[i] = eval_for_board(combo_table[i]);
     }
     out_original_ranks = ranks;
+    if (!build_dense) return;
 
     // v1.4.1 Phase 3: row-parallel matchup precompute. Each ci writes a
     // disjoint row of out_ev/out_valid (idx = ci*nc+cj is unique per ci),
@@ -1972,7 +2171,7 @@ inline void compute_matchup_for_board(
     }
 }
 
-inline void Solver::precompute_matchups() {
+inline void Solver::precompute_matchups(bool force_dense) {
     uint16_t nc = iso_.num_canonical;
     auto& eval = get_evaluator();
 
@@ -2036,10 +2235,27 @@ inline void Solver::precompute_matchups() {
     // as JSON for the UI.
     const bool build_showdown_coeff =
         should_build_signed_showdown_coeff(config_, iso_);
+    // A4-host inc 3: decide ONCE whether the dense nc² tables get built at
+    // all. Two inputs the plan alone can't supply:
+    //   - reach: the CPU backends' narrow-range terminal kernels have no
+    //     blocker route (host_dense_matchup_required documents which).
+    //     initialize_reach_probs() runs BEFORE precompute for exactly this.
+    //   - the ORDERING TRAP: the refined plan does not exist yet, so this
+    //     consults the STATIC plan. solve() re-checks after refinement and
+    //     rebuilds (force_dense) on the rare demote-to-dense edge.
+    matchup_dense_materialized_ = force_dense
+        || host_dense_matchup_required(
+               plan_terminal_representation(config_, iso_),
+               iso_, oop_reach_, ip_reach_);
+    const bool build_dense = matchup_dense_materialized_;
     const uint64_t bytes_per_matchup_cell =
         matchup_bytes_per_cell(config_, iso_);
-    const uint64_t per_table_bytes = bytes_for_matchup_tables(
-        1, nc, bytes_per_matchup_cell);
+    // Price the cap against what is actually allocated: under the blocker
+    // path a "table" is the per-original rank vector plus its board mask,
+    // not an nc² matrix.
+    const uint64_t per_table_bytes = build_dense
+        ? bytes_for_matchup_tables(1, nc, bytes_per_matchup_cell)
+        : bytes_for_matchup_rank_tables(1);
     // Reserve half the host budget for matchup tables (same split as the
     // tree builder gate). Floor of 3 GB matches the builder's safety floor.
     const uint64_t matchup_byte_cap = (config_.memory_budget.host_bytes > 0)
@@ -2065,14 +2281,28 @@ inline void Solver::precompute_matchups() {
                 static_cast<double>(next_bytes)  / (1024.0 * 1024.0 * 1024.0),
                 static_cast<double>(matchup_byte_cap) / (1024.0 * 1024.0 * 1024.0),
                 new_idx + 1, static_cast<unsigned>(nc));
-            snprintf(buf, sizeof(buf),
-                "precompute_matchups would allocate %.2f GB (cap %.2f GB, "
-                "%d tables x %u canonical^2 x %llu B). Reduce flop runout enumeration, "
-                "use --strategy-tree-evs none, or raise --host-memory-mb.",
-                static_cast<double>(next_bytes)  / (1024.0 * 1024.0 * 1024.0),
-                static_cast<double>(matchup_byte_cap) / (1024.0 * 1024.0 * 1024.0),
-                new_idx + 1, static_cast<unsigned>(nc),
-                static_cast<unsigned long long>(bytes_per_matchup_cell));
+            if (build_dense) {
+                snprintf(buf, sizeof(buf),
+                    "precompute_matchups would allocate %.2f GB (cap %.2f GB, "
+                    "%d tables x %u canonical^2 x %llu B). Reduce flop runout "
+                    "enumeration, use --strategy-tree-evs none, or raise "
+                    "--host-memory-mb.",
+                    static_cast<double>(next_bytes)  / (1024.0 * 1024.0 * 1024.0),
+                    static_cast<double>(matchup_byte_cap) / (1024.0 * 1024.0 * 1024.0),
+                    new_idx + 1, static_cast<unsigned>(nc),
+                    static_cast<unsigned long long>(bytes_per_matchup_cell));
+            } else {
+                // A4-host inc 3: no dense tables here — the cap is being hit
+                // by the rank tables alone, which is a budget far too small
+                // for the solve rather than a runout-enumeration problem.
+                snprintf(buf, sizeof(buf),
+                    "precompute_matchups would allocate %.2f GB of rank tables "
+                    "(cap %.2f GB, %d tables x %llu B). Raise --host-memory-mb.",
+                    static_cast<double>(next_bytes)  / (1024.0 * 1024.0 * 1024.0),
+                    static_cast<double>(matchup_byte_cap) / (1024.0 * 1024.0 * 1024.0),
+                    new_idx + 1,
+                    static_cast<unsigned long long>(per_table_bytes));
+            }
             throw std::runtime_error(buf);
         }
 
@@ -2086,8 +2316,13 @@ inline void Solver::precompute_matchups() {
         uint8_t bs = static_cast<uint8_t>(sig.size());
         compute_matchup_for_board(*this, iso_, sig.data(), bs,
             make_eval_for(sig.data(), bs), ev, valid, category,
-            showdown_coeff, showdown_count, build_showdown_coeff, original_ranks);
+            showdown_coeff, showdown_count, build_showdown_coeff, original_ranks,
+            build_dense);
         matchup_board_masks_.push_back(board_to_mask(sig.data(), bs));
+        // Under the blocker path these three stay EMPTY, but an entry is
+        // still pushed per table: matchup_ev_per_runout_.size() is the
+        // deduplicated table COUNT that estimators, gates, telemetry and the
+        // GPU's runout indexing all read.
         matchup_ev_per_runout_.push_back(std::move(ev));
         matchup_valid_per_runout_.push_back(std::move(valid));
         matchup_category_per_runout_.push_back(std::move(category));
@@ -2137,7 +2372,7 @@ inline void Solver::precompute_matchups() {
             ? matchup_showdown_count_per_runout_[0]
             : std::vector<int8_t>{};
         matchup_original_ranks_ = matchup_original_ranks_per_runout_[0];
-    } else {
+    } else if (build_dense) {
         matchup_ev_.assign(static_cast<size_t>(nc) * nc, 0.0f);
         matchup_valid_.assign(static_cast<size_t>(nc) * nc, 0.0f);
         matchup_category_.assign(static_cast<size_t>(nc) * nc, 0u);
@@ -2153,7 +2388,7 @@ inline void Solver::precompute_matchups() {
     matchup_ev_valid_per_runout_.clear();
     const bool postsolve_will_run =
         config_.compute_exploitability || config_.compute_combo_evs;
-    if (postsolve_will_run && !matchup_ev_per_runout_.empty()) {
+    if (build_dense && postsolve_will_run && !matchup_ev_per_runout_.empty()) {
         const size_t ntab = matchup_ev_per_runout_.size();
         const uint64_t fused_total =
             static_cast<uint64_t>(ntab) * nc * nc * sizeof(float);
@@ -2280,10 +2515,19 @@ inline std::vector<float> Solver::cpu_ev_traverse(
             ? matchup_ev_valid_per_runout_[mi].data() : nullptr;
 
         // A4-host inc 1: blocker path — see cpu_best_response_traverse.
-        if (postsolve_blocker_enabled() &&
-            postsolve_terminal_blocker(node_idx, perspective, tt, half_pot,
-                                       mi, reach_oop, reach_ip, values)) {
-            return record(std::move(values));
+        if (postsolve_blocker_enabled()) {
+            if (postsolve_terminal_blocker(node_idx, perspective, tt, half_pot,
+                                           mi, reach_oop, reach_ip, values)) {
+                return record(std::move(values));
+            }
+            // inc 3: the dense fallback below would read tables that were
+            // never built. Unreachable (every node carries a valid
+            // matchup_idx), but silence here means out-of-bounds reads.
+            if (!matchup_dense_materialized_) {
+                throw std::runtime_error(
+                    "postsolve EV sweep fell back to the dense tables, which "
+                    "this solve never materialized (A4-host inc 3)");
+            }
         }
 
         if (tt == TerminalType::SHOWDOWN) {
@@ -2601,10 +2845,18 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
         // A4-host inc 1: blocker path (flag-gated, RankBlockerOnly plans
         // only). Falls through to the dense loops when disabled or when
         // this runout lacks blocker inputs.
-        if (postsolve_blocker_enabled() &&
-            postsolve_terminal_blocker(node_idx, player, tt, half_pot, mi,
-                                       reach_oop, reach_ip, values)) {
-            return values;
+        if (postsolve_blocker_enabled()) {
+            if (postsolve_terminal_blocker(node_idx, player, tt, half_pot, mi,
+                                           reach_oop, reach_ip, values)) {
+                return values;
+            }
+            // inc 3: see the matching guard in cpu_ev_traverse.
+            if (!matchup_dense_materialized_) {
+                throw std::runtime_error(
+                    "postsolve best-response sweep fell back to the dense "
+                    "tables, which this solve never materialized "
+                    "(A4-host inc 3)");
+            }
         }
 
         if (tt == TerminalType::SHOWDOWN) {

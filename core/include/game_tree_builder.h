@@ -16,6 +16,7 @@
 #include "types.h"
 #include "isomorphism.h"
 #include "memory_budget.h"
+#include "terminal_plan.h"   // bytes_for_matchup_rank_tables (A4-host inc 4)
 #include <vector>
 #include <cmath>
 
@@ -67,14 +68,24 @@ public:
     /// byte-based instead of an arbitrary "projected <= 2000". When
     /// `nc_canonical_estimate == 0` the builder falls back to the legacy
     /// runout-count heuristic.
+    /// `host_dense_matchup` (A4-host inc 4): false when the solve will take
+    /// the rank/fold blockers and therefore never materializes the dense nc²
+    /// tables — the gate must then price the per-runout RANK tables instead.
+    /// Charging the dense price there is a ~500× over-estimate and is what
+    /// used to collapse every rainbow flop (28.6 GB projected vs 6.2 MB
+    /// real on AsKd7c). Callers derive it from
+    /// `host_dense_matchup_required()` so builder, precompute and the
+    /// estimators cannot disagree.
     void set_memory_policy(
         uint16_t nc_canonical_estimate,
         const MemoryBudget& budget,
         uint64_t matchup_bytes_per_cell =
-            memory_budget::kMatchupBytesPerCell) {
+            memory_budget::kMatchupBytesPerCell,
+        bool host_dense_matchup = true) {
         nc_estimate_   = nc_canonical_estimate;
         budget_        = budget;
         matchup_bytes_per_cell_ = matchup_bytes_per_cell;
+        host_dense_matchup_ = host_dense_matchup;
         budget_set_    = true;
     }
 
@@ -110,6 +121,8 @@ private:
     MemoryBudget  budget_      = MemoryBudget::defaults();
     uint64_t      matchup_bytes_per_cell_ =
         memory_budget::kMatchupBytesPerCell;
+    /// See set_memory_policy(). Default true = pre-A4-inc-4 behavior.
+    bool          host_dense_matchup_ = true;
     bool          budget_set_  = false;
     /// Set true when the memory gate forces the single-child runout fallback
     /// (no card dealt → turn/river solved on the stale flop matchup). Surfaced
@@ -432,10 +445,20 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
                 // is needed for CPU CFR state, strategy-tree EV cache, and
                 // the JSON response. This is the single decision point the
                 // 10-point plan calls out.
-                const uint64_t matchup_bytes = bytes_for_matchup_tables(
-                    static_cast<uint64_t>(projected_leaves),
-                    static_cast<uint64_t>(nc_estimate_),
-                    matchup_bytes_per_cell_);
+                // A4-host inc 4: price what precompute will REALLY build.
+                // On a blocker solve that is one rank vector + board mask per
+                // runout (nc-independent), not an nc² matrix — the difference
+                // between 28.6 GB and 6.2 MB on a rainbow flop, i.e. between
+                // "always collapse" and "enumerate if the CFR state fits".
+                // The state itself is gated after precompute by solver.h's
+                // ① collapse gate, which measures the built tree.
+                const uint64_t matchup_bytes = host_dense_matchup_
+                    ? bytes_for_matchup_tables(
+                          static_cast<uint64_t>(projected_leaves),
+                          static_cast<uint64_t>(nc_estimate_),
+                          matchup_bytes_per_cell_)
+                    : bytes_for_matchup_rank_tables(
+                          static_cast<uint64_t>(projected_leaves));
                 const uint64_t matchup_cap = (budget_.host_bytes > 0)
                     ? (budget_.host_bytes / 2ULL)
                     : (3ULL * 1024 * 1024 * 1024); // 3 GB safety floor

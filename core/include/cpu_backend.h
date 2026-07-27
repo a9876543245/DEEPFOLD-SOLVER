@@ -31,12 +31,14 @@
 #include "cpu_simd.h"
 #include "fold_blocker.h"
 #include "showdown_rank_blocker.h"
+#include "terminal_plan.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 #ifdef _OPENMP
@@ -177,9 +179,12 @@ public:
         d.showdown_signed_coeff_shortcut =
             use_signed_coeff_showdown_for_traverser(0)
             || use_signed_coeff_showdown_for_traverser(1);
-        populate_matchup_category_diagnostics(
-            d, ctx_.matchup_category_per_runout,
-            ctx_.matchup_category, nc);
+        // A4-host inc 3: dense-only diagnostic — see the levelized backend.
+        if (ctx_.matchup_dense_materialized) {
+            populate_matchup_category_diagnostics(
+                d, ctx_.matchup_category_per_runout,
+                ctx_.matchup_category, nc);
+        }
         return d;
     }
 
@@ -416,7 +421,9 @@ inline void CpuBackend::prepare(const SolverContext& ctx) {
     ip_use_terminal_output_skip_ =
         (static_cast<uint32_t>(ip_out_of_range_count) * 8u
          >= static_cast<uint32_t>(nc) * 7u);
-    constexpr uint32_t kActiveListDensityDen = 4u; // active <= 25%
+    // Shared with the A4-host inc-3 predictor (terminal_plan.h) — precompute
+    // mirrors THIS threshold when deciding whether the dense tables exist.
+    constexpr uint32_t kActiveListDensityDen = kTerminalActiveListDensityDen;
     oop_use_terminal_active_list_ =
         (static_cast<uint32_t>(oop_terminal_active_indices_.size())
             * kActiveListDensityDen
@@ -447,6 +454,24 @@ inline void CpuBackend::prepare(const SolverContext& ctx) {
         (static_cast<uint32_t>(ip_terminal_active_indices_.size())
             * kActive2DensityDen
          <= static_cast<uint32_t>(nc));
+
+    // A4-host inc 3: this backend's showdown rank-blocker and fold-blocker
+    // shortcuts are both disabled once a traverser takes the active-list
+    // path, so it needs the dense tables for narrow ranges. The predictor
+    // uses exactly this threshold; check rather than trust.
+    if (!ctx.matchup_dense_materialized) {
+        for (int t = 0; t < 2; ++t) {
+            if (use_terminal_active_list_for_player(t)) {
+                throw std::runtime_error(
+                    std::string("CpuBackend: dense matchup tables were not "
+                                "materialized but traverser ")
+                    + (t == 0 ? "OOP" : "IP")
+                    + " takes the active-list terminal kernels, which have no "
+                      "blocker route. The A4-host materialization predictor "
+                      "and the backend kernel gates have drifted.");
+            }
+        }
+    }
 
     // Reserve scratch arena capacity. Worst case per recursion frame at a
     // player decision node is (max_actions * nc) for action_vals + (nc) for

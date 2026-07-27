@@ -120,6 +120,16 @@ struct SolverContext {
     /// their own (identical) derivation.
     const struct TerminalRepresentationPlan* terminal_plan = nullptr;
 
+    /// A4-host inc 3: false when precompute SKIPPED the dense nc² EV / valid
+    /// / category tables because the rank/fold blockers serve every terminal
+    /// (see host_dense_matchup_required). The per-runout outer vectors are
+    /// still sized — table COUNT stays meaningful for estimators, gates and
+    /// the GPU's runout indexing — but every inner table is empty. A backend
+    /// that would read them must throw instead: the decision was priced by
+    /// the memory gates, so silently reading absent tables is exactly the
+    /// drift PR-4's hard checks exist to prevent.
+    bool                         matchup_dense_materialized = true;
+
     /// Precomputed showdown matchup matrix for the ROOT board. Indexed
     /// [ci * nc + cj]. Kept for backward-compat / shortcut when no chance
     /// node is in the tree (e.g. solving a river spot).
