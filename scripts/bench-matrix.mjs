@@ -9,6 +9,24 @@
 //     silently clamped 16T→8T run can never be quoted as 16T) — hard fail.
 //   - any run failure fails the whole fixture: no partial medians.
 //   - process exits non-zero if ANY fixture failed.
+//
+// Fixture kinds (T0):
+//   default                  — iterations/sec at a fixed iteration count.
+//   mode: "time_to_target"   — wall-clock and iterations to reach each accuracy
+//                              in `targets` (% of pot), read off the solve's
+//                              --convergence-log curve. This is the currency a
+//                              PioSOLVER comparison is quoted in; iterations/sec
+//                              is not. The tightest declared target must equal
+//                              the --exploitability argument, and not reaching
+//                              it is a hard fail (a capped run must never be
+//                              quoted as a time-to-target).
+//   estimate_only: true      — --estimate-only pre-flight; records the memory
+//                              estimate instead of a solve. tree_mode comes
+//                              from resources.runout_approximated.
+//   known_gap: "<reason>"    — this fixture is EXPECTED to fail until the named
+//                              work lands. Reported as a GAP, does not set the
+//                              process exit code. Its whole purpose is to be
+//                              red today and green when the gap closes.
 // Stats: median + min + max over N runs (5 samples cannot honestly support
 // a p95 — the old "p95" landed on the 4th order statistic ≈ p80).
 //
@@ -55,12 +73,24 @@ const outPath = join(outDir, `${stamp}.jsonl`);
 const records = [];
 let anyFailed = false;
 
+/** First probe at or below `target`, or null. Pio-style first-reach. */
+const firstReach = (probes, target) =>
+  probes.find((p) => p.exploitability_pct <= target) ?? null;
+
 for (const fx of manifest.fixtures) {
   if (only.length && !only.includes(fx.name)) continue;
+  const isEstimate = fx.estimate_only === true;
+  const isT2T = fx.mode === 'time_to_target';
+  // targetHits[target] = array of {iteration, elapsed_ms} across runs
+  const targetHits = new Map((fx.targets ?? []).map((t) => [t, []]));
+  const probeOverheads = [];
   const rates = [], walls = [], procWalls = [], rss = [], vram = [];
   let last = null;
   let failed = null;
-  for (let k = 0; k < runs && !failed; ++k) {
+  let completed = 0;
+  // An estimate is a deterministic pre-flight; repeating it measures nothing.
+  const fxRuns = isEstimate ? 1 : runs;
+  for (let k = 0; k < fxRuns && !failed; ++k) {
     let out;
     const t0 = Date.now();
     try {
@@ -73,9 +103,14 @@ for (const fx of manifest.fixtures) {
                                        // serialization + I/O the child's
                                        // own timing cannot see
     const j = JSON.parse(out);
-    if (j.status !== 'success') { failed = `run ${k + 1}: status=${j.status}`; break; }
+    const wantStatus = isEstimate ? 'estimate' : 'success';
+    if (j.status !== wantStatus) { failed = `run ${k + 1}: status=${j.status}`; break; }
     // ---- contract gates (hard failures, not annotations) ----
-    const mode = j.tree_mode ?? j.resources?.tree_mode ?? null;
+    // --estimate-only emits no tree_mode; runout_approximated is the same
+    // decision under its pre-flight name.
+    const mode = isEstimate
+      ? (j.resources?.runout_approximated === false ? 'enumerated' : 'collapsed')
+      : (j.tree_mode ?? j.resources?.tree_mode ?? null);
     if (mode === 'decomposed') {
       // Decomposed telemetry is NOT aggregated yet — timing/resources
       // describe the monolithic prefix solve only. Reject unconditionally
@@ -94,32 +129,86 @@ for (const fx of manifest.fixtures) {
         break;
       }
     }
-    const iterMs = j.timing?.iterations_ms ?? 0;
-    rates.push(iterMs > 0 ? (j.iterations_run * 1000) / iterMs : 0);
-    walls.push(j.timing?.total_ms ?? 0);
-    procWalls.push(procWall);
-    rss.push(j.resources?.measured_peak_rss_bytes ?? 0);
-    vram.push(j.resources?.measured_peak_vram_bytes ?? 0);
+    if (isT2T) {
+      const targets = [...targetHits.keys()];
+      const tightest = Math.min(...targets);
+      const declared = parseFloat(fx.args[fx.args.indexOf('--exploitability') + 1]);
+      if (!(Math.abs(declared - tightest) < 1e-9)) {
+        failed = `tightest target ${tightest}% != --exploitability ${declared}%`;
+        break;
+      }
+      const probes = j.convergence?.probes;
+      if (!Array.isArray(probes)) {
+        failed = `no convergence block — fixture needs --convergence-log`;
+        break;
+      }
+      if (!firstReach(probes, tightest)) {
+        // A capped run reports the cap's wall time, not a time-to-target.
+        failed = `run ${k + 1}: never reached ${tightest}% ` +
+                 `(stopped "${j.early_stop_reason}" at iter ${j.iterations_run}, ` +
+                 `best ${Math.min(...probes.map((p) => p.exploitability_pct))}%)`;
+        break;
+      }
+      for (const t of targets) {
+        const hit = firstReach(probes, t);
+        if (hit) targetHits.get(t).push(hit);
+      }
+      probeOverheads.push(j.convergence.probe_overhead_ms ?? 0);
+    }
+    if (!isEstimate) {
+      const iterMs = j.timing?.iterations_ms ?? 0;
+      rates.push(iterMs > 0 ? (j.iterations_run * 1000) / iterMs : 0);
+      walls.push(j.timing?.total_ms ?? 0);
+      procWalls.push(procWall);
+      rss.push(j.resources?.measured_peak_rss_bytes ?? 0);
+      vram.push(j.resources?.measured_peak_vram_bytes ?? 0);
+    }
+    completed++;
     last = j;
   }
   if (failed) {
     // No partial stats of ANY kind — a fixture either delivers its full
     // run set under contract or reports nothing (review round 2).
-    anyFailed = true;
+    // A known_gap fixture is EXPECTED to be red until its blocker lands, so
+    // it is reported but does not condemn the run.
+    if (!fx.known_gap) anyFailed = true;
     rates.length = walls.length = procWalls.length = 0;
     rss.length = vram.length = 0;
+    probeOverheads.length = 0;
+    for (const hits of targetHits.values()) hits.length = 0;
+    completed = 0;
     last = null;
   }
   const reqThreadsIdx = fx.args.indexOf('--cpu-threads');
+  const timeToTarget = isT2T && completed ? [...targetHits.entries()].map(([t, hits]) => ({
+    target_pct: t,
+    reached: hits.length === completed,
+    // median across runs, so a single scheduling hiccup cannot set the number
+    elapsed_ms_median: hits.length ? Math.round(median(hits.map((h) => h.elapsed_ms))) : null,
+    iterations_median: hits.length ? Math.round(median(hits.map((h) => h.iteration))) : null,
+  })) : null;
+
   const rec = {
     fixture: fx.name,
     family: fx.family,
+    kind: isEstimate ? 'estimate' : (isT2T ? 'time_to_target' : 'throughput'),
+    known_gap: fx.known_gap ?? null,
     exe_sha1: exeSha1,
     exe_mtime: exeStat.mtime.toISOString(),
-    runs: rates.length,
+    runs: completed,
     failed,
+    time_to_target: timeToTarget,
+    // Probe cost is real wall time the user waits, so it is INCLUDED in the
+    // elapsed figures above and reported separately rather than netted out.
+    probe_overhead_ms_median: probeOverheads.length ? Math.round(median(probeOverheads)) : null,
+    final_exploit_pct: last?.exploitability_pct ?? null,
+    early_stop_reason: last?.early_stop_reason ?? null,
     backend: last?.backend ?? null,
-    tree_mode: last?.tree_mode ?? last?.resources?.tree_mode ?? null,
+    tree_mode: last
+      ? (isEstimate
+          ? (last.resources?.runout_approximated === false ? 'enumerated' : 'collapsed')
+          : (last.tree_mode ?? last.resources?.tree_mode ?? null))
+      : null,
     terminal_representation: last?.resources?.terminal_representation ?? null,
     threads_requested: reqThreadsIdx >= 0
       ? parseInt(fx.args[reqThreadsIdx + 1], 10) : null,
@@ -146,14 +235,32 @@ for (const fx of manifest.fixtures) {
   records.push(rec);
   const isGpuRow = (rec.backend ?? '').startsWith('CUDA');
   const stateEst = isGpuRow ? rec.est_gpu_state_mb : rec.est_cpu_state_mb;
-  console.log(
-    `${rec.fixture.padEnd(20)} ${String(rec.iter_per_sec_median ?? 'FAIL').padStart(10)} it/s med  ` +
-    `rss ${String(rec.peak_rss_mb_max ?? '-').padStart(8)} MB (est peak ${rec.est_peak_host_mb ?? '-'})  ` +
-    `vram ${String(rec.peak_vram_mb_max ?? '-').padStart(8)} MB  ` +
-    `state est/alloc ${stateEst}/${rec.allocated_state_mb} MB` +
-    (rec.failed ? `  FAILED: ${rec.failed}` : ''));
+  const status = rec.failed
+    ? `  ${fx.known_gap ? `GAP (${fx.known_gap})` : 'FAILED'}: ${rec.failed}`
+    : '';
+  if (isT2T) {
+    const cols = (timeToTarget ?? []).map((r) =>
+      `${r.target_pct}%: ${r.reached ? `${(r.elapsed_ms_median / 1000).toFixed(2)}s/${r.iterations_median}it` : '—'}`
+    ).join('  ');
+    console.log(`${rec.fixture.padEnd(20)} ${cols}` +
+      (rec.probe_overhead_ms_median !== null ? `  (probe ${rec.probe_overhead_ms_median} ms)` : '') + status);
+  } else if (isEstimate) {
+    console.log(`${rec.fixture.padEnd(20)} estimate  mode ${rec.tree_mode ?? '-'}  ` +
+      `host ${rec.est_peak_host_mb ?? '-'} MB  device total ${rec.est_device_total_mb ?? '-'} MB` + status);
+  } else {
+    console.log(
+      `${rec.fixture.padEnd(20)} ${String(rec.iter_per_sec_median ?? 'FAIL').padStart(10)} it/s med  ` +
+      `rss ${String(rec.peak_rss_mb_max ?? '-').padStart(8)} MB (est peak ${rec.est_peak_host_mb ?? '-'})  ` +
+      `vram ${String(rec.peak_vram_mb_max ?? '-').padStart(8)} MB  ` +
+      `state est/alloc ${stateEst}/${rec.allocated_state_mb} MB` + status);
+  }
 }
 
 writeFileSync(outPath, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+const gaps = records.filter((r) => r.failed && r.known_gap);
+if (gaps.length) {
+  console.log(`\nopen gaps (expected red, not counted as failures):`);
+  for (const g of gaps) console.log(`  ${g.fixture} — blocked on ${g.known_gap}`);
+}
 console.log(`\nwrote ${records.length} records → ${outPath}` + (anyFailed ? '  (WITH FAILURES)' : ''));
 process.exit(anyFailed ? 1 : 0);

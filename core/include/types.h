@@ -213,6 +213,19 @@ struct SolverConfig {
     int max_iterations = 500;
     float target_exploitability = 0.005f;   ///< 0.5%
     int exploitability_check_interval = 50;
+    /// Benchmark knob (T0/0b): pin the probe cadence to exactly
+    /// `exploitability_check_interval` instead of letting it self-calibrate.
+    /// The adaptive cadence is the right PRODUCT behavior (a probe costs a
+    /// full best-response pass), but it overshoots the target by an unbounded
+    /// margin, which makes "time to reach X%" unreproducible. Default false
+    /// keeps the shipped behavior.
+    bool exploitability_fixed_cadence = false;
+    /// Benchmark knob (T0/0b): keep every probe's (iteration, exploitability,
+    /// elapsed) sample instead of discarding all but the crossing one. One
+    /// solve to the TIGHTEST target then yields time-to-accuracy for every
+    /// looser threshold, which is the currency a PioSOLVER comparison is
+    /// quoted in. Default false = nothing recorded, output unchanged.
+    bool record_convergence = false;
 
     /// Output plan (review round 2): whether the caller will emit the
     /// navigation strategy tree. The memory gates price the strategy-tree
@@ -711,6 +724,17 @@ struct SolveResources {
     std::string cpu_backend_kind;
 };
 
+/// One exploitability probe taken during the iteration loop (T0/0b).
+/// Recorded only when SolverConfig::record_convergence is set.
+struct ConvergenceProbe {
+    int iteration = 0;              ///< 1-based iteration the probe ran after
+    float exploitability_pct = 0.0f;///< best-response exploitability, % of pot
+    float elapsed_ms = 0.0f;        ///< wall-clock since solve start, probe
+                                    ///< overhead INCLUDED (it is real time the
+                                    ///< user waits)
+    float probe_ms = 0.0f;          ///< what this best-response pass itself cost
+};
+
 /// Full solver result
 struct SolverResult {
     int iterations_run = 0;
@@ -732,6 +756,13 @@ struct SolverResult {
     /// time-budgeted runs may have higher exploit% than usual and the
     /// strategy is "what we got in the budget", not "fully converged".
     std::string early_stop_reason;
+
+    /// T0/0b: the exploitability-probe samples, in iteration order. Empty
+    /// unless SolverConfig::record_convergence was set.
+    std::vector<ConvergenceProbe> convergence;
+    /// Cumulative cost of all probes, so a time-to-target number can be
+    /// quoted both as measured and net of its own instrumentation.
+    float exploit_probe_overhead_ms = 0.0f;
 
     /// Action labels for the current node (e.g., "Check", "Bet_33", "Bet_75")
     std::vector<std::string> action_labels;

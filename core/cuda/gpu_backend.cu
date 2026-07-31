@@ -18,6 +18,7 @@
 #include "card.h"
 #include "showdown_rank_blocker.h"
 #include "terminal_plan.h"
+#include "gpu_value_layout.h"
 
 #include "util.cuh"
 #include <cuda_runtime.h>
@@ -71,11 +72,12 @@ void launch_aggregate_node_values(
     const uint8_t* d_num_children,
     const uint32_t* d_children_offset, const uint32_t* d_children,
     const uint8_t*  d_runout_weight,
-    const uint32_t* d_node_offset,
+    const uint32_t* d_node_offset, const uint32_t* d_value_row,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
     const float* d_strat_src, int strat_src_mode,
     float* d_node_values,
-    uint16_t nc, int traverser);
+    uint16_t nc, int traverser,
+    float* d_regrets, float pos_disc, float neg_disc);
 
 // Postsolve variant: max-over-actions at traverser-acting nodes.
 // Same signature as launch_aggregate_node_values.
@@ -84,21 +86,11 @@ void launch_aggregate_node_values_br(
     const uint8_t* d_num_children,
     const uint32_t* d_children_offset, const uint32_t* d_children,
     const uint8_t*  d_runout_weight,
-    const uint32_t* d_node_offset,
+    const uint32_t* d_node_offset, const uint32_t* d_value_row,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
     const float* d_strat_src, int strat_src_mode,
     float* d_node_values,
     uint16_t nc, int traverser);
-
-void launch_update_regrets(
-    float* d_regrets,
-    const float* d_node_values,
-    const uint8_t* d_node_types, const uint8_t* d_active_player,
-    const uint8_t* d_num_children,
-    const uint32_t* d_children_offset, const uint32_t* d_children,
-    const uint32_t* d_node_offset,
-    uint32_t num_nodes, uint16_t nc,
-    int traverser, float pos_disc, float neg_disc);
 
 void launch_update_strategy_sum(
     float* d_strategy_sum, const float* d_strat_src, int strat_src_mode,
@@ -127,6 +119,7 @@ void launch_terminal_level(
     const uint32_t* d_parent_indices,
     const float* d_bet_into,
     const int32_t* d_matchup_idx,
+    const uint32_t* d_value_row,
     const uint32_t* d_level_indices,
     uint32_t num_level_nodes,
     const float* d_matchup_ev_concat,
@@ -134,6 +127,8 @@ void launch_terminal_level(
     const float* d_canonical_weights,
     uint32_t num_runouts,
     const float* d_reach_opp_base,
+    const uint16_t* d_opp_live,
+    uint16_t num_opp_live,
     uint16_t nc,
     int perspective,
     float rake_rate,
@@ -147,6 +142,7 @@ void launch_rank_blocker_terminal_level(
     const uint32_t* d_parent_indices,
     const float* d_bet_into,
     const int32_t* d_matchup_idx,
+    const uint32_t* d_value_row,
     const uint32_t* d_level_indices,
     uint32_t num_level_nodes,
     const uint16_t* d_combo_bucket,
@@ -227,6 +223,28 @@ struct DeviceMatchup {
 struct DeviceReach {
     float* ip_reach   = nullptr;  // [nc]
     float* oop_reach  = nullptr;  // [nc]
+
+    // B1b inc 1: the canonical combos each player actually holds — root reach
+    // strictly positive — in ASCENDING order. A hand with zero reach at the
+    // root has zero reach everywhere (reach is a product of strategy
+    // probabilities), so this is a STATIC property of the ranges, not a
+    // per-iteration one.
+    //
+    // The terminal kernels sum `reach_opp[cj] * ...` over every opponent combo.
+    // A zero-reach term contributes exactly ±0.0 and `x + 0.0 == x` bit-for-bit,
+    // so iterating this list instead of [0, nc) is bit-identical while cutting
+    // the inner loop to the opponent's real range. Measured across the app's 26
+    // shipped matchups on a monotone board: 15.7%-61.0% of nc per player
+    // (median ~23%), so this is a 1.6x-6.4x cut on the kernel that dominates
+    // GPU time on iso boards.
+    //
+    // ASCENDING matters: the retained terms are then added in the same relative
+    // order as the dense loop, which is what makes it bit-exact rather than
+    // merely equivalent.
+    uint16_t* live_oop     = nullptr;  // [num_live_oop]
+    uint16_t* live_ip      = nullptr;  // [num_live_ip]
+    uint16_t  num_live_oop = 0;
+    uint16_t  num_live_ip  = 0;
 };
 
 /// Node locks on device — sparse list of forced strategies at (node, combo) pairs.
@@ -257,7 +275,11 @@ struct DeviceSolverState {
     // Scratch buffers for backward pass (Phase 4.5 uses these)
     float* reach_scratch_oop = nullptr;  // [N * nc]   per-node reach for OOP
     float* reach_scratch_ip  = nullptr;  // [N * nc]   per-node reach for IP
-    float* node_values       = nullptr;  // [N * nc]
+    // B3 inc 1: [value_rows * nc], NOT [N * nc] — compacted terminal rows plus
+    // a 2-level non-terminal window. Index through value_row[n], never by n.
+    float* node_values       = nullptr;
+    uint32_t* value_row      = nullptr;  // [N] node index → value buffer row
+    size_t    value_rows     = 0;
 
     uint32_t* node_offset    = nullptr;  // [N] device slot table
     size_t    total_slots    = 0;        // Σ na over player nodes
@@ -267,9 +289,12 @@ struct DeviceSolverState {
     std::vector<uint32_t> host_node_offset;
 };
 
-/// Topologically sorted level schedule: node indices grouped by depth
-/// (distance to nearest leaf). Level 0 = terminals; level max_depth = root.
-/// The backward pass processes levels 0 → max_depth (leaves-to-root).
+/// Topologically sorted level schedule: node indices grouped by DEPTH FROM
+/// ROOT. Level 0 = root; level max_depth = the deepest leaves. Forward
+/// (reach) runs 0 → max_depth, backward (values) runs max_depth → 0.
+/// Every child sits exactly one level below its parent — see
+/// compute_depth_from_root for why that property is the whole point.
+/// Terminals are spread across levels rather than all sitting at level 0.
 ///
 /// Layout:
 ///   node_order[level_offsets[L] .. level_offsets[L+1]) = node indices at level L
@@ -278,6 +303,18 @@ struct DeviceLevels {
     uint32_t* level_offsets = nullptr;  // [max_depth + 2] (prefix-sum, +1 sentinel)
     uint32_t  max_depth     = 0;
     uint32_t  num_levels    = 0;        // max_depth + 1
+
+    // B3: every terminal node index, ascending. Under the old HEIGHT-keyed
+    // schedule all terminals sat at level 0, so one launch over that level
+    // covered them; depth keying scatters them across levels, and launching
+    // the terminal kernel once per level cost 65% of throughput on small trees
+    // (549-node tree, 9 levels, 2 traversers — pure launch overhead). A
+    // terminal's value depends only on REACH, never on another node's value,
+    // so the whole set is still evaluable in ONE launch once the forward pass
+    // has finished. That also moves the last reach reader out of the backward
+    // pass, which is what the reach buffers need before they can be windowed.
+    uint32_t* terminal_order = nullptr;  // [num_terminals]
+    uint32_t  num_terminals  = 0;
 };
 
 // ---- Generic upload helpers ----
@@ -566,12 +603,31 @@ static DeviceReach upload_reach(const std::vector<float>& ip_reach,
     DeviceReach dr;
     dr.ip_reach  = upload_vector(ip_reach);
     dr.oop_reach = upload_vector(oop_reach);
+
+    auto live_list = [](const std::vector<float>& reach) {
+        std::vector<uint16_t> live;
+        live.reserve(reach.size());
+        for (std::size_t c = 0; c < reach.size(); ++c) {
+            if (reach[c] > 0.0f) live.push_back(static_cast<uint16_t>(c));
+        }
+        return live;
+    };
+    const std::vector<uint16_t> lo = live_list(oop_reach);
+    const std::vector<uint16_t> li = live_list(ip_reach);
+    dr.live_oop     = upload_vector(lo);
+    dr.live_ip      = upload_vector(li);
+    dr.num_live_oop = static_cast<uint16_t>(lo.size());
+    dr.num_live_ip  = static_cast<uint16_t>(li.size());
     return dr;
 }
 
 static void free_reach(DeviceReach& dr) {
     free_device(dr.ip_reach);
     free_device(dr.oop_reach);
+    free_device(dr.live_oop);
+    free_device(dr.live_ip);
+    dr.num_live_oop = 0;
+    dr.num_live_ip  = 0;
 }
 
 // ---- Node lock upload ----
@@ -644,73 +700,48 @@ __global__ void apply_locks_kernel(
 
 // ---- Topological level sort ----
 
-/// Compute each node's distance to nearest leaf (terminals = 0).
-/// Requires: BFS-built tree where children have larger indices than parents,
-/// OR falls back to iterative post-order if the assumption is violated.
-static std::vector<uint32_t> compute_node_depths(const FlatGameTree& tree) {
+/// Compute each node's DEPTH FROM ROOT (root = 0, every child = parent + 1).
+///
+/// B3: this schedule used to key on HEIGHT (`1 + max child height`). Under
+/// height keying a node's children can sit ANY number of levels below it, so a
+/// node's reach — written by its PARENT, read when the node itself is
+/// processed — has an unbounded live window, and all three full-tree buffers
+/// (reach_scratch_oop/_ip, node_values) must be N×nc. Depth keying puts every
+/// child exactly one level below its parent, which is what lets those buffers
+/// become 2-level rolling windows.
+///
+/// Both passes stay correctly ordered under the new key: forward runs 0 →
+/// max_depth (a level's reach is written before that level propagates), and
+/// backward runs max_depth → 0 (a node's children are evaluated before it
+/// aggregates them). The one behavioral difference is that terminals no longer
+/// all live at one level — under height keying every terminal was at level 0,
+/// under depth keying they scatter, so the terminal kernel runs per level. Same
+/// total work, more launches (9-13 levels on real trees).
+///
+/// Requires the BFS-flattened tree (child index > parent index) — the same
+/// assumption the height version made, and guaranteed by GameTreeBuilder.
+static std::vector<uint32_t> compute_depth_from_root(const FlatGameTree& tree) {
     const uint32_t N = tree.total_nodes;
     std::vector<uint32_t> depth(N, 0);
     if (N == 0) return depth;
 
-    // First pass: reverse iteration assuming child idx > parent idx (BFS order).
-    // Safe because the tree is BFS-flattened from GameTreeBuilder.
-    for (int64_t i = static_cast<int64_t>(N) - 1; i >= 0; --i) {
-        uint8_t na = tree.num_children[i];
-        if (na == 0) {
-            depth[i] = 0;
-            continue;
-        }
-        uint32_t max_child = 0;
+    for (uint32_t n = 0; n < N; ++n) {
+        const uint8_t na = tree.num_children[n];
         for (uint8_t a = 0; a < na; ++a) {
-            uint32_t child = tree.children[tree.children_offset[i] + a];
-            if (child < N && depth[child] + 1 > max_child) {
-                max_child = depth[child] + 1;
-            }
+            const uint32_t child = tree.children[tree.children_offset[n] + a];
+            if (child < N) depth[child] = depth[n] + 1;
         }
-        depth[i] = max_child;
     }
     return depth;
-}
-
-static DeviceLevels upload_levels(const FlatGameTree& tree) {
-    DeviceLevels dl;
-    const uint32_t N = tree.total_nodes;
-    if (N == 0) return dl;
-
-    std::vector<uint32_t> depth = compute_node_depths(tree);
-    uint32_t max_d = 0;
-    for (uint32_t d : depth) if (d > max_d) max_d = d;
-
-    const uint32_t num_levels = max_d + 1;
-    std::vector<uint32_t> count(num_levels, 0);
-    for (uint32_t d : depth) count[d]++;
-
-    // Prefix-sum offsets; offsets[num_levels] = N (sentinel)
-    std::vector<uint32_t> offsets(num_levels + 1, 0);
-    for (uint32_t L = 0; L < num_levels; ++L) {
-        offsets[L + 1] = offsets[L] + count[L];
-    }
-
-    // Bucket fill: for each node, place at its level's cursor
-    std::vector<uint32_t> node_order(N, 0);
-    std::vector<uint32_t> cursor(offsets);
-    for (uint32_t n = 0; n < N; ++n) {
-        uint32_t L = depth[n];
-        node_order[cursor[L]++] = n;
-    }
-
-    dl.node_order    = upload_vector(node_order);
-    dl.level_offsets = upload_vector(offsets);
-    dl.max_depth     = max_d;
-    dl.num_levels    = num_levels;
-    return dl;
 }
 
 static void free_levels(DeviceLevels& dl) {
     free_device(dl.node_order);
     free_device(dl.level_offsets);
+    free_device(dl.terminal_order);
     dl.max_depth = 0;
     dl.num_levels = 0;
+    dl.num_terminals = 0;
 }
 
 // ---- Solver state allocation ----
@@ -724,7 +755,9 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
                                               uint8_t max_actions,
                                               uint16_t num_canonical,
                                               const FlatGameTree& tree,
-                                              bool materialize_strategy)
+                                              bool materialize_strategy,
+                                              const std::vector<uint32_t>& host_value_row,
+                                              size_t value_rows)
 {
     DeviceSolverState ds;
     size_t N  = num_nodes;
@@ -755,11 +788,16 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
     //     on node-locked solves) = 2 or 3 buffers of total_slots*nc floats
     //     (compact; inc 2 dropped action_values, inc 3 dropped
     //     current_strategy — keep bytes_for_gpu_state_compact in sync)
-    //   reach + node_values = 3 buffers of N*nc floats (full tree)
+    //   reach = 2 buffers of N*nc floats (full tree)
+    //   node_values = value_rows*nc floats — B3 inc 1 split it into compacted
+    //     terminal rows + a 2-level non-terminal window, so it is smaller than
+    //     N*nc (83.9% on the 4.65M-node target)
     const size_t strat_buffers = materialize_strategy ? 3u : 2u;
     size_t bytes_strat = strat_stride * sizeof(float);
     size_t bytes_reach = N * nc * sizeof(float);
-    size_t state_bytes_required = bytes_strat * strat_buffers + bytes_reach * 3;
+    size_t bytes_values = value_rows * nc * sizeof(float);
+    size_t state_bytes_required = bytes_strat * strat_buffers
+                                + bytes_reach * 2 + bytes_values;
     {
         size_t free_dev = 0, total_dev = 0;
         if (cudaMemGetInfo(&free_dev, &total_dev) == cudaSuccess) {
@@ -783,7 +821,9 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
         ? alloc_device_zero<float>(strat_stride) : nullptr;
     ds.reach_scratch_oop  = alloc_device_zero<float>(N * nc);
     ds.reach_scratch_ip   = alloc_device_zero<float>(N * nc);
-    ds.node_values        = alloc_device_zero<float>(N * nc);
+    ds.node_values        = alloc_device_zero<float>(value_rows * nc);
+    ds.value_rows         = value_rows;
+    ds.value_row          = upload_vector(host_value_row);
     ds.node_offset        = upload_vector(ds.host_node_offset);
 
     // Initialize current_strategy to uniform 1/num_children per player node.
@@ -819,10 +859,12 @@ static void free_solver_state(DeviceSolverState& ds) {
     free_device(ds.reach_scratch_oop);
     free_device(ds.reach_scratch_ip);
     free_device(ds.node_values);
+    free_device(ds.value_row);
     free_device(ds.node_offset);
     ds.host_node_offset.clear();
     ds.total_slots = 0;
     ds.state_stride = 0;
+    ds.value_rows = 0;
 }
 
 /// Build a GPU device-name string for the UI indicator
@@ -856,6 +898,11 @@ struct GpuBackend::Impl {
     // Host-side copies of level schedule (for iterating on host to launch per-terminal kernels)
     std::vector<uint32_t> host_node_order;
     std::vector<uint32_t> host_level_offsets;
+
+    // B3 inc 1: node index → row in the value buffer (see prepare()).
+    std::vector<uint32_t> host_value_row;
+    size_t value_rows = 0;
+
 
     // Cached host-side info for finalize() and bookkeeping
     const SolverConfig*       config = nullptr;
@@ -1060,7 +1107,7 @@ void GpuBackend::prepare(const SolverContext& ctx) {
         // Compute level schedule, keep host copies + upload device copies
         {
             const uint32_t N = ctx.tree->total_nodes;
-            std::vector<uint32_t> depth = compute_node_depths(*ctx.tree);
+            std::vector<uint32_t> depth = compute_depth_from_root(*ctx.tree);
             uint32_t max_d = 0;
             for (uint32_t d : depth) if (d > max_d) max_d = d;
             const uint32_t num_levels = max_d + 1;
@@ -1074,30 +1121,14 @@ void GpuBackend::prepare(const SolverContext& ctx) {
             std::vector<uint32_t> cursor(offsets);
             for (uint32_t n = 0; n < N; ++n) order[cursor[depth[n]]++] = n;
 
-            // DEEPSOLVER_LEVEL_HISTOGRAM=1 — structural instrument for GPU B3
-            // (full-tree buffer lifetimes). The two full-tree buffer families
-            // (reach_scratch_*, node_values) are N×nc because the CURRENT level
-            // schedule keys on HEIGHT (depth[i] = 1 + max child height), under which
-            // a node's children can sit ANY number of levels below it, so neither
-            // buffer has a bounded live window. Keying on DEPTH-from-root instead
-            // makes every child exactly one level below its parent — which is what
-            // would let both buffers become 2-level rolling windows. What that costs
-            // is max_level_width × nc instead of N × nc, so the width distribution
-            // below IS the B3 design input. Prints both schedules; costs nothing
-            // when the env var is unset.
+            // DEEPSOLVER_LEVEL_HISTOGRAM=1 — B3 sizing instrument. The three
+            // full-tree buffers (reach_scratch_oop/_ip, node_values) can be
+            // windowed to the widest ADJACENT PAIR of depth levels, because a
+            // node's row is written one level above it and read on its own
+            // level. That pair width, not N, is what those buffers must hold —
+            // so this is the number that says whether a given tree fits.
+            // Costs nothing when the env var is unset.
             if (std::getenv("DEEPSOLVER_LEVEL_HISTOGRAM") != nullptr) {
-                std::vector<uint32_t> depth_from_root(N, 0);
-                for (uint32_t n = 0; n < N; ++n) {
-                    uint8_t na = ctx.tree->num_children[n];
-                    for (uint8_t a = 0; a < na; ++a) {
-                        uint32_t child = ctx.tree->children[ctx.tree->children_offset[n] + a];
-                        if (child < N) depth_from_root[child] = depth_from_root[n] + 1;
-                    }
-                }
-                uint32_t max_dfr = 0;
-                for (uint32_t d : depth_from_root) if (d > max_dfr) max_dfr = d;
-                std::vector<uint32_t> dfr_count(max_dfr + 1, 0);
-                for (uint32_t d : depth_from_root) dfr_count[d]++;
                 uint32_t n_term = 0, n_player = 0, n_chance = 0;
                 for (uint32_t n = 0; n < N; ++n) {
                     auto nt = static_cast<NodeType>(ctx.tree->node_types[n]);
@@ -1105,20 +1136,141 @@ void GpuBackend::prepare(const SolverContext& ctx) {
                     else if (nt == NodeType::CHANCE) ++n_chance;
                     else ++n_player;
                 }
-                uint32_t widest_h = 0, widest_d = 0;
-                for (uint32_t L = 0; L < num_levels; ++L) widest_h = std::max(widest_h, count[L]);
-                for (uint32_t d = 0; d <= max_dfr; ++d) widest_d = std::max(widest_d, dfr_count[d]);
+                // Non-terminal counts are tracked separately because the value
+                // buffer can drop terminal rows into a compacted side table
+                // (terminals are evaluated in the forward descent, where their
+                // reach is live), leaving only non-terminal rows to window.
+                // Whether that split beats one full N×nc buffer depends
+                // entirely on these widths, so print both.
+                std::vector<uint32_t> nonterm(num_levels, 0);
+                for (uint32_t n = 0; n < N; ++n) {
+                    if (static_cast<NodeType>(ctx.tree->node_types[n]) !=
+                        NodeType::TERMINAL) nonterm[depth[n]]++;
+                }
+                uint32_t widest = 0, widest_pair = 0, widest_nt_pair = 0;
+                for (uint32_t L = 0; L < num_levels; ++L) {
+                    widest = std::max(widest, count[L]);
+                    const uint32_t pair =
+                        count[L] + (L + 1 < num_levels ? count[L + 1] : 0u);
+                    widest_pair = std::max(widest_pair, pair);
+                    const uint32_t nt_pair =
+                        nonterm[L] + (L + 1 < num_levels ? nonterm[L + 1] : 0u);
+                    widest_nt_pair = std::max(widest_nt_pair, nt_pair);
+                }
                 std::fprintf(stderr,
-                    "[levels] N=%u player=%u chance=%u terminal=%u | height-levels=%u "
-                    "widest=%u (%.1f%% of N) | depth-levels=%u widest=%u (%.1f%% of N)\n",
-                    N, n_player, n_chance, n_term, num_levels, widest_h,
-                    100.0 * widest_h / static_cast<double>(N),
-                    max_dfr + 1, widest_d, 100.0 * widest_d / static_cast<double>(N));
-                std::fprintf(stderr, "[levels] height widths:");
+                    "[levels] N=%u player=%u chance=%u terminal=%u | depth-levels=%u "
+                    "widest=%u (%.1f%% of N) widest-2-level-window=%u (%.1f%% of N) "
+                    "| nonterm-2-level-window=%u (%.1f%% of N) "
+                    "value-split=%.1f%% of N vs 100%% whole\n",
+                    N, n_player, n_chance, n_term, num_levels, widest,
+                    100.0 * widest / static_cast<double>(N),
+                    widest_pair, 100.0 * widest_pair / static_cast<double>(N),
+                    widest_nt_pair, 100.0 * widest_nt_pair / static_cast<double>(N),
+                    100.0 * (n_term + widest_nt_pair) / static_cast<double>(N));
+                std::fprintf(stderr, "[levels] depth widths:");
                 for (uint32_t L = 0; L < num_levels; ++L) std::fprintf(stderr, " %u", count[L]);
-                std::fprintf(stderr, "\n[levels] depth  widths:");
-                for (uint32_t d = 0; d <= max_dfr; ++d) std::fprintf(stderr, " %u", dfr_count[d]);
+                std::fprintf(stderr, "\n[levels] nonterm widths:");
+                for (uint32_t L = 0; L < num_levels; ++L) std::fprintf(stderr, " %u", nonterm[L]);
                 std::fprintf(stderr, "\n");
+
+                // B1b sizing: every nc-factored buffer is sized to the GLOBAL
+                // canonical count, but a buffer only ever holds rows for one
+                // player's hands — regrets/strategy_sum at an OOP-acting node
+                // only index OOP hands, reach_oop only OOP hands. A hand with
+                // zero reach at the ROOT is zero everywhere (reach is a product
+                // of strategy probabilities), so per-player live counts are a
+                // STATIC bound, not a per-iteration one. Print the ratio the
+                // per-player dimension would buy.
+                uint32_t live_oop = 0, live_ip = 0, live_union = 0;
+                for (uint16_t c = 0; c < ctx.iso->num_canonical; ++c) {
+                    const bool o = (*ctx.oop_reach)[c] > 0.0f;
+                    const bool i = (*ctx.ip_reach)[c]  > 0.0f;
+                    if (o) ++live_oop;
+                    if (i) ++live_ip;
+                    if (o || i) ++live_union;
+                }
+                const uint32_t ncu = ctx.iso->num_canonical;
+                std::fprintf(stderr,
+                    "[b1b] nc=%u live_oop=%u (%.1f%%) live_ip=%u (%.1f%%) "
+                    "per-player mean=%.1f%% union=%u (%.1f%%) of nc\n",
+                    ncu, live_oop, 100.0 * live_oop / ncu,
+                    live_ip, 100.0 * live_ip / ncu,
+                    100.0 * 0.5 * (live_oop + live_ip) / ncu,
+                    live_union, 100.0 * live_union / ncu);
+            }
+
+            std::vector<uint32_t> terminals;
+            terminals.reserve(N);
+            for (uint32_t n = 0; n < N; ++n) {
+                if (static_cast<NodeType>(ctx.tree->node_types[n]) ==
+                    NodeType::TERMINAL) {
+                    terminals.push_back(n);
+                }
+            }
+            impl_->levels.terminal_order = upload_vector(terminals);
+            impl_->levels.num_terminals  = static_cast<uint32_t>(terminals.size());
+
+            // B3 inc 1: the value buffer's row map. node_values was [N][nc];
+            // it is now a two-region buffer and every consumer indexes through
+            // this table instead of by node index.
+            //
+            //   TERMINAL rows  — one per terminal, packed in node order. A
+            //     terminal's value is written once per traverser pass (all of
+            //     them in a single launch, since it depends only on reach) and
+            //     read by its parent during the backward ascent. That span is
+            //     the whole ascent, so these rows cannot be windowed.
+            //   NON-TERMINAL rows — a 2-level rolling window, addressed by
+            //     (depth parity, slot within level). A non-terminal's value is
+            //     written when its level is aggregated and read one level up,
+            //     so level L and L+1 must coexist and nothing else must. Level
+            //     L-1 has the same parity as L+1 and overwrites exactly the
+            //     rows that just went dead.
+            //
+            // Measured on the 4.65M-node target: 63.4% terminal + a 20.5%
+            // non-terminal window = 83.9% of a full N×nc buffer.
+            std::vector<uint32_t> nt_slot(N, 0);
+            std::vector<uint32_t> nt_width(num_levels, 0);
+            for (uint32_t n = 0; n < N; ++n) {
+                if (static_cast<NodeType>(ctx.tree->node_types[n]) !=
+                    NodeType::TERMINAL) {
+                    nt_slot[n] = nt_width[depth[n]]++;
+                }
+            }
+            uint32_t nt_parity_width[2] = {0, 0};
+            for (uint32_t L = 0; L < num_levels; ++L) {
+                nt_parity_width[L & 1u] =
+                    std::max(nt_parity_width[L & 1u], nt_width[L]);
+            }
+            const uint32_t nt_base[2] = {
+                static_cast<uint32_t>(terminals.size()),
+                static_cast<uint32_t>(terminals.size()) + nt_parity_width[0]
+            };
+            std::vector<uint32_t> value_row(N, 0);
+            uint32_t term_ordinal = 0;
+            for (uint32_t n = 0; n < N; ++n) {
+                if (static_cast<NodeType>(ctx.tree->node_types[n]) ==
+                    NodeType::TERMINAL) {
+                    value_row[n] = term_ordinal++;
+                } else {
+                    value_row[n] = nt_base[depth[n] & 1u] + nt_slot[n];
+                }
+            }
+            impl_->host_value_row = std::move(value_row);
+            impl_->value_rows = static_cast<size_t>(terminals.size())
+                              + nt_parity_width[0] + nt_parity_width[1];
+
+            // The estimator sizes the VRAM gate from gpu_value_rows(tree); if
+            // that ever disagrees with the table actually built here, the gate
+            // is deciding on a footprint the solve does not have. Same
+            // hard-check discipline the TerminalRepresentationPlan uses.
+            const uint64_t predicted = gpu_value_rows(*ctx.tree);
+            if (predicted != impl_->value_rows) {
+                std::ostringstream oss;
+                oss << "GpuBackend: value-row layout disagrees with the "
+                       "estimator — gpu_value_rows() says " << predicted
+                    << " but prepare() built " << impl_->value_rows
+                    << ". The VRAM gate would be pricing the wrong footprint.";
+                throw std::runtime_error(oss.str());
             }
 
             impl_->host_node_order    = order;
@@ -1137,15 +1289,19 @@ void GpuBackend::prepare(const SolverContext& ctx) {
                                            MAX_ACTIONS,
                                            ctx.iso->num_canonical,
                                            *ctx.tree,
-                                           impl_->materialize_strategy);
+                                           impl_->materialize_strategy,
+                                           impl_->host_value_row,
+                                           impl_->value_rows);
         {
             const uint64_t nc64 = ctx.iso->num_canonical;
             const uint64_t n64  = ctx.tree->total_nodes;
             const uint64_t strat_buffers = impl_->materialize_strategy ? 3ULL : 2ULL;
             impl_->device_state_bytes_exact =
                 strat_buffers * impl_->state.state_stride * sizeof(float)
-              + 3ULL * n64 * nc64 * sizeof(float)                  // full-tree ×3
-              + n64 * sizeof(uint32_t);                            // node_offset
+              + 2ULL * n64 * nc64 * sizeof(float)                  // reach ×2
+              + static_cast<uint64_t>(impl_->value_rows) * nc64    // B3 inc 1
+                    * sizeof(float)
+              + 2ULL * n64 * sizeof(uint32_t);   // node_offset + value_row
         }
 
         // Post-allocation sample: prepare() holds every buffer the CFR loop
@@ -1214,7 +1370,9 @@ void GpuBackend::reprepare_keep_board(const SolverContext& ctx) {
                                           MAX_ACTIONS,
                                           impl_->iso->num_canonical,
                                           *impl_->host_tree,
-                                          impl_->materialize_strategy);
+                                          impl_->materialize_strategy,
+                                          impl_->host_value_row,
+                                          impl_->value_rows);
         impl_->sample_vram();  // keep-board path: track min-free vs the
                                // original prepare()'s baseline
         impl_->prepared = true;
@@ -1278,7 +1436,7 @@ void GpuBackend::reprepare_keep_state(const SolverContext& ctx) {
 // iterate: one DCFR iteration
 //   1. Regret matching → current_strategy
 //   2. Forward reach propagation (root → leaves)
-//   3. Backward pass for OOP traverser: level 0 → max_depth
+//   3. Backward pass for OOP traverser: max_depth → level 0 (root)
 //      - At terminals: launch showdown/fold kernel
 //      - At player/chance: lift children values + aggregate
 //   4. Update OOP regrets + strategy_sum
@@ -1372,10 +1530,12 @@ void GpuBackend::iterate(int iteration) {
                            static_cast<size_t>(nc) * sizeof(float),
                            cudaMemcpyDeviceToDevice));
 
-    // Level schedule: level 0 = leaves, max_depth = root. Propagate parents→children,
-    // i.e. iterate levels from ROOT (max_depth) DOWN to 1.
+    // Depth-keyed schedule: level 0 = root, max_depth = deepest leaves.
+    // Reach propagates parents→children, so iterate ROOT-DOWN and launch on the
+    // PARENT level. The deepest level has no children by construction, so it is
+    // skipped rather than launched on.
     const auto& offsets = I.host_level_offsets;
-    for (int L = static_cast<int>(I.levels.max_depth); L >= 1; --L) {
+    for (uint32_t L = 0; L < I.levels.max_depth; ++L) {
         uint32_t start = offsets[L];
         uint32_t end   = offsets[L + 1];
         uint32_t count = end - start;
@@ -1405,59 +1565,53 @@ void GpuBackend::iterate(int iteration) {
 
         float* reach_opp_base = (traverser == 0) ? I.state.reach_scratch_ip
                                                   : I.state.reach_scratch_oop;
+        // B1b inc 1: whichever reach the terminals read, walk THAT player's
+        // live list. Getting these two out of step would silently drop or
+        // double-count opponent hands.
+        const uint16_t* opp_live = (traverser == 0) ? I.reach.live_ip
+                                                   : I.reach.live_oop;
+        const uint16_t  num_opp_live = (traverser == 0) ? I.reach.num_live_ip
+                                                       : I.reach.num_live_oop;
 
-        // Backward: level 0 (leaves) → max_depth (root)
-        for (uint32_t L = 0; L < num_levels; ++L) {
-            uint32_t start = offsets[L];
-            uint32_t end   = offsets[L + 1];
-            uint32_t count = end - start;
-            if (count == 0) continue;
-
-            // Terminal nodes at this level — one kernel launch per terminal
-            // Non-terminal nodes: lift children values + aggregate (kernel filters by type)
-            const uint32_t* d_level = I.levels.node_order + start;
-            if (L == 0) {
-                if (I.matchup.rb_valid) {
-                    launch_rank_blocker_terminal_level(
-                        I.tree.node_types, I.tree.terminal_types, I.tree.pots,
-                        I.tree.parent_indices, I.tree.bet_into, I.tree.matchup_idx,
-                        d_level, count,
-                        I.matchup.rb_combo_bucket, I.matchup.rb_bucket_count,
-                        I.matchup.rb_combo_card0, I.matchup.rb_combo_card1,
-                        I.matchup.rb_card_off, I.matchup.rb_card_list,
-                        I.matchup.num_runouts, reach_opp_base, nc,
-                        I.matchup.rb_max_bucket_count, traverser,
-                        I.config->rake_rate, I.config->rake_cap,
-                        I.state.node_values);
-                } else {
-                    launch_terminal_level(
-                        I.tree.node_types,
-                        I.tree.terminal_types,
-                        I.tree.pots,
-                        I.tree.parent_indices,
-                        I.tree.bet_into,
-                        I.tree.matchup_idx,
-                        d_level, count,
-                        I.matchup.matchup_ev,
-                        I.matchup.matchup_valid,
-                        I.matchup.canonical_weights,
-                        I.matchup.num_runouts,
-                        reach_opp_base,
-                        nc, traverser,
-                        I.config->rake_rate, I.config->rake_cap,
-                        I.state.node_values);
-                }
+        // All terminals in ONE launch. Their value depends only on reach —
+        // which the forward pass has already finished — so they do not need to
+        // be interleaved with the level sweep, and keeping them out of it is
+        // what keeps the depth-keyed schedule from paying 9-13× the launch
+        // overhead on small trees.
+        if (I.levels.num_terminals > 0) {
+            if (I.matchup.rb_valid) {
+                launch_rank_blocker_terminal_level(
+                    I.tree.node_types, I.tree.terminal_types, I.tree.pots,
+                    I.tree.parent_indices, I.tree.bet_into, I.tree.matchup_idx,
+                    I.state.value_row,
+                    I.levels.terminal_order, I.levels.num_terminals,
+                    I.matchup.rb_combo_bucket, I.matchup.rb_bucket_count,
+                    I.matchup.rb_combo_card0, I.matchup.rb_combo_card1,
+                    I.matchup.rb_card_off, I.matchup.rb_card_list,
+                    I.matchup.num_runouts, reach_opp_base, nc,
+                    I.matchup.rb_max_bucket_count, traverser,
+                    I.config->rake_rate, I.config->rake_cap,
+                    I.state.node_values);
+            } else {
+                launch_terminal_level(
+                    I.tree.node_types,
+                    I.tree.terminal_types,
+                    I.tree.pots,
+                    I.tree.parent_indices,
+                    I.tree.bet_into,
+                    I.tree.matchup_idx,
+                    I.state.value_row,
+                    I.levels.terminal_order, I.levels.num_terminals,
+                    I.matchup.matchup_ev,
+                    I.matchup.matchup_valid,
+                    I.matchup.canonical_weights,
+                    I.matchup.num_runouts,
+                    reach_opp_base,
+                    opp_live, num_opp_live,
+                    nc, traverser,
+                    I.config->rake_rate, I.config->rake_cap,
+                    I.state.node_values);
             }
-
-            launch_aggregate_node_values(
-                I.tree.node_types, I.tree.active_player, I.tree.num_children,
-                I.tree.children_offset, I.tree.children,
-                I.tree.runout_weight,
-                I.state.node_offset,
-                d_level, count,
-                strat_src, strat_src_mode,
-                I.state.node_values,
-                nc, traverser);
         }
 
         // Strategy_sum update — branch on schedule (decay-and-add for
@@ -1466,10 +1620,12 @@ void GpuBackend::iterate(int iteration) {
         // ORDER MATTERS since B1a inc 3: this reads the ITERATION-START
         // strategy. With the materialized buffer that was a snapshot and the
         // order was free; deriving it from regrets makes "before
-        // update_regrets" the only correct position. Swapping the two launches
-        // is otherwise inert — update_regrets reads node_values and writes
-        // regrets, update_strategy_sum reads reach + regrets and writes
-        // strategy_sum.
+        // update_regrets" the only correct position.
+        //
+        // B3 inc 1 moved it AHEAD of the backward pass, because update_regrets
+        // now runs inside that pass. Its inputs (reach + regrets) are untouched
+        // by the backward pass, so the move is inert — but the constraint it
+        // encodes is now structural rather than a convention.
         const float* reach_own = (traverser == 0) ? I.state.reach_scratch_oop
                                                   : I.state.reach_scratch_ip;
         launch_update_strategy_sum(
@@ -1478,14 +1634,31 @@ void GpuBackend::iterate(int iteration) {
             I.state.node_offset,
             N, nc, traverser, strat_weight, decay_and_add ? 1 : 0);
 
-        // Regret update (at traverser's own nodes). Reads per-action values
-        // straight from the children's node_values rows (inc 2 — no lift).
-        launch_update_regrets(
-            I.state.regrets, I.state.node_values,
-            I.tree.node_types, I.tree.active_player, I.tree.num_children,
-            I.tree.children_offset, I.tree.children,
-            I.state.node_offset,
-            N, nc, traverser, pos_disc, neg_disc);
+        // Backward: deepest level → root. Every child sits exactly one level
+        // below its parent, so a level's children are all evaluated before it.
+        for (int L = static_cast<int>(num_levels) - 1; L >= 0; --L) {
+            uint32_t start = offsets[L];
+            uint32_t end   = offsets[L + 1];
+            uint32_t count = end - start;
+            if (count == 0) continue;
+            const uint32_t* d_level = I.levels.node_order + start;
+
+            launch_aggregate_node_values(
+                I.tree.node_types, I.tree.active_player, I.tree.num_children,
+                I.tree.children_offset, I.tree.children,
+                I.tree.runout_weight,
+                I.state.node_offset, I.state.value_row,
+                d_level, count,
+                strat_src, strat_src_mode,
+                I.state.node_values,
+                nc, traverser,
+                // Regret update for THIS level, fused. It used to be one sweep
+                // over all N nodes after the pass, which only worked while
+                // every value row stayed live; the window forces it per level,
+                // and a separate launch per level cost 23% of small-tree
+                // throughput. Fused it is launch-free and re-reads nothing.
+                I.state.regrets, pos_disc, neg_disc);
+        }
     };
 
     // Deterministic kernel-vs-kernel self-check (env DEEPSOLVER_RB_SELFCHECK).
@@ -1497,11 +1670,16 @@ void GpuBackend::iterate(int iteration) {
         (std::getenv("DEEPSOLVER_RB_SELFCHECK") != nullptr);
     if (kRbSelfCheck && iteration == 0 && I.matchup.rb_valid &&
         I.levels.num_levels > 0) {
-        const size_t span = static_cast<size_t>(N) * nc;
+        // B3 inc 1: these mirror node_values, so they are value-row shaped.
+        const size_t span = I.state.value_rows * nc;
         float* d_dense = alloc_device_zero<float>(span);
         float* d_rb    = alloc_device_zero<float>(span);
-        const uint32_t start = I.host_level_offsets[0];
-        const uint32_t count = I.host_level_offsets[1] - start;
+        // Under height keying level 0 held EVERY terminal, so the check swept
+        // that one level. Depth keying scatters terminals across levels, so it
+        // sweeps the whole node list instead — both kernels filter by node
+        // type, and this is a one-shot debug path.
+        const uint32_t start = 0;
+        const uint32_t count = N;
         const uint32_t* d_level = I.levels.node_order + start;
         for (int trav = 0; trav < 2; ++trav) {
             float* reach_opp = (trav == 0) ? I.state.reach_scratch_ip
@@ -1509,15 +1687,18 @@ void GpuBackend::iterate(int iteration) {
             launch_terminal_level(
                 I.tree.node_types, I.tree.terminal_types, I.tree.pots,
                 I.tree.parent_indices, I.tree.bet_into, I.tree.matchup_idx,
-                d_level, count,
+                I.state.value_row, d_level, count,
                 I.matchup.matchup_ev, I.matchup.matchup_valid,
                 I.matchup.canonical_weights, I.matchup.num_runouts,
-                reach_opp, nc, trav,
+                reach_opp,
+                (trav == 0) ? I.reach.live_ip : I.reach.live_oop,
+                (trav == 0) ? I.reach.num_live_ip : I.reach.num_live_oop,
+                nc, trav,
                 I.config->rake_rate, I.config->rake_cap, d_dense);
             launch_rank_blocker_terminal_level(
                 I.tree.node_types, I.tree.terminal_types, I.tree.pots,
                 I.tree.parent_indices, I.tree.bet_into, I.tree.matchup_idx,
-                d_level, count,
+                I.state.value_row, d_level, count,
                 I.matchup.rb_combo_bucket, I.matchup.rb_bucket_count,
                 I.matchup.rb_combo_card0, I.matchup.rb_combo_card1,
                 I.matchup.rb_card_off, I.matchup.rb_card_list,
@@ -1532,12 +1713,13 @@ void GpuBackend::iterate(int iteration) {
                                   cudaMemcpyDeviceToHost));
             double max_abs = 0.0, sum_ref = 0.0;
             uint32_t worst_node = 0; uint16_t worst_c = 0;
-            for (uint32_t k = start; k < I.host_level_offsets[1]; ++k) {
+            for (uint32_t k = start; k < start + count; ++k) {
                 uint32_t n2 = I.host_node_order[k];
                 if (static_cast<NodeType>(I.host_tree->node_types[n2]) !=
                     NodeType::TERMINAL) continue;
                 for (uint16_t c = 0; c < nc; ++c) {
-                    size_t idx = static_cast<size_t>(n2) * nc + c;
+                    size_t idx =
+                        static_cast<size_t>(I.host_value_row[n2]) * nc + c;
                     double d = std::fabs(static_cast<double>(hd[idx]) - hr[idx]);
                     sum_ref += std::fabs(static_cast<double>(hd[idx]));
                     if (d > max_abs) { max_abs = d; worst_node = n2; worst_c = c; }
@@ -1553,8 +1735,10 @@ void GpuBackend::iterate(int iteration) {
                 static_cast<unsigned>(count), max_abs,
                 static_cast<unsigned>(worst_node),
                 static_cast<unsigned>(worst_c),
-                static_cast<double>(hd[static_cast<size_t>(worst_node) * nc + worst_c]),
-                static_cast<double>(hr[static_cast<size_t>(worst_node) * nc + worst_c]),
+                static_cast<double>(
+                    hd[static_cast<size_t>(I.host_value_row[worst_node]) * nc + worst_c]),
+                static_cast<double>(
+                    hr[static_cast<size_t>(I.host_value_row[worst_node]) * nc + worst_c]),
                 sum_ref);
         }
         cudaFree(d_dense);
@@ -1562,7 +1746,7 @@ void GpuBackend::iterate(int iteration) {
     }
 
     auto dump_traverser_hashes = [&](const char* tag) {
-        const size_t nvspan = static_cast<size_t>(N) * nc;
+        const size_t nvspan = I.state.value_rows * nc;
         std::fprintf(stderr,
                      "[ih] it=%d %s nv=%016llx reg=%016llx "
                      "ss=%016llx\n",
@@ -1713,7 +1897,7 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
     //    strategy, so opponent-of-traverser reach absorbs the population
     //    strategy correctly for both EV and BR variants.
     const auto& offsets = host_level_offsets;
-    for (int L = static_cast<int>(levels.max_depth); L >= 1; --L) {
+    for (uint32_t L = 0; L < levels.max_depth; ++L) {
         uint32_t start = offsets[L];
         uint32_t end   = offsets[L + 1];
         uint32_t count = end - start;
@@ -1728,59 +1912,65 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
             state.reach_scratch_oop, state.reach_scratch_ip, nc);
     }
 
-    // 3) Backward value pass: leaves → root.
-    //    L==0: terminal kernel writes node_values for terminals at this level.
-    //    Every level: aggregate gathers children's node_values directly
-    //    (sum-mode for EV, max-at-traverser for BR) — inc 2, no lift.
+    // 3) Terminals in ONE launch (their value depends only on reach, which the
+    //    forward pass above has already finished), then the backward value
+    //    pass deepest level → root, where aggregate gathers children's
+    //    node_values directly (sum-mode for EV, max-at-traverser for BR).
     float* reach_opp_base = (traverser == 0) ? state.reach_scratch_ip
                                               : state.reach_scratch_oop;
+    const uint16_t* opp_live = (traverser == 0) ? reach.live_ip : reach.live_oop;
+    const uint16_t  num_opp_live =
+        (traverser == 0) ? reach.num_live_ip : reach.num_live_oop;
+    if (levels.num_terminals > 0) {
+        if (matchup.rb_valid) {
+            launch_rank_blocker_terminal_level(
+                tree.node_types, tree.terminal_types, tree.pots,
+                tree.parent_indices, tree.bet_into, tree.matchup_idx,
+                state.value_row,
+                levels.terminal_order, levels.num_terminals,
+                matchup.rb_combo_bucket, matchup.rb_bucket_count,
+                matchup.rb_combo_card0, matchup.rb_combo_card1,
+                matchup.rb_card_off, matchup.rb_card_list,
+                matchup.num_runouts, reach_opp_base, nc,
+                matchup.rb_max_bucket_count, traverser,
+                config->rake_rate, config->rake_cap,
+                state.node_values);
+        } else {
+            launch_terminal_level(
+                tree.node_types,
+                tree.terminal_types,
+                tree.pots,
+                tree.parent_indices,
+                tree.bet_into,
+                tree.matchup_idx,
+                state.value_row,
+                levels.terminal_order, levels.num_terminals,
+                matchup.matchup_ev,
+                matchup.matchup_valid,
+                matchup.canonical_weights,
+                matchup.num_runouts,
+                reach_opp_base,
+                opp_live, num_opp_live,
+                nc, traverser,
+                config->rake_rate, config->rake_cap,
+                state.node_values);
+        }
+    }
+
     const uint32_t num_levels = levels.num_levels;
-    for (uint32_t L = 0; L < num_levels; ++L) {
+    for (int L = static_cast<int>(num_levels) - 1; L >= 0; --L) {
         uint32_t start = offsets[L];
         uint32_t end   = offsets[L + 1];
         uint32_t count = end - start;
         if (count == 0) continue;
         const uint32_t* d_level = levels.node_order + start;
 
-        if (L == 0) {
-            if (matchup.rb_valid) {
-                launch_rank_blocker_terminal_level(
-                    tree.node_types, tree.terminal_types, tree.pots,
-                    tree.parent_indices, tree.bet_into, tree.matchup_idx,
-                    d_level, count,
-                    matchup.rb_combo_bucket, matchup.rb_bucket_count,
-                    matchup.rb_combo_card0, matchup.rb_combo_card1,
-                    matchup.rb_card_off, matchup.rb_card_list,
-                    matchup.num_runouts, reach_opp_base, nc,
-                    matchup.rb_max_bucket_count, traverser,
-                    config->rake_rate, config->rake_cap,
-                    state.node_values);
-            } else {
-                launch_terminal_level(
-                    tree.node_types,
-                    tree.terminal_types,
-                    tree.pots,
-                    tree.parent_indices,
-                    tree.bet_into,
-                    tree.matchup_idx,
-                    d_level, count,
-                    matchup.matchup_ev,
-                    matchup.matchup_valid,
-                    matchup.canonical_weights,
-                    matchup.num_runouts,
-                    reach_opp_base,
-                    nc, traverser,
-                    config->rake_rate, config->rake_cap,
-                    state.node_values);
-            }
-        }
-
         if (best_response) {
             launch_aggregate_node_values_br(
                 tree.node_types, tree.active_player, tree.num_children,
                 tree.children_offset, tree.children,
                 tree.runout_weight,
-                state.node_offset,
+                state.node_offset, state.value_row,
                 d_level, count,
                 ps_src, ps_src_mode,
                 state.node_values,
@@ -1790,20 +1980,24 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
                 tree.node_types, tree.active_player, tree.num_children,
                 tree.children_offset, tree.children,
                 tree.runout_weight,
-                state.node_offset,
+                state.node_offset, state.value_row,
                 d_level, count,
                 ps_src, ps_src_mode,
                 state.node_values,
-                nc, traverser);
+                nc, traverser,
+                /*regrets=*/nullptr, 0.0f, 0.0f);
         }
     }
 
-    // 4) Download root node_values → host. Root is node 0, layout is
-    //    [node][combo] stride nc, so the first nc floats are root's values.
+    // 4) Download root node_values → host. B3 inc 1: the root is node 0 but
+    //    its row is wherever value_row puts it (depth 0, non-terminal, so the
+    //    first slot of the even-parity window), NOT the start of the buffer.
     CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<float> root_values(nc, 0.0f);
+    const size_t root_row = host_value_row.empty()
+        ? 0u : static_cast<size_t>(host_value_row[0]);
     CUDA_CHECK(cudaMemcpy(root_values.data(),
-                          state.node_values,
+                          state.node_values + root_row * nc,
                           static_cast<size_t>(nc) * sizeof(float),
                           cudaMemcpyDeviceToHost));
     // Peak-VRAM honesty (P2 review): cover the postsolve path in the

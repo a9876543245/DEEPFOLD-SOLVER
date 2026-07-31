@@ -647,6 +647,18 @@ if(BUILD_TESTS)
         LABELS "smoke;memory;gpu" TIMEOUT 60
         PASS_REGULAR_EXPRESSION "peak host RAM")
 
+    # T0/0b: time-to-target instrumentation contract — the probe curve exists
+    # under --convergence-log, the cadence is pinned by
+    # --exploitability-interval, and a DEFAULT solve emits no such block (the
+    # bit-exact A/B depends on that). CPU-only, so it lives outside the CUDA
+    # block. Red on v2.5.0: neither flag exists there.
+    add_test(NAME CliConvergenceLog
+        COMMAND ${CMAKE_COMMAND}
+            -DEXE=$<TARGET_FILE:deepsolver_core>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_convergence_log.cmake)
+    set_tests_properties(CliConvergenceLog PROPERTIES
+        LABELS "smoke" TIMEOUT 180)
+
     # GPU postsolve parity test — only when CUDA is available, since the test
     # exercises the GPU backend path directly. Skip-marker inside the test
     # handles "CUDA compiled in but no device present" at runtime.
@@ -712,6 +724,7 @@ if(BUILD_TESTS)
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_enumerated_parity.cmake)
         set_tests_properties(CliEnumeratedGpuParity PROPERTIES
             LABELS "smoke;gpu;parity" TIMEOUT 300)
+
 
         # 2026-07-20 ETA honesty: the Exact estimate must predict how many
         # turn subgames the adaptive VRAM pin will hold, because the leaves

@@ -29,6 +29,7 @@
 #include "showdown_rank_blocker.h"
 #include "fold_blocker.h"
 #include "terminal_plan.h"
+#include "gpu_value_layout.h"
 
 #ifdef _OPENMP
 #  include <omp.h>
@@ -556,6 +557,11 @@ private:
     const IsomorphismMapping* forced_iso_ = nullptr;
     bool solved_ = false;
     int actual_iterations_run_ = 0;
+    /// T0/0b: exploitability-probe samples for the current solve. Filled only
+    /// when config_.record_convergence is set; moved into the result and
+    /// cleared at the start of every solve (decomposition re-solves reuse
+    /// the same Solver).
+    std::vector<ConvergenceProbe> convergence_probes_;
 
     /// Optional peak-RSS probe installed by the CLI (P1-1 phase-lifetime
     /// telemetry). Lives here as a callback so this header never includes
@@ -886,7 +892,8 @@ inline Solver::EnumeratedFit Solver::check_enumerated_fit(
         // leaves it to the existing prepare error paths.
         device_needed = bytes_for_gpu_device_total(
             total_n, tree_.total_edges, player_slots, tables, nc,
-            device_dense_upload, gpu_materializes_strategy());
+            device_dense_upload, gpu_materializes_strategy(),
+            gpu_value_rows(tree_));
         device_budget = config_.memory_budget.gpu_bytes > 0
             ? config_.memory_budget.gpu_bytes
             : static_cast<uint64_t>(
@@ -922,6 +929,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         ? detail::effective_postsolve_threads(config_.postsolve_threads)
         : 1;
     actual_iterations_run_ = 0;
+    convergence_probes_.clear();
 
     auto elapsed_since = [](Clock::time_point begin, Clock::time_point end) {
         return std::chrono::duration<float, std::milli>(end - begin).count();
@@ -1132,8 +1140,10 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
             comp_cpu_state += bytes_for_levelized_cpu_extra(total_n, nc);
         }
+        const uint64_t gpu_value_rows_est = gpu_value_rows(tree_);
         comp_gpu_state = bytes_for_gpu_state_compact(
-            total_n, gate_player_slots, nc, gpu_materializes_strategy());
+            total_n, gate_player_slots, nc, gpu_materializes_strategy(),
+            gpu_value_rows_est);
         // Review round 2 P1-3: the VRAM ceiling gates on the device TOTAL
         // (state + matchup upload + tree metadata + levels + reserve), not
         // state alone — a dense turn solve measurably exceeded the user's
@@ -1143,7 +1153,8 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         comp_device_total = bytes_for_gpu_device_total(
             total_n, tree_.total_edges, gate_player_slots,
             matchup_ev_per_runout_.size(), nc,
-            terminal_plan_.device_dense_upload, gpu_materializes_strategy());
+            terminal_plan_.device_dense_upload, gpu_materializes_strategy(),
+            gpu_value_rows_est);
         // Peak-host lifetime terms (P1-1): finalize holds TWO materialized
         // strategy copies on every backend.
         comp_final_strategy = bytes_for_final_strategy(
@@ -1450,7 +1461,22 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             solved_ = true;
             const float exploit_pct = compute_exploitability();
             const auto probe_end = Clock::now();
+            const double probe_ms = elapsed_since(probe_start, probe_end);
+            // Accumulated BEFORE the crossing test: the probe that stops the
+            // solve costs real time too, and a time-to-target number that
+            // hides its own last measurement is not honest.
+            exploit_probe_overhead_ms += probe_ms;
             const float target_pct = config_.target_exploitability * 100.0f;
+            // T0/0b: keep the sample. Recorded BEFORE the crossing test so the
+            // curve always ends on the point that actually met the target.
+            if (config_.record_convergence) {
+                ConvergenceProbe probe;
+                probe.iteration          = t + 1;
+                probe.exploitability_pct = exploit_pct;
+                probe.elapsed_ms         = elapsed_since(start_time, probe_end);
+                probe.probe_ms           = elapsed_since(probe_start, probe_end);
+                convergence_probes_.push_back(probe);
+            }
             if (exploit_pct <= target_pct) {
                 early_stop_reason = "exploit_target";
                 exploitability_pct_ = exploit_pct;
@@ -1468,8 +1494,10 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             // fraction of the segment it covers, and coarsen further while far
             // from target (we clearly aren't about to stop). Floored at the
             // base interval, capped at 16× to keep latency bounded.
-            const double probe_ms = elapsed_since(probe_start, probe_end);
-            exploit_probe_overhead_ms += probe_ms;
+            //
+            // T0/0b: a benchmark run pins the cadence to the base interval
+            // instead, so the overshoot past the target is bounded and the
+            // measured time-to-target is reproducible.
             const double clean_iter_ms = std::max(1e-3,
                 static_cast<double>(elapsed_since(iter_start, probe_end))
                     - exploit_probe_overhead_ms);
@@ -1481,6 +1509,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             if (ratio > 4.0f) stride *= 2;
             stride = std::min(std::max(stride, exp_check_interval),
                               exp_check_interval * 16);
+            if (config_.exploitability_fixed_cadence) stride = exp_check_interval;
             next_exp_check = (t + 1) + stride;
         }
 
@@ -1606,6 +1635,9 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     result.exploitability_computed = config_.compute_exploitability;
     result.runout_approximated = tree_.runout_approximated;
     result.early_stop_reason   = early_stop_reason;
+    result.convergence         = std::move(convergence_probes_);
+    result.exploit_probe_overhead_ms =
+        static_cast<float>(exploit_probe_overhead_ms);
     result.action_labels       = get_action_labels_at(0);
     result.global_strategy     = extract_global_strategy_at(0);
     result.combo_strategies    = extract_combo_strategies_at(0);
@@ -1888,14 +1920,17 @@ inline SolveResources Solver::estimate_only() {
         r.estimated_cpu_state_bytes += bytes_for_levelized_cpu_extra(total_n, nc);
     }
     r.terminal_representation        = est_plan.label();
+    const uint64_t gpu_value_rows_est = gpu_value_rows(tree_);
     r.estimated_gpu_state_bytes      = bytes_for_gpu_state_compact(
-        total_n, player_slots, nc, gpu_materializes_strategy());
+        total_n, player_slots, nc, gpu_materializes_strategy(),
+        gpu_value_rows_est);
     r.estimated_gpu_matchup_bytes    = est_plan.device_dense_upload
         ? bytes_for_matchup_tables(matchup_count_est, nc, 2ULL * sizeof(float))
         : 0;
     r.estimated_device_total_bytes   = bytes_for_gpu_device_total(
         total_n, tree_.total_edges, player_slots, matchup_count_est, nc,
-        est_plan.device_dense_upload, gpu_materializes_strategy());
+        est_plan.device_dense_upload, gpu_materializes_strategy(),
+        gpu_value_rows_est);
 
     // Output plan (review round 2): only price the navigation cache + full
     // JSON when the caller will emit them.

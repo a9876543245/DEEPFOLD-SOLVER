@@ -82,6 +82,15 @@ struct CLIArgs {
     std::string target_combo;
     int iterations = 500;
     float exploitability = 0.5f;    // percentage
+    /// T0/0b: base exploitability-probe interval. -1 = unset (solver default
+    /// 50 + its self-calibrating cadence). Naming an interval also PINS the
+    /// cadence to it — an explicit request that the adaptive stride then
+    /// silently overrode would be a lie, and a reproducible time-to-target
+    /// measurement needs a bounded overshoot past the target.
+    int exploitability_interval = -1;
+    /// T0/0b: record every probe (iteration, exploitability, elapsed) and emit
+    /// a "convergence" block. Off by default so solve output is unchanged.
+    bool convergence_log = false;
     /// v1.3.0: hard wall-clock cap on the iteration phase. 0 = no cap.
     /// UI presets: Quick=60, Standard=300, Deep=900.
     int time_budget_seconds = 0;
@@ -220,6 +229,10 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.iterations = std::stoi(argv[++i]);
         } else if (arg == "--exploitability" && i + 1 < argc) {
             args.exploitability = std::stof(argv[++i]);
+        } else if (arg == "--exploitability-interval" && i + 1 < argc) {
+            args.exploitability_interval = std::max(1, std::stoi(argv[++i]));
+        } else if (arg == "--convergence-log") {
+            args.convergence_log = true;
         } else if (arg == "--ip-range" && i + 1 < argc) {
             args.ip_range_str = argv[++i];
         } else if (arg == "--oop-range" && i + 1 < argc) {
@@ -372,6 +385,14 @@ Arguments:
   --exploitability <float> Target exploitability % of pot; the solve stops early
                            once the running-average reaches it (default: 0.5,
                            checked every 50 iters; 0 = run all iterations)
+  --exploitability-interval <int>
+                           Probe every N iterations and PIN that cadence (the
+                           default cadence self-calibrates against probe cost,
+                           which overshoots the target by an unbounded margin).
+                           Use for reproducible time-to-target measurement.
+  --convergence-log        Record every exploitability probe and emit a
+                           "convergence" block (probe curve + probe overhead).
+                           Off by default; solve output is otherwise unchanged.
   --backend <string>       Execution backend: auto | cpu | gpu (default: auto)
   --postsolve <string>     Reporting pass: full | ev | exploitability | none
   --fast-postsolve         Alias for --postsolve none
@@ -805,6 +826,35 @@ std::string result_to_json(
     // trusted as exact on later streets.
     json << "  \"runout_approximated\": "
          << (result.runout_approximated ? "true" : "false") << ",\n";
+    // T0/0b: the exploitability curve, emitted only under --convergence-log so
+    // that a default solve's JSON is byte-identical to previous builds (the
+    // bit-exact A/B in ROADMAP §5 is the method this project verifies with).
+    // One solve to the tightest target yields time-to-accuracy for every looser
+    // threshold, which is how PioSOLVER's own benchmarks are quoted.
+    if (args.convergence_log) {
+        // 4 decimals, not the file-wide 2: a 0.05%-of-pot target rounds to
+        // "0.05" at 2 dp, so the crossing points the harness reads off this
+        // curve would quantize away exactly where they matter most.
+        json << std::setprecision(4);
+        json << "  \"convergence\": {\n";
+        json << "    \"probe_overhead_ms\": "
+             << jsafe(result.exploit_probe_overhead_ms) << ",\n";
+        json << "    \"probe_interval\": "
+             << (args.exploitability_interval > 0
+                     ? args.exploitability_interval : 0) << ",\n";
+        json << "    \"probes\": [";
+        for (std::size_t i = 0; i < result.convergence.size(); ++i) {
+            const auto& p = result.convergence[i];
+            json << (i ? ",\n      " : "\n      ")
+                 << "{\"iteration\": " << p.iteration
+                 << ", \"exploitability_pct\": " << jsafe(p.exploitability_pct)
+                 << ", \"elapsed_ms\": " << jsafe(p.elapsed_ms)
+                 << ", \"probe_ms\": " << jsafe(p.probe_ms) << "}";
+        }
+        json << (result.convergence.empty() ? "]\n" : "\n    ]\n");
+        json << "  },\n";
+        json << std::setprecision(2);
+    }
     json << "  \"timing\": {\n";
     json << std::setprecision(3);
     json << "    \"tree_build_ms\": " << result.timing.tree_build_ms << ",\n";
@@ -1634,6 +1684,11 @@ int main(int argc, char* argv[]) {
         }
         config.max_iterations = args.iterations;
         config.target_exploitability = args.exploitability / 100.0f;
+        if (args.exploitability_interval > 0) {
+            config.exploitability_check_interval = args.exploitability_interval;
+            config.exploitability_fixed_cadence = true;
+        }
+        config.record_convergence = args.convergence_log;
         config.time_budget_seconds = args.time_budget_seconds;
         config.bet_sizing.flop_sizes = args.flop_sizes;
         config.bet_sizing.turn_sizes = args.turn_sizes;

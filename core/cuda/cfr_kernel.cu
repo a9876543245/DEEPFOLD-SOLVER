@@ -227,6 +227,8 @@ __global__ void propagate_reach_forward_kernel(
         // parent reach so its CFR computes counterfactual values correctly).
         for (int k = 0; k < na; ++k) {
             uint32_t child = children[offset + k];
+            // Reach is still full-tree [N][nc] — B3 inc 1 only re-mapped the
+            // VALUE buffer. Do not route this through value_row.
             size_t child_idx = static_cast<size_t>(child) * num_canonical + combo;
             reach_oop[child_idx] = r_oop;
             reach_ip [child_idx] = r_ip;
@@ -270,7 +272,16 @@ __global__ void propagate_reach_forward_kernel(
  * For chance nodes: copy first child's node_value.
  * For terminals: node_value is set separately by terminal kernels (eval_kernel.cu).
  */
-template <bool BestResponse, int SRC>
+/// `FuseRegrets` (B3 inc 1): also perform this node's DCFR regret update,
+/// using the per-action child values this kernel has already gathered into
+/// registers. update_regrets used to be one sweep over all N nodes after the
+/// backward pass; the windowed value buffer forced it per level, and a
+/// separate per-level launch cost 23% of small-tree throughput in pure launch
+/// overhead. Fusing removes the launch AND the second read of every child row.
+/// Safe because thread (node, combo) reads and writes only its own node's
+/// regret slots at its own combo — no other thread in the launch touches them.
+/// Off for the postsolve variants, which have no regret update.
+template <bool BestResponse, bool FuseRegrets, int SRC>
 __global__ void aggregate_node_values_kernel(
     const uint8_t*  __restrict__ node_types,
     const uint8_t*  __restrict__ active_player,
@@ -279,12 +290,16 @@ __global__ void aggregate_node_values_kernel(
     const uint32_t* __restrict__ children,
     const uint8_t*  __restrict__ runout_weight,  // Phase 2: per-child orbit size
     const uint32_t* __restrict__ node_offset,    // [N] per-node slot index
+    const uint32_t* __restrict__ value_row,      // [N] node → value buffer row
     const uint32_t* __restrict__ level_node_indices,
     uint32_t num_level_nodes,
     const float* __restrict__ strat_src,         // compact [slot * nc]; see StrategyRow
-    float* __restrict__ node_values,             // [N * nc]
+    float* __restrict__ node_values,             // [value_rows * nc]; see value_row
     uint16_t num_canonical,
-    int traverser)
+    int traverser,
+    float* __restrict__ regrets,                 // FuseRegrets only
+    float pos_disc,
+    float neg_disc)
 {
     // 64-bit launch index — see compute_strategy_kernel.
     const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -299,7 +314,9 @@ __global__ void aggregate_node_values_kernel(
     if (nt == NT_TERMINAL) return;  // set by terminal kernel
 
     uint8_t na = num_children[n];
-    size_t node_idx = static_cast<size_t>(n) * num_canonical + combo;
+    // B3 inc 1: node_values is no longer indexed by node — terminals live in a
+    // compacted region and non-terminals in a 2-level rolling window.
+    size_t node_idx = static_cast<size_t>(value_row[n]) * num_canonical + combo;
     uint32_t offset = children_offset[n];
 
     if (nt == NT_CHANCE) {
@@ -322,7 +339,8 @@ __global__ void aggregate_node_values_kernel(
             uint32_t child = children[offset + k];
             uint32_t w = runout_weight[child];
             if (w == 0) w = 1;  // guard: treat 0 as 1, not as "skip"
-            size_t child_idx = static_cast<size_t>(child) * num_canonical + combo;
+            size_t child_idx =
+                static_cast<size_t>(value_row[child]) * num_canonical + combo;
             acc += static_cast<float>(w) * node_values[child_idx];
             total_w += w;
         }
@@ -347,7 +365,8 @@ __global__ void aggregate_node_values_kernel(
 
     auto child_value = [&](int a) -> float {
         uint32_t child = children[offset + a];
-        return node_values[static_cast<size_t>(child) * num_canonical + combo];
+        return node_values[static_cast<size_t>(value_row[child]) * num_canonical
+                           + combo];
     };
 
     if (acting == traverser) {
@@ -370,6 +389,18 @@ __global__ void aggregate_node_values_kernel(
                 sum += s * child_value(a);
             }
             node_values[node_idx] = sum;
+            if constexpr (FuseRegrets) {
+                // Identical arithmetic to the old update_regrets_kernel:
+                // instant = action value - node value, applied to the
+                // separately-discounted existing regret.
+                for (int a = 0; a < na; ++a) {
+                    const float instant = child_value(a) - sum;
+                    float r = regrets[strat_base + a * stride];
+                    r *= (r > 0.0f) ? pos_disc : neg_disc;
+                    r += instant;
+                    regrets[strat_base + a * stride] = r;
+                }
+            }
         }
     } else {
         // Opponent's strategy absorbed into reach; just SUM the child values
@@ -388,66 +419,6 @@ __global__ void aggregate_node_values_kernel(
 // ============================================================================
 // Kernel 5: Regret Update — accumulate instantaneous regret + DCFR discount
 // ============================================================================
-
-/**
- * At each traverser node (acting == traverser), for each action and combo:
- *   instant = node_value[child(n,a)][c] - node_value[c]
- *   regret[a][c] = (regret * discount) + instant
- *
- * Runs AFTER the full backward pass, and node_values is written exactly once
- * per node per pass — so node_values[child] still holds the per-action value
- * the old lift kernel materialized into action_values (B1a inc 2 fusion).
- *
- * Discount applied to EXISTING regret before adding new (standard DCFR).
- * Positive/negative regrets discounted separately with alpha / beta.
- */
-__global__ void update_regrets_kernel(
-    float*       __restrict__ regrets,         // compact [slot * nc]
-    const float* __restrict__ node_values,     // [N * nc]
-    const uint8_t* __restrict__ node_types,
-    const uint8_t* __restrict__ active_player,
-    const uint8_t* __restrict__ num_children,
-    const uint32_t* __restrict__ children_offset,
-    const uint32_t* __restrict__ children,
-    const uint32_t* __restrict__ node_offset,  // [N] per-node slot index
-    uint32_t num_nodes,
-    uint16_t num_canonical,
-    int traverser,
-    float pos_disc,
-    float neg_disc)
-{
-    // 64-bit launch index — see compute_strategy_kernel.
-    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const size_t total = static_cast<size_t>(num_nodes) * num_canonical;
-    if (tid >= total) return;
-
-    const uint32_t node  = static_cast<uint32_t>(tid / num_canonical);
-    const uint32_t combo = static_cast<uint32_t>(tid % num_canonical);
-
-    uint8_t nt = node_types[node];
-    if (nt != NT_PLAYER_OOP && nt != NT_PLAYER_IP) return;
-    if (active_player[node] != traverser) return;
-
-    uint8_t na = num_children[node];
-    if (na == 0) return;
-
-    float nv = node_values[static_cast<size_t>(node) * num_canonical + combo];
-
-    size_t reg_base = static_cast<size_t>(node_offset[node]) * num_canonical
-                    + static_cast<size_t>(combo);
-    size_t stride = num_canonical;
-    uint32_t offset = children_offset[node];
-
-    for (int a = 0; a < na; ++a) {
-        uint32_t child = children[offset + a];
-        float av = node_values[static_cast<size_t>(child) * num_canonical + combo];
-        float instant = av - nv;
-        float r = regrets[reg_base + a * stride];
-        r *= (r > 0.0f) ? pos_disc : neg_disc;
-        r += instant;
-        regrets[reg_base + a * stride] = r;
-    }
-}
 
 // ============================================================================
 // Kernel 6: Strategy Sum Update — strategy_sum += weight * reach * current_strategy
@@ -583,22 +554,37 @@ void launch_aggregate_node_values(
     const uint8_t* d_num_children,
     const uint32_t* d_children_offset, const uint32_t* d_children,
     const uint8_t*  d_runout_weight,
-    const uint32_t* d_node_offset,
+    const uint32_t* d_node_offset, const uint32_t* d_value_row,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
     const float* d_strat_src, int strat_src_mode,
     float* d_node_values,
-    uint16_t nc, int traverser)
+    uint16_t nc, int traverser,
+    float* d_regrets, float pos_disc, float neg_disc)
 {
     const size_t total = static_cast<size_t>(num_level_nodes) * nc;
     const int grid = static_cast<int>(
         (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
-#define DEEPSOLVER_LAUNCH_AGG_EV(SRC)                                        \
-    aggregate_node_values_kernel<false, SRC><<<grid, DEFAULT_BLOCK_SIZE>>>(  \
+    if (d_regrets != nullptr) {
+#define DEEPSOLVER_LAUNCH_AGG_CFR(SRC)                                       \
+    aggregate_node_values_kernel<false, true, SRC>                           \
+        <<<grid, DEFAULT_BLOCK_SIZE>>>(                                      \
         d_node_types, d_active_player, d_num_children,                       \
         d_children_offset, d_children, d_runout_weight, d_node_offset,       \
-        d_level_indices, num_level_nodes,                                    \
+        d_value_row, d_level_indices, num_level_nodes,                       \
         d_strat_src,                                                         \
-        d_node_values, nc, traverser)
+        d_node_values, nc, traverser, d_regrets, pos_disc, neg_disc)
+        DEEPSOLVER_DISPATCH_STRAT_SRC(strat_src_mode, DEEPSOLVER_LAUNCH_AGG_CFR);
+#undef DEEPSOLVER_LAUNCH_AGG_CFR
+        return;
+    }
+#define DEEPSOLVER_LAUNCH_AGG_EV(SRC)                                        \
+    aggregate_node_values_kernel<false, false, SRC>                          \
+        <<<grid, DEFAULT_BLOCK_SIZE>>>(                                      \
+        d_node_types, d_active_player, d_num_children,                       \
+        d_children_offset, d_children, d_runout_weight, d_node_offset,       \
+        d_value_row, d_level_indices, num_level_nodes,                       \
+        d_strat_src,                                                         \
+        d_node_values, nc, traverser, nullptr, 0.0f, 0.0f)
     DEEPSOLVER_DISPATCH_STRAT_SRC(strat_src_mode, DEEPSOLVER_LAUNCH_AGG_EV);
 #undef DEEPSOLVER_LAUNCH_AGG_EV
 }
@@ -611,7 +597,7 @@ void launch_aggregate_node_values_br(
     const uint8_t* d_num_children,
     const uint32_t* d_children_offset, const uint32_t* d_children,
     const uint8_t*  d_runout_weight,
-    const uint32_t* d_node_offset,
+    const uint32_t* d_node_offset, const uint32_t* d_value_row,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
     const float* d_strat_src, int strat_src_mode,
     float* d_node_values,
@@ -621,36 +607,15 @@ void launch_aggregate_node_values_br(
     const int grid = static_cast<int>(
         (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
 #define DEEPSOLVER_LAUNCH_AGG_BR(SRC)                                        \
-    aggregate_node_values_kernel<true, SRC><<<grid, DEFAULT_BLOCK_SIZE>>>(   \
+    aggregate_node_values_kernel<true, false, SRC>                           \
+        <<<grid, DEFAULT_BLOCK_SIZE>>>(                                      \
         d_node_types, d_active_player, d_num_children,                       \
         d_children_offset, d_children, d_runout_weight, d_node_offset,       \
-        d_level_indices, num_level_nodes,                                    \
+        d_value_row, d_level_indices, num_level_nodes,                       \
         d_strat_src,                                                         \
-        d_node_values, nc, traverser)
+        d_node_values, nc, traverser, nullptr, 0.0f, 0.0f)
     DEEPSOLVER_DISPATCH_STRAT_SRC(strat_src_mode, DEEPSOLVER_LAUNCH_AGG_BR);
 #undef DEEPSOLVER_LAUNCH_AGG_BR
-}
-
-void launch_update_regrets(
-    float* d_regrets,
-    const float* d_node_values,
-    const uint8_t* d_node_types, const uint8_t* d_active_player,
-    const uint8_t* d_num_children,
-    const uint32_t* d_children_offset, const uint32_t* d_children,
-    const uint32_t* d_node_offset,
-    uint32_t num_nodes, uint16_t nc,
-    int traverser, float pos_disc, float neg_disc)
-{
-    const size_t total = static_cast<size_t>(num_nodes) * nc;
-    const int grid = static_cast<int>(
-        (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
-    update_regrets_kernel<<<grid, DEFAULT_BLOCK_SIZE>>>(
-        d_regrets, d_node_values,
-        d_node_types, d_active_player, d_num_children,
-        d_children_offset, d_children, d_node_offset,
-        num_nodes, nc,
-        traverser, pos_disc, neg_disc);
-    CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_update_strategy_sum(

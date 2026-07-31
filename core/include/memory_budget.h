@@ -148,8 +148,9 @@ constexpr uint64_t kNoTreeJsonFloorBytes = 4ULL * 1024ULL * 1024ULL;
 
 /// GPU backend keeps regrets, strategy_sum, current_strategy (3 compact
 /// strat-shaped buffers of Σ-player-actions × nc; B1a inc 2 dropped
-/// action_values), plus reach_scratch_oop, reach_scratch_ip and node_values
-/// (3 full-tree N×nc buffers). Summed in `bytes_for_gpu_state_compact`.
+/// action_values), plus reach_scratch_oop and reach_scratch_ip (2 full-tree
+/// N×nc buffers) and node_values (B3 inc 1: value_rows × nc, smaller than
+/// N × nc — see gpu_value_layout.h). Summed in `bytes_for_gpu_state_compact`.
 
 } // namespace memory_budget
 
@@ -325,14 +326,22 @@ inline uint64_t bytes_for_levelized_cpu_extra(uint64_t total_nodes, uint64_t nc)
 /// strategy_sum inside each consumer, so the strat-shaped term is 2 buffers,
 /// not 3. Passed explicitly rather than defaulted so a caller that has not
 /// thought about locks fails to compile.
+/// B3 inc 1: `value_rows` is the device value buffer's row count — terminals
+/// plus a two-level non-terminal window, NOT total_nodes. Callers get it from
+/// `gpu_value_rows(tree)` (gpu_value_layout.h), the same function
+/// GpuBackend::prepare() builds its table from, so the estimate keeps matching
+/// the allocation to the byte. Passing 0 falls back to total_nodes, which is
+/// the pre-B3 behavior and a safe over-estimate.
 inline uint64_t bytes_for_gpu_state_compact(uint64_t total_nodes,
                                             uint64_t player_action_slots,
                                             uint64_t nc,
-                                            bool materialize_strategy) {
+                                            bool materialize_strategy,
+                                            uint64_t value_rows) {
     const uint64_t strat_buffers = materialize_strategy ? 3ULL : 2ULL;
-    return (strat_buffers * player_action_slots + 3ULL * total_nodes)
+    const uint64_t values = value_rows ? value_rows : total_nodes;
+    return (strat_buffers * player_action_slots + 2ULL * total_nodes + values)
              * nc * sizeof(float)
-         + total_nodes * sizeof(uint32_t);
+         + 2ULL * total_nodes * sizeof(uint32_t);  // node_offset + value_row
 }
 
 /// Device-side TOTAL for a GPU solve (review round 2, P1-3): the VRAM
@@ -359,9 +368,10 @@ inline uint64_t bytes_for_gpu_device_total(uint64_t total_nodes,
                                            uint64_t matchup_tables,
                                            uint64_t nc,
                                            bool device_dense_upload,
-                                           bool materialize_strategy) {
+                                           bool materialize_strategy,
+                                           uint64_t value_rows) {
     const uint64_t state   = bytes_for_gpu_state_compact(
-        total_nodes, player_action_slots, nc, materialize_strategy);
+        total_nodes, player_action_slots, nc, materialize_strategy, value_rows);
     const uint64_t matchup = device_dense_upload
         ? bytes_for_matchup_tables(matchup_tables, nc, 2ULL * sizeof(float))
         : 0ULL;

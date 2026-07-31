@@ -329,6 +329,7 @@ __global__ void terminal_level_kernel(
     const uint32_t* __restrict__ parent_indices,
     const float* __restrict__ bet_into,
     const int32_t* __restrict__ matchup_idx,
+    const uint32_t* __restrict__ value_row,
     const uint32_t* __restrict__ level_node_indices,
     uint32_t num_level_nodes,
     const float* __restrict__ matchup_ev_concat,
@@ -336,6 +337,12 @@ __global__ void terminal_level_kernel(
     const float* __restrict__ canonical_weights,
     uint32_t num_runouts,
     const float* __restrict__ reach_opp_base,
+    // B1b inc 1: the opponent's live canonical combos, ascending. Every loop
+    // below sums reach_opp[cj]*...; zero-reach terms contribute exactly +-0.0
+    // and x + 0.0 == x, so walking this list instead of [0, nc) is bit-exact
+    // and cuts the inner loop to the opponent's real range.
+    const uint16_t* __restrict__ opp_live,
+    uint16_t num_opp_live,
     uint16_t num_canonical,
     int perspective,
     float rake_rate,
@@ -360,7 +367,9 @@ __global__ void terminal_level_kernel(
     const float* matchup_ev = matchup_ev_concat + table_off;
     const float* matchup_valid = matchup_valid_concat + table_off;
     const float* reach_opp = reach_opp_base + static_cast<size_t>(n) * num_canonical;
-    float* out_values = node_values + static_cast<size_t>(n) * num_canonical;
+    // B3 inc 1: rows are addressed through value_row, not by node index.
+    float* out_values =
+        node_values + static_cast<size_t>(value_row[n]) * num_canonical;
 
     float pot_total = pots[n];
     float half_pot = pot_total * 0.5f;
@@ -376,7 +385,8 @@ __global__ void terminal_level_kernel(
         // (+1 = OOP wins, -1 = OOP loses, 0 = tie).
         float val = 0.0f;
         if (perspective == 0) {
-            for (int cj = 0; cj < num_canonical; ++cj) {
+            for (int k = 0; k < num_opp_live; ++k) {
+                const int cj = opp_live[k];
                 size_t idx = static_cast<size_t>(c) * num_canonical + cj;
                 float ev = matchup_ev[idx];
                 float valid = matchup_valid[idx];
@@ -388,7 +398,8 @@ __global__ void terminal_level_kernel(
                 val += reach_opp[cj] * valid * canonical_weights[cj] * payoff;
             }
         } else {
-            for (int ci = 0; ci < num_canonical; ++ci) {
+            for (int k = 0; k < num_opp_live; ++k) {
+                const int ci = opp_live[k];
                 size_t idx = static_cast<size_t>(ci) * num_canonical + c;
                 float ev = matchup_ev[idx];  // OOP perspective
                 float valid = matchup_valid[idx];
@@ -417,12 +428,14 @@ __global__ void terminal_level_kernel(
 
     float opp_total = 0.0f;
     if (perspective == 0) {
-        for (int cj = 0; cj < num_canonical; ++cj) {
+        for (int k = 0; k < num_opp_live; ++k) {
+            const int cj = opp_live[k];
             size_t idx = static_cast<size_t>(c) * num_canonical + cj;
             opp_total += reach_opp[cj] * matchup_valid[idx] * canonical_weights[cj];
         }
     } else {
-        for (int ci = 0; ci < num_canonical; ++ci) {
+        for (int k = 0; k < num_opp_live; ++k) {
+            const int ci = opp_live[k];
             size_t idx = static_cast<size_t>(ci) * num_canonical + c;
             opp_total += reach_opp[ci] * matchup_valid[idx] * canonical_weights[ci];
         }
@@ -473,6 +486,7 @@ __global__ void rank_blocker_terminal_kernel(
     const uint32_t* __restrict__ parent_indices,
     const float* __restrict__ bet_into,
     const int32_t* __restrict__ matchup_idx,
+    const uint32_t* __restrict__ value_row,
     const uint32_t* __restrict__ level_node_indices,
     uint32_t num_level_nodes,
     const uint16_t* __restrict__ combo_bucket,   // [num_runouts * nc] per-runout
@@ -483,7 +497,7 @@ __global__ void rank_blocker_terminal_kernel(
     const uint16_t* __restrict__ card_list,      // [2*nc]
     uint32_t num_runouts,
     const float* __restrict__ reach_opp_base,    // [N * nc]
-    float* __restrict__ node_values,             // [N * nc]
+    float* __restrict__ node_values,             // [value_rows * nc]
     uint16_t num_canonical,
     uint16_t max_bucket_count,
     int perspective,
@@ -503,7 +517,8 @@ __global__ void rank_blocker_terminal_kernel(
     const uint16_t* __restrict__ mbucket = combo_bucket + static_cast<size_t>(mi) * nc;
     const int B = static_cast<int>(bucket_count[mi]);
     const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(n) * nc;
-    float* __restrict__ out_values = node_values + static_cast<size_t>(n) * nc;
+    float* __restrict__ out_values =
+        node_values + static_cast<size_t>(value_row[n]) * nc;
 
     // Shared memory layout (ull array first for 8-byte alignment):
     // [s_acc : max_B ull][s_total : max_B][s_prefix : max_B+1][s_chunk : blockDim]
@@ -669,6 +684,7 @@ void launch_terminal_level(
     const uint32_t* d_parent_indices,
     const float* d_bet_into,
     const int32_t* d_matchup_idx,
+    const uint32_t* d_value_row,
     const uint32_t* d_level_indices,
     uint32_t num_level_nodes,
     const float* d_matchup_ev_concat,
@@ -676,6 +692,8 @@ void launch_terminal_level(
     const float* d_canonical_weights,
     uint32_t num_runouts,
     const float* d_reach_opp_base,
+    const uint16_t* d_opp_live,
+    uint16_t num_opp_live,
     uint16_t nc,
     int perspective,
     float rake_rate,
@@ -691,10 +709,10 @@ void launch_terminal_level(
     terminal_level_kernel<<<grid, block>>>(
         d_node_types, d_terminal_types, d_pots,
         d_parent_indices, d_bet_into, d_matchup_idx,
-        d_level_indices, num_level_nodes,
+        d_value_row, d_level_indices, num_level_nodes,
         d_matchup_ev_concat, d_matchup_valid_concat,
         d_canonical_weights, num_runouts,
-        d_reach_opp_base, nc, perspective,
+        d_reach_opp_base, d_opp_live, num_opp_live, nc, perspective,
         rake_rate, rake_cap, d_node_values);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -706,6 +724,7 @@ void launch_rank_blocker_terminal_level(
     const uint32_t* d_parent_indices,
     const float* d_bet_into,
     const int32_t* d_matchup_idx,
+    const uint32_t* d_value_row,
     const uint32_t* d_level_indices,
     uint32_t num_level_nodes,
     const uint16_t* d_combo_bucket,
@@ -734,7 +753,7 @@ void launch_rank_blocker_terminal_level(
     rank_blocker_terminal_kernel<<<grid, block, shmem>>>(
         d_node_types, d_terminal_types, d_pots,
         d_parent_indices, d_bet_into, d_matchup_idx,
-        d_level_indices, num_level_nodes,
+        d_value_row, d_level_indices, num_level_nodes,
         d_combo_bucket, d_bucket_count,
         d_combo_card0, d_combo_card1, d_card_off, d_card_list,
         num_runouts, d_reach_opp_base, d_node_values,

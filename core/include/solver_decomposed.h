@@ -1845,7 +1845,8 @@ inline DecompositionEstimate estimate_decomposition(const SolverConfig& cfg,
                 // strategy buffer off (via the resolved subset).
                 per_bytes = bytes_for_gpu_state_compact(
                                 st.total_nodes, sub_slots, nc,
-                                /*materialize_strategy=*/!cfg.node_locks.empty())
+                                /*materialize_strategy=*/!cfg.node_locks.empty(),
+                                /*value_rows=*/0)
                           + decomp_estimate_detail::kPinPredictSlackBytesPerLeaf;
                 if (!showdown_rank_blocker::supports_singleton_iso(iso)) {
                     per_bytes += tables * nc * nc * 2ULL * sizeof(float);
