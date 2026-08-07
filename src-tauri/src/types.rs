@@ -235,6 +235,11 @@ pub struct SolverResponse {
 pub struct SolveResources {
     #[serde(default)]
     pub canonical_combos: u32,
+    /// B1b inc 2: the index space the solve allocated, after dropping the
+    /// canonical slots neither player holds. Equals `canonical_combos` on a
+    /// full-range solve.
+    #[serde(default)]
+    pub live_combos: u32,
     #[serde(default)]
     pub player_nodes: u32,
     #[serde(default)]

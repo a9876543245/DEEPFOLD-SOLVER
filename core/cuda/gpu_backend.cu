@@ -77,7 +77,10 @@ void launch_aggregate_node_values(
     const float* d_strat_src, int strat_src_mode,
     float* d_node_values,
     uint16_t nc, int traverser,
-    float* d_regrets, float pos_disc, float neg_disc);
+    float* d_regrets, float pos_disc, float neg_disc,
+    // gridDim.z = num_traversers; blockIdx.z picks the traverser and offsets
+    // node_values by blockIdx.z * value_span. 1 / 0 reproduces the old launch.
+    int num_traversers = 1, size_t value_span = 0);
 
 // Postsolve variant: max-over-actions at traverser-acting nodes.
 // Same signature as launch_aggregate_node_values.
@@ -277,9 +280,17 @@ struct DeviceSolverState {
     float* reach_scratch_ip  = nullptr;  // [N * nc]   per-node reach for IP
     // B3 inc 1: [value_rows * nc], NOT [N * nc] — compacted terminal rows plus
     // a 2-level non-terminal window. Index through value_row[n], never by n.
+    //
+    // Traverser fusion: TWO such regions back to back, one per traverser, so
+    // both backward passes can be in flight in a single grid. The passes write
+    // different values to the same rows, so sharing one region is what forced
+    // them to be serialized into 2× the launches. Region t starts at
+    // `node_values + t * value_span`. The postsolve path is mutex-serialized
+    // and only ever uses region 0.
     float* node_values       = nullptr;
     uint32_t* value_row      = nullptr;  // [N] node index → value buffer row
     size_t    value_rows     = 0;
+    size_t    value_span     = 0;        // value_rows * nc — one region
 
     uint32_t* node_offset    = nullptr;  // [N] device slot table
     size_t    total_slots    = 0;        // Σ na over player nodes
@@ -789,13 +800,16 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
     //     (compact; inc 2 dropped action_values, inc 3 dropped
     //     current_strategy — keep bytes_for_gpu_state_compact in sync)
     //   reach = 2 buffers of N*nc floats (full tree)
-    //   node_values = value_rows*nc floats — B3 inc 1 split it into compacted
-    //     terminal rows + a 2-level non-terminal window, so it is smaller than
-    //     N*nc (83.9% on the 4.65M-node target)
+    //   node_values = 2 × value_rows*nc floats — B3 inc 1 split it into
+    //     compacted terminal rows + a 2-level non-terminal window, so one
+    //     region is smaller than N*nc (83.9% on the 4.65M-node target); the
+    //     factor 2 is the per-traverser region that lets both backward passes
+    //     share one grid (kGpuValueRegions)
     const size_t strat_buffers = materialize_strategy ? 3u : 2u;
     size_t bytes_strat = strat_stride * sizeof(float);
     size_t bytes_reach = N * nc * sizeof(float);
-    size_t bytes_values = value_rows * nc * sizeof(float);
+    size_t bytes_values =
+        memory_budget::kGpuValueRegions * value_rows * nc * sizeof(float);
     size_t state_bytes_required = bytes_strat * strat_buffers
                                 + bytes_reach * 2 + bytes_values;
     {
@@ -821,8 +835,10 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
         ? alloc_device_zero<float>(strat_stride) : nullptr;
     ds.reach_scratch_oop  = alloc_device_zero<float>(N * nc);
     ds.reach_scratch_ip   = alloc_device_zero<float>(N * nc);
-    ds.node_values        = alloc_device_zero<float>(value_rows * nc);
+    ds.node_values        = alloc_device_zero<float>(
+        memory_budget::kGpuValueRegions * value_rows * nc);
     ds.value_rows         = value_rows;
+    ds.value_span         = value_rows * nc;
     ds.value_row          = upload_vector(host_value_row);
     ds.node_offset        = upload_vector(ds.host_node_offset);
 
@@ -1299,8 +1315,9 @@ void GpuBackend::prepare(const SolverContext& ctx) {
             impl_->device_state_bytes_exact =
                 strat_buffers * impl_->state.state_stride * sizeof(float)
               + 2ULL * n64 * nc64 * sizeof(float)                  // reach ×2
-              + static_cast<uint64_t>(impl_->value_rows) * nc64    // B3 inc 1
-                    * sizeof(float)
+              + memory_budget::kGpuValueRegions                    // B3 inc 1 +
+                    * static_cast<uint64_t>(impl_->value_rows)     // one region
+                    * nc64 * sizeof(float)                         // per traverser
               + 2ULL * n64 * sizeof(uint32_t);   // node_offset + value_row
         }
 
@@ -1563,6 +1580,12 @@ void GpuBackend::iterate(int iteration) {
         const auto& offsets = I.host_level_offsets;
         const uint32_t num_levels = I.levels.num_levels;
 
+        // This traverser's own value region. Both passes write the same ROWS
+        // with different values, so separate regions are what makes them
+        // independent — and independence is what lets them share a grid.
+        float* nv = I.state.node_values
+                  + static_cast<size_t>(traverser) * I.state.value_span;
+
         float* reach_opp_base = (traverser == 0) ? I.state.reach_scratch_ip
                                                   : I.state.reach_scratch_oop;
         // B1b inc 1: whichever reach the terminals read, walk THAT player's
@@ -1591,7 +1614,7 @@ void GpuBackend::iterate(int iteration) {
                     I.matchup.num_runouts, reach_opp_base, nc,
                     I.matchup.rb_max_bucket_count, traverser,
                     I.config->rake_rate, I.config->rake_cap,
-                    I.state.node_values);
+                    nv);
             } else {
                 launch_terminal_level(
                     I.tree.node_types,
@@ -1610,7 +1633,7 @@ void GpuBackend::iterate(int iteration) {
                     opp_live, num_opp_live,
                     nc, traverser,
                     I.config->rake_rate, I.config->rake_cap,
-                    I.state.node_values);
+                    nv);
             }
         }
 
@@ -1633,9 +1656,23 @@ void GpuBackend::iterate(int iteration) {
             I.tree.node_types, I.tree.active_player, I.tree.num_children,
             I.state.node_offset,
             N, nc, traverser, strat_weight, decay_and_add ? 1 : 0);
+    };
 
-        // Backward: deepest level → root. Every child sits exactly one level
-        // below its parent, so a level's children are all evaluated before it.
+    // Backward: deepest level → root, BOTH traversers in one grid. Every child
+    // sits exactly one level below its parent, so a level's children are all
+    // evaluated before it.
+    //
+    // Traverser fusion (ROADMAP §2(4)): this used to run once per traverser,
+    // which made 26 of the 42 launches per iteration 13 depth levels × 2. The
+    // two passes are independent — the opponent-acting branch reads no
+    // strategy at all ("absorbed into reach"), regret writes are partitioned by
+    // active_player, and each traverser now owns its own value region — so the
+    // only thing that ever coupled them was sharing one node_values buffer.
+    // Measured launch cost: the kernel averages 2.6 µs to RUN and 3.26 µs to
+    // ISSUE.
+    auto run_backward_fused = [&]() {
+        const auto& offsets = I.host_level_offsets;
+        const uint32_t num_levels = I.levels.num_levels;
         for (int L = static_cast<int>(num_levels) - 1; L >= 0; --L) {
             uint32_t start = offsets[L];
             uint32_t end   = offsets[L + 1];
@@ -1651,13 +1688,15 @@ void GpuBackend::iterate(int iteration) {
                 d_level, count,
                 strat_src, strat_src_mode,
                 I.state.node_values,
-                nc, traverser,
+                nc, /*traverser=*/0,
                 // Regret update for THIS level, fused. It used to be one sweep
                 // over all N nodes after the pass, which only worked while
                 // every value row stayed live; the window forces it per level,
                 // and a separate launch per level cost 23% of small-tree
                 // throughput. Fused it is launch-free and re-reads nothing.
-                I.state.regrets, pos_disc, neg_disc);
+                I.state.regrets, pos_disc, neg_disc,
+                static_cast<int>(memory_budget::kGpuValueRegions),
+                I.state.value_span);
         }
     };
 
@@ -1746,7 +1785,9 @@ void GpuBackend::iterate(int iteration) {
     }
 
     auto dump_traverser_hashes = [&](const char* tag) {
-        const size_t nvspan = I.state.value_rows * nc;
+        // Both traverser regions — the buffer is 2× value_rows since fusion.
+        const size_t nvspan =
+            memory_budget::kGpuValueRegions * I.state.value_span;
         std::fprintf(stderr,
                      "[ih] it=%d %s nv=%016llx reg=%016llx "
                      "ss=%016llx\n",
@@ -1756,10 +1797,16 @@ void GpuBackend::iterate(int iteration) {
                      hash_dev(I.state.strategy_sum, I.state.state_stride));
     };
 
-    run_traverser(0);  // OOP
-    if (kIterHash) dump_traverser_hashes("oop");
-    run_traverser(1);  // IP
-    if (kIterHash) dump_traverser_hashes("ip");
+    // Prologue per traverser (terminal values into its own region, then the
+    // strategy_sum update that must read iteration-start regrets), then ONE
+    // fused backward pass. Both strategy_sum launches stay ahead of every
+    // regret write, which is the same ordering the serialized version had:
+    // traverser 1's update only ever reads its own player's slots, so
+    // traverser 0's regret writes never reached it.
+    run_traverser(0);  // OOP prologue
+    run_traverser(1);  // IP prologue
+    run_backward_fused();
+    if (kIterHash) dump_traverser_hashes("fused");
 
     // Wait for all kernels to complete before next iteration
     CUDA_CHECK(cudaDeviceSynchronize());

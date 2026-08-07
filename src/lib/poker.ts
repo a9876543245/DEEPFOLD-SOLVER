@@ -281,6 +281,10 @@ export interface SolverResponse {
  *  default in C++/Rust so older `.dsolver` files load unchanged. */
 export interface SolveResources {
   canonical_combos: number;
+  /** B1b inc 2: the index space the solve allocated, after dropping the
+   *  canonical slots neither player holds. Equals `canonical_combos` on a
+   *  full-range solve. Optional — older `.dsolver` files predate it. */
+  live_combos?: number;
   player_nodes: number;
   estimated_matchup_bytes: number;
   estimated_cpu_state_bytes: number;

@@ -599,8 +599,20 @@ inline void populate_matchup_category_diagnostics(
 /// (and benchmark harness) can show "this run cost X MB host, Y MB GPU,
 /// Z MB JSON; reduced runouts? truncated tree? fell back to CPU?".
 struct SolveResources {
+    /// The BOARD's canonical combo count — what suit isomorphism alone gives,
+    /// independent of the ranges. Unchanged meaning since v1.x.
     uint32_t canonical_combos          = 0;
+    /// B1b inc 2: the index space the solve actually allocated, after the
+    /// canonical slots neither player holds were dropped. Equal to
+    /// `canonical_combos` on a full-range solve (and whenever compaction is
+    /// disabled); every nc-factored buffer and the nc² matchup tables are
+    /// sized by THIS number, not by the one above.
+    uint32_t live_combos               = 0;
     uint32_t player_nodes              = 0;
+    /// Total nodes in the tree this footprint describes. The solve path also
+    /// reports it as `timing.tree_nodes`; this field is what makes an
+    /// ESTIMATE self-describing, which any cross-solver comparison needs.
+    uint32_t tree_nodes                = 0;
     uint64_t estimated_matchup_bytes   = 0;
     uint64_t estimated_cpu_state_bytes = 0;
     uint64_t estimated_gpu_state_bytes = 0;

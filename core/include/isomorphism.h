@@ -39,6 +39,12 @@ struct IsomorphismMapping {
 
     /// Weight of each canonical combo (number of originals it represents)
     std::vector<uint16_t> canonical_weights;
+
+    /// The board's FULL canonical count, before any range compaction
+    /// (B1b inc 2). Equals num_canonical on an uncompacted mapping. Kept so
+    /// telemetry can report the board's index space and the solve's side by
+    /// side — every buffer is sized by num_canonical, not by this.
+    uint16_t board_canonical = 0;
 };
 
 // ============================================================================
@@ -165,7 +171,8 @@ inline IsomorphismMapping compute_isomorphism(const Card* board, uint8_t board_s
         }
     }
 
-    result.num_canonical = next_canonical;
+    result.num_canonical  = next_canonical;
+    result.board_canonical = next_canonical;
 
     // Build reverse mapping
     result.canonical_to_originals.resize(next_canonical);
@@ -180,6 +187,79 @@ inline IsomorphismMapping compute_isomorphism(const Card* board, uint8_t board_s
     }
 
     return result;
+}
+
+/**
+ * @brief B1b inc 2 — restrict the canonical index space to the hands the
+ *        players actually hold.
+ *
+ * Every nc-factored buffer (regrets, strategy_sum, both reach scratches, node
+ * values) and the nc² matchup tables are sized to the BOARD's canonical count,
+ * but a canonical slot whose reach is zero for both players is dead storage:
+ * reach is a product of strategy frequencies, so a hand with zero reach at the
+ * root has zero reach everywhere, and every term it contributes is exactly
+ * ±0.0. Dropping those slots shrinks every one of those buffers at once.
+ *
+ * Liveness is the UNION of the two players' reach — ONE shared index space
+ * rather than a per-player split. Measured across the 26 matchups the app
+ * ships, the union is 18.3% / 27.9% / 66.6% of nc (min/median/max) against
+ * 15.7% / 23.3% / 55.2% for the per-player mean, so the union captures most of
+ * the win at a fraction of the complexity: every kernel just sees a smaller nc.
+ *
+ * Live indices are assigned in ASCENDING order of the full index, which keeps
+ * the retained terms of every showdown sum in their original relative order —
+ * the same property that made the increment-1 live-list terminal loop
+ * bit-exact.
+ *
+ * Returns `full` unchanged when nothing is dead (the 100%-live case — notably
+ * every default-range fixture), so the mapping is the identity and the solve
+ * is byte-for-byte what it was.
+ *
+ * @param full      The board's canonical mapping (from compute_isomorphism)
+ * @param oop_reach Root reach per canonical slot, [full.num_canonical]
+ * @param ip_reach  Root reach per canonical slot, [full.num_canonical]
+ */
+inline IsomorphismMapping compact_isomorphism(
+    const IsomorphismMapping& full,
+    const std::vector<float>& oop_reach,
+    const std::vector<float>& ip_reach)
+{
+    const uint16_t nc = full.num_canonical;
+    // Short reach vectors would make every slot look dead. The callers build
+    // them from this very mapping, so this is a contract check, not a policy.
+    if (nc == 0 || oop_reach.size() < nc || ip_reach.size() < nc) return full;
+
+    std::vector<uint16_t> full_to_live(nc, UINT16_MAX);
+    uint16_t live = 0;
+    for (uint16_t c = 0; c < nc; ++c) {
+        if (oop_reach[c] != 0.0f || ip_reach[c] != 0.0f) {
+            full_to_live[c] = live++;
+        }
+    }
+    if (live == nc) return full;   // identity — nothing to renumber
+
+    IsomorphismMapping out;
+    out.num_canonical   = live;
+    out.board_canonical = full.board_canonical ? full.board_canonical : nc;
+    out.canonical_to_originals.resize(live);
+    out.canonical_weights.assign(live, 0);
+
+    // An original whose canonical class died becomes UINT16_MAX, i.e. exactly
+    // what a board-blocked combo already looks like. Every reader of
+    // original_to_canonical already skips that value, and every per-hand
+    // output already skips reach == 0, so the two cases need no distinction.
+    for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+        const uint16_t ci = full.original_to_canonical[i];
+        out.original_to_canonical[i] =
+            (ci == UINT16_MAX) ? UINT16_MAX : full_to_live[ci];
+    }
+    for (uint16_t c = 0; c < nc; ++c) {
+        const uint16_t d = full_to_live[c];
+        if (d == UINT16_MAX) continue;
+        out.canonical_to_originals[d] = full.canonical_to_originals[c];
+        out.canonical_weights[d]      = full.canonical_weights[c];
+    }
+    return out;
 }
 
 // ============================================================================

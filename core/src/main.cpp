@@ -903,6 +903,8 @@ std::string result_to_json(
         const auto& r = result.resources;
         json << "  \"resources\": {\n";
         json << "    \"canonical_combos\": " << r.canonical_combos << ",\n";
+        json << "    \"live_combos\": " << r.live_combos << ",\n";
+        json << "    \"tree_nodes\": " << r.tree_nodes << ",\n";
         json << "    \"player_nodes\": " << r.player_nodes << ",\n";
         json << "    \"estimated_matchup_bytes\": " << r.estimated_matchup_bytes << ",\n";
         json << "    \"estimated_cpu_state_bytes\": " << r.estimated_cpu_state_bytes << ",\n";
@@ -1837,6 +1839,8 @@ int main(int argc, char* argv[]) {
                       << "  \"schema_version\": 2,\n"
                       << "  \"resources\": {\n"
                       << "    \"canonical_combos\": " << r.canonical_combos << ",\n"
+                      << "    \"live_combos\": " << r.live_combos << ",\n"
+                      << "    \"tree_nodes\": " << r.tree_nodes << ",\n"
                       << "    \"player_nodes\": " << r.player_nodes << ",\n"
                       << "    \"estimated_matchup_bytes\": " << r.estimated_matchup_bytes << ",\n"
                       << "    \"estimated_cpu_state_bytes\": " << r.estimated_cpu_state_bytes << ",\n"
@@ -2236,6 +2240,7 @@ int main(int argc, char* argv[]) {
                       << "  \"host_dense_matchup\": "
                       << (rr.host_dense_matchup ? "true" : "false") << ",\n"
                       << "  \"canonical_combos\": " << rr.canonical_combos << ",\n"
+                      << "  \"live_combos\": " << rr.live_combos << ",\n"
                       << "  \"player_nodes\": " << rr.player_nodes << ",\n"
                       << "  \"threads_requested\": " << args.cpu_threads << ",\n"
                       << "  \"memory\": {\n"

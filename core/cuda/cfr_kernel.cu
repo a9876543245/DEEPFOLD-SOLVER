@@ -299,8 +299,16 @@ __global__ void aggregate_node_values_kernel(
     int traverser,
     float* __restrict__ regrets,                 // FuseRegrets only
     float pos_disc,
-    float neg_disc)
+    float neg_disc,
+    // Traverser fusion: gridDim.z carries the traverser dimension, so ONE
+    // launch covers both backward passes instead of two. blockIdx.z picks the
+    // traverser and its own value region. With gridDim.z == 1 (postsolve, and
+    // any single-traverser caller) both reduce to what they were.
+    size_t value_span)
 {
+    const int trav = traverser + static_cast<int>(blockIdx.z);
+    node_values += static_cast<size_t>(blockIdx.z) * value_span;
+
     // 64-bit launch index — see compute_strategy_kernel.
     const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t total = static_cast<size_t>(num_level_nodes) * num_canonical;
@@ -369,7 +377,7 @@ __global__ void aggregate_node_values_kernel(
                            + combo];
     };
 
-    if (acting == traverser) {
+    if (acting == trav) {
         // Traverser-acting branch differs by mode:
         //   BR (postsolve):  per-combo MAX over actions — traverser plays the
         //                    pointwise best response, ignoring averaged strategy.
@@ -559,11 +567,13 @@ void launch_aggregate_node_values(
     const float* d_strat_src, int strat_src_mode,
     float* d_node_values,
     uint16_t nc, int traverser,
-    float* d_regrets, float pos_disc, float neg_disc)
+    float* d_regrets, float pos_disc, float neg_disc,
+    int num_traversers, size_t value_span)
 {
     const size_t total = static_cast<size_t>(num_level_nodes) * nc;
-    const int grid = static_cast<int>(
-        (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE);
+    const dim3 grid(static_cast<unsigned>(
+                        (total + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE),
+                    1u, static_cast<unsigned>(num_traversers));
     if (d_regrets != nullptr) {
 #define DEEPSOLVER_LAUNCH_AGG_CFR(SRC)                                       \
     aggregate_node_values_kernel<false, true, SRC>                           \
@@ -572,7 +582,8 @@ void launch_aggregate_node_values(
         d_children_offset, d_children, d_runout_weight, d_node_offset,       \
         d_value_row, d_level_indices, num_level_nodes,                       \
         d_strat_src,                                                         \
-        d_node_values, nc, traverser, d_regrets, pos_disc, neg_disc)
+        d_node_values, nc, traverser, d_regrets, pos_disc, neg_disc,         \
+        value_span)
         DEEPSOLVER_DISPATCH_STRAT_SRC(strat_src_mode, DEEPSOLVER_LAUNCH_AGG_CFR);
 #undef DEEPSOLVER_LAUNCH_AGG_CFR
         return;
@@ -584,7 +595,7 @@ void launch_aggregate_node_values(
         d_children_offset, d_children, d_runout_weight, d_node_offset,       \
         d_value_row, d_level_indices, num_level_nodes,                       \
         d_strat_src,                                                         \
-        d_node_values, nc, traverser, nullptr, 0.0f, 0.0f)
+        d_node_values, nc, traverser, nullptr, 0.0f, 0.0f, value_span)
     DEEPSOLVER_DISPATCH_STRAT_SRC(strat_src_mode, DEEPSOLVER_LAUNCH_AGG_EV);
 #undef DEEPSOLVER_LAUNCH_AGG_EV
 }
@@ -613,7 +624,7 @@ void launch_aggregate_node_values_br(
         d_children_offset, d_children, d_runout_weight, d_node_offset,       \
         d_value_row, d_level_indices, num_level_nodes,                       \
         d_strat_src,                                                         \
-        d_node_values, nc, traverser, nullptr, 0.0f, 0.0f)
+        d_node_values, nc, traverser, nullptr, 0.0f, 0.0f, 0u)
     DEEPSOLVER_DISPATCH_STRAT_SRC(strat_src_mode, DEEPSOLVER_LAUNCH_AGG_BR);
 #undef DEEPSOLVER_LAUNCH_AGG_BR
 }

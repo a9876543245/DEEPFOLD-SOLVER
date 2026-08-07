@@ -234,10 +234,20 @@ elseif(CASE STREQUAL "host_dense_matchup_skip")
   # The SECOND half of this test is the one that keeps the first honest: the
   # skip is NOT valid whenever a player's range is narrow enough to engage
   # the CPU backends' active-list terminal kernels, which have no blocker
-  # route. The medium_sparse preset (169 combos/player on the same rainbow
-  # board family) must therefore still report the dense tables as built. A
-  # test that only checked the skip would pass just as happily on a build
-  # that skipped them unconditionally — and that build reads empty tables.
+  # route. Such a solve must still report the dense tables as built. A test
+  # that only checked the skip would pass just as happily on a build that
+  # skipped them unconditionally — and that build reads empty tables.
+  #
+  # B1b inc 2 moved which fixture can prove that. The old one was the
+  # medium_sparse preset — narrow on BOTH sides — and compaction dissolves
+  # its premise: dropping the slots neither player holds leaves a space that
+  # is 100% dense by construction, so the active-list kernels correctly stop
+  # engaging and the tables are correctly skipped. What compaction cannot
+  # remove is ASYMMETRY: a player whose range is sparse relative to the
+  # UNION of both ranges still engages those kernels. So the guard now runs
+  # a wide-IP / 3-combo-OOP solve, and a third case pins the new behaviour
+  # (two-sided narrow ⇒ compaction engages ⇒ skip) so a regression that
+  # silently stopped compacting would be caught here too.
   execute_process(
     COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c2h
             --iterations 5 --exploitability 0 --backend cpu
@@ -266,27 +276,71 @@ elseif(CASE STREQUAL "host_dense_matchup_skip")
       "solve no longer builds")
   endif()
 
+  # Asymmetric: OOP holds 3 canonical combos, IP holds the full default
+  # range. The union is therefore everything IP holds, so compaction cannot
+  # engage, OOP stays sparse within it, and the active-list kernels must
+  # still force the dense tables.
   execute_process(
-    COMMAND ${EXE} --benchmark medium_sparse --no-progress
+    COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c2h
+            --iterations 5 --exploitability 0 --backend cpu
+            --no-strategy-tree --no-progress --oop-range "AA:1"
     OUTPUT_VARIABLE narrow_out RESULT_VARIABLE narrow_rc ERROR_VARIABLE narrow_err)
   if(NOT narrow_rc EQUAL 0)
-    message(FATAL_ERROR "narrow-range preset failed rc=${narrow_rc}: ${narrow_err}")
+    message(FATAL_ERROR "asymmetric-range solve failed rc=${narrow_rc}: ${narrow_err}")
   endif()
-  string(JSON narrow_rep GET "${narrow_out}" terminal_representation)
-  string(JSON narrow_dense GET "${narrow_out}" host_dense_matchup)
+  string(JSON narrow_rep GET "${narrow_out}" resources terminal_representation)
+  string(JSON narrow_dense GET "${narrow_out}" resources host_dense_matchup)
+  string(JSON narrow_nc GET "${narrow_out}" resources canonical_combos)
+  string(JSON narrow_live GET "${narrow_out}" resources live_combos)
   if(NOT narrow_rep STREQUAL "rank_blocker_only")
     message(FATAL_ERROR
-      "medium_sparse no longer runs a blocker-plan board (got "
-      "\"${narrow_rep}\") - it can no longer prove the narrow-range guard")
+      "asymmetric fixture no longer runs a blocker-plan board (got "
+      "\"${narrow_rep}\") - it can no longer prove the guard")
+  endif()
+  if(NOT narrow_live EQUAL narrow_nc)
+    message(FATAL_ERROR
+      "asymmetric fixture compacted (${narrow_live} of ${narrow_nc}) - it no "
+      "longer holds a player sparse within the union, so it cannot prove "
+      "that the active-list kernels still force the dense tables")
   endif()
   if(NOT narrow_dense)
     message(FATAL_ERROR
-      "narrow-range solve skipped the dense tables, but its active-list "
+      "asymmetric-range solve skipped the dense tables, but its active-list "
       "terminal kernels have no blocker route - they would read empty "
       "tables")
   endif()
+
+  # B1b inc 2: narrow on BOTH sides. Compaction must engage, and with it the
+  # active-list route retires — the space it would have walked IS the space.
+  execute_process(
+    COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c2h
+            --iterations 5 --exploitability 0 --backend cpu
+            --no-strategy-tree --no-progress
+            --oop-range "AA:1,KK:1,QQ:1,AKs:1" --ip-range "JJ:1,TT:1,99:1,JTs:1"
+    OUTPUT_VARIABLE b1b_out RESULT_VARIABLE b1b_rc ERROR_VARIABLE b1b_err)
+  if(NOT b1b_rc EQUAL 0)
+    message(FATAL_ERROR "two-sided narrow solve failed rc=${b1b_rc}: ${b1b_err}")
+  endif()
+  # Behaviour first, engagement second: a build that shipped the telemetry but
+  # stopped compacting fails with the behavioural message rather than an
+  # arithmetic one. (On a pre-B1b binary this case fails earlier still, on the
+  # missing live_combos field — also red, just less informative.)
+  string(JSON b1b_dense GET "${b1b_out}" resources host_dense_matchup)
+  if(b1b_dense)
+    message(FATAL_ERROR
+      "two-sided narrow solve kept the dense tables: the compacted space is "
+      "100% live, so no active-list kernel can engage and nothing reads them")
+  endif()
+  string(JSON b1b_nc GET "${b1b_out}" resources canonical_combos)
+  string(JSON b1b_live GET "${b1b_out}" resources live_combos)
+  if(NOT b1b_live LESS b1b_nc)
+    message(FATAL_ERROR
+      "B1b compaction did not engage on a two-sided narrow range "
+      "(live_combos ${b1b_live} of ${b1b_nc})")
+  endif()
   message(STATUS
-    "host_dense_matchup_skip: wide=skipped (${mbytes} B), narrow=kept")
+    "host_dense_matchup_skip: wide=skipped (${mbytes} B), asymmetric=kept, "
+    "two-sided-narrow=compacted ${b1b_live}/${b1b_nc} and skipped")
 
 elseif(CASE STREQUAL "rainbow_gate_enumerates")
   # A4-host increment 4: the tree builder's runout gate used to charge the
@@ -434,6 +488,80 @@ elseif(CASE STREQUAL "gpu_strat_buffer")
   message(STATUS
     "gpu_strat_buffer: unlocked ${free_state} B, locked ${lock_state} B "
     "(+${delta} B = the materialized strategy)")
+
+elseif(CASE STREQUAL "peak_host_not_under")
+  # The peak-host gate REJECTS solves whose predicted host footprint exceeds
+  # the budget. It may be conservative; it must never be materially UNDER, or
+  # it waves through solves that then exhaust host RAM.
+  #
+  # B1b inc 2 broke that property by fixing something else: compaction shrank
+  # every nc-scaled term, and the terms that do NOT scale with nc — the flat
+  # game tree, the GPU's host-side per-node index tables, and the strategy copy
+  # the mid-loop exploitability probe materializes — had been hiding inside the
+  # old over-charge. A narrow-range enumerated GPU solve read −17.9%.
+  #
+  # This runs exactly that shape: real ranges (so compaction engages), a
+  # rainbow flop that enumerates, GPU, and the probe ON, then compares the
+  # estimate the gate used against the measured peak RSS of the same run.
+  # 120 iterations, not 40: the probe cadence means a short run never fires one,
+  # and then the estimate's probe charge is compared against a peak that never
+  # paid it — the test would pass for the wrong reason (measured at +51% margin
+  # while the real regime reads +12%). The engagement assertion below pins it.
+  execute_process(
+    COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c
+            --iterations 120 --backend gpu --no-progress
+            --host-memory-mb 16384
+            --oop-range "AA:1,KK:1,QQ:1,JJ:1,TT:1,99:1,88:1,77:1,66:1,55:1,AKs:1,AQs:1,AJs:1,ATs:1,A5s:1,A4s:1,KQs:1,KJs:1,KTs:1,QJs:1,QTs:1,JTs:1,T9s:1,98s:1,AKo:1,AQo:1,AJo:1,KQo:1"
+            --ip-range "JJ:1,TT:1,99:1,88:1,77:1,66:1,55:1,44:1,33:1,22:1,AQs:1,AJs:1,ATs:1,A9s:1,A8s:1,KQs:1,KJs:1,KTs:1,QJs:1,QTs:1,JTs:1,J9s:1,T9s:1,98s:1,87s:1,76s:1,AQo:1,AJo:1,KQo:1"
+    OUTPUT_VARIABLE ph_out RESULT_VARIABLE ph_rc ERROR_VARIABLE ph_err)
+  if(NOT ph_rc EQUAL 0)
+    message(FATAL_ERROR "peak-host fixture failed rc=${ph_rc}: ${ph_err}")
+  endif()
+  string(JSON ph_mode GET "${ph_out}" tree_mode)
+  string(JSON ph_nc   GET "${ph_out}" resources canonical_combos)
+  string(JSON ph_live GET "${ph_out}" resources live_combos)
+  string(JSON ph_est  GET "${ph_out}" resources estimated_peak_host_bytes)
+  string(JSON ph_meas GET "${ph_out}" resources measured_peak_rss_bytes)
+  # Fixture validity first — every one of these is load-bearing. A collapsed
+  # tree, an inert compaction or a missing measurement would each make the
+  # comparison below pass without testing anything.
+  if(NOT ph_mode STREQUAL "enumerated")
+    message(FATAL_ERROR
+      "fixture collapsed (tree_mode ${ph_mode}) - the under-estimate needs the "
+      "enumerated tree's host terms")
+  endif()
+  if(NOT ph_live LESS ph_nc)
+    message(FATAL_ERROR
+      "compaction inert (${ph_live} of ${ph_nc}) - this fixture only exposes "
+      "the gap once the nc-scaled over-charge is gone")
+  endif()
+  if(ph_meas LESS 100000000)
+    message(FATAL_ERROR
+      "measured peak RSS ${ph_meas} B is implausibly small - telemetry broken?")
+  endif()
+  # Prove the mid-loop probe actually fired: it calls finalize(), so host RSS
+  # jumps by a whole strategy copy DURING iterations. Without that jump the run
+  # never paid the cost the estimate charges, and the comparison is decoration.
+  string(JSON ph_prep GET "${ph_out}" resources measured_rss_after_prepare_bytes)
+  string(JSON ph_iter GET "${ph_out}" resources measured_rss_after_iterations_bytes)
+  math(EXPR ph_prep_x2 "${ph_prep} * 2")
+  if(ph_iter LESS ph_prep_x2)
+    message(FATAL_ERROR
+      "the exploitability probe never fired (RSS after prepare ${ph_prep} B, "
+      "after iterations ${ph_iter} B) - raise --iterations until it does, or "
+      "this fixture cannot test the probe's strategy copy")
+  endif()
+  if(ph_est LESS ph_meas)
+    math(EXPR ph_short "(${ph_meas} - ${ph_est}) / 1048576")
+    message(FATAL_ERROR
+      "peak-host estimate is UNDER measured by ${ph_short} MiB "
+      "(est ${ph_est} B vs measured ${ph_meas} B). The host gate must never "
+      "under-charge - it exists to reject solves that do not fit.")
+  endif()
+  math(EXPR ph_margin "(${ph_est} - ${ph_meas}) * 100 / ${ph_meas}")
+  message(STATUS
+    "peak_host_not_under: enumerated, live ${ph_live}/${ph_nc}, "
+    "estimate +${ph_margin}% over measured peak RSS")
 
 else()
   message(FATAL_ERROR "unknown CASE: ${CASE}")

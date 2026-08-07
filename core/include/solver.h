@@ -487,7 +487,8 @@ public:
     /// by solver_decomposed.h. ~O(precompute) cheaper than solve() because the
     /// tree build and matchup precompute are skipped.
     void resolve() {
-        if (!backend_ || tree_.total_nodes == 0) { solve(); return; }
+        if (!backend_ || tree_.total_nodes == 0 ||
+            !ranges_fit_index_space()) { solve(); return; }
         initialize_reach_probs();
         if (!config_.node_locks.empty()) resolve_node_locks();
         SolverContext ctx = make_context();
@@ -506,7 +507,8 @@ public:
     /// dominant matchup re-upload. Bit-identical to resolve() for the same
     /// board. Used by the decomposition pinned-leaf fast path (Stage 3.5).
     void resolve_keep_board() {
-        if (!backend_ || tree_.total_nodes == 0) { solve(); return; }
+        if (!backend_ || tree_.total_nodes == 0 ||
+            !ranges_fit_index_space()) { solve(); return; }
         initialize_reach_probs();
         if (!config_.node_locks.empty()) resolve_node_locks();
         SolverContext ctx = make_context();
@@ -531,7 +533,8 @@ public:
     /// (still correct — just no warm-start benefit); check
     /// `backend_supports_warm_start()` to know which happened.
     void resolve_keep_state(int iter_offset) {
-        if (!backend_ || tree_.total_nodes == 0) { solve(); return; }
+        if (!backend_ || tree_.total_nodes == 0 ||
+            !ranges_fit_index_space()) { solve(); return; }
         initialize_reach_probs();
         if (!config_.node_locks.empty()) resolve_node_locks();
         SolverContext ctx = make_context();
@@ -674,6 +677,69 @@ private:
                    TerminalRepresentation::RankBlockerOnly
             && !matchup_original_ranks_per_runout_.empty()
             && !matchup_board_masks_.empty();
+    }
+
+    /// B1b inc 2: may this solve restrict the canonical index space to the
+    /// hands the players actually hold? On by default; DEEPSOLVER_B1B_COMPACT=0
+    /// forces the board's full space, which is the oracle side of the
+    /// compact-vs-full self-check (the default-range fixtures cannot show the
+    /// difference — they are 100% live, so the mapping is the identity there).
+    ///
+    /// Never engages under a FORCED iso: decomposition hands the trunk's
+    /// mapping to every subgame precisely so they share one index space, and
+    /// `TrunkDecomposition::read_subgame_values` zero-fills on a size
+    /// mismatch — a subgame that renumbered itself would report all-zero
+    /// values silently. Compacting the decomposed path needs an explicit
+    /// expand-on-read step; it is a later increment.
+    bool b1b_compaction_enabled() const {
+        static const bool env_off = [] {
+            const char* v = std::getenv("DEEPSOLVER_B1B_COMPACT");
+            return v != nullptr && v[0] == '0';
+        }();
+        return !env_off && forced_iso_ == nullptr;
+    }
+
+    /// A re-solve reuses the tree, the matchup tables and the index space the
+    /// last solve() pinned. If the new ranges reach a canonical slot that
+    /// compaction dropped, that slot has no rows anywhere and the hand would
+    /// vanish silently — so rebuild from scratch instead. One pass over the
+    /// 1326 originals, and it can only fire on a compacted mapping (which
+    /// decomposition, the only caller of the re-solve entry points today,
+    /// never has: a forced iso is never compacted).
+    bool ranges_fit_index_space() const {
+        if (iso_.board_canonical == 0 ||
+            iso_.num_canonical >= iso_.board_canonical) return true;
+        const auto& combo_table = get_combo_table();
+        const CardMask dead =
+            board_to_mask(config_.board.data(), config_.board_size);
+        for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+            if (iso_.original_to_canonical[i] != UINT16_MAX) continue;
+            if (combo_table[i].conflicts_with(dead)) continue;
+            if (config_.oop_range_weights[i] != 0.0f ||
+                config_.ip_range_weights[i]  != 0.0f) return false;
+        }
+        return true;
+    }
+
+    /// The board's canonical count regardless of compaction. `board_canonical`
+    /// is zero on a mapping built before B1b inc 2 (or by a test that fills the
+    /// struct by hand), so fall back to the live count there.
+    uint32_t board_canonical_combos() const {
+        return iso_.board_canonical ? iso_.board_canonical : iso_.num_canonical;
+    }
+
+    /// Compact `iso_` to the union live set and rebuild the reaches in the new
+    /// index space. No-op when every slot is live or when the gate is off.
+    /// Must run AFTER initialize_reach_probs() (it needs the reaches to decide
+    /// liveness) and BEFORE the tree builder, the terminal plan and precompute,
+    /// all of which are sized or routed by nc.
+    void compact_index_space() {
+        if (!b1b_compaction_enabled()) return;
+        IsomorphismMapping compact =
+            compact_isomorphism(iso_, oop_reach_, ip_reach_);
+        if (compact.num_canonical == iso_.num_canonical) return;
+        iso_ = std::move(compact);
+        initialize_reach_probs();
     }
 
     /// Result of the "does the ENUMERATED tree fit?" question.
@@ -953,6 +1019,11 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     // order-independent.
     stage_start = Clock::now();
     initialize_reach_probs();
+    // B1b inc 2: drop the canonical slots neither player holds. Every
+    // nc-factored buffer and the nc² matchup tables shrink with the index
+    // space. Placed between the reaches (which decide liveness) and the
+    // builder (which prices bytes from nc).
+    compact_index_space();
     stage_end = Clock::now();
     timing.reach_init_ms = elapsed_since(stage_start, stage_end);
 
@@ -1193,6 +1264,17 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         e.device_total_bytes     = (final_be == BackendType::GPU) ? comp_device_total : 0;
         e.final_strategy_bytes   = comp_final_strategy;
         e.gpu_backend            = (final_be == BackendType::GPU);
+        // Same predicate as the iteration loop's `exploit_early_stop`: a probe
+        // calls finalize(), which on GPU materializes a whole extra strategy
+        // copy on the host well before the real finalize does.
+        e.exploit_probe_runs     = config_.compute_exploitability
+                                && config_.target_exploitability > 0.0f;
+        e.flat_tree_bytes        = memory_budget::bytes_for_flat_tree(
+            tree_.total_nodes, tree_.total_edges)
+            + ((final_be == BackendType::GPU)
+                   ? memory_budget::bytes_for_gpu_host_index_tables(
+                         tree_.total_nodes)
+                   : 0);
         // A4-host inc 4: the CUDA host overhead scales with the device
         // footprint (WDDM backing store), so it is derived from the same
         // device total this footprint carries — not a flat constant.
@@ -1653,13 +1735,15 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     // Reuses gate_est computed before backend allocation.
     {
         SolveResources r;
-        r.canonical_combos = iso_.num_canonical;
+        r.canonical_combos = board_canonical_combos();
+        r.live_combos      = iso_.num_canonical;
         uint32_t player_nodes = 0;
         for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
             auto t = static_cast<NodeType>(tree_.node_types[n]);
             if (t == NodeType::PLAYER_OOP || t == NodeType::PLAYER_IP) ++player_nodes;
         }
         r.player_nodes = player_nodes;
+        r.tree_nodes   = tree_.total_nodes;
 
         r.estimated_matchup_bytes        = gate_est.matchup_tables_bytes;
         r.estimated_cpu_state_bytes      = gate_est.cpu_state_bytes;
@@ -1804,6 +1888,9 @@ inline SolveResources Solver::estimate_only() {
     // estimate below need. Same order as solve(), so the estimate describes
     // the tree the solve would actually build.
     initialize_reach_probs();
+    // B1b inc 2: same order as solve(), so the preview prices the index space
+    // the solve will actually allocate.
+    compact_index_space();
     const TerminalRepresentationPlan est_plan =
         plan_terminal_representation(config_, iso_);
     const bool est_host_dense =
@@ -1818,7 +1905,8 @@ inline SolveResources Solver::estimate_only() {
     tree_ = builder.build();
 
     SolveResources r;
-    r.canonical_combos = iso_.num_canonical;
+    r.canonical_combos = board_canonical_combos();
+    r.live_combos      = iso_.num_canonical;
 
     uint32_t player_nodes = 0;
     uint64_t player_slots = 0;   // Σ num_children over player nodes (B1a compact)
@@ -1900,6 +1988,11 @@ inline SolveResources Solver::estimate_only() {
         }
     }
     r.player_nodes = player_nodes;
+    // The estimate has built the tree, so it knows its size — and "how big is
+    // the tree" is the first question asked of any cross-solver comparison
+    // (§0-pre cause 4). The solve path reports this as timing.tree_nodes;
+    // without it here, an estimate could not be compared to anything.
+    r.tree_nodes   = tree_.total_nodes;
 
     const uint64_t nc      = iso_.num_canonical;
     const uint64_t total_n = tree_.total_nodes;
@@ -2046,6 +2139,14 @@ inline SolveResources Solver::estimate_only() {
     gate_est.final_strategy_bytes   = bytes_for_final_strategy(
         player_slots, nc, player_nodes);
     gate_est.gpu_backend            = gpu_final;
+    // Mirrors build_footprint() in solve() — see the note there.
+    gate_est.exploit_probe_runs     = config_.compute_exploitability
+                                   && config_.target_exploitability > 0.0f;
+    gate_est.flat_tree_bytes        = memory_budget::bytes_for_flat_tree(
+        tree_.total_nodes, tree_.total_edges)
+        + (gpu_final ? memory_budget::bytes_for_gpu_host_index_tables(
+                           tree_.total_nodes)
+                     : 0);
     gate_est.process_overhead_bytes = memory_budget::kHostProcessOverheadBytes
         + (gpu_final ? memory_budget::bytes_for_gpu_host_overhead(
                            gate_est.device_total_bytes)

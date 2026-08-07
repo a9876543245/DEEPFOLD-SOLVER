@@ -98,8 +98,32 @@ constexpr uint64_t kCpuActionLaneFloats = 8;
 ///             vs 2.433 GB measured   (+3.6%)
 ///   mono GPU  .528 + 2×.236 + context ≈ 1.16 GB vs 1.166 GB measured
 ///   std  GPU  .012 + .007 + context ≈ .138 GB vs .144 GB measured
-/// Process baseline (CRT, tree arrays, iso tables, code) — small but real.
+/// Process baseline (CRT, iso tables, code) — small but real. It used to be
+/// described as covering the tree arrays too; it does not, and cannot — see
+/// `bytes_for_flat_tree` below.
 constexpr uint64_t kHostProcessOverheadBytes = 96ULL * 1024ULL * 1024ULL;
+
+/// The host-resident FlatGameTree. Thirteen per-node arrays (31 B/node) and
+/// three per-edge arrays (9 B/edge), from the struct in types.h.
+///
+/// This was folded into the flat 96 MB process baseline until 2026-08-03,
+/// which was harmless while trees were thousands of nodes and wrong once B1b
+/// inc 2 let 4.65M-node trees through: 4,654,449 nodes is 186 MB of arrays
+/// before the builder's push_back growth, and the 4.65M gate measured 393 MB
+/// of unexplained peak RSS. The builder does not reserve, so capacity can sit
+/// at up to 2× size — which is both the honest bound and what that gap says
+/// (393 measured vs 372 modeled). On a 627k-node rainbow the same term
+/// accounts for the CPU spot's residual −0.6% (20.6 MB measured vs 50 modeled,
+/// i.e. conservative, which is the direction the gate needs).
+constexpr uint64_t kFlatTreeBytesPerNode = 31;
+constexpr uint64_t kFlatTreeBytesPerEdge = 9;
+constexpr double   kFlatTreeGrowthFactor = 2.0;
+inline uint64_t bytes_for_flat_tree(uint64_t nodes, uint64_t edges) {
+    return static_cast<uint64_t>(
+        static_cast<double>(nodes * kFlatTreeBytesPerNode
+                          + edges * kFlatTreeBytesPerEdge)
+        * kFlatTreeGrowthFactor);
+}
 /// CUDA runtime/context host-side RSS (driver pools, pinned staging).
 /// Measured 125–140 MB on CUDA 13.2 / Win11 / RTX 5090; padded slightly.
 constexpr uint64_t kGpuHostContextBytes = 160ULL * 1024ULL * 1024ULL;
@@ -123,6 +147,20 @@ inline uint64_t bytes_for_gpu_host_overhead(uint64_t device_total_bytes) {
                * kGpuDeviceHostMirrorFraction);
 }
 
+/// Per-node index tables the GPU backend keeps HOST-side for the whole solve:
+/// `host_node_order[N]` (the level schedule, walked on the host to launch per
+/// level) and `host_value_row[N]` (B3 inc 1's node → value-row indirection),
+/// 4 B each, plus the `depth[N]` array that is live inside prepare(). Not the
+/// device copies — these are separate host vectors, exactly sized.
+///
+/// 12 B/node is invisible until the trees get large, and then it is not: the
+/// 4.65M-node spot retains 37 MB of it, which was exactly the residual left
+/// after the flat-tree term was added (measured est 4505.4 vs 4544.4 MB).
+constexpr uint64_t kGpuHostIndexBytesPerNode = 12;
+inline uint64_t bytes_for_gpu_host_index_tables(uint64_t nodes) {
+    return nodes * kGpuHostIndexBytesPerNode;
+}
+
 /// How many copies of the finalized strategy are alive at peak. Measured as
 /// (finalize RSS delta ÷ one copy) across turn/mono/rainbow spots, 2026-07-27:
 ///     CPU  2.05  2.09  2.11  2.13   — the backend's nested copy and
@@ -135,16 +173,45 @@ inline uint64_t bytes_for_gpu_host_overhead(uint64_t device_total_bytes) {
 /// measurement without charging a copy that never exists.
 constexpr double kFinalStrategyCopiesCpu = 2.0;
 constexpr double kFinalStrategyCopiesGpu = 1.5;
+
+/// ...and that calibration measured the wrong moment. It divided the FINALIZE
+/// RSS delta by one copy, which is blind to the mid-loop exploitability probe:
+/// the probe calls finalize() too, so on a GPU solve it downloads and repacks
+/// a full strategy long before the real finalize does, and the allocator's
+/// high-water mark keeps it. Measured 2026-08-03 on narrow ranges, peak RSS
+/// with the probe on vs off (`node scripts/peakhost.mjs`):
+///     rainbow flop 627k nodes   1424.0 vs 1057.8 MB   (+366 = 0.98 copies)
+///     paired  flop 395k nodes    985.3 vs  803.7 MB   (+182 = ~1 copy)
+///     mono    flop 185k nodes    302.1 vs  274.8 MB   (+27  = ~1 copy)
+/// The CPU is unaffected (422.5 vs 422.2, 3233.6 vs 3233.7): its finalize
+/// already keeps two copies live, so the probe reuses that same heap.
+///
+/// This only became visible after B1b inc 2 shrank every nc-scaled term — the
+/// old over-charge was hiding a full strategy copy, and on the 627k rainbow
+/// that showed up as a 17.9% UNDER-estimate on the gate the solve has to pass.
+constexpr double kFinalStrategyProbeCopiesGpu = 1.0;
 inline uint64_t bytes_for_live_final_strategy(uint64_t one_copy_bytes,
-                                              bool gpu_backend) {
-    return static_cast<uint64_t>(
-        static_cast<double>(one_copy_bytes)
-        * (gpu_backend ? kFinalStrategyCopiesGpu : kFinalStrategyCopiesCpu));
+                                              bool gpu_backend,
+                                              bool exploit_probe_runs = false) {
+    double copies = gpu_backend ? kFinalStrategyCopiesGpu
+                                : kFinalStrategyCopiesCpu;
+    if (gpu_backend && exploit_probe_runs) copies += kFinalStrategyProbeCopiesGpu;
+    return static_cast<uint64_t>(static_cast<double>(one_copy_bytes) * copies);
 }
 /// Result JSON floor when the navigation strategy tree is NOT emitted
 /// (--no-strategy-tree): root strategies + diagnostics + resources, no
 /// per-node cache. Measured ~0.3–2.7 MB depending on nc.
 constexpr uint64_t kNoTreeJsonFloorBytes = 4ULL * 1024ULL * 1024ULL;
+
+/// One value region per traverser. The two backward passes write different
+/// values to the same rows, so a shared region forced them to run one after
+/// the other — 26 of the 42 kernel launches per iteration were 13 depth levels
+/// × 2 traversers. Giving each its own region lets one grid carry both
+/// (`blockIdx.z`), which is the launch-count lever measured in ROADMAP §2(4):
+/// the two hot kernels average 2.6 µs and 2.1 µs to run against 3.26 µs to
+/// issue. The cost is one extra value buffer — 348 MB on the 627k-node
+/// enumerated rainbow, 1.47 GB on the 4.65M-node target.
+constexpr uint64_t kGpuValueRegions = 2;
 
 /// GPU backend keeps regrets, strategy_sum, current_strategy (3 compact
 /// strat-shaped buffers of Σ-player-actions × nc; B1a inc 2 dropped
@@ -196,6 +263,10 @@ struct SolveFootprintEstimate {
     /// CPU est 2.00 GB vs 2.43 GB actual peak).
     uint64_t final_strategy_bytes      = 0;   ///< ONE copy; see gpu_backend.
     uint64_t process_overhead_bytes    = 0;
+    /// Host-resident FlatGameTree (bytes_for_flat_tree). Separate from the
+    /// process baseline because it scales with the tree, and at 4.65M nodes
+    /// it is hundreds of MB.
+    uint64_t flat_tree_bytes           = 0;
     uint64_t strategy_tree_ev_bytes    = 0;
     uint64_t json_response_bytes       = 0;
 
@@ -208,12 +279,18 @@ struct SolveFootprintEstimate {
     /// backend this is, but they can legitimately be 0, so it is explicit.
     bool gpu_backend = false;
 
+    /// True when the solve will run the mid-loop exploitability probe. The
+    /// probe calls finalize(), so on GPU it costs an extra live strategy copy
+    /// at peak (see kFinalStrategyProbeCopiesGpu).
+    bool exploit_probe_runs = false;
+
     uint64_t total_host_bytes() const {
         return matchup_tables_bytes
              + cpu_state_bytes
              + memory_budget::bytes_for_live_final_strategy(
-                   final_strategy_bytes, gpu_backend)
+                   final_strategy_bytes, gpu_backend, exploit_probe_runs)
              + process_overhead_bytes
+             + flat_tree_bytes
              + strategy_tree_ev_bytes
              + json_response_bytes;
     }
@@ -339,7 +416,8 @@ inline uint64_t bytes_for_gpu_state_compact(uint64_t total_nodes,
                                             uint64_t value_rows) {
     const uint64_t strat_buffers = materialize_strategy ? 3ULL : 2ULL;
     const uint64_t values = value_rows ? value_rows : total_nodes;
-    return (strat_buffers * player_action_slots + 2ULL * total_nodes + values)
+    return (strat_buffers * player_action_slots + 2ULL * total_nodes
+              + memory_budget::kGpuValueRegions * values)
              * nc * sizeof(float)
          + 2ULL * total_nodes * sizeof(uint32_t);  // node_offset + value_row
 }

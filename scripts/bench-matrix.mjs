@@ -215,6 +215,10 @@ for (const fx of manifest.fixtures) {
     threads_effective: last?.resources?.cpu_threads_effective ?? null,
     tree_nodes: last?.timing?.tree_nodes ?? null,
     canonical_combos: last?.resources?.canonical_combos ?? null,
+    // B1b inc 2: the index space the solve allocated. Equal to the line above
+    // whenever the ranges are full, which is why a default-range row cannot
+    // tell you whether compaction engaged.
+    live_combos: last?.resources?.live_combos ?? null,
     iter_per_sec_median: rates.length ? r3(median(rates)) : null,
     iter_per_sec_min: rates.length ? r3(Math.min(...rates)) : null,
     iter_per_sec_max: rates.length ? r3(Math.max(...rates)) : null,

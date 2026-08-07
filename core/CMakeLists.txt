@@ -781,6 +781,17 @@ if(BUILD_TESTS)
         set_tests_properties(CliBudgetGpuDeviceTotalReject PROPERTIES
             LABELS "smoke;gpu;memory" TIMEOUT 60)
 
+        # The peak-host estimate may be conservative but must never sit BELOW
+        # the measured peak RSS of the same run. Red before the 2026-08-03
+        # recalibration (−17.9% on this fixture), which is what B1b inc 2
+        # exposed by removing the over-charge that hid it.
+        add_test(NAME CliPeakHostNotUnder
+            COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=peak_host_not_under
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+        set_tests_properties(CliPeakHostNotUnder PROPERTIES
+            LABELS "smoke;gpu;memory" TIMEOUT 180)
+
         # ----------------------------------------------------------------
         # Stage 3: GPU subgame streaming validation. SAME source as the CPU
         # `Decomposition` test, but compiled WITH DEEPSOLVER_USE_CUDA + the
