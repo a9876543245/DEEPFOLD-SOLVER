@@ -10,6 +10,9 @@
  *   node scripts/bulk-presolve.mjs --sizings standard # subset
  *   node scripts/bulk-presolve.mjs --limit 5          # solve first 5 spots only (smoke)
  *   node scripts/bulk-presolve.mjs --resume           # skip files that already exist
+ *   node scripts/bulk-presolve.mjs --shard 0/2        # every 2nd spot starting at 0 (run
+ *                                                     # the shards as separate processes;
+ *                                                     # each keeps its own failures log)
  *
  * Output:
  *   gto_output/presolved/raw/m<i>_b<j>_<sizing>_<stack>bb.json
@@ -56,6 +59,7 @@ function parseArgs(argv) {
   const out = {
     dryRun: false,
     resume: false,
+    shard: null,             // {k, n}: solve plan indices with i % n == k
     sizings: ['standard', 'lite'],
     stacksBb: ['default'],   // 'default' = use the matchup's defaultStack
     limit: 0,
@@ -78,6 +82,11 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '--dry-run')        out.dryRun = true;
     else if (a === '--resume')    out.resume = true;
+    else if (a === '--shard') {
+      const m = String(argv[++i]).match(/^(\d+)\/(\d+)$/);
+      if (!m || Number(m[1]) >= Number(m[2])) throw new Error('--shard expects k/n with k < n');
+      out.shard = { k: Number(m[1]), n: Number(m[2]) };
+    }
     else if (a === '--sizings')   out.sizings = argv[++i].split(',');
     else if (a === '--stacks')    out.stacksBb = argv[++i].split(',');
     else if (a === '--limit')     out.limit = parseInt(argv[++i], 10);
@@ -290,7 +299,11 @@ async function main() {
   }
 
   mkdirSync(OUT_RAW_DIR, { recursive: true });
-  const plan = buildPlan();
+  let plan = buildPlan();
+  if (args.shard) {
+    plan = plan.filter((_, i) => i % args.shard.n === args.shard.k);
+    console.log(`Shard ${args.shard.k}/${args.shard.n}: ${plan.length} spots`);
+  }
   console.log(`\n=== ${plan.length} spots to solve ===\n`);
 
   const t0 = Date.now();
@@ -331,7 +344,8 @@ async function main() {
   console.log(`Failed:      ${failed}`);
 
   if (failures.length > 0) {
-    const failPath = join(OUT_RAW_DIR, 'failures.log');
+    const failPath = join(OUT_RAW_DIR,
+      args.shard ? `failures_${args.shard.k}of${args.shard.n}.log` : 'failures.log');
     writeFileSync(failPath, JSON.stringify(failures, null, 2));
     console.log(`Failures logged: ${failPath}`);
   }

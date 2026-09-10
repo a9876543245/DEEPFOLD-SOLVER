@@ -67,6 +67,46 @@ using CardMask = uint64_t;
 constexpr CardMask card_to_mask(Card c) { return 1ULL << c; }
 
 // ============================================================================
+// Game-model conventions shared by EVERY backend and EVERY postsolve sweep
+// (CPU reference, CPU levelized, CUDA, Solver postsolve, decomposition trunk).
+// One definition each, so the CFR kernels and the exploitability / EV sweeps
+// can never disagree about the game they are playing.
+// ============================================================================
+
+/// Chance nodes: the children's runout weights sum to the number of cards
+/// still in the deck GIVEN THE BOARD (49 at flop→turn, 48 at turn→river).
+/// But every legal matchup also removes both players' hole cards, so for any
+/// pair of hands only (total − 4) of those cards can actually be dealt. The
+/// terminals already zero the pairs a runout conflicts with (valid = 0 when
+/// either hand shares a card with the runout), so dividing the weighted sum
+/// by (total − 4) instead of by total is exactly the conditional expectation
+/// over the runouts that can happen — for every pair at once, because every
+/// pair removes the same four cards. Dividing by the full total (pre-2026-09)
+/// multiplied every continuation value by 45/49 (flop→turn) and 44/48
+/// (turn→river) relative to the fold value it competes with: a systematic
+/// bias toward whichever action has the smaller |EV|.
+///
+/// The collapsed single-child fallback deals nothing (one child, weight 1)
+/// and keeps 1/1. A real deal always totals ≥ 44, so the threshold cannot
+/// confuse the two cases. cfr_kernel.cu mirrors this rule on the device.
+constexpr uint32_t kChanceHoleCardsExcluded = 4;
+inline uint32_t chance_runout_denominator(uint32_t total_weight) {
+    if (total_weight > kChanceHoleCardsExcluded) {
+        return total_weight - kChanceHoleCardsExcluded;
+    }
+    return total_weight == 0 ? 1u : total_weight;
+}
+
+/// Rake taken out of `raked_pot`: min(raked_pot × rate, cap), never negative.
+/// The BASE differs by terminal type — see SolverConfig::rake_rate: the full
+/// pot at a showdown, the MATCHED pot at a fold (the uncalled bet is returned
+/// before the rake is taken, exactly as a live room does it).
+inline float terminal_rake(float raked_pot, float rake_rate, float rake_cap) {
+    const float rake = std::min(raked_pot * rake_rate, rake_cap);
+    return rake < 0.0f ? 0.0f : rake;
+}
+
+// ============================================================================
 // Game Tree Node Types
 // ============================================================================
 
@@ -122,14 +162,14 @@ struct FlatGameTree {
     // Per-node arrays (indexed by node_id)
     std::vector<uint8_t>   node_types;        ///< NodeType enum value
     std::vector<float>     pots;              ///< Pot size at this node
-    std::vector<float>     stacks;            ///< Remaining effective stack
+    std::vector<float>     stacks;            ///< At decisions: remaining stack of active_player
     std::vector<uint32_t>  parent_indices;    ///< Index of parent node (0 = root)
     std::vector<uint32_t>  children_offset;   ///< Start index in children[] array
     std::vector<uint8_t>   num_children;      ///< Number of child actions
     std::vector<uint8_t>   street;            ///< 0=flop, 1=turn, 2=river
     std::vector<uint8_t>   terminal_types;    ///< TerminalType for TERMINAL nodes
     std::vector<uint8_t>   active_player;     ///< 0=OOP, 1=IP for player nodes
-    std::vector<float>     bet_into;          ///< Amount bet into this node
+    std::vector<float>     bet_into;          ///< Outstanding amount to call, not the last total investment
 
     // ---- Runout enumeration (Phase 1: chance-node enumeration) ----
     /// Card dealt by the chance node that produced THIS node (only meaningful
@@ -287,9 +327,16 @@ struct SolverConfig {
     DcfrSchedule dcfr_schedule = DcfrSchedule::POSTFLOP_STYLE;
 
     // Cash-game rake. Applied at every fold/showdown terminal:
-    //   rake = min(pot_at_terminal * rake_rate, rake_cap)
-    // Winner takes (pot - rake), losers take pot's share unchanged. On a
-    // showdown tie each player loses rake/2 (split rake equally).
+    //   rake = min(raked_pot * rake_rate, rake_cap)     (see terminal_rake)
+    // Winner takes (raked_pot - rake), losers take pot's share unchanged. On
+    // a showdown tie each player loses rake/2 (split rake equally).
+    //
+    // Rake base (2026-09-09 audit, "define whether the uncalled bet is
+    // raked"): at a SHOWDOWN the whole pot is matched, so the base is the
+    // pot. At a FOLD the last bet was never called; the uncalled portion is
+    // returned to the bettor BEFORE the rake is taken, so the base is the
+    // MATCHED pot (pot minus the outstanding bet_into of the folding node).
+    // Every CFR kernel and every postsolve sweep uses this same rule.
     // Default 0/0 = rake-free (matches solver-textbook / Pio cash mode).
     // NL25 typical: 0.05 / 2.0 (5% capped at 2bb). NL100+: lower cap usually.
     float rake_rate = 0.0f;
@@ -300,6 +347,15 @@ struct SolverConfig {
     std::array<float, NUM_COMBOS> ip_range_weights;
     std::array<float, NUM_COMBOS> oop_range_weights;
     bool has_custom_ranges = false;    ///< True if user provided custom ranges
+
+    /// A solve whose two ranges have NO card-compatible hand pair (or an
+    /// empty range) has nothing to solve: every EV and the exploitability
+    /// would be 0/0. solve() rejects it with an error instead of reporting a
+    /// perfectly "converged" 0% (2026-09-09 audit). The runout decomposition
+    /// sets this for its turn subgames: a betting line nobody takes hands the
+    /// subgame an all-zero entering reach, which is legitimate there and must
+    /// solve to zeros rather than throw.
+    bool allow_unreachable_ranges = false;
 
     // Node locks: force strategy at specific (node, combo) pairs
     std::vector<NodeLockEntry> node_locks;
@@ -599,8 +655,11 @@ inline void populate_matchup_category_diagnostics(
 /// (and benchmark harness) can show "this run cost X MB host, Y MB GPU,
 /// Z MB JSON; reduced runouts? truncated tree? fell back to CPU?".
 struct SolveResources {
-    /// The BOARD's canonical combo count — what suit isomorphism alone gives,
-    /// independent of the ranges. Unchanged meaning since v1.x.
+    /// The canonical combo count of the symmetry the board, both ranges and
+    /// the node locks SHARE (2026-09-09 audit: an asymmetric range breaks a
+    /// suit symmetry and must not be bucketed). Equals the board-only count
+    /// for suit-symmetric inputs — every preset range — so it is unchanged
+    /// there since v1.x.
     uint32_t canonical_combos          = 0;
     /// B1b inc 2: the index space the solve actually allocated, after the
     /// canonical slots neither player holds were dropped. Equal to
@@ -613,6 +672,11 @@ struct SolveResources {
     /// reports it as `timing.tree_nodes`; this field is what makes an
     /// ESTIMATE self-describing, which any cross-solver comparison needs.
     uint32_t tree_nodes                = 0;
+    /// 2026-09-09 audit: runout tables whose board is short of the river and
+    /// carries a showdown terminal, each holding an nc² equity matrix (see
+    /// SolverContext::matchup_equity_per_runout). Their bytes are inside
+    /// estimated_matchup_bytes / estimated_gpu_matchup_bytes.
+    uint32_t matchup_equity_tables     = 0;
     uint64_t estimated_matchup_bytes   = 0;
     uint64_t estimated_cpu_state_bytes = 0;
     uint64_t estimated_gpu_state_bytes = 0;

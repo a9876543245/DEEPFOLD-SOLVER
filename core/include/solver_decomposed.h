@@ -35,6 +35,7 @@
 #include "game_tree_builder.h"
 #include "solver.h"           // Solver, compute_matchup_for_board, get_evaluator
 #include "solver_backend.h"   // compute_dcfr_factors, BackendType
+#include "fold_blocker.h"     // compatible_opponent_mass, legal_joint_mass
 
 #include <algorithm>
 #include <cmath>
@@ -220,6 +221,11 @@ private:
 
     // Flop-board matchup (all trunk terminals are on the flop board).
     std::vector<float>    mev_, mvalid_;
+    /// 2026-09-09 audit P0: every trunk showdown is a called flop all-in, so
+    /// it settles on the flop EQUITY table (win − lose over all 990 runouts,
+    /// × compatibility), never on flop best-5 ranks. Same convention as
+    /// Solver's matchup_equity_per_runout_.
+    std::vector<float>    meq_;
     std::vector<float>    cw_;           ///< canonical weights as float.
 
     // Root entering reach (flop canonical), from base_cfg_ ranges.
@@ -278,7 +284,7 @@ private:
     // node_opp_* hold the opponent reach mass at the node for PIO normalization
     // — same convention as Solver::build_strategy_tree's evs_at.
     std::map<uint32_t, std::vector<float>> tnode_vals_oop_, tnode_vals_ip_;
-    std::map<uint32_t, float>              tnode_opp_oop_,  tnode_opp_ip_;
+    std::map<uint32_t, std::vector<float>> tnode_opp_oop_,  tnode_opp_ip_;
 
     int subgame_solves_ = 0;
 
@@ -354,7 +360,7 @@ private:
             std::vector<float> roop, std::vector<float> rip,
             std::vector<float>& out,
             std::map<uint32_t, std::vector<float>>* cap_vals = nullptr,
-            std::map<uint32_t, float>* cap_opp = nullptr) const;
+            std::map<uint32_t, std::vector<float>>* cap_opp = nullptr) const;
 
     // Best-response pass for `player` using cached br_* at leaves.
     void br(uint32_t node, int player,
@@ -390,7 +396,13 @@ private:
 // ============================================================================
 
 inline void TrunkDecomposition::build_trunk() {
-    iso_ = compute_isomorphism(base_cfg_.board.data(), base_cfg_.board_size);
+    {
+        IsoConstraints c;
+        c.oop_weights = &base_cfg_.oop_range_weights;
+        c.ip_weights  = &base_cfg_.ip_range_weights;
+        c.node_locks  = &base_cfg_.node_locks;
+        iso_ = compute_isomorphism(base_cfg_.board.data(), base_cfg_.board_size, &c);
+    }
     nc_  = iso_.num_canonical;
 
     GameTreeBuilder builder(base_cfg_);
@@ -420,6 +432,8 @@ inline void TrunkDecomposition::build_trunk() {
                               // consumer reads mev_/mvalid_ directly, so it is
                               // never eligible for the A4 inc-3 skip.
                               /*build_dense=*/true);
+    compute_equity_matchup_for_board(iso_, base_cfg_.board.data(),
+                                     base_cfg_.board_size, meq_);
 
     // Identify leaves (turn-card children of truncated chance nodes).
     leaf_idx_.assign(trunk_.total_nodes, -1);
@@ -511,40 +525,57 @@ inline void TrunkDecomposition::terminal_value(
 {
     out.assign(nc_, 0.0f);
     auto tt = static_cast<TerminalType>(trunk_.terminal_types[node]);
-    float half_pot = trunk_.pots[node] * 0.5f;
+    const float pot_total = trunk_.pots[node];
+    const float half_pot  = pot_total * 0.5f;
 
     if (tt == TerminalType::SHOWDOWN) {
+        // Same raked linear payoff as Solver::postsolve_terminal_values:
+        // payoff_self(ev) = A·ev_self + B, A = half_pot − rake/2, B = −rake/2.
+        const float rake = terminal_rake(pot_total, base_cfg_.rake_rate, base_cfg_.rake_cap);
+        const float A = half_pot - 0.5f * rake;
+        const float B = -0.5f * rake;
+        const bool raked = (B != 0.0f);
         if (who == 0) {
             std::vector<float> wip(nc_);
             for (uint16_t cj = 0; cj < nc_; ++cj) wip[cj] = rip[cj] * cw_[cj];
             for (uint16_t c = 0; c < nc_; ++c) {
                 const std::size_t base = static_cast<std::size_t>(c) * nc_;
-                float v = 0.0f;
-                for (uint16_t cj = 0; cj < nc_; ++cj)
-                    v += wip[cj] * mev_[base + cj] * mvalid_[base + cj];
-                out[c] = v * half_pot;
+                float v = 0.0f, s2 = 0.0f;
+                for (uint16_t cj = 0; cj < nc_; ++cj) {
+                    v  += wip[cj] * meq_[base + cj];
+                    if (raked) s2 += wip[cj] * mvalid_[base + cj];
+                }
+                out[c] = v * A + (raked ? s2 * B : 0.0f);
             }
         } else {
             std::vector<float> woop(nc_);
             for (uint16_t ci = 0; ci < nc_; ++ci) woop[ci] = roop[ci] * cw_[ci];
             for (uint16_t ci = 0; ci < nc_; ++ci) {
-                float s = woop[ci];
-                if (s == 0.0f) continue;
-                s *= half_pot;
+                const float w = woop[ci];
+                if (w == 0.0f) continue;
+                const float sa = w * A;
                 const std::size_t base = static_cast<std::size_t>(ci) * nc_;
                 for (uint16_t c = 0; c < nc_; ++c)
-                    out[c] -= s * mev_[base + c] * mvalid_[base + c];
+                    out[c] -= sa * meq_[base + c];
+                if (raked) {
+                    const float sb = w * B;
+                    for (uint16_t c = 0; c < nc_; ++c) out[c] += sb * mvalid_[base + c];
+                }
             }
         }
         return;
     }
 
-    // Fold terminal: winner gets only the matched portion.
+    // Fold terminal: winner gets only the matched portion and pays the rake
+    // on that matched pot (uncalled bet returned first — types.h).
     uint32_t parent = trunk_.parent_indices[node];
     float unmatched = (parent < trunk_.total_nodes) ? trunk_.bet_into[parent] : 0.0f;
-    float gain = (trunk_.pots[node] - unmatched) * 0.5f;
-    float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
-    float sign = (who == 0) ? sign_oop : -sign_oop;
+    const float matched_pot = pot_total - unmatched;
+    const float fold_rake = terminal_rake(matched_pot, base_cfg_.rake_rate, base_cfg_.rake_cap);
+    const float gain = matched_pot * 0.5f;
+    const bool self_wins = (who == 0) ? (tt == TerminalType::FOLD_IP)
+                                      : (tt == TerminalType::FOLD_OOP);
+    const float self_payoff = self_wins ? (gain - fold_rake) : -gain;
     if (who == 0) {
         std::vector<float> wip(nc_);
         for (uint16_t cj = 0; cj < nc_; ++cj) wip[cj] = rip[cj] * cw_[cj];
@@ -552,16 +583,15 @@ inline void TrunkDecomposition::terminal_value(
             const std::size_t base = static_cast<std::size_t>(c) * nc_;
             float opp = 0.0f;
             for (uint16_t cj = 0; cj < nc_; ++cj) opp += wip[cj] * mvalid_[base + cj];
-            out[c] = sign * gain * opp;
+            out[c] = self_payoff * opp;
         }
     } else {
         std::vector<float> woop(nc_);
         for (uint16_t ci = 0; ci < nc_; ++ci) woop[ci] = roop[ci] * cw_[ci];
-        const float sg = sign * gain;
         for (uint16_t ci = 0; ci < nc_; ++ci) {
             float s = woop[ci];
             if (s == 0.0f) continue;
-            s *= sg;
+            s *= self_payoff;
             const std::size_t base = static_cast<std::size_t>(ci) * nc_;
             for (uint16_t c = 0; c < nc_; ++c) out[c] += s * mvalid_[base + c];
         }
@@ -639,6 +669,9 @@ inline SolverConfig TrunkDecomposition::make_sub_cfg(
     sub.time_budget_seconds = 0;
     sub.compute_combo_evs = false;
     sub.compute_exploitability = false;
+    // A betting line nobody takes hands this leaf an all-zero entering
+    // reach; that must solve to zeros, not be rejected as an empty range.
+    sub.allow_unreachable_ranges = true;
     sub.cpu_threads = 1;                       // CPU: leaf-level parallelism instead.
     sub.parallel_postsolve = false;
     return sub;
@@ -943,7 +976,11 @@ inline void TrunkDecomposition::cfr(
             for (uint16_t c = 0; c < nc_; ++c) out[c] += static_cast<float>(w) * cv[c];
             total_w += w;
         }
-        if (total_w > 0) { float inv = 1.0f / total_w; for (auto& v : out) v *= inv; }
+        if (total_w > 0) {
+            // Conditional on both players' hole cards — see types.h.
+            const float inv = 1.0f / static_cast<float>(chance_runout_denominator(total_w));
+            for (auto& v : out) v *= inv;
+        }
         return;
     }
 
@@ -1042,7 +1079,7 @@ inline void TrunkDecomposition::ev(
     std::vector<float> roop, std::vector<float> rip,
     std::vector<float>& out,
     std::map<uint32_t, std::vector<float>>* cap_vals,
-    std::map<uint32_t, float>* cap_opp) const
+    std::map<uint32_t, std::vector<float>>* cap_opp) const
 {
     auto nt = static_cast<NodeType>(trunk_.node_types[node]);
     if (nt == NodeType::TERMINAL) { terminal_value(node, perspective, roop, rip, out); return; }
@@ -1060,7 +1097,11 @@ inline void TrunkDecomposition::ev(
             for (uint16_t c = 0; c < nc_; ++c) out[c] += static_cast<float>(w) * cv[c];
             total_w += w;
         }
-        if (total_w > 0) { float inv = 1.0f / total_w; for (auto& v : out) v *= inv; }
+        if (total_w > 0) {
+            // Conditional on both players' hole cards — see types.h.
+            const float inv = 1.0f / static_cast<float>(chance_runout_denominator(total_w));
+            for (auto& v : out) v *= inv;
+        }
         return;
     }
     int acting = trunk_.active_player[node];
@@ -1078,10 +1119,14 @@ inline void TrunkDecomposition::ev(
         // reach mass here, for the flop-node combo_evs (PIO normalization).
         if (cap_vals) (*cap_vals)[node] = out;
         if (cap_opp) {
+            // Per-hand card-compatible opponent mass (PIO conditional EV) —
+            // same convention as Solver::cpu_ev_traverse's record lambda.
             const std::vector<float>& opp = (acting == 0) ? rip : roop;
-            float mass = 0.0f;
-            for (uint16_t c = 0; c < nc_; ++c) mass += opp[c] * cw_[c];
-            (*cap_opp)[node] = mass;
+            std::vector<float> compat(nc_, 0.0f);
+            fold_blocker::compatible_opponent_mass(
+                iso_, board_to_mask(base_cfg_.board.data(), base_cfg_.board_size),
+                opp.data(), compat.data());
+            (*cap_opp)[node] = std::move(compat);
         }
     } else {
         std::vector<float>& ar = (acting == 0) ? roop : rip;
@@ -1117,7 +1162,11 @@ inline void TrunkDecomposition::br(
             for (uint16_t c = 0; c < nc_; ++c) out[c] += static_cast<float>(w) * cv[c];
             total_w += w;
         }
-        if (total_w > 0) { float inv = 1.0f / total_w; for (auto& v : out) v *= inv; }
+        if (total_w > 0) {
+            // Conditional on both players' hole cards — see types.h.
+            const float inv = 1.0f / static_cast<float>(chance_runout_denominator(total_w));
+            for (auto& v : out) v *= inv;
+        }
         return;
     }
     int acting = trunk_.active_player[node];
@@ -1274,8 +1323,7 @@ TrunkDecomposition::trunk_evs(uint32_t n) const {
     const std::vector<float>& vals = it->second;
     const auto& opp_map = acting_is_ip ? tnode_opp_ip_ : tnode_opp_oop_;
     auto oit = opp_map.find(n);
-    float opp_mass = (oit != opp_map.end()) ? oit->second : 0.0f;
-    float norm = (opp_mass > 1e-6f) ? (1.0f / opp_mass) : 0.0f;
+    const std::vector<float>* compat = (oit != opp_map.end()) ? &oit->second : nullptr;
     const auto& reach = acting_is_ip ? root_reach_ip_ : root_reach_oop_;
     const auto& combo_table = get_combo_table();
     std::map<std::string, float> sum_w_val, sum_w;
@@ -1284,9 +1332,11 @@ TrunkDecomposition::trunk_evs(uint32_t n) const {
         if (ci == UINT16_MAX) continue;
         float r = (ci < reach.size()) ? reach[ci] : 0.0f;
         if (r <= 0.0f) continue;
+        const float mass = (compat && ci < compat->size()) ? (*compat)[ci] : 0.0f;
+        if (mass <= 0.0f) continue;
         std::string label = combo_to_grid_label(combo_table[i]);
         float v = (ci < vals.size()) ? vals[ci] : 0.0f;
-        sum_w_val[label] += r * v * norm;
+        sum_w_val[label] += r * (v / mass);
         sum_w[label]     += r;
     }
     for (auto& [label, sw] : sum_w) {
@@ -1524,23 +1574,32 @@ inline DecomposedResult TrunkDecomposition::run() {
 
     // True full-game exploitability over trunk+subgames; normalization matches
     // Solver::compute_exploitability exactly so the numbers are comparable.
+    // Same definition as Solver::compute_exploitability: ½ Σ_p (BR_p − EV_p)
+    // over the LEGAL joint deal (card-compatible pairs); the EV terms only
+    // matter when raked (they sum to zero otherwise).
     std::vector<float> bro, bri;
     br(0, 0, root_reach_oop_, root_reach_ip_, bro);
     br(0, 1, root_reach_oop_, root_reach_ip_, bri);
-    float br_oop_total = 0.0f, br_ip_total = 0.0f;
-    float total_oop_w = 0.0f, total_ip_w = 0.0f;
+    const double mass = fold_blocker::legal_joint_mass(
+        iso_, board_to_mask(base_cfg_.board.data(), base_cfg_.board_size),
+        root_reach_oop_, root_reach_ip_);
+    double br_oop_total = 0.0, br_ip_total = 0.0, ev_total = 0.0;
     for (uint16_t c = 0; c < nc_; ++c) {
-        br_oop_total += root_reach_oop_[c] * cw_[c] * bro[c];
-        br_ip_total  += root_reach_ip_[c]  * cw_[c] * bri[c];
-        total_oop_w  += root_reach_oop_[c] * cw_[c];
-        total_ip_w   += root_reach_ip_[c]  * cw_[c];
+        br_oop_total += static_cast<double>(root_reach_oop_[c]) * cw_[c] * bro[c];
+        br_ip_total  += static_cast<double>(root_reach_ip_[c])  * cw_[c] * bri[c];
     }
-    float denom = total_oop_w * total_ip_w;
-    float avg_oop = (denom > 1e-6f) ? (br_oop_total / denom) : 0.0f;
-    float avg_ip  = (denom > 1e-6f) ? (br_ip_total  / denom) : 0.0f;
-    float exploit_chips = (avg_oop + avg_ip) / 2.0f;
-    r.exploitability_pct =
-        std::max(0.0f, exploit_chips / std::max(base_cfg_.pot, 1.0f) * 100.0f);
+    if (base_cfg_.rake_rate > 0.0f && base_cfg_.rake_cap > 0.0f) {
+        std::vector<float> ev_ip;
+        ev(0, 1, root_reach_oop_, root_reach_ip_, ev_ip);
+        for (uint16_t c = 0; c < nc_; ++c) {
+            ev_total += static_cast<double>(root_reach_oop_[c]) * cw_[c] * r.root_value_oop[c];
+            ev_total += static_cast<double>(root_reach_ip_[c])  * cw_[c] * ev_ip[c];
+        }
+    }
+    const double exploit_chips = (mass > 0.0)
+        ? (br_oop_total + br_ip_total - ev_total) / (2.0 * mass) : 0.0;
+    r.exploitability_pct = std::max(0.0f, static_cast<float>(
+        exploit_chips / std::max(static_cast<double>(base_cfg_.pot), 1.0) * 100.0));
 
     // Stage 5: stitch the UI navigation strategy tree (trunk flop betting +
     // every turn subgame spliced under the turn chance). Off by default.
@@ -1724,7 +1783,11 @@ inline DecompositionEstimate estimate_decomposition(const SolverConfig& cfg,
     // their per-iteration ops and matchup cells scale with the PARENT nc² —
     // pricing them at the subgame board's own (finer) iso over-counted 4×
     // on the calibration spot.
-    IsomorphismMapping iso = compute_isomorphism(cfg.board.data(), cfg.board_size);
+    IsoConstraints iso_c;
+    iso_c.oop_weights = &cfg.oop_range_weights;
+    iso_c.ip_weights  = &cfg.ip_range_weights;
+    iso_c.node_locks  = &cfg.node_locks;
+    IsomorphismMapping iso = compute_isomorphism(cfg.board.data(), cfg.board_size, &iso_c);
     const uint64_t nc = iso.num_canonical;
 
     GameTreeBuilder builder(cfg);

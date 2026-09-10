@@ -18,10 +18,16 @@ if(NOT EXE)
   message(FATAL_ERROR "pass -DEXE=<deepsolver_core path>")
 endif()
 
+# 2026-09-09: the corrected betting tree enumerates this flop to 1.12M nodes
+# (32.8 GB of VRAM), so the state gate collapses it and quotes its budget in
+# the `diagnostic` string. Without an explicit budget that number is the
+# free-VRAM probe (cudaMemGetInfo × 0.80), which legitimately wobbles by a
+# few MB between runs — pin it so the only thing this test can catch is a
+# real solver nondeterminism.
 set(ARGS
   --pot 100 --stack 500 --board AsKd2c
   --iterations 30 --postsolve none
-  --backend gpu --dcfr-schedule standard
+  --backend gpu --dcfr-schedule standard --gpu-memory-mb 24000
   --node-locks "[{\"history\":\"\",\"combo\":\"AhKh\",\"strategy\":[1,0,0,0]}]")
 
 foreach(run 1 2)

@@ -906,6 +906,7 @@ std::string result_to_json(
         json << "    \"live_combos\": " << r.live_combos << ",\n";
         json << "    \"tree_nodes\": " << r.tree_nodes << ",\n";
         json << "    \"player_nodes\": " << r.player_nodes << ",\n";
+        json << "    \"matchup_equity_tables\": " << r.matchup_equity_tables << ",\n";
         json << "    \"estimated_matchup_bytes\": " << r.estimated_matchup_bytes << ",\n";
         json << "    \"estimated_cpu_state_bytes\": " << r.estimated_cpu_state_bytes << ",\n";
         json << "    \"estimated_gpu_state_bytes\": " << r.estimated_gpu_state_bytes << ",\n";
@@ -1842,6 +1843,7 @@ int main(int argc, char* argv[]) {
                       << "    \"live_combos\": " << r.live_combos << ",\n"
                       << "    \"tree_nodes\": " << r.tree_nodes << ",\n"
                       << "    \"player_nodes\": " << r.player_nodes << ",\n"
+                      << "    \"matchup_equity_tables\": " << r.matchup_equity_tables << ",\n"
                       << "    \"estimated_matchup_bytes\": " << r.estimated_matchup_bytes << ",\n"
                       << "    \"estimated_cpu_state_bytes\": " << r.estimated_cpu_state_bytes << ",\n"
                       << "    \"estimated_gpu_state_bytes\": " << r.estimated_gpu_state_bytes << ",\n"

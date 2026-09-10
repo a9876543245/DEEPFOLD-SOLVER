@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cmath>
 #include <mutex>
 #include <sstream>
@@ -136,6 +137,8 @@ void launch_terminal_level(
     int perspective,
     float rake_rate,
     float rake_cap,
+    const float* d_equity_concat,
+    const int32_t* d_equity_slot,
     float* d_node_values);
 
 void launch_rank_blocker_terminal_level(
@@ -159,6 +162,66 @@ void launch_rank_blocker_terminal_level(
     uint16_t nc,
     uint16_t max_bucket_count,
     int perspective,
+    float rake_rate,
+    float rake_cap,
+    const float* d_equity_concat,
+    const int32_t* d_equity_slot,
+    float* d_node_values);
+
+// 2026-09-10: batched equity showdowns (eval_kernel.cu). One launch settles
+// every partial-board SHOWDOWN terminal of a traverser pass as a GEMM.
+void launch_equity_showdown_gemm(
+    const EquityTile* d_tiles,
+    uint32_t num_tiles,
+    const uint32_t* d_eq_terminal_order,
+    const float* d_pots,
+    const uint32_t* d_value_row,
+    const float* d_matrix_concat,
+    int index_by_runout,
+    const float* d_canonical_weights,
+    const float* d_reach_opp_base,
+    uint16_t nc,
+    float rake_rate,
+    float rake_cap,
+    int coef_kind,
+    int accumulate,
+    float* d_node_values);
+
+// 2026-09-10: dedicated fold kernel for rank-blocker boards (eval_kernel.cu).
+void launch_fold_blocker_terminals(
+    const uint8_t* d_terminal_types,
+    const float* d_pots,
+    const uint32_t* d_parent_indices,
+    const float* d_bet_into,
+    const int32_t* d_matchup_idx,
+    const uint32_t* d_value_row,
+    const uint32_t* d_fold_terminal_order,
+    uint32_t num_fold_terminals,
+    const uint16_t* d_combo_bucket,
+    const uint8_t* d_combo_card0,
+    const uint8_t* d_combo_card1,
+    uint32_t num_runouts,
+    const float* d_reach_opp_base,
+    uint16_t nc,
+    int perspective,
+    float rake_rate,
+    float rake_cap,
+    float* d_node_values);
+
+void launch_equity_rb_compat_add(
+    const uint32_t* d_eq_terminal_order,
+    uint32_t num_eq_terminals,
+    const float* d_pots,
+    const int32_t* d_matchup_idx,
+    const uint32_t* d_value_row,
+    const uint16_t* d_combo_bucket,
+    const uint8_t* d_combo_card0,
+    const uint8_t* d_combo_card1,
+    const uint32_t* d_card_off,
+    const uint16_t* d_card_list,
+    uint32_t num_runouts,
+    const float* d_reach_opp_base,
+    uint16_t nc,
     float rake_rate,
     float rake_cap,
     float* d_node_values);
@@ -220,6 +283,17 @@ struct DeviceMatchup {
     uint16_t* rb_card_list       = nullptr;  // [2*nc] canonical combos using each card
     uint16_t  rb_max_bucket_count = 0;       // max over runouts (shared-mem sizing)
     bool      rb_valid           = false;
+
+    // 2026-09-09 audit P0: partial-board showdown equity tables, packed
+    // [num_equity_tables × nc × nc], with equity_slot[mi] ∈ {slot, −1}.
+    // Uploaded on EVERY plan — the rank blocker cannot represent a showdown
+    // with cards still to come.
+    float*    equity             = nullptr;
+    int32_t*  equity_slot        = nullptr;  // [num_runouts]
+    uint32_t  num_equity_tables  = 0;
+    // Host copy of equity_slot so prepare() can split the equity showdowns
+    // out of the per-terminal launch (see DeviceEquityBatch).
+    std::vector<int32_t> host_equity_slot;
 };
 
 /// Per-player root-level reach probabilities, on device.
@@ -326,6 +400,25 @@ struct DeviceLevels {
     // pass, which is what the reach buffers need before they can be windowed.
     uint32_t* terminal_order = nullptr;  // [num_terminals]
     uint32_t  num_terminals  = 0;
+
+    // 2026-09-10: on rank-blocker boards the FOLD terminals leave
+    // terminal_order for fold_blocker_terminal_kernel (eval_kernel.cu); on dense-
+    // plan boards this list is empty and the dense kernel keeps them.
+    uint32_t* fold_order = nullptr;      // [num_folds]
+    uint32_t  num_folds  = 0;
+};
+
+/// 2026-09-10: batched partial-board (equity) showdowns. Every SHOWDOWN
+/// terminal whose table still has cards to come is pulled OUT of
+/// levels.terminal_order and settled by ONE GEMM launch per traverser pass
+/// (eval_kernel.cu::equity_showdown_gemm_kernel) instead of streaming the
+/// nc² equity table once per terminal. `terminal_order` lists them grouped
+/// by equity table; `tiles` cuts each group into ≤64-terminal spans.
+struct DeviceEquityBatch {
+    uint32_t*        terminal_order = nullptr;  // [num_terminals]
+    uint32_t         num_terminals  = 0;
+    gpu::EquityTile* tiles          = nullptr;  // [num_tiles]
+    uint32_t         num_tiles      = 0;
 };
 
 // ---- Generic upload helpers ----
@@ -415,7 +508,8 @@ static DeviceMatchup upload_matchup(
     const std::vector<std::vector<float>>& ev_per_runout,
     const std::vector<std::vector<float>>& valid_per_runout,
     const std::vector<uint16_t>& weights,
-    bool materialize_dense)
+    bool materialize_dense,
+    const std::vector<std::vector<float>>* equity_per_runout = nullptr)
 {
     DeviceMatchup dm;
     dm.num_canonical = static_cast<uint16_t>(weights.size());
@@ -423,6 +517,35 @@ static DeviceMatchup upload_matchup(
 
     size_t per_table = static_cast<size_t>(dm.num_canonical) * dm.num_canonical;
     size_t total     = per_table * dm.num_runouts;
+
+    // 2026-09-09 audit P0: equity tables for partial-board showdowns. Packed
+    // by slot so only the tables that exist cost VRAM; independent of the
+    // dense-upload decision.
+    if (equity_per_runout != nullptr && per_table > 0) {
+        std::vector<int32_t> slot(dm.num_runouts, -1);
+        std::vector<uint32_t> tables;
+        for (uint32_t r = 0; r < dm.num_runouts; ++r) {
+            if (r < equity_per_runout->size() &&
+                (*equity_per_runout)[r].size() == per_table) {
+                slot[r] = static_cast<int32_t>(tables.size());
+                tables.push_back(r);
+            }
+        }
+        if (!tables.empty()) {
+            dm.num_equity_tables = static_cast<uint32_t>(tables.size());
+            const size_t bytes = per_table * sizeof(float) * tables.size();
+            CUDA_CHECK(cudaMalloc(&dm.equity, bytes));
+            for (size_t t = 0; t < tables.size(); ++t) {
+                CUDA_CHECK(cudaMemcpy(
+                    dm.equity + t * per_table,
+                    (*equity_per_runout)[tables[t]].data(),
+                    per_table * sizeof(float),
+                    cudaMemcpyHostToDevice));
+            }
+            dm.equity_slot = upload_vector(slot);
+        }
+        dm.host_equity_slot = std::move(slot);
+    }
 
     // On rank-blocker boards the dense EV/valid tables are never read (CFR and
     // postsolve both branch to the rank-blocker kernel when rb_valid), so the
@@ -600,6 +723,10 @@ static void free_matchup(DeviceMatchup& dm) {
     free_device(dm.rb_combo_card1);
     free_device(dm.rb_card_off);
     free_device(dm.rb_card_list);
+    free_device(dm.equity);
+    free_device(dm.equity_slot);
+    dm.num_equity_tables = 0;
+    dm.host_equity_slot.clear();
     dm.rb_max_bucket_count = 0;
     dm.rb_valid = false;
     dm.num_canonical = 0;
@@ -750,9 +877,132 @@ static void free_levels(DeviceLevels& dl) {
     free_device(dl.node_order);
     free_device(dl.level_offsets);
     free_device(dl.terminal_order);
+    free_device(dl.fold_order);
+    dl.num_folds = 0;
     dl.max_depth = 0;
     dl.num_levels = 0;
     dl.num_terminals = 0;
+}
+
+static void free_equity_batch(DeviceEquityBatch& eb) {
+    free_device(eb.terminal_order);
+    // Not free_device(): ADL on gpu::EquityTile* also finds util.cuh's
+    // template and the call becomes ambiguous.
+    if (eb.tiles != nullptr) {
+        CUDA_CHECK(cudaFree(eb.tiles));
+        eb.tiles = nullptr;
+    }
+    eb.num_terminals = 0;
+    eb.num_tiles = 0;
+}
+
+/// Settle every equity showdown of one traverser pass into `nv` (that
+/// traverser's value region). Raked solves add B·compat: card lists on
+/// rank-blocker boards, a second GEMM against the per-runout `valid` table
+/// on dense boards. Exactly one of those is resident by construction (the
+/// plan check in prepare()); neither is a bug worth guessing around.
+static void run_equity_batch(const DeviceTree& tree,
+                             const DeviceMatchup& mu,
+                             const DeviceEquityBatch& eb,
+                             const uint32_t* d_value_row,
+                             const float* reach_opp_base,
+                             uint16_t nc,
+                             const SolverConfig& cfg,
+                             float* nv)
+{
+    using namespace deepsolver::gpu;
+    if (eb.num_tiles == 0) return;
+    launch_equity_showdown_gemm(
+        eb.tiles, eb.num_tiles, eb.terminal_order, tree.pots, d_value_row,
+        mu.equity, /*index_by_runout=*/0, mu.canonical_weights,
+        reach_opp_base, nc, cfg.rake_rate, cfg.rake_cap,
+        /*coef_kind=*/0, /*accumulate=*/0, nv);
+    if (cfg.rake_rate > 0.0f && cfg.rake_cap > 0.0f) {
+        if (mu.rb_valid) {
+            launch_equity_rb_compat_add(
+                eb.terminal_order, eb.num_terminals, tree.pots,
+                tree.matchup_idx, d_value_row,
+                mu.rb_combo_bucket, mu.rb_combo_card0, mu.rb_combo_card1,
+                mu.rb_card_off, mu.rb_card_list, mu.num_runouts,
+                reach_opp_base, nc, cfg.rake_rate, cfg.rake_cap, nv);
+        } else if (mu.matchup_valid != nullptr) {
+            launch_equity_showdown_gemm(
+                eb.tiles, eb.num_tiles, eb.terminal_order, tree.pots,
+                d_value_row, mu.matchup_valid, /*index_by_runout=*/1,
+                mu.canonical_weights, reach_opp_base, nc,
+                cfg.rake_rate, cfg.rake_cap,
+                /*coef_kind=*/1, /*accumulate=*/1, nv);
+        } else {
+            throw std::runtime_error(
+                "GpuBackend: raked equity showdowns need the rank-blocker "
+                "card lists or the dense valid tables on device; neither "
+                "is resident.");
+        }
+    }
+}
+
+/// The terminal launches of ONE traverser pass: rank-blocker showdowns plus
+/// the fold kernel on rank-blocker boards, the dense kernel otherwise, then
+/// the batched equity GEMM. CFR, postsolve and the RB self-check all call this
+/// ONE body. The self-check exists to catch a production launch that drifted,
+/// which it can only do if it runs the production launches: on 2026-09-10 a
+/// fold launch nested inside `if (num_terminals > 0)` never ran on collapsed
+/// trees (their plain list is empty — every showdown is an equity terminal)
+/// while the self-check's private copy of the launches ran, and passed.
+static void run_terminal_pass(const DeviceTree& tree,
+                              const DeviceMatchup& mu,
+                              const DeviceLevels& lv,
+                              const DeviceEquityBatch& eb,
+                              const DeviceReach& reach,
+                              const uint32_t* d_value_row,
+                              const float* reach_opp_base,
+                              uint16_t nc,
+                              int traverser,
+                              const SolverConfig& cfg,
+                              float* nv)
+{
+    using namespace deepsolver::gpu;
+    if (lv.num_terminals > 0) {
+        if (mu.rb_valid) {
+            launch_rank_blocker_terminal_level(
+                tree.node_types, tree.terminal_types, tree.pots,
+                tree.parent_indices, tree.bet_into, tree.matchup_idx,
+                d_value_row, lv.terminal_order, lv.num_terminals,
+                mu.rb_combo_bucket, mu.rb_bucket_count,
+                mu.rb_combo_card0, mu.rb_combo_card1,
+                mu.rb_card_off, mu.rb_card_list,
+                mu.num_runouts, reach_opp_base, nc,
+                mu.rb_max_bucket_count, traverser,
+                cfg.rake_rate, cfg.rake_cap,
+                mu.equity, mu.equity_slot, nv);
+        } else {
+            // B1b inc 1: whichever reach the terminals read, walk THAT
+            // player's live list. Getting these two out of step would
+            // silently drop or double-count opponent hands.
+            const uint16_t* opp_live = (traverser == 0) ? reach.live_ip
+                                                       : reach.live_oop;
+            const uint16_t  num_opp_live = (traverser == 0) ? reach.num_live_ip
+                                                           : reach.num_live_oop;
+            launch_terminal_level(
+                tree.node_types, tree.terminal_types, tree.pots,
+                tree.parent_indices, tree.bet_into, tree.matchup_idx,
+                d_value_row, lv.terminal_order, lv.num_terminals,
+                mu.matchup_ev, mu.matchup_valid, mu.canonical_weights,
+                mu.num_runouts, reach_opp_base, opp_live, num_opp_live,
+                nc, traverser, cfg.rake_rate, cfg.rake_cap,
+                mu.equity, mu.equity_slot, nv);
+        }
+    }
+    if (mu.rb_valid && lv.num_folds > 0) {
+        launch_fold_blocker_terminals(
+            tree.terminal_types, tree.pots, tree.parent_indices,
+            tree.bet_into, tree.matchup_idx, d_value_row,
+            lv.fold_order, lv.num_folds,
+            mu.rb_combo_bucket, mu.rb_combo_card0, mu.rb_combo_card1,
+            mu.num_runouts, reach_opp_base, nc, traverser,
+            cfg.rake_rate, cfg.rake_cap, nv);
+    }
+    run_equity_batch(tree, mu, eb, d_value_row, reach_opp_base, nc, cfg, nv);
 }
 
 // ---- Solver state allocation ----
@@ -909,6 +1159,7 @@ struct GpuBackend::Impl {
     DeviceReach       reach{};
     DeviceSolverState state{};
     DeviceLevels      levels{};
+    DeviceEquityBatch eqbatch{};
     DeviceNodeLocks   locks{};
 
     // Host-side copies of level schedule (for iterating on host to launch per-terminal kernels)
@@ -976,6 +1227,7 @@ struct GpuBackend::Impl {
         free_solver_state(state);
         free_locks(locks);
         free_levels(levels);
+        free_equity_batch(eqbatch);
         free_reach(reach);
         free_matchup(matchup);
         free_tree(tree);
@@ -1031,6 +1283,7 @@ void GpuBackend::prepare(const SolverContext& ctx) {
     free_solver_state(impl_->state);
     free_locks(impl_->locks);
     free_levels(impl_->levels);
+    free_equity_batch(impl_->eqbatch);
     free_reach(impl_->reach);
     free_matchup(impl_->matchup);
     free_tree(impl_->tree);
@@ -1100,7 +1353,8 @@ void GpuBackend::prepare(const SolverContext& ctx) {
             }
             impl_->matchup = upload_matchup(
                 *ctx.matchup_ev_per_runout, *ctx.matchup_valid_per_runout,
-                ctx.iso->canonical_weights, materialize_dense);
+                ctx.iso->canonical_weights, materialize_dense,
+                ctx.matchup_equity_per_runout);
         } else {
             // Legacy single-table path (Phase 0/1 callers): no per-runout rank
             // tables, so the rank-blocker never activates -- keep dense.
@@ -1223,8 +1477,72 @@ void GpuBackend::prepare(const SolverContext& ctx) {
                     terminals.push_back(n);
                 }
             }
-            impl_->levels.terminal_order = upload_vector(terminals);
-            impl_->levels.num_terminals  = static_cast<uint32_t>(terminals.size());
+            // 2026-09-10: the partial-board (equity) showdowns leave the
+            // per-terminal launch and go to the batched GEMM — grouped by
+            // equity table, cut into ≤64-terminal tiles (DeviceEquityBatch).
+            // Same `mi` clamp the terminal kernels apply.
+            struct EqTerm { int32_t slot; int32_t mi; uint32_t n; };
+            std::vector<uint32_t> plain_terminals;
+            std::vector<uint32_t> fold_terminals;   // rb boards only
+            std::vector<EqTerm> eq_terms;
+            plain_terminals.reserve(terminals.size());
+            for (uint32_t n : terminals) {
+                int32_t slot = -1;
+                int32_t mi = 0;
+                if (static_cast<TerminalType>(ctx.tree->terminal_types[n]) ==
+                        TerminalType::SHOWDOWN &&
+                    n < ctx.tree->matchup_idx.size()) {
+                    mi = ctx.tree->matchup_idx[n];
+                    if (mi < 0 || static_cast<uint32_t>(mi) >=
+                                      impl_->matchup.num_runouts) {
+                        mi = 0;
+                    }
+                    const auto& hslot = impl_->matchup.host_equity_slot;
+                    if (static_cast<size_t>(mi) < hslot.size()) {
+                        slot = hslot[static_cast<size_t>(mi)];
+                    }
+                }
+                if (slot >= 0) {
+                    eq_terms.push_back({slot, mi, n});
+                } else if (impl_->matchup.rb_valid &&
+                           static_cast<TerminalType>(ctx.tree->terminal_types[n]) !=
+                               TerminalType::SHOWDOWN) {
+                    fold_terminals.push_back(n);   // fold_blocker_terminal_kernel
+                } else {
+                    plain_terminals.push_back(n);
+                }
+            }
+            std::stable_sort(eq_terms.begin(), eq_terms.end(),
+                             [](const EqTerm& a, const EqTerm& b) {
+                                 return a.slot < b.slot;
+                             });
+            std::vector<uint32_t> eq_order;
+            std::vector<gpu::EquityTile> eq_tiles;
+            eq_order.reserve(eq_terms.size());
+            for (const EqTerm& t : eq_terms) eq_order.push_back(t.n);
+            for (size_t i = 0; i < eq_terms.size();) {
+                size_t j = i;
+                while (j < eq_terms.size() && j - i < 64 &&
+                       eq_terms[j].slot == eq_terms[i].slot) {
+                    ++j;
+                }
+                eq_tiles.push_back({eq_terms[i].slot, eq_terms[i].mi,
+                                    static_cast<uint32_t>(i),
+                                    static_cast<uint32_t>(j)});
+                i = j;
+            }
+            impl_->levels.terminal_order = upload_vector(plain_terminals);
+            impl_->levels.num_terminals  =
+                static_cast<uint32_t>(plain_terminals.size());
+            impl_->levels.fold_order = upload_vector(fold_terminals);
+            impl_->levels.num_folds  =
+                static_cast<uint32_t>(fold_terminals.size());
+            impl_->eqbatch.terminal_order = upload_vector(eq_order);
+            impl_->eqbatch.num_terminals  =
+                static_cast<uint32_t>(eq_order.size());
+            impl_->eqbatch.tiles          = upload_vector(eq_tiles);
+            impl_->eqbatch.num_tiles      =
+                static_cast<uint32_t>(eq_tiles.size());
 
             // B3 inc 1: the value buffer's row map. node_values was [N][nc];
             // it is now a two-region buffer and every consumer indexes through
@@ -1340,6 +1658,7 @@ void GpuBackend::prepare(const SolverContext& ctx) {
         free_solver_state(impl_->state);
         free_locks(impl_->locks);
         free_levels(impl_->levels);
+        free_equity_batch(impl_->eqbatch);
         free_reach(impl_->reach);
         free_matchup(impl_->matchup);
         free_tree(impl_->tree);
@@ -1588,54 +1907,15 @@ void GpuBackend::iterate(int iteration) {
 
         float* reach_opp_base = (traverser == 0) ? I.state.reach_scratch_ip
                                                   : I.state.reach_scratch_oop;
-        // B1b inc 1: whichever reach the terminals read, walk THAT player's
-        // live list. Getting these two out of step would silently drop or
-        // double-count opponent hands.
-        const uint16_t* opp_live = (traverser == 0) ? I.reach.live_ip
-                                                   : I.reach.live_oop;
-        const uint16_t  num_opp_live = (traverser == 0) ? I.reach.num_live_ip
-                                                       : I.reach.num_live_oop;
-
-        // All terminals in ONE launch. Their value depends only on reach —
-        // which the forward pass has already finished — so they do not need to
-        // be interleaved with the level sweep, and keeping them out of it is
-        // what keeps the depth-keyed schedule from paying 9-13× the launch
-        // overhead on small trees.
-        if (I.levels.num_terminals > 0) {
-            if (I.matchup.rb_valid) {
-                launch_rank_blocker_terminal_level(
-                    I.tree.node_types, I.tree.terminal_types, I.tree.pots,
-                    I.tree.parent_indices, I.tree.bet_into, I.tree.matchup_idx,
-                    I.state.value_row,
-                    I.levels.terminal_order, I.levels.num_terminals,
-                    I.matchup.rb_combo_bucket, I.matchup.rb_bucket_count,
-                    I.matchup.rb_combo_card0, I.matchup.rb_combo_card1,
-                    I.matchup.rb_card_off, I.matchup.rb_card_list,
-                    I.matchup.num_runouts, reach_opp_base, nc,
-                    I.matchup.rb_max_bucket_count, traverser,
-                    I.config->rake_rate, I.config->rake_cap,
-                    nv);
-            } else {
-                launch_terminal_level(
-                    I.tree.node_types,
-                    I.tree.terminal_types,
-                    I.tree.pots,
-                    I.tree.parent_indices,
-                    I.tree.bet_into,
-                    I.tree.matchup_idx,
-                    I.state.value_row,
-                    I.levels.terminal_order, I.levels.num_terminals,
-                    I.matchup.matchup_ev,
-                    I.matchup.matchup_valid,
-                    I.matchup.canonical_weights,
-                    I.matchup.num_runouts,
-                    reach_opp_base,
-                    opp_live, num_opp_live,
-                    nc, traverser,
-                    I.config->rake_rate, I.config->rake_cap,
-                    nv);
-            }
-        }
+        // All terminals in a handful of launches (rank-blocker showdowns,
+        // folds, equity GEMM — see run_terminal_pass). Their value depends
+        // only on reach, which the forward pass has already finished, so
+        // they do not need to be interleaved with the level sweep, and
+        // keeping them out of it is what keeps the depth-keyed schedule
+        // from paying 9-13× the launch overhead on small trees.
+        run_terminal_pass(I.tree, I.matchup, I.levels, I.eqbatch, I.reach,
+                          I.state.value_row, reach_opp_base, nc, traverser,
+                          *I.config, nv);
 
         // Strategy_sum update — branch on schedule (decay-and-add for
         // POSTFLOP, accumulative reach-weighted for STANDARD).
@@ -1733,17 +2013,14 @@ void GpuBackend::iterate(int iteration) {
                 (trav == 0) ? I.reach.live_ip : I.reach.live_oop,
                 (trav == 0) ? I.reach.num_live_ip : I.reach.num_live_oop,
                 nc, trav,
-                I.config->rake_rate, I.config->rake_cap, d_dense);
-            launch_rank_blocker_terminal_level(
-                I.tree.node_types, I.tree.terminal_types, I.tree.pots,
-                I.tree.parent_indices, I.tree.bet_into, I.tree.matchup_idx,
-                I.state.value_row, d_level, count,
-                I.matchup.rb_combo_bucket, I.matchup.rb_bucket_count,
-                I.matchup.rb_combo_card0, I.matchup.rb_combo_card1,
-                I.matchup.rb_card_off, I.matchup.rb_card_list,
-                I.matchup.num_runouts, reach_opp, nc,
-                I.matchup.rb_max_bucket_count, trav,
-                I.config->rake_rate, I.config->rake_cap, d_rb);
+                I.config->rake_rate, I.config->rake_cap,
+                I.matchup.equity, I.matchup.equity_slot, d_dense);
+            // The other side is the PRODUCTION terminal pass (rank-blocker
+            // showdowns + fold kernel + equity GEMM over the production
+            // lists), so a drifted production launch shows up here.
+            run_terminal_pass(I.tree, I.matchup, I.levels, I.eqbatch, I.reach,
+                              I.state.value_row, reach_opp, nc, trav,
+                              *I.config, d_rb);
             CUDA_CHECK(cudaDeviceSynchronize());
             std::vector<float> hd(span), hr(span);
             CUDA_CHECK(cudaMemcpy(hd.data(), d_dense, span * sizeof(float),
@@ -1766,12 +2043,15 @@ void GpuBackend::iterate(int iteration) {
             }
             std::fprintf(stderr,
                 "[RB-SELFCHECK] trav=%d nc=%u runouts=%u maxB=%u terminals=%u "
+                "eq_gemm=%u folds=%u "
                 "max_abs_diff=%.6g (node=%u combo=%u dense=%.6g rb=%.6g) "
                 "sum|dense|=%.6g\n",
                 trav, static_cast<unsigned>(nc),
                 static_cast<unsigned>(I.matchup.num_runouts),
                 static_cast<unsigned>(I.matchup.rb_max_bucket_count),
-                static_cast<unsigned>(count), max_abs,
+                static_cast<unsigned>(count),
+                static_cast<unsigned>(I.eqbatch.num_terminals),
+                static_cast<unsigned>(I.levels.num_folds), max_abs,
                 static_cast<unsigned>(worst_node),
                 static_cast<unsigned>(worst_c),
                 static_cast<double>(
@@ -1808,7 +2088,26 @@ void GpuBackend::iterate(int iteration) {
     run_backward_fused();
     if (kIterHash) dump_traverser_hashes("fused");
 
-    // Wait for all kernels to complete before next iteration
+    // 2026-09-10: no per-iteration device sync. Measured on the collapsed
+    // full-menu rainbow, A/B against the synchronizing build with identical
+    // outputs: 0.474 -> 0.459 ms/iter on the app's real ranges (live union
+    // 261), 2.52 -> 2.50 ms at nc 1176 - a small stall, not the 10 ms a
+    // first profile showed (that was another process hogging the GPU).
+    // The stream keeps iterations ordered, the launch queue bounds how far
+    // the host can run ahead, probes and finalize() synchronize on their
+    // own, and Solver::solve() calls synchronize() after the loop so the
+    // timing stays honest. cudaStreamQuery is the non-blocking way to make
+    // the driver submit what is queued instead of waiting for its buffer
+    // to fill; cudaErrorNotReady is its normal answer, not an error.
+    {
+        const cudaError_t q = cudaStreamQuery(0);
+        if (q != cudaSuccess && q != cudaErrorNotReady) CUDA_CHECK(q);
+        (void)cudaGetLastError();
+    }
+}
+
+void GpuBackend::synchronize() {
+    if (!impl_->prepared) return;
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
@@ -1900,6 +2199,19 @@ void GpuBackend::finalize() {
     impl_->finalized = true;
 }
 
+bool GpuBackend::finalize_for_probe() {
+    if (!impl_->prepared) {
+        throw std::runtime_error(
+            "GpuBackend::finalize_for_probe called before prepare()");
+    }
+    // run_postsolve_pass() normalizes strategy_sum on the device
+    // (kStratSrcSum); the host strategy that finalize() downloads and
+    // normalizes is only needed by CPU consumers. Marking the state
+    // postsolve-ready is the whole job.
+    impl_->finalized = true;
+    return true;
+}
+
 // ============================================================================
 // GPU postsolve: per-combo EV and best response at root.
 //
@@ -1965,44 +2277,8 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
     //    node_values directly (sum-mode for EV, max-at-traverser for BR).
     float* reach_opp_base = (traverser == 0) ? state.reach_scratch_ip
                                               : state.reach_scratch_oop;
-    const uint16_t* opp_live = (traverser == 0) ? reach.live_ip : reach.live_oop;
-    const uint16_t  num_opp_live =
-        (traverser == 0) ? reach.num_live_ip : reach.num_live_oop;
-    if (levels.num_terminals > 0) {
-        if (matchup.rb_valid) {
-            launch_rank_blocker_terminal_level(
-                tree.node_types, tree.terminal_types, tree.pots,
-                tree.parent_indices, tree.bet_into, tree.matchup_idx,
-                state.value_row,
-                levels.terminal_order, levels.num_terminals,
-                matchup.rb_combo_bucket, matchup.rb_bucket_count,
-                matchup.rb_combo_card0, matchup.rb_combo_card1,
-                matchup.rb_card_off, matchup.rb_card_list,
-                matchup.num_runouts, reach_opp_base, nc,
-                matchup.rb_max_bucket_count, traverser,
-                config->rake_rate, config->rake_cap,
-                state.node_values);
-        } else {
-            launch_terminal_level(
-                tree.node_types,
-                tree.terminal_types,
-                tree.pots,
-                tree.parent_indices,
-                tree.bet_into,
-                tree.matchup_idx,
-                state.value_row,
-                levels.terminal_order, levels.num_terminals,
-                matchup.matchup_ev,
-                matchup.matchup_valid,
-                matchup.canonical_weights,
-                matchup.num_runouts,
-                reach_opp_base,
-                opp_live, num_opp_live,
-                nc, traverser,
-                config->rake_rate, config->rake_cap,
-                state.node_values);
-        }
-    }
+    run_terminal_pass(tree, matchup, levels, eqbatch, reach, state.value_row,
+                      reach_opp_base, nc, traverser, *config, state.node_values);
 
     const uint32_t num_levels = levels.num_levels;
     for (int L = static_cast<int>(num_levels) - 1; L >= 0; --L) {
@@ -2053,9 +2329,10 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
     return root_values;
 }
 
-std::vector<float> GpuBackend::compute_combo_evs_gpu() {
+std::vector<float> GpuBackend::compute_combo_evs_gpu(int perspective) {
     if (!impl_->prepared || !impl_->finalized) return {};
-    return impl_->run_postsolve_pass(/*traverser=*/0, /*best_response=*/false);
+    if (perspective != 0 && perspective != 1) return {};
+    return impl_->run_postsolve_pass(perspective, /*best_response=*/false);
 }
 
 std::vector<float> GpuBackend::compute_best_response_gpu(int player) {

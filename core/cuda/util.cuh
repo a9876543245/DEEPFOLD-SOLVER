@@ -68,6 +68,19 @@ private:
     cudaError_t code_;
 };
 
+/// 2026-09-10: one block-tile of the batched equity-showdown GEMM
+/// (eval_kernel.cu::equity_showdown_gemm_kernel). Terminals
+/// [t_begin, t_end) of the equity terminal list share the equity table
+/// `eq_slot` (packed slot) == runout `mi` (for the per-runout `valid` table).
+/// Spans are cut to at most kEqTileM (64) terminals by the host.
+struct EquityTile {
+    int32_t  eq_slot;
+    int32_t  mi;
+    uint32_t t_begin;
+    uint32_t t_end;
+};
+
+
 } // namespace gpu
 } // namespace deepsolver
 

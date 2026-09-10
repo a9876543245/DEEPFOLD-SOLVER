@@ -1592,6 +1592,55 @@ static void test_showdown_oop_full_batch() {
     }
 }
 
+// 2026-09-10: equity-table build kernel. Integer arithmetic, so the naive
+// reference, the scalar kernel and the AVX2 kernel must agree bit for bit —
+// including the unaligned `begin` offsets and the <16-lane tails the caller
+// produces (begin = a + 1 for every hand a).
+static void test_equity_sign_accumulate() {
+    static const std::vector<std::size_t> kLens =
+        {1, 7, 8, 15, 16, 17, 33, 200, 1176, 1185};
+    std::uniform_int_distribution<int> drank(1, 7462);
+    std::uniform_int_distribution<int> dalive(0, 1);
+    std::uniform_int_distribution<int> dacc(-1200, 1200);
+    for (auto n : kLens) {
+        std::vector<int16_t> ranks(n), alive(n), base(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            ranks[i] = static_cast<int16_t>(drank(rng()));
+            alive[i] = dalive(rng()) ? static_cast<int16_t>(-1) : static_cast<int16_t>(0);
+            base[i]  = static_cast<int16_t>(dacc(rng()));
+        }
+        if (n > 4) {   // duplicate ranks so ties are exercised
+            ranks[1] = ranks[0];
+            ranks[n - 1] = ranks[n / 2];
+        }
+        const std::size_t begins[4] = {0, 1, n / 3, n - 1};
+        for (std::size_t begin : begins) {
+            if (begin > n) continue;
+            const int16_t ra = ranks[begin < n ? begin : 0];
+            std::vector<int16_t> ref = base, sc = base, av = base;
+            for (std::size_t b = begin; b < n; ++b) {
+                const int sgn = (ra < ranks[b]) ? 1 : (ra > ranks[b]) ? -1 : 0;
+                if (alive[b]) ref[b] = static_cast<int16_t>(ref[b] + sgn);
+            }
+            scalar_kernels.equity_sign_accumulate(
+                ranks.data(), alive.data(), sc.data(), begin, n, ra);
+            avx2_kernels.equity_sign_accumulate(
+                ranks.data(), alive.data(), av.data(), begin, n, ra);
+            for (std::size_t b = 0; b < n; ++b) {
+                const std::string where = " (n=" + std::to_string(n)
+                    + " begin=" + std::to_string(begin)
+                    + " b=" + std::to_string(b) + ")";
+                if (sc[b] != ref[b]) {
+                    fail("equity_sign_accumulate scalar != reference" + where);
+                }
+                if (av[b] != ref[b]) {
+                    fail("equity_sign_accumulate avx2 != reference" + where);
+                }
+            }
+        }
+    }
+}
+
 static void test_showdown_ip_full() {
     static const std::vector<std::size_t> kFullLengths = {1, 7, 8, 16, 32, 200, 1176};
     for (auto n : kFullLengths) {
@@ -1988,6 +2037,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
     RUN_TEST(test_showdown_ip_full);
     RUN_TEST(test_showdown_signed_count_weighted_formula);
     RUN_TEST(test_showdown_oop_full_batch);
+    RUN_TEST(test_equity_sign_accumulate);
     RUN_TEST(test_edge_case_zero_input);
     RUN_TEST(test_edge_case_all_invalid_showdown);
 

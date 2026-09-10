@@ -551,20 +551,34 @@ static void test_parity_iso_rank_blocker_enumerated() {
 // just need ref vs lvl agreement to gate against drift).
 // ----------------------------------------------------------------------------
 
+// `ip_full_range` keeps IP at 100% and narrows only OOP.
+//
+// B1b increment 2 (v2.7.0) is why that flag has to exist. The index space is
+// now COMPACTED to the UNION of the two players' live hands, so a range that is
+// narrow on BOTH sides yields a 100%-dense space and the out-of-range skip
+// machinery these fixtures exist to test stops engaging altogether — measured
+// on the narrow fixture: nc 1176 -> live 33, oop_active_count 33 == nc, and
+// sparse_traversal / terminal_active_list / active_blocks ALL false. The
+// fixtures kept passing while testing nothing.
+//
+// What compaction cannot remove is ASYMMETRY: a sparse side inside a full-range
+// union. `CliHostDenseMatchupSkip` needed exactly this rework for exactly this
+// reason (ROADMAP §2(3-bis)); these two were missed.
 static void apply_uniform_grid_labels(
     SolverConfig& sc,
-    std::initializer_list<const char*> labels)
+    std::initializer_list<const char*> labels,
+    bool ip_full_range = false)
 {
     sc.has_custom_ranges = true;
     sc.oop_range_weights.fill(0.0f);
-    sc.ip_range_weights.fill(0.0f);
+    sc.ip_range_weights.fill(ip_full_range ? 1.0f : 0.0f);
     const auto& combo_table = get_combo_table();
     for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
         const std::string grid = combo_to_grid_label(combo_table[i]);
         for (const char* label : labels) {
             if (grid == label) {
                 sc.oop_range_weights[i] = 1.0f;
-                sc.ip_range_weights[i]  = 1.0f;
+                if (!ip_full_range) sc.ip_range_weights[i] = 1.0f;
                 break;
             }
         }
@@ -588,11 +602,12 @@ static void test_parity_narrow_range_skip() {
         sc.exploitability_check_interval = 1000;
         sc.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
 
-        // Narrow ranges — set most combos to 0 weight so the skip mask
-        // fires on the bulk of the canonical-combo space.
+        // Narrow OOP (33 combos = 2.8% of nc) against a FULL IP range, so the
+        // skip mask fires on the bulk of the space and compaction stays inert.
+        // Symmetric narrow ranges do NOT work here any more — see the helper.
         apply_uniform_grid_labels(sc, {
             "AA", "KK", "QQ", "JJ", "TT", "AKs", "AKo"
-        });
+        }, /*ip_full_range=*/true);
         return sc;
     };
 
@@ -611,7 +626,26 @@ static void test_parity_narrow_range_skip() {
     std::cout << "  narrow ref  exploit=" << r_ref.exploitability_pct
               << "%  AhKh ev=" << akh_ref.ev << "\n";
     std::cout << "  narrow lvl  exploit=" << r_lvl.exploitability_pct
-              << "%  AhKh ev=" << akh_lvl.ev << "\n";
+              << "%  AhKh ev=" << akh_lvl.ev
+              << "  [" << r_lvl.timing.tree_nodes << " nodes, oop_active="
+              << r_lvl.cpu_diagnostics.oop_active_count << "]\n";
+
+    // Topology pin. B1b inc 2 flipped this fixture from a 549-node collapsed
+    // tree to a 627,726-node enumerated one (compaction shrank nc 1176 -> 33,
+    // so the runout gate let it through) and its runtime from 30 ms to 17.7 s,
+    // which is half of why CpuParityFast blew its 30 s timeout. The fixture is
+    // about RANGE handling, not runout topology, so pin the topology and fail
+    // loudly rather than silently paying for a tree it does not need.
+    assert_true(r_ref.runout_approximated,
+                "narrow range: tree must COLLAPSE runouts (ref)");
+    assert_true(r_lvl.runout_approximated,
+                "narrow range: tree must COLLAPSE runouts (lvl)");
+
+    // Engagement pin. Without this the fixture passes while testing nothing —
+    // which is exactly what it did from v2.7.0 until this assert was added.
+    assert_true(r_lvl.cpu_diagnostics.oop_sparse_traversal,
+                "narrow range: levelized must take the SPARSE traversal path "
+                "- the skip machinery this fixture exists to test is inert");
 
     assert_near(akh_ref.ev, akh_lvl.ev, 0.05f,
                 "narrow range: AhKh EV must match within 0.05 chip");
@@ -629,7 +663,21 @@ static void test_parity_medium_sparse_range() {
     auto make_cfg = []() {
         SolverConfig sc;
         sc.pot = 100.0f;
-        sc.effective_stack = 500.0f;
+        // SPR 2, not the 5 this fixture used before. Once IP went full-range
+        // (below) the SPR-5 spot became near-indifferent between check and
+        // bet, and ref/lvl separated by ~0.8pp at 60 iters — inside the noise
+        // this engine is documented to have (the FORCE_DENSE control pair,
+        // equivalent BY CONSTRUCTION, moves root frequencies up to 47pp) but
+        // outside this fixture's 0.5pp bar. Shortening the SPR is the same
+        // lever test_parity_river_no_chance already uses, and it keeps the bar
+        // tight instead of widening it: agreement is 0.1pp here.
+        //
+        // If this fixture ever fails, check whether it is indifference or a
+        // real kernel divergence before touching the tolerance: run the same
+        // ranges symmetrically with DEEPSOLVER_B1B_COMPACT=0, which is the
+        // pre-v2.7.0 shape, and the active-list kernel reproduces the
+        // reference to 0.1pp there.
+        sc.effective_stack = 200.0f;
         sc.board_size = 3;
         auto board = parse_board("AsKd7c");
         for (size_t i = 0; i < 3; ++i) sc.board[i] = board[i];
@@ -638,7 +686,10 @@ static void test_parity_medium_sparse_range() {
         sc.exploitability_check_interval = 1000;
         sc.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
 
-        // Active-list should fire here, but sparse traversal should not.
+        // Active-list should fire here, but sparse traversal should not
+        // (169 combos = 14.4% of nc, above the 12.5% sparse threshold).
+        // IP stays full so compaction cannot dissolve the premise — see the
+        // helper's comment.
         apply_uniform_grid_labels(sc, {
             "AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66",
             "55", "44", "33", "22",
@@ -646,7 +697,7 @@ static void test_parity_medium_sparse_range() {
             "A5s", "A4s", "A3s", "A2s",
             "KQs", "KJs", "KTs", "QJs", "QTs", "JTs", "T9s", "98s", "87s",
             "AKo", "AQo", "AJo", "KQo"
-        });
+        }, /*ip_full_range=*/true);
         return sc;
     };
 
@@ -665,7 +716,24 @@ static void test_parity_medium_sparse_range() {
     std::cout << "  medium sparse ref  exploit=" << r_ref.exploitability_pct
               << "%  AhKh ev=" << akh_ref.ev << "\n";
     std::cout << "  medium sparse lvl  exploit=" << r_lvl.exploitability_pct
-              << "%  AhKh ev=" << akh_lvl.ev << "\n";
+              << "%  AhKh ev=" << akh_lvl.ev
+              << "  [" << r_lvl.timing.tree_nodes << " nodes, oop_active="
+              << r_lvl.cpu_diagnostics.oop_active_count << "]\n";
+
+    // Same two pins as the narrow fixture. This one was the worse half of the
+    // CpuParityFast timeout: 33 ms collapsed vs 60.0 s enumerated.
+    assert_true(r_ref.runout_approximated,
+                "medium sparse: tree must COLLAPSE runouts (ref)");
+    assert_true(r_lvl.runout_approximated,
+                "medium sparse: tree must COLLAPSE runouts (lvl)");
+
+    // The fixture's whole premise, now asserted instead of assumed: the active
+    // list fires, the sparse traversal does not.
+    assert_true(r_lvl.cpu_diagnostics.oop_terminal_active_list,
+                "medium sparse: levelized must use the terminal ACTIVE LIST");
+    assert_true(!r_lvl.cpu_diagnostics.oop_sparse_traversal,
+                "medium sparse: range is too dense for sparse traversal - if "
+                "this fires the fixture stopped covering the medium regime");
 
     assert_near(akh_ref.ev, akh_lvl.ev, 0.05f,
                 "medium sparse: AhKh EV must match within 0.05 chip");
@@ -705,6 +773,16 @@ static void test_parity_postflop_convergence() {
         sc.target_exploitability = 0.0f;
         sc.exploitability_check_interval = 1000000;
         sc.dcfr_schedule = SolverConfig::DcfrSchedule::POSTFLOP_STYLE;
+        // Topology pin, same reason and same value as
+        // test_parity_flop_limited_sizing. B1b inc 2 (v2.7.0) compacts the
+        // index space to the union live set (nc 1176 -> 169 here), which drops
+        // the memory estimate far enough for the runout gate to ENUMERATE:
+        // 627,726 nodes instead of 549, at 1200 iterations, twice. That is the
+        // whole of the CpuParityExtended timeout. This fixture is about the
+        // POSTFLOP schedule's convergence, not runout topology — and its
+        // "1200 iters reaches <= 2%" calibration was measured on the collapsed
+        // tree, so enumerating silently invalidates the assertion too.
+        sc.memory_budget.host_bytes = 256ULL * 1024ULL * 1024ULL;
         apply_uniform_grid_labels(sc, {
             "AA", "KK", "QQ", "JJ", "TT", "99", "88", "77", "66",
             "55", "44", "33", "22",
@@ -732,6 +810,10 @@ static void test_parity_postflop_convergence() {
               << "%  AhKh ev=" << ar.ev << "\n";
     std::cout << "  postflop lvl  exploit=" << rl.exploitability_pct
               << "%  AhKh ev=" << al.ev << "\n";
+
+    assert_true(rr.runout_approximated && rl.runout_approximated,
+                "postflop: tree must COLLAPSE runouts - the 1200-iter "
+                "convergence bar below is calibrated on the collapsed tree");
 
     assert_near(rr.exploitability_pct, 0.0f, 2.0f,
                 "postflop: reference must converge (exploit <= 2%)");

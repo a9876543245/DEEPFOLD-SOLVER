@@ -50,6 +50,19 @@ inline std::vector<uint32_t> gpu_depth_from_root(const FlatGameTree& tree) {
     return depth;
 }
 
+/// The row formula itself: every terminal plus the widest non-terminal
+/// level of each depth parity. Exposed so Solver::project_enumerated_tree()
+/// can price an enumerated tree it never builds from projected per-level
+/// widths with the SAME arithmetic (2026-09-10).
+inline uint64_t gpu_value_rows_from_widths(uint64_t terminals,
+                                           const std::vector<uint64_t>& nt_width) {
+    uint64_t parity_width[2] = {0, 0};
+    for (std::size_t L = 0; L < nt_width.size(); ++L) {
+        parity_width[L & 1u] = std::max(parity_width[L & 1u], nt_width[L]);
+    }
+    return terminals + parity_width[0] + parity_width[1];
+}
+
 /// Rows in the device value buffer: terminals (all of them) plus the widest
 /// non-terminal level of each depth parity.
 inline uint64_t gpu_value_rows(const FlatGameTree& tree) {
@@ -60,7 +73,7 @@ inline uint64_t gpu_value_rows(const FlatGameTree& tree) {
     uint32_t num_levels = 0;
     for (uint32_t d : depth) num_levels = std::max(num_levels, d + 1u);
 
-    std::vector<uint32_t> nt_width(num_levels, 0);
+    std::vector<uint64_t> nt_width(num_levels, 0);
     uint64_t terminals = 0;
     for (uint32_t n = 0; n < N; ++n) {
         if (static_cast<NodeType>(tree.node_types[n]) == NodeType::TERMINAL) {
@@ -69,12 +82,7 @@ inline uint64_t gpu_value_rows(const FlatGameTree& tree) {
             nt_width[depth[n]]++;
         }
     }
-
-    uint32_t parity_width[2] = {0, 0};
-    for (uint32_t L = 0; L < num_levels; ++L) {
-        parity_width[L & 1u] = std::max(parity_width[L & 1u], nt_width[L]);
-    }
-    return terminals + parity_width[0] + parity_width[1];
+    return gpu_value_rows_from_widths(terminals, nt_width);
 }
 
 }  // namespace deepsolver

@@ -52,6 +52,86 @@ struct IsomorphismMapping {
 // ============================================================================
 
 /**
+ * @brief What a suit permutation must preserve besides the board (2026-09-09
+ *        audit P0: "花色合併沒有保護自訂範圍").
+ *
+ * Two hands may share a canonical slot only if EVERYTHING that defines the
+ * game treats them identically. The board is not enough: a range that holds
+ * Q♣J♣ but not Q♦J♦ on A♠K♠7♥ makes the ♣↔♦ swap a non-symmetry, and merging
+ * the two would silently deal Q♦J♦ into the range (the old reach-init took the
+ * MAX weight over the bucket). The same holds for a node lock placed on one
+ * suit combination only. So a permutation is admitted only when it maps every
+ * combo to a combo of equal OOP weight, equal IP weight, and an identical set
+ * of locks. Symmetric inputs (the normal case) keep the full board group and
+ * the full compression; asymmetric ones fall back — as far as needed, down to
+ * the identity — to an EXACT representation instead of an approximate one.
+ */
+struct IsoConstraints {
+    const std::array<float, NUM_COMBOS>* oop_weights = nullptr;
+    const std::array<float, NUM_COMBOS>* ip_weights  = nullptr;
+    const std::vector<NodeLockEntry>*    node_locks  = nullptr;
+};
+
+/// Permute a card's suit.
+inline Card permute_card(Card c, const std::array<uint8_t, 4>& perm) {
+    return make_card(card_rank(c), static_cast<Suit>(perm[card_suit(c)]));
+}
+
+/// Does `perm` preserve the ranges and locks in `c`? Combos that conflict with
+/// `dead` (the root board) are dead on every board of the tree and ignored.
+inline bool perm_preserves_constraints(
+    const std::array<uint8_t, 4>& perm,
+    const IsoConstraints& c,
+    CardMask dead)
+{
+    const auto& combo_table = get_combo_table();
+    auto image_index = [&](uint16_t i) -> uint16_t {
+        const Combo& cb = combo_table[i];
+        return Combo(permute_card(cb.cards[0], perm),
+                     permute_card(cb.cards[1], perm)).index();
+    };
+    if (c.oop_weights != nullptr || c.ip_weights != nullptr) {
+        for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+            if (combo_table[i].conflicts_with(dead)) continue;
+            const uint16_t j = image_index(i);
+            if (j == i) continue;
+            if (c.oop_weights && (*c.oop_weights)[i] != (*c.oop_weights)[j]) return false;
+            if (c.ip_weights  && (*c.ip_weights)[i]  != (*c.ip_weights)[j])  return false;
+        }
+    }
+    if (c.node_locks != nullptr && !c.node_locks->empty()) {
+        // Every lock (history, combo, strategy) must have its image
+        // (history, perm(combo), same strategy) among the locks.
+        for (const auto& lock : *c.node_locks) {
+            if (lock.combo_idx >= NUM_COMBOS) continue;   // never resolved
+            const uint16_t j = image_index(lock.combo_idx);
+            if (j == lock.combo_idx) continue;
+            bool found = false;
+            for (const auto& other : *c.node_locks) {
+                if (other.combo_idx == j && other.history == lock.history &&
+                    other.strategy == lock.strategy) { found = true; break; }
+            }
+            if (!found) return false;
+        }
+    }
+    return true;
+}
+
+/// The suit permutations that preserve the ranges/locks in `c` — the
+/// board-independent half of every symmetry group in the tree. The tree
+/// builder intersects this with the group fixing each chance node's board.
+inline std::vector<std::array<uint8_t, 4>> suit_perms_preserving_constraints(
+    const IsoConstraints& c, CardMask dead = 0)
+{
+    std::vector<std::array<uint8_t, 4>> out;
+    std::array<uint8_t, 4> perm = {0, 1, 2, 3};
+    do {
+        if (perm_preserves_constraints(perm, c, dead)) out.push_back(perm);
+    } while (std::next_permutation(perm.begin(), perm.end()));
+    return out;
+}
+
+/**
  * @brief Compute the canonical suit mapping for a given board.
  *
  * Algorithm:
@@ -62,9 +142,13 @@ struct IsomorphismMapping {
  *
  * @param board Board cards
  * @param board_size Number of board cards (3-5)
+ * @param constraints Ranges / locks the permutations must also preserve
+ *        (nullptr = board only; see IsoConstraints for why the solver
+ *        never passes nullptr).
  * @return IsomorphismMapping
  */
-inline IsomorphismMapping compute_isomorphism(const Card* board, uint8_t board_size) {
+inline IsomorphismMapping compute_isomorphism(const Card* board, uint8_t board_size,
+                                              const IsoConstraints* constraints = nullptr) {
     IsomorphismMapping result;
 
     // Step 1: Determine which suits appear on the board
@@ -116,7 +200,14 @@ inline IsomorphismMapping compute_isomorphism(const Card* board, uint8_t board_s
         }
 
         if (original_board == permuted_board) {
-            valid_perms.push_back(perm);
+            // 2026-09-09 audit: the ranges and locks must be symmetric under
+            // the permutation too, or the bucket would merge hands the game
+            // distinguishes.
+            if (constraints == nullptr ||
+                perm_preserves_constraints(
+                    perm, *constraints, board_to_mask(board, board_size))) {
+                valid_perms.push_back(perm);
+            }
         }
     } while (std::next_permutation(perm.begin(), perm.end()));
 
@@ -327,12 +418,27 @@ suit_perms_fixing_board(const Card* board, uint8_t board_size) {
  *
  * @param full_board Current full board (config flop + cards dealt so far)
  * @param full_size  Number of cards in full_board (3..5)
+ * @param allowed    Optional: the permutations that preserve the players'
+ *                   ranges and locks (suit_perms_preserving_constraints). The
+ *                   orbit group is then G = {fixes board} ∩ allowed — two
+ *                   runouts may share a child only if the WHOLE subgame is
+ *                   isomorphic, ranges included (2026-09-09 audit P0).
  */
 inline CanonicalRunouts enumerate_canonical_runouts(
-    const Card* full_board, uint8_t full_size)
+    const Card* full_board, uint8_t full_size,
+    const std::vector<std::array<uint8_t, 4>>* allowed = nullptr)
 {
     CanonicalRunouts out;
     auto perms = suit_perms_fixing_board(full_board, full_size);
+    if (allowed != nullptr) {
+        std::vector<std::array<uint8_t, 4>> kept;
+        for (const auto& p : perms) {
+            if (std::find(allowed->begin(), allowed->end(), p) != allowed->end()) {
+                kept.push_back(p);
+            }
+        }
+        perms = std::move(kept);
+    }
 
     bool dead[NUM_CARDS] = {};
     for (uint8_t i = 0; i < full_size; ++i) dead[full_board[i]] = true;

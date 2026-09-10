@@ -592,9 +592,10 @@ inline void CpuBackend::cfr_traverse(
         auto tt = static_cast<TerminalType>(tree.terminal_types[node_idx]);
         float pot_total = tree.pots[node_idx];
         float half_pot = pot_total * 0.5f;
-        float rake = std::min(pot_total * ctx_.config->rake_rate,
-                              ctx_.config->rake_cap);
-        if (rake < 0.0f) rake = 0.0f;
+        // Showdown rake base = the whole (matched) pot. Fold terminals rake
+        // the MATCHED pot only — see types.h::terminal_rake.
+        float rake = terminal_rake(pot_total, ctx_.config->rake_rate,
+                                   ctx_.config->rake_cap);
         float win_payoff  = half_pot - rake;
         float lose_payoff = -half_pot;
         float tie_payoff  = -0.5f * rake;
@@ -671,6 +672,56 @@ inline void CpuBackend::cfr_traverse(
                 ? oop_out_of_range_mask_.data()
                 : ip_out_of_range_mask_.data())
             : nullptr;
+
+        // 2026-09-09 audit P0: a showdown with cards still to come (called
+        // all-in; every showdown of a collapsed tree) is settled on the EQUITY
+        // table — expected (win − lose) over every remaining runout — never on
+        // the current board's best-5 ranks. Linear payoff (types.h):
+        //   value_c = A·Σ_j opp_w[j]·eq[c,j] + B·Σ_j opp_w[j]·valid[c,j],
+        //   A = half_pot − rake/2, B = −rake/2.
+        // The zero-rake signed kernels ARE that first dot product (coefficient
+        // matrix × weighted reach, scaled), so no new SIMD kernel is needed;
+        // the B term (raked solves only) is the fold blocker's compatibility
+        // sum. Checked BEFORE every other showdown route on purpose.
+        const std::vector<float>* equity_table = nullptr;
+        if (tt == TerminalType::SHOWDOWN && ctx_.matchup_equity_per_runout &&
+            mi >= 0 &&
+            static_cast<std::size_t>(mi) < ctx_.matchup_equity_per_runout->size()) {
+            const auto& eq = (*ctx_.matchup_equity_per_runout)[mi];
+            if (eq.size() == static_cast<std::size_t>(nc) * nc) equity_table = &eq;
+        }
+        if (equity_table != nullptr) {
+            std::size_t mark = arena.mark();
+            float* opp_w = arena.alloc(nc);
+            cpu_simd::vec_copy(opp_w, opp_reach, nc);
+            cpu_simd::vec_mul_in_place(opp_w, canonical_weights_f_.data(), nc);
+            const float A = half_pot - 0.5f * rake;
+            if (traverser == 0) {
+                cpu_simd::showdown_oop_signed_zero_rake(
+                    equity_table->data(), opp_w, skip_mask, out_vals, nc, A);
+            } else {
+                cpu_simd::showdown_ip_signed_zero_rake(
+                    equity_table->data(), opp_w, skip_mask, out_vals, nc, A);
+            }
+            if (rake != 0.0f) {
+                CardMask board_mask = 0;
+                if (ctx_.matchup_board_masks && mi >= 0 &&
+                    static_cast<std::size_t>(mi) < ctx_.matchup_board_masks->size()) {
+                    board_mask = (*ctx_.matchup_board_masks)[static_cast<std::size_t>(mi)];
+                } else if (ctx_.config != nullptr) {
+                    board_mask = board_to_mask(
+                        ctx_.config->board.data(), ctx_.config->board_size);
+                }
+                float* compat = arena.alloc(nc);
+                fold_blocker::fold_dense(
+                    *ctx_.iso, board_mask, opp_reach, skip_mask,
+                    /*self_payoff=*/-0.5f * rake, compat, nc);
+                cpu_simd::vec_add_in_place(out_vals, compat, nc);
+            }
+            arena.rewind(mark);
+            return;
+        }
+
         const bool use_signed_coeff_showdown =
             tt == TerminalType::SHOWDOWN
             && use_signed_coeff_showdown_for_traverser(traverser)
@@ -694,7 +745,9 @@ inline void CpuBackend::cfr_traverse(
             float unmatched_bet = (parent < tree.total_nodes)
                 ? tree.bet_into[parent] : 0.0f;
             float matched_pot = pot_total - unmatched_bet;
-            float fold_win_gain  = matched_pot * 0.5f - rake;
+            float fold_win_gain  = matched_pot * 0.5f
+                - terminal_rake(matched_pot, ctx_.config->rake_rate,
+                                ctx_.config->rake_cap);
             float fold_lose_loss = -matched_pot * 0.5f;
             float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
             const float self_payoff =
@@ -802,7 +855,9 @@ inline void CpuBackend::cfr_traverse(
             float unmatched_bet = (parent < tree.total_nodes)
                 ? tree.bet_into[parent] : 0.0f;
             float matched_pot = pot_total - unmatched_bet;
-            float fold_win_gain  = matched_pot * 0.5f - rake;
+            float fold_win_gain  = matched_pot * 0.5f
+                - terminal_rake(matched_pot, ctx_.config->rake_rate,
+                                ctx_.config->rake_cap);
             float fold_lose_loss = -matched_pot * 0.5f;
 
             float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
@@ -943,7 +998,9 @@ inline void CpuBackend::cfr_traverse(
             total_weight += weight;
         }
         if (total_weight > 0) {
-            float inv = 1.0f / static_cast<float>(total_weight);
+            // Conditional on both players' hole cards — see types.h.
+            float inv = 1.0f / static_cast<float>(
+                chance_runout_denominator(total_weight));
             cpu_simd::vec_scale_in_place(out_vals, inv, nc);
         }
         arena.rewind(mark);

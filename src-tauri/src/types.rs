@@ -242,6 +242,11 @@ pub struct SolveResources {
     pub live_combos: u32,
     #[serde(default)]
     pub player_nodes: u32,
+    /// 2026-09-09 audit: runout tables whose board is short of the river and
+    /// carries a showdown (called pre-river all-ins), each an nc² equity
+    /// matrix. Their bytes are inside `estimated_matchup_bytes`.
+    #[serde(default)]
+    pub matchup_equity_tables: u32,
     #[serde(default)]
     pub estimated_matchup_bytes: u64,
     #[serde(default)]

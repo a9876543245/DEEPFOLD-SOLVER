@@ -352,4 +352,47 @@ inline void fold_active(
     }
 }
 
+/// Card-compatible opponent mass per canonical hand on `board_mask`:
+///
+///   out[c] = Σ_j opp_reach[j] · weight[j] · valid_board[c, j]
+///
+/// i.e. exactly the fold terminal's reduction with payoff 1 (valid is pure
+/// card compatibility, averaged over c's originals). This is the denominator
+/// every conditional quantity needs (2026-09-09 audit): a hand's EV is
+/// conditional on the opponent holding a hand it CAN hold, and the
+/// exploitability is an expectation over the LEGAL joint deal, not over the
+/// product of the two unconditional range masses. `opp_reach` is the RAW
+/// per-canonical reach (fold_dense weights each original itself).
+inline void compatible_opponent_mass(
+    const IsomorphismMapping& iso,
+    CardMask board_mask,
+    const float* opp_reach,
+    float* out)
+{
+    fold_dense(iso, board_mask, opp_reach, /*skip_mask=*/nullptr,
+               /*self_payoff=*/1.0f, out, iso.num_canonical);
+}
+
+/// Σ over card-compatible ORIGINAL hand pairs of self_reach · opp_reach —
+/// the mass of the legal joint deal. Zero means the two ranges cannot both be
+/// dealt on this board (every pair shares a card, or a range is empty).
+inline double legal_joint_mass(
+    const IsomorphismMapping& iso,
+    CardMask board_mask,
+    const std::vector<float>& self_reach,
+    const std::vector<float>& opp_reach)
+{
+    const uint16_t nc = iso.num_canonical;
+    if (nc == 0 || self_reach.size() < nc || opp_reach.size() < nc) return 0.0;
+    std::vector<float> compat(nc, 0.0f);
+    compatible_opponent_mass(iso, board_mask, opp_reach.data(), compat.data());
+    double mass = 0.0;
+    for (uint16_t c = 0; c < nc; ++c) {
+        mass += static_cast<double>(self_reach[c])
+              * static_cast<double>(iso.canonical_weights[c])
+              * static_cast<double>(compat[c]);
+    }
+    return mass;
+}
+
 }  // namespace deepsolver::fold_blocker

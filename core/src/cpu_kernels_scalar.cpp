@@ -667,6 +667,17 @@ static void showdown_oop_full_batch(
     }
 }
 
+static void equity_sign_accumulate(
+    const int16_t* ranks, const int16_t* alive, int16_t* acc,
+    std::size_t begin, std::size_t end, int16_t ra)
+{
+    for (std::size_t b = begin; b < end; ++b) {
+        const int16_t rb = ranks[b];
+        const int16_t sgn = static_cast<int16_t>((ra < rb) - (ra > rb));
+        acc[b] = static_cast<int16_t>(acc[b] + (sgn & alive[b]));
+    }
+}
+
 }  // namespace deepsolver::cpu_simd::scalar_impl
 
 namespace deepsolver::cpu_simd {
@@ -708,6 +719,7 @@ const Kernels scalar_kernels = {
     &scalar_impl::showdown_oop_full_active2,
     &scalar_impl::showdown_ip_full_active2,
     &scalar_impl::showdown_oop_full_batch,
+    &scalar_impl::equity_sign_accumulate,
 };
 
 }  // namespace deepsolver::cpu_simd

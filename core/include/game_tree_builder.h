@@ -27,14 +27,14 @@ namespace deepsolver {
 // ============================================================================
 
 struct TreeNode {
-    NodeType type;
-    uint8_t  street;          ///< 0=flop, 1=turn, 2=river
-    uint8_t  active_player;   ///< 0=OOP, 1=IP
-    float    pot;
-    float    stack;           ///< Remaining effective stack
-    float    bet_into;        ///< Current bet to call (0 if no bet)
-    int      raise_count;     ///< Number of raises so far in this street
-    bool     oop_has_initiative; ///< Did OOP make the last aggressive action?
+    NodeType type = NodeType::PLAYER_OOP;
+    uint8_t  street = 0;          ///< 0=flop, 1=turn, 2=river
+    uint8_t  active_player = 0;   ///< 0=OOP, 1=IP
+    float    pot = 0.0f;
+    float    stack = 0.0f;        ///< Remaining stack of the player TO ACT
+    float    bet_into = 0.0f;     ///< Outstanding contribution difference to call
+    int      raise_count = 0;     ///< Number of raises so far in this street
+    bool     oop_has_initiative = false; ///< Did OOP make the last aggressive action?
 
     TerminalType terminal_type = TerminalType::SHOWDOWN;
 
@@ -114,9 +114,22 @@ public:
     /// Get the total node count (valid after build)
     uint32_t node_count() const { return static_cast<uint32_t>(nodes_.size()); }
 
+    /// The suit permutations every chance node's runout orbits are taken
+    /// under (see range_perms_). Solver::project_enumerated_tree()
+    /// re-enumerates the canonical runouts with exactly this set, so its
+    /// per-chance counts are the builder's own.
+    const std::vector<std::array<uint8_t, 4>>& range_perms() const {
+        return range_perms_;
+    }
+
 private:
     const SolverConfig& config_;
     std::vector<TreeNode> nodes_;
+    /// 2026-09-09 audit P0: the suit permutations the players' ranges and
+    /// node locks are symmetric under. Every chance node's runout orbits are
+    /// taken under (board-fixing perms) ∩ this set, so two turn cards share
+    /// one child only when the two resulting subgames are truly isomorphic.
+    std::vector<std::array<uint8_t, 4>> range_perms_;
     uint16_t      nc_estimate_ = 0;
     MemoryBudget  budget_      = MemoryBudget::defaults();
     uint64_t      matchup_bytes_per_cell_ =
@@ -166,7 +179,14 @@ private:
 
 inline GameTreeBuilder::GameTreeBuilder(const SolverConfig& config)
     : config_(config)
-{}
+{
+    IsoConstraints c;
+    c.oop_weights = &config.oop_range_weights;
+    c.ip_weights  = &config.ip_range_weights;
+    c.node_locks  = &config.node_locks;
+    range_perms_ = suit_perms_preserving_constraints(
+        c, board_to_mask(config.board.data(), config.board_size));
+}
 
 inline uint32_t GameTreeBuilder::add_node(TreeNode node) {
     node.node_id = static_cast<uint32_t>(nodes_.size());
@@ -224,12 +244,17 @@ inline std::vector<Action> GameTreeBuilder::generate_actions(const TreeNode& nod
         actions.push_back({ActionType::CALL, node.bet_into});
 
         // Raise options (if under raise cap)
-        if (node.raise_count < config_.raise_cap) {
+        if (node.raise_count < config_.raise_cap && node.stack > node.bet_into) {
             const auto& sizes = get_bet_sizes(node.street);
             float current_pot = node.pot + node.bet_into; // pot when facing bet
 
             for (float frac : sizes) {
-                float raise_to = node.bet_into + current_pot * frac;
+                // Amount is the actor's ADDITIONAL investment (call + raise),
+                // not a street-total wager. Heads-up, bet_into is also the
+                // last wager increment, so a full raise invests at least 2x it.
+                // A short all-in is legal even when it cannot meet that minimum.
+                float raise_to = std::max(2.0f * node.bet_into,
+                                         node.bet_into + current_pot * frac);
                 raise_to = std::min(raise_to, node.stack);
 
                 // Check all-in threshold
@@ -382,7 +407,8 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
         for (uint8_t c : n_runout_cards) full_board.push_back(c);
 
         CanonicalRunouts cr = enumerate_canonical_runouts(
-            full_board.data(), static_cast<uint8_t>(full_board.size()));
+            full_board.data(), static_cast<uint8_t>(full_board.size()),
+            &range_perms_);
 
         uint8_t cards_already = static_cast<uint8_t>(full_board.size());
 
@@ -601,23 +627,26 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
             case ActionType::ALLIN: {
                 float bet_amount = action.amount;
                 float new_pot = n_pot + bet_amount;
-                float new_stack = n_stack - bet_amount;
-
-                if (new_stack <= 0.01f) new_stack = 0;
+                // The opponent has already invested bet_into more than this
+                // actor. Switching turns must switch stack ownership too; it
+                // must NOT subtract this actor's new investment twice.
+                const float opponent_stack = n_stack - n_bet_into;
+                const float outstanding = bet_amount - n_bet_into;
+                const float bettor_remaining = n_stack - bet_amount;
 
                 child.type = (n_active_player == 0)
                     ? NodeType::PLAYER_IP : NodeType::PLAYER_OOP;
                 child.active_player = 1 - n_active_player;
                 child.pot = new_pot;
-                child.stack = new_stack;
-                child.bet_into = bet_amount;
+                child.stack = opponent_stack;
+                child.bet_into = outstanding;
                 child.raise_count = (action.type == ActionType::RAISE)
                     ? n_raise_count + 1 : n_raise_count;
 
                 // Track initiative
                 child.oop_has_initiative = (n_active_player == 0);
 
-                if (new_stack <= 0.01f) {
+                if (bettor_remaining <= 0.01f) {
                     // All-in: opponent can only call or fold
                     child.raise_count = config_.raise_cap;
                 }

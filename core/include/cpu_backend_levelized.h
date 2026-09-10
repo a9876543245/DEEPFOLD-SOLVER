@@ -127,8 +127,9 @@ public:
         return s * 1000.0;
     }
 
-    // Actual heap held by the six dominant state buffers: the 3 compact
-    // strategy-shaped arrays + the 3 full-tree [N × row_stride_] flats.
+    // Actual heap held by the dominant state buffers: the compact
+    // strategy-shaped arrays (2, or 3 when materialize_strategy_ keeps
+    // current_strategy_) + the 3 full-tree [N × row_stride_] flats.
     // Scratch vectors (per-thread terminal buffers, pos-sum rows) are
     // excluded — they are KB-scale next to these. This is the number the
     // estimator (bytes_for_cpu_state_compact + bytes_for_levelized_cpu_extra)
@@ -248,10 +249,45 @@ private:
 
     std::vector<float> regrets_;
     std::vector<float> strategy_sum_;
+    // Third strategy-shaped array. Allocated ONLY when materialize_strategy_
+    // is true (node locks / STANDARD schedule) — otherwise every consumer
+    // derives the regret-matched row into per-thread scratch on demand. See
+    // materialize_strategy_ below; the GPU dropped the same buffer in B1a
+    // increment 3.
     std::vector<float> current_strategy_;
     std::vector<std::size_t> node_state_offset_;
     std::size_t action_stride_ = 0;
     std::size_t row_stride_ = 0;
+    std::size_t max_actions_ = 0;
+
+    /// Does this solve keep current_strategy_ materialized?
+    ///
+    /// Two cases need it, and both are decidable from the CONFIG alone, which
+    /// is what keeps the estimator (Solver::cpu_materializes_strategy) exact
+    /// to the byte rather than merely conservative:
+    ///
+    ///  - Node locks. The lock override is a WRITE over the regret-matched
+    ///    row, and applying it on demand would repeat an O(nc) hash probe per
+    ///    node per consumer instead of once per iteration.
+    ///  - STANDARD dcfr schedule. It enables compute_strategy()'s sparse and
+    ///    block specializations, which write only the ACTIVE lanes of the row.
+    ///    kEnableBlockStrategy is true while kEnableBlockTraversal is false, so
+    ///    under blocks the dense consumers read lanes the block writer never
+    ///    touched — with a persistent buffer those hold that node's previous
+    ///    iteration, which a shared scratch row cannot reproduce. Under the
+    ///    default POSTFLOP_STYLE schedule allow_sparse_strategy is false and
+    ///    every path writes the full stride, so a derived row is bit-identical
+    ///    to the materialized one at every lane a consumer can read.
+    bool materialize_strategy_ = true;
+
+    // Per-thread scratch for derived strategy rows: [tid * strat_scratch_stride_]
+    // holds max_actions_ × action_stride_ floats, i.e. one full node row.
+    std::size_t strat_scratch_stride_ = 0;
+    std::vector<float> strat_scratch_;
+
+    // NOTE: dynamic per-terminal skipping of the opponent dimension was built
+    // here and REVERTED — ROADMAP §2b-4 has the two measured implementations
+    // and why neither pays. Do not rebuild it without re-reading that section.
 
     // Final averaged strategy (populated in finalize()).
     std::vector<std::vector<float>> strategy_;
@@ -310,7 +346,9 @@ private:
     std::vector<float> reach_ip_;
     std::vector<float> value_;
 
-    // Per-node scratch for compute_strategy() (reused across nodes).
+    // Per-node scratch for derive_strategy_row() (reused across nodes).
+    // PER-THREAD: [tid * action_stride_ ..) — derivation now happens inside
+    // forward_pass / backward_pass, which are OMP-parallel over nodes.
     std::vector<float> pos_sum_scratch_;
     std::vector<float> inv_pos_sum_scratch_;
     std::vector<float> uniform_or_zero_scratch_;
@@ -796,7 +834,56 @@ private:
     }
 
     // ---- Internal methods ----
+
+    /// Regret-matches node n into `out` (na * action_stride_ floats), using
+    /// this thread's slice of the pos_sum / inv / uniform scratch rows. This
+    /// is the ONLY place regret matching happens: compute_strategy() calls it
+    /// with out = current_strategy_ptr(n), the derived path calls it with out
+    /// = this thread's strat_scratch_ row. Same kernels, same order, same
+    /// inputs, so the two are bit-identical wherever both write.
+    void derive_strategy_row(uint32_t n, float* out, uint32_t tid);
+
+    /// Materializes every player node's row into current_strategy_. Only
+    /// called when materialize_strategy_ is true.
     void compute_strategy();
+
+    /// The strategy row consumers read at node n. Materialized buffer under
+    /// locks / STANDARD, otherwise derived into this thread's scratch.
+    inline const float* strategy_row(uint32_t n, uint32_t tid) {
+        if (materialize_strategy_) return current_strategy_ptr(n);
+        float* out = strat_scratch_.data()
+                   + static_cast<std::size_t>(tid) * strat_scratch_stride_;
+        derive_strategy_row(n, out, tid);
+        return out;
+    }
+
+    /// DCFR discount for ONE player node's regrets, over the same index set
+    /// the node's regret update will touch. Shared by apply_dcfr_discount()
+    /// (materialized path: one pass before the traversals) and backward_pass
+    /// (derived path: fused per node, immediately before that node's regret
+    /// update — see iterate() for why the fusion is what keeps the derived
+    /// strategy reading PRE-discount regrets, exactly as the snapshot did).
+    void discount_node_regrets(uint32_t n, float pos_disc, float neg_disc);
+
+    /// DEEPSOLVER_PRUNE_STATS=1 diagnostic. Off by default, called once from
+    /// finalize(), and it touches nothing any solve reads — see its definition
+    /// for what it measures and why.
+    void report_prune_opportunity() const;
+
+    /// Builds this thread's dead-block mask for `opp_reach` and returns it, or
+    /// nullptr when too few blocks are dead for the per-block test to pay for
+    /// itself. Returning nullptr matters: on DEFAULT ranges every lane is live,
+    /// so the mask would be all-zero and the kernel would pay a load+branch per
+    /// block for nothing — this is what keeps the feature free when inert.
+    /// OMP thread id, or 0 outside a parallel region / without OpenMP.
+    static inline uint32_t scratch_tid() {
+        #if defined(_OPENMP)
+        const int t = omp_get_thread_num();
+        return (t > 0) ? static_cast<uint32_t>(t) : 0u;
+        #else
+        return 0u;
+        #endif
+    }
 
     // v1.8.2 Phase 2: process all SHOWDOWN terminals in `group` (which all
     // share the same matchup_idx) for the OOP traverser via the fused
@@ -816,7 +903,9 @@ private:
 
     // One backward pass for the given traverser. Computes value_[node]
     // bottom-up, updates regrets_[node] at acting == traverser nodes.
-    void backward_pass(int traverser);
+    // `iteration` is only needed for the fused DCFR discount on the derived
+    // path; the materialized path discounts in its own pass.
+    void backward_pass(int traverser, int iteration);
 
     // Per-node terminal payoff helper. Writes nc floats to `out`.
     void evaluate_terminal(uint32_t node_idx, int traverser, float* out);
@@ -935,6 +1024,7 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     player_nodes_.reserve(N / 4);
 
     std::size_t decision_state_floats = 0;
+    max_actions_ = 0;
     for (uint32_t i = 0; i < N; ++i) {
         uint8_t na = ctx.tree->num_children[i];
         auto nt = static_cast<NodeType>(ctx.tree->node_types[i]);
@@ -943,18 +1033,31 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
         player_nodes_.push_back(i);
         node_state_offset_[i] = decision_state_floats;
         decision_state_floats += static_cast<std::size_t>(na) * action_stride_;
+        if (na > max_actions_) max_actions_ = na;
     }
+
+    // Decided from the CONFIG alone so Solver::cpu_materializes_strategy()
+    // predicts it exactly — see the member's doc comment for both reasons.
+    materialize_strategy_ =
+        !ctx.config->node_locks.empty()
+        || ctx.config->dcfr_schedule != SolverConfig::DcfrSchedule::POSTFLOP_STYLE;
 
     regrets_.assign(decision_state_floats, 0.0f);
     strategy_sum_.assign(decision_state_floats, 0.0f);
-    current_strategy_.assign(decision_state_floats, 0.0f);
-    for (uint32_t i : player_nodes_) {
-        const uint8_t na = ctx.tree->num_children[i];
-        const float uniform = 1.0f / na;
-        for (uint8_t a = 0; a < na; ++a) {
-            float* strat = current_strategy_ptr(i, a);
-            std::fill(strat, strat + action_stride_, uniform);
+    if (materialize_strategy_) {
+        current_strategy_.assign(decision_state_floats, 0.0f);
+        for (uint32_t i : player_nodes_) {
+            const uint8_t na = ctx.tree->num_children[i];
+            const float uniform = 1.0f / na;
+            for (uint8_t a = 0; a < na; ++a) {
+                float* strat = current_strategy_ptr(i, a);
+                std::fill(strat, strat + action_stride_, uniform);
+            }
         }
+    } else {
+        // Free it outright: a re-prepare that flips the decision must not
+        // leave the old array holding decision_state_floats of dead heap.
+        std::vector<float>().swap(current_strategy_);
     }
 
     canonical_weights_f_.resize(nc);
@@ -971,9 +1074,20 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     reach_ip_.assign(flat_sz, 0.0f);
     value_.assign(flat_sz, 0.0f);
 
-    pos_sum_scratch_.assign(action_stride_, 0.0f);
-    inv_pos_sum_scratch_.assign(action_stride_, 0.0f);
-    uniform_or_zero_scratch_.assign(action_stride_, 0.0f);
+    // Regret-matching scratch, one row per thread: the derived path runs
+    // derive_strategy_row() inside the OMP-parallel node loops.
+    const std::size_t scratch_rows =
+        std::max<std::size_t>(1, cpu_threads_effective_);
+    pos_sum_scratch_.assign(scratch_rows * action_stride_, 0.0f);
+    inv_pos_sum_scratch_.assign(scratch_rows * action_stride_, 0.0f);
+    uniform_or_zero_scratch_.assign(scratch_rows * action_stride_, 0.0f);
+    strat_scratch_stride_ = max_actions_ * action_stride_;
+    if (materialize_strategy_) {
+        std::vector<float>().swap(strat_scratch_);
+    } else {
+        strat_scratch_.assign(scratch_rows * strat_scratch_stride_, 0.0f);
+    }
+
 
     // v1.8.0 P2-5: pre-allocate the terminal scratch so the inner OMP loop
     // doesn't heap-allocate per terminal visit. cpu_threads_effective_ is
@@ -1241,7 +1355,13 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
                     const std::size_t bin = static_cast<std::size_t>(mi);
                     terminals_by_table_[bin].push_back(n);
                     auto tt = static_cast<TerminalType>(ctx.tree->terminal_types[n]);
-                    if (tt == TerminalType::SHOWDOWN) {
+                    // Equity (partial-board) showdowns have no category
+                    // matrix — keep them out of the batched category kernel.
+                    const bool equity_showdown =
+                        ctx.matchup_equity_per_runout != nullptr
+                        && bin < ctx.matchup_equity_per_runout->size()
+                        && !(*ctx.matchup_equity_per_runout)[bin].empty();
+                    if (tt == TerminalType::SHOWDOWN && !equity_showdown) {
                         showdowns_by_table_[bin].push_back(n);
                     } else {
                         non_showdown_l0_.push_back(n);
@@ -1286,17 +1406,31 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
 // path slows. Sprint 3's persistent-team refactor is the right
 // structural fix; revisit parallelization here once that lands.
 inline void LevelizedCpuBackend::compute_strategy() {
+    for (uint32_t n : player_nodes_) {
+        derive_strategy_row(n, current_strategy_ptr(n), 0u);
+    }
+}
+
+inline void LevelizedCpuBackend::derive_strategy_row(
+    uint32_t n, float* out, uint32_t tid)
+{
     const uint16_t nc = ctx_.iso->num_canonical;
     const std::size_t stride = action_stride_;
     const auto& resolved_locks = *ctx_.resolved_locks;
     const bool allow_sparse_strategy =
         (ctx_.config->dcfr_schedule != SolverConfig::DcfrSchedule::POSTFLOP_STYLE);
+    const std::size_t scratch_off =
+        static_cast<std::size_t>(tid) * action_stride_;
+    float* const pos_sum_scratch = pos_sum_scratch_.data() + scratch_off;
+    float* const inv_pos_sum_scratch = inv_pos_sum_scratch_.data() + scratch_off;
+    float* const uniform_or_zero_scratch =
+        uniform_or_zero_scratch_.data() + scratch_off;
 
-    for (uint32_t n : player_nodes_) {
+    {
         uint8_t na = ctx_.tree->num_children[n];
         const float uniform = 1.0f / na;
         const float* regret_base = regret_ptr(n);
-        float*       strat_base  = current_strategy_ptr(n);
+        float*       strat_base  = out;
         const int acting = ctx_.tree->active_player[n];
 
         const bool use_sparse_strategy =
@@ -1305,13 +1439,13 @@ inline void LevelizedCpuBackend::compute_strategy() {
             allow_sparse_strategy && use_block_strategy_for_player(acting);
         if (use_block_strategy) {
             const auto& blocks = active_blocks_for_player(acting);
-            vec_set_zero_active_runs(pos_sum_scratch_.data(), blocks);
+            vec_set_zero_active_runs(pos_sum_scratch, blocks);
             for (uint8_t a = 0; a < na; ++a) {
                 const float* regret_a =
                     regret_base + static_cast<std::size_t>(a) * stride;
                 for (const auto& block : blocks) {
                     cpu_simd::vec_pos_add(
-                        pos_sum_scratch_.data() + block.start,
+                        pos_sum_scratch + block.start,
                         regret_a + block.start,
                         block.count);
                 }
@@ -1321,13 +1455,13 @@ inline void LevelizedCpuBackend::compute_strategy() {
                 const uint16_t end =
                     static_cast<uint16_t>(block.start + block.count);
                 for (uint16_t c = block.start; c < end; ++c) {
-                    if (pos_sum_scratch_[c] > 0.0f) {
-                        inv_pos_sum_scratch_[c] =
-                            1.0f / pos_sum_scratch_[c];
-                        uniform_or_zero_scratch_[c] = 0.0f;
+                    if (pos_sum_scratch[c] > 0.0f) {
+                        inv_pos_sum_scratch[c] =
+                            1.0f / pos_sum_scratch[c];
+                        uniform_or_zero_scratch[c] = 0.0f;
                     } else {
-                        inv_pos_sum_scratch_[c] = 0.0f;
-                        uniform_or_zero_scratch_[c] = uniform;
+                        inv_pos_sum_scratch[c] = 0.0f;
+                        uniform_or_zero_scratch[c] = uniform;
                     }
                 }
             }
@@ -1341,8 +1475,8 @@ inline void LevelizedCpuBackend::compute_strategy() {
                     cpu_simd::vec_pos_normalize(
                         strat_a + block.start,
                         regret_a + block.start,
-                        inv_pos_sum_scratch_.data() + block.start,
-                        uniform_or_zero_scratch_.data() + block.start,
+                        inv_pos_sum_scratch + block.start,
+                        uniform_or_zero_scratch + block.start,
                         block.count);
                 }
             }
@@ -1389,21 +1523,21 @@ inline void LevelizedCpuBackend::compute_strategy() {
                     regret_base + stride,
                     stride);
             } else {
-                cpu_simd::vec_set_zero(pos_sum_scratch_.data(), stride);
+                cpu_simd::vec_set_zero(pos_sum_scratch, stride);
                 for (uint8_t a = 0; a < na; ++a) {
                     cpu_simd::vec_pos_add(
-                        pos_sum_scratch_.data(),
+                        pos_sum_scratch,
                         regret_base + static_cast<std::size_t>(a) * stride,
                         stride);
                 }
 
                 for (std::size_t c = 0; c < stride; ++c) {
-                    if (pos_sum_scratch_[c] > 0.0f) {
-                        inv_pos_sum_scratch_[c] = 1.0f / pos_sum_scratch_[c];
-                        uniform_or_zero_scratch_[c] = 0.0f;
+                    if (pos_sum_scratch[c] > 0.0f) {
+                        inv_pos_sum_scratch[c] = 1.0f / pos_sum_scratch[c];
+                        uniform_or_zero_scratch[c] = 0.0f;
                     } else {
-                        inv_pos_sum_scratch_[c] = 0.0f;
-                        uniform_or_zero_scratch_[c] = uniform;
+                        inv_pos_sum_scratch[c] = 0.0f;
+                        uniform_or_zero_scratch[c] = uniform;
                     }
                 }
 
@@ -1411,8 +1545,8 @@ inline void LevelizedCpuBackend::compute_strategy() {
                     cpu_simd::vec_pos_normalize(
                         strat_base + static_cast<std::size_t>(a) * stride,
                         regret_base + static_cast<std::size_t>(a) * stride,
-                        inv_pos_sum_scratch_.data(),
-                        uniform_or_zero_scratch_.data(),
+                        inv_pos_sum_scratch,
+                        uniform_or_zero_scratch,
                         stride);
                 }
             }
@@ -1431,55 +1565,58 @@ inline void LevelizedCpuBackend::compute_strategy() {
     }
 }
 
+inline void LevelizedCpuBackend::discount_node_regrets(
+    uint32_t n, float pos_disc, float neg_disc)
+{
+    const std::size_t stride = action_stride_;
+    uint8_t na = ctx_.tree->num_children[n];
+    const int acting = ctx_.tree->active_player[n];
+    if (use_sparse_traversal_for_player(acting)) {
+        float* regret_base = regret_ptr(n);
+        for (uint8_t a = 0; a < na; ++a) {
+            float* regret = regret_base + static_cast<std::size_t>(a) * stride;
+            if (use_active_runs_for_player(acting)) {
+                vec_dcfr_discount_active_runs(
+                    regret, pos_disc, neg_disc, active_runs_for_player(acting));
+            } else {
+                const auto& active = active_indices_for_player(acting);
+                for (uint16_t c : active) {
+                    const float r = regret[c];
+                    regret[c] = (r > 0.0f) ? r * pos_disc : r * neg_disc;
+                }
+            }
+        }
+    } else if (use_block_traversal_for_player(acting)) {
+        float* regret_base = regret_ptr(n);
+        for (uint8_t a = 0; a < na; ++a) {
+            float* regret = regret_base + static_cast<std::size_t>(a) * stride;
+            vec_dcfr_discount_active_runs(
+                regret, pos_disc, neg_disc, active_blocks_for_player(acting));
+        }
+    } else {
+        std::size_t total = static_cast<std::size_t>(na) * stride;
+        cpu_simd::vec_dcfr_discount(regret_ptr(n), pos_disc, neg_disc, total);
+    }
+}
+
 inline void LevelizedCpuBackend::apply_dcfr_discount(int iteration) {
     float pos_disc, neg_disc, strat_weight;
     compute_dcfr_factors(iteration, *ctx_.config, pos_disc, neg_disc, strat_weight);
     (void)strat_weight;
-    const std::size_t stride = action_stride_;
-
-    auto discount_node = [&](uint32_t n) {
-        uint8_t na = ctx_.tree->num_children[n];
-        const int acting = ctx_.tree->active_player[n];
-        if (use_sparse_traversal_for_player(acting)) {
-            float* regret_base = regret_ptr(n);
-            for (uint8_t a = 0; a < na; ++a) {
-                float* regret = regret_base + static_cast<std::size_t>(a) * stride;
-                if (use_active_runs_for_player(acting)) {
-                    vec_dcfr_discount_active_runs(
-                        regret, pos_disc, neg_disc, active_runs_for_player(acting));
-                } else {
-                    const auto& active = active_indices_for_player(acting);
-                    for (uint16_t c : active) {
-                        const float r = regret[c];
-                        regret[c] = (r > 0.0f) ? r * pos_disc : r * neg_disc;
-                    }
-                }
-            }
-        } else if (use_block_traversal_for_player(acting)) {
-            float* regret_base = regret_ptr(n);
-            for (uint8_t a = 0; a < na; ++a) {
-                float* regret = regret_base + static_cast<std::size_t>(a) * stride;
-                vec_dcfr_discount_active_runs(
-                    regret, pos_disc, neg_disc, active_blocks_for_player(acting));
-            }
-        } else {
-            std::size_t total = static_cast<std::size_t>(na) * stride;
-            cpu_simd::vec_dcfr_discount(regret_ptr(n), pos_disc, neg_disc, total);
-        }
-    };
 
 #if defined(_OPENMP)
     if (cpu_threads_effective_ > 1 && player_nodes_.size() >= 4096) {
         #pragma omp parallel for schedule(static) num_threads(static_cast<int>(cpu_threads_effective_))
         for (int64_t i = 0; i < static_cast<int64_t>(player_nodes_.size()); ++i) {
-            discount_node(player_nodes_[static_cast<std::size_t>(i)]);
+            discount_node_regrets(
+                player_nodes_[static_cast<std::size_t>(i)], pos_disc, neg_disc);
         }
         return;
     }
 #endif
 
     for (uint32_t n : player_nodes_) {
-        discount_node(n);
+        discount_node_regrets(n, pos_disc, neg_disc);
     }
 }
 
@@ -1497,9 +1634,10 @@ inline void LevelizedCpuBackend::evaluate_terminal(
 
     float pot_total = tree.pots[node_idx];
     float half_pot  = pot_total * 0.5f;
-    float rake = std::min(pot_total * ctx_.config->rake_rate,
-                          ctx_.config->rake_cap);
-    if (rake < 0.0f) rake = 0.0f;
+    // Showdown rake base = the whole (matched) pot. Fold terminals rake the
+    // MATCHED pot only — see types.h::terminal_rake.
+    float rake = terminal_rake(pot_total, ctx_.config->rake_rate,
+                               ctx_.config->rake_cap);
     float win_payoff  = half_pot - rake;
     float lose_payoff = -half_pot;
     float tie_payoff  = -0.5f * rake;
@@ -1628,7 +1766,9 @@ inline void LevelizedCpuBackend::evaluate_terminal(
         float unmatched_bet = (parent < tree.total_nodes)
             ? tree.bet_into[parent] : 0.0f;
         float matched_pot = pot_total - unmatched_bet;
-        float fold_win_gain  = matched_pot * 0.5f - rake;
+        float fold_win_gain  = matched_pot * 0.5f
+            - terminal_rake(matched_pot, ctx_.config->rake_rate,
+                            ctx_.config->rake_cap);
         float fold_lose_loss = -matched_pot * 0.5f;
         float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
         return ((traverser == 0 && sign_oop > 0)
@@ -1636,6 +1776,53 @@ inline void LevelizedCpuBackend::evaluate_terminal(
             ? fold_win_gain
             : fold_lose_loss;
     };
+
+    // 2026-09-09 audit P0: partial-board showdown → EQUITY table (see
+    // CpuBackend::cfr_traverse for the derivation). Checked before every
+    // other showdown route; builds its own FULL weighted opponent reach
+    // because the sparse/active builds below only fill active lanes.
+    const std::vector<float>* equity_table = nullptr;
+    if (tt == TerminalType::SHOWDOWN && ctx_.matchup_equity_per_runout &&
+        mi >= 0 &&
+        static_cast<std::size_t>(mi) < ctx_.matchup_equity_per_runout->size()) {
+        const auto& eq = (*ctx_.matchup_equity_per_runout)[mi];
+        if (eq.size() == static_cast<std::size_t>(nc) * nc) equity_table = &eq;
+    }
+    if (equity_table != nullptr) {
+        int eq_tid = 0;
+#ifdef _OPENMP
+        eq_tid = omp_get_thread_num();
+        const double _eq_t0 = omp_get_wtime();
+#endif
+        float* opp_w = terminal_scratch_for_thread(eq_tid);
+        cpu_simd::vec_copy(opp_w, opp_reach, nc);
+        cpu_simd::vec_mul_in_place(opp_w, canonical_weights_f_.data(), nc);
+        const float A = half_pot - 0.5f * rake;
+        if (traverser == 0) {
+            cpu_simd::showdown_oop_signed_zero_rake(
+                equity_table->data(), opp_w, skip_mask, out, nc, A);
+        } else {
+            cpu_simd::showdown_ip_signed_zero_rake(
+                equity_table->data(), opp_w, skip_mask, out, nc, A);
+        }
+        if (rake != 0.0f) {
+            std::vector<float> compat(nc, 0.0f);
+            fold_blocker::fold_dense(
+                *ctx_.iso, current_board_mask(), opp_reach, skip_mask,
+                /*self_payoff=*/-0.5f * rake, compat.data(), nc);
+            cpu_simd::vec_add_in_place(out, compat.data(), nc);
+        }
+        for (std::size_t i = nc; i < row_stride_; ++i) out[i] = 0.0f;
+#ifdef _OPENMP
+        {
+            const uint32_t _safe = (eq_tid < 0
+                || static_cast<uint32_t>(eq_tid) >= cpu_threads_effective_)
+                    ? 0u : static_cast<uint32_t>(eq_tid);
+            showdown_acc_per_thread_[_safe] += omp_get_wtime() - _eq_t0;
+        }
+#endif
+        return;
+    }
 
     const bool use_active_fold_blocker =
         use_active_list && !use_sparse_traversal_for_player(traverser);
@@ -2265,7 +2452,10 @@ inline void LevelizedCpuBackend::forward_pass(int iteration) {
         int acting = tree.active_player[n];
         uint8_t na = tree.num_children[n];
         if (na == 0) return;
-        const float* strat = current_strategy_ptr(n);
+        // Derived path: regrets here are still the ones compute_strategy()
+        // used to snapshot from — the DCFR discount now runs inside the
+        // backward pass, per node, after its own strategy is read.
+        const float* strat = strategy_row(n, scratch_tid());
         const std::size_t stride = action_stride_;
 
         // Strategy_sum update at this node ??uses reach of the ACTING
@@ -2398,10 +2588,21 @@ inline void LevelizedCpuBackend::forward_pass(int iteration) {
 // Backward pass for one traverser. Walks levels 0 ??max_depth.
 // ============================================================================
 
-inline void LevelizedCpuBackend::backward_pass(int traverser) {
+inline void LevelizedCpuBackend::backward_pass(int traverser, int iteration) {
     const auto& tree = *ctx_.tree;
     const uint32_t N = tree.total_nodes;
     if (N == 0) return;
+    // Derived path: the DCFR discount is applied per node here rather than in
+    // one sweep before the traversals, so that every strategy derivation still
+    // reads PRE-discount regrets. Each player node is discounted exactly once,
+    // in the pass where acting == traverser. See iterate().
+    const bool fuse_discount = !materialize_strategy_;
+    float fused_pos_disc = 1.0f, fused_neg_disc = 1.0f, fused_sw = 1.0f;
+    if (fuse_discount) {
+        compute_dcfr_factors(
+            iteration, *ctx_.config, fused_pos_disc, fused_neg_disc, fused_sw);
+    }
+    (void)fused_sw;
     const bool sparse_value = use_sparse_traversal_for_player(traverser);
     const bool block_value = use_block_traversal_for_player(traverser);
     const bool sparse_opp_reach =
@@ -2466,17 +2667,15 @@ inline void LevelizedCpuBackend::backward_pass(int traverser) {
                 total_weight += weight;
             }
             if (total_weight > 0) {
+                // Conditional on both players' hole cards — see types.h.
+                const float inv = 1.0f / static_cast<float>(
+                    chance_runout_denominator(total_weight));
                 if (sparse_value) {
-                    sparse_scale(
-                        out, 1.0f / static_cast<float>(total_weight),
-                        traverser);
+                    sparse_scale(out, inv, traverser);
                 } else if (block_value) {
-                    block_scale(
-                        out, 1.0f / static_cast<float>(total_weight),
-                        traverser);
+                    block_scale(out, inv, traverser);
                 } else {
-                    cpu_simd::vec_scale_in_place(
-                        out, 1.0f / static_cast<float>(total_weight), row_stride_);
+                    cpu_simd::vec_scale_in_place(out, inv, row_stride_);
                 }
             }
             return;
@@ -2495,11 +2694,15 @@ inline void LevelizedCpuBackend::backward_pass(int traverser) {
             }
             return;
         }
-        const float* strat = current_strategy_ptr(n);
         const std::size_t stride = action_stride_;
         uint32_t off = tree.children_offset[n];
 
         if (acting == traverser) {
+            // Read the strategy BEFORE the discount touches this node's
+            // regrets: under the derived path the row comes from regrets, and
+            // "before this node's own update" is the only position that
+            // reproduces the old iterate()-top snapshot bit for bit.
+            const float* strat = strategy_row(n, scratch_tid());
             // node_val = Σ_a strat[a] · child_val[a]
             if (sparse_value) {
                 sparse_set_zero(out, traverser);
@@ -2530,6 +2733,13 @@ inline void LevelizedCpuBackend::backward_pass(int traverser) {
                         &value_[row_off(child)],
                         stride);
                 }
+            }
+            // Fused DCFR discount (derived path only — the materialized path
+            // ran its own pass in iterate()). Same helper, same index set, and
+            // it writes r*disc to memory exactly as the standalone pass did
+            // before the update below read it, so the two are bit-identical.
+            if (fuse_discount) {
+                discount_node_regrets(n, fused_pos_disc, fused_neg_disc);
             }
             // regret[a, c] += child_val[a, c] ??node_val[c]
             for (uint8_t a = 0; a < na; ++a) {
@@ -2768,10 +2978,23 @@ inline void LevelizedCpuBackend::iterate(int iteration) {
         #endif
     };
 
+    // Two shapes of one iteration, and the difference is only WHERE the
+    // regret-matched strategy and the DCFR discount live:
+    //
+    //   materialized — compute_strategy() snapshots every node's row, then one
+    //     discount sweep, then the traversals read the snapshot. Unchanged.
+    //   derived — no snapshot and no sweep. Each consumer regret-matches the
+    //     node it is standing on, and the discount is fused into the backward
+    //     pass right after that node's strategy has been read. Every
+    //     derivation therefore sees exactly the regrets the snapshot saw, so
+    //     the two shapes agree bit for bit.
+    //
+    // The saving is the whole third strategy-shaped array (-17% of CPU state)
+    // plus the two full sweeps over it. GPU B1a increment 3 is the template.
     const double t0 = now();
-    compute_strategy();
+    if (materialize_strategy_) compute_strategy();
     const double t1 = now();
-    apply_dcfr_discount(iteration);
+    if (materialize_strategy_) apply_dcfr_discount(iteration);
     const double t2 = now();
 
     // Single forward pass updates reach + strategy_sum for both traversers.
@@ -2783,9 +3006,9 @@ inline void LevelizedCpuBackend::iterate(int iteration) {
     // could in principle run on separate threads, but each backward pass
     // is already heavily multi-threaded inside via the per-level OMP. We
     // keep them serial to avoid oversubscribing the thread pool.
-    backward_pass(0);
+    backward_pass(0, iteration);
     const double t4 = now();
-    backward_pass(1);
+    backward_pass(1, iteration);
     const double t5 = now();
 
     phase_compute_strategy_ms_  += (t1 - t0) * 1000.0;
@@ -2796,12 +3019,131 @@ inline void LevelizedCpuBackend::iterate(int iteration) {
 }
 
 // ============================================================================
+// Pruning-opportunity diagnostic (DEEPSOLVER_PRUNE_STATS=1)
+//
+// Sizes the CFR-family lever this engine does not have: skipping subtrees
+// whose counterfactual contribution is exactly zero — regret-based pruning in
+// the Brown/Sandholm sense, specialized to vector-form CFR.
+//
+// The condition is about the OPPONENT's reach, not the traverser's. In
+// backward_pass(t) a node's value row is a counterfactual value over t's hands
+// WEIGHTED BY the opponent's reach, so if the opponent reaches node n with
+// probability 0 on every hand, every terminal beneath n scores 0 for every one
+// of t's hands and every regret update down there is `+= 0`. Skipping it is
+// bit-exact for the same reason B1b increment 1's live lists were: x + 0.0f
+// == x. (Pruning on the TRAVERSER's own reach would be wrong — a node the
+// traverser never reaches still needs its counterfactual regrets.)
+//
+// It runs at finalize(), where reach_oop_/reach_ip_ still hold the last
+// forward pass, so it costs one sweep on a converged strategy and stays
+// entirely out of every hot path. Terminals are counted separately because
+// showdown evaluation is where the time actually goes.
+// ============================================================================
+
+inline void LevelizedCpuBackend::report_prune_opportunity() const {
+    const char* env = std::getenv("DEEPSOLVER_PRUNE_STATS");
+    if (env == nullptr || env[0] == '0' || env[0] == '\0') return;
+    const uint32_t N = ctx_.tree->total_nodes;
+    if (N == 0 || reach_oop_.empty() || reach_ip_.empty()) return;
+    const uint16_t nc = ctx_.iso->num_canonical;
+
+    auto row_all_zero = [&](const std::vector<float>& buf, uint32_t n) {
+        const float* r = buf.data() + row_off(n);
+        for (uint16_t c = 0; c < nc; ++c) if (r[c] != 0.0f) return false;
+        return true;
+    };
+
+    auto row_live_count = [&](const std::vector<float>& buf, uint32_t n) {
+        const float* r = buf.data() + row_off(n);
+        uint32_t live = 0;
+        for (uint16_t c = 0; c < nc; ++c) if (r[c] != 0.0f) ++live;
+        return live;
+    };
+
+    // Lane-aligned dead blocks: the only form of dynamic skipping that keeps
+    // the terminal kernels on SIMD. An index-list gather saves (1 - live) of
+    // the work but turns a contiguous vector loop into a scalar gather, which
+    // this codebase has already measured as a REGRESSION at 14.4% density
+    // (~104 ms -> ~219 ms per 100 iters; see the kSparseTraversalDensityDen
+    // note in prepare()). A block is skippable only if EVERY lane in it is
+    // zero, so this counts what a SIMD-safe implementation could actually win.
+    auto row_dead_blocks = [&](const std::vector<float>& buf, uint32_t n) {
+        const float* r = buf.data() + row_off(n);
+        uint32_t dead = 0;
+        for (uint16_t b = 0; b < nc; b = static_cast<uint16_t>(b + kActionLane)) {
+            const uint16_t end = static_cast<uint16_t>(
+                std::min<std::size_t>(b + kActionLane, nc));
+            bool all_zero = true;
+            for (uint16_t c = b; c < end; ++c) {
+                if (r[c] != 0.0f) { all_zero = false; break; }
+            }
+            if (all_zero) ++dead;
+        }
+        return dead;
+    };
+    const uint32_t blocks_per_row =
+        static_cast<uint32_t>((nc + kActionLane - 1) / kActionLane);
+
+    // The static live count B1b already exploits: hands with root reach > 0.
+    // Everything below is measured against THIS, not against nc, because the
+    // static win is already banked.
+    uint32_t static_live[2] = {0, 0};
+    for (uint16_t c = 0; c < nc; ++c) {
+        if ((*ctx_.oop_reach)[c] != 0.0f) ++static_live[0];
+        if ((*ctx_.ip_reach)[c] != 0.0f) ++static_live[1];
+    }
+
+    for (int traverser = 0; traverser < 2; ++traverser) {
+        const int opp_player = 1 - traverser;
+        const std::vector<float>& opp = (traverser == 0) ? reach_ip_ : reach_oop_;
+        uint32_t dead_nodes = 0, dead_terms = 0, terms = 0;
+        uint64_t term_live_sum = 0, term_dead_block_sum = 0;
+        for (uint32_t n = 0; n < N; ++n) {
+            const bool is_term =
+                static_cast<NodeType>(ctx_.tree->node_types[n]) == NodeType::TERMINAL;
+            if (is_term) ++terms;
+            if (row_all_zero(opp, n)) {
+                ++dead_nodes;
+                if (is_term) ++dead_terms;
+            }
+            // Per-hand: how wide is the terminal inner loop really, once the
+            // strategy has zeroed hands out on the way down? B1b inc 1 walks
+            // the STATIC root-range list; this is what a per-node dynamic list
+            // would cost instead.
+            if (is_term) {
+                term_live_sum += row_live_count(opp, n);
+                term_dead_block_sum += row_dead_blocks(opp, n);
+            }
+        }
+        const double dyn_live = terms ? static_cast<double>(term_live_sum) / terms : 0.0;
+        const double dead_blk = terms
+            ? static_cast<double>(term_dead_block_sum) / terms : 0.0;
+        std::fprintf(stderr,
+            "[prune] traverser=%d nc=%u nodes=%u dead=%u (%.1f%%) "
+            "terminals=%u dead_terminals=%u (%.1f%%) "
+            "opp_live static=%u dynamic_mean=%.1f (%.1f%% of static) "
+            "| lanes_live=%.1f%% dead_blocks=%.1f/%u (%.1f%% SIMD-skippable)\n",
+            traverser, static_cast<unsigned>(nc), N, dead_nodes,
+            100.0 * dead_nodes / static_cast<double>(N),
+            terms, dead_terms,
+            terms ? 100.0 * dead_terms / static_cast<double>(terms) : 0.0,
+            static_live[opp_player], dyn_live,
+            static_live[opp_player]
+                ? 100.0 * dyn_live / static_live[opp_player] : 0.0,
+            nc ? 100.0 * dyn_live / nc : 0.0,
+            dead_blk, blocks_per_row,
+            blocks_per_row ? 100.0 * dead_blk / blocks_per_row : 0.0);
+    }
+}
+
+// ============================================================================
 // finalize ??same as CpuBackend; normalize strategy_sum into strategy.
 // ============================================================================
 
 inline void LevelizedCpuBackend::finalize() {
     const uint16_t nc = ctx_.iso->num_canonical;
     const uint32_t N = ctx_.tree->total_nodes;
+    report_prune_opportunity();
     strategy_.assign(N, {});
 
     auto finalize_node = [&](uint32_t i) {

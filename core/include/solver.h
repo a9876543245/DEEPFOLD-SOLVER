@@ -194,9 +194,11 @@ inline void postsolve_parallel_for(
 constexpr uint32_t kGpuAutoMinNodes = 256;        // below this → CPU (rivers, tiny spots)
 constexpr uint64_t kGpuAutoMinWork  = 150000;     // nodes × iters to amortize ~130ms prepare
 
+/// Node-count form: the projected ① gate (Solver::project_enumerated_tree)
+/// asks this before the enumerated tree exists.
 inline bool should_auto_select_gpu(
     const SolverConfig& config,
-    const FlatGameTree& tree,
+    uint64_t total_nodes,
     size_t matchup_table_count)
 {
     if (!GPU_BACKEND_FUNCTIONAL || !has_cuda_gpu()) return false;
@@ -209,13 +211,21 @@ inline bool should_auto_select_gpu(
     // Tiny trees (single-street river spots ~33 nodes): the GPU is slower even
     // per-iteration here and the prepare cost dwarfs the whole solve. No
     // iteration count makes GPU win, so floor it to CPU.
-    if (tree.total_nodes < kGpuAutoMinNodes) return false;
+    if (total_nodes < kGpuAutoMinNodes) return false;
 
     // Otherwise GPU wins once nodes × iterations clears the fixed prepare cost.
     const uint64_t work =
-        static_cast<uint64_t>(tree.total_nodes) *
-        static_cast<uint64_t>(config.max_iterations);
+        total_nodes * static_cast<uint64_t>(config.max_iterations);
     return work >= kGpuAutoMinWork;
+}
+
+inline bool should_auto_select_gpu(
+    const SolverConfig& config,
+    const FlatGameTree& tree,
+    size_t matchup_table_count)
+{
+    return should_auto_select_gpu(
+        config, static_cast<uint64_t>(tree.total_nodes), matchup_table_count);
 }
 
 // PR-4: both of these now DELEGATE to the shared terminal plan — they are
@@ -616,6 +626,28 @@ private:
     std::vector<std::vector<int8_t>> matchup_showdown_count_per_runout_;
     std::vector<std::vector<uint16_t>> matchup_original_ranks_per_runout_;
     std::vector<CardMask> matchup_board_masks_;
+    /// 2026-09-09 audit P0: per-table equity matrix for partial-board
+    /// showdowns (empty for full boards / fold-only tables). See
+    /// SolverContext::matchup_equity_per_runout and
+    /// compute_equity_matchup_for_board.
+    std::vector<std::vector<float>> matchup_equity_per_runout_;
+    /// Which tables NEED an equity matrix (partial board + a showdown
+    /// terminal). Marked by precompute_matchups(); the matrices themselves
+    /// are built by build_equity_tables() only after every memory gate has
+    /// accepted the tree, so a gate that collapses or rejects never pays for
+    /// them (and its own message is the one the user sees). The estimators
+    /// price the NEEDED count, which is why it is kept separately.
+    std::vector<uint8_t> matchup_equity_needed_;
+    /// Board card count per runout table (3/4/5), parallel to the tables.
+    std::vector<uint8_t> matchup_board_size_per_runout_;
+    uint32_t matchup_equity_count() const {
+        uint32_t n = 0;
+        for (uint8_t need : matchup_equity_needed_) if (need) ++n;
+        return n;
+    }
+    /// Materialize the equity matrices precompute_matchups() marked as
+    /// needed (idempotent — already-built tables are kept).
+    void build_equity_tables();
     std::map<std::pair<uint32_t, uint16_t>, std::vector<float>> resolved_locks_;
 
     /// PR-4: the ONE terminal-representation decision for this solve.
@@ -750,6 +782,20 @@ private:
         const char* label  = "";   ///< "VRAM" | "host RAM"
     };
 
+    /// The tree-shaped inputs of check_enumerated_fit(), passed explicitly
+    /// (2026-09-10) so the gate can price a tree that does not exist yet —
+    /// project_enumerated_tree() — instead of reading `tree_`.
+    struct TreeStats {
+        uint64_t total_nodes = 0;
+        uint64_t total_edges = 0;
+        uint64_t value_rows  = 0;   ///< gpu_value_rows() of that tree
+    };
+    static TreeStats tree_stats(const FlatGameTree& t) {
+        return {static_cast<uint64_t>(t.total_nodes),
+                static_cast<uint64_t>(t.total_edges),
+                gpu_value_rows(t)};
+    }
+
     /// The ONE formula behind solve()'s ① collapse gate and
     /// estimate_only()'s preview. A4-host inc 4 made sharing it mandatory:
     /// the builder no longer collapses rainbow flops on its matchup
@@ -765,7 +811,47 @@ private:
     EnumeratedFit check_enumerated_fit(
         BackendType planned, uint64_t tables, uint64_t player_nodes,
         uint64_t player_slots, uint64_t host_matchup,
-        bool device_dense_upload) const;
+        bool device_dense_upload, uint64_t equity_tables,
+        const TreeStats& stats) const;
+
+    /// Does a mid-loop exploitability probe materialize a HOST strategy
+    /// copy on this backend? Since 2026-09-10 the GPU answers probes from
+    /// device state (ISolverBackend::finalize_for_probe), so on a GPU solve
+    /// only a CPU-routed probe (force_cpu_postsolve) still pays finalize()'s
+    /// copy. The ① collapse gate, build_footprint() and estimate_only()
+    /// all charge the probe copy through THIS predicate — the first two
+    /// used to disagree (1.5× vs 2.5× copies), which let a 2.08M-node lite
+    /// rainbow enumerate past the collapse gate and then die at the host
+    /// hard gate (2026-09-10 regen).
+    bool host_probe_copies(BackendType backend) const {
+        return config_.compute_exploitability
+            && config_.target_exploitability > 0.0f
+            && (backend != BackendType::GPU || config_.force_cpu_postsolve);
+    }
+
+    /// 2026-09-10: the ENUMERATED flop tree's exact size, derived from the
+    /// COLLAPSED tree without building it. Betting subtrees do not depend on
+    /// the cards dealt, so with chance depth d = number of chance nodes above
+    /// a node (0 flop part, 1 turn part, 2 river part):
+    ///     N_enum = N_0 + K_t·N_1 + K_tr·N_2
+    /// where K_t is the canonical turn-card count and K_tr the sum over turn
+    /// cards of the canonical river-card counts, both enumerated with the
+    /// builder's own permutation set. Same for player nodes and action slots.
+    /// Tables follow precompute_matchups()'s dedup rule (sorted board
+    /// signature); equity tables are the partial-board tables that carry a
+    /// showdown terminal. Verified equal to the built tree on AsKd7c
+    /// (1,105,818 / 1,225 tables), AsKsQs (309,753) and AsKs7c (648,102).
+    struct EnumeratedProjection {
+        uint64_t nodes         = 0;
+        uint64_t player_nodes  = 0;
+        uint64_t player_slots  = 0;
+        uint64_t tables        = 0;
+        uint64_t equity_tables = 0;
+        TreeStats stats;   ///< nodes / edges / value rows of the enumerated tree
+    };
+    EnumeratedProjection project_enumerated_tree(
+        const FlatGameTree& collapsed,
+        const std::vector<std::array<uint8_t, 4>>& range_perms) const;
 
     /// B1a inc 3: does a GPU solve of this config keep a materialized
     /// current_strategy buffer? Only node-locked solves do — GpuBackend
@@ -776,16 +862,36 @@ private:
         return !config_.node_locks.empty();
     }
 
+    /// Same question for the CPU. MUST agree with
+    /// LevelizedCpuBackend::materialize_strategy_ exactly — the CPU state
+    /// estimate is contractually equal to the allocation (Phase 0), not merely
+    /// an upper bound, so a mismatch here is a broken contract rather than a
+    /// conservative rounding. Both terms are config-only for that reason.
+    ///
+    /// The reference backend still keeps its third array; only the levelized
+    /// one derives.
+    bool cpu_materializes_strategy() const {
+        if (config_.cpu_backend_kind != SolverConfig::CpuBackendKind::LEVELIZED) {
+            return true;
+        }
+        return !config_.node_locks.empty()
+            || config_.dcfr_schedule != SolverConfig::DcfrSchedule::POSTFLOP_STYLE;
+    }
+
     /// Same accounting as host_matchup_bytes() but for a PREDICTED table
     /// count / materialization decision (estimate_only, which never runs
     /// precompute). One body so the preview and the solve price the matchup
     /// family identically.
     uint64_t estimated_host_matchup_bytes(uint64_t tables,
-                                          bool host_dense) const {
+                                          bool host_dense,
+                                          uint64_t equity_tables) const {
         const uint64_t nc = iso_.num_canonical;
-        if (!host_dense) return bytes_for_matchup_rank_tables(tables);
+        // 2026-09-09 audit: the partial-board equity tables are built on
+        // every plan (the blockers cannot represent them).
+        const uint64_t equity = bytes_for_equity_tables(equity_tables, nc);
+        if (!host_dense) return bytes_for_matchup_rank_tables(tables) + equity;
         const uint64_t dense = bytes_for_matchup_tables(
-            tables, nc, matchup_bytes_per_cell(config_, iso_));
+            tables, nc, matchup_bytes_per_cell(config_, iso_)) + equity;
         const bool postsolve_will_run =
             config_.compute_exploitability || config_.compute_combo_evs;
         if (!postsolve_will_run || tables == 0) return dense;
@@ -808,25 +914,46 @@ private:
     /// and both fitting the same half-host cap.
     uint64_t host_matchup_bytes() const {
         return estimated_host_matchup_bytes(matchup_ev_per_runout_.size(),
-                                            matchup_dense_materialized_);
+                                            matchup_dense_materialized_,
+                                            matchup_equity_count());
     }
 
     /// Blocker-path terminal evaluation shared by the BR and EV sweeps
     /// (their dense terminal blocks are line-for-line identical). Returns
     /// false when this runout lacks blocker inputs — caller falls back to
     /// the dense path.
-    bool postsolve_terminal_blocker(uint32_t node_idx, int self_player,
-                                    TerminalType tt, float half_pot,
-                                    int32_t mi,
-                                    const std::vector<float>& reach_oop,
-                                    const std::vector<float>& reach_ip,
-                                    std::vector<float>& values) const;
+    /// 2026-09-09 audit: ONE terminal evaluator for both postsolve sweeps
+    /// (EV and best response). Uses the CFR kernels' payoff model — raked
+    /// showdowns, matched-pot fold rake, equity tables for partial-board
+    /// showdowns — so the reported exploitability measures the game that was
+    /// actually solved. Routes to the rank/fold blockers when the plan allows
+    /// and to the dense tables otherwise.
+    void postsolve_terminal_values(uint32_t node_idx, int self_player,
+                                   const std::vector<float>& reach_oop,
+                                   const std::vector<float>& reach_ip,
+                                   std::vector<float>& values) const;
+    /// Board mask of the runout table a node evaluates on (root board when
+    /// the table has no mask, e.g. before precompute).
+    CardMask board_mask_at(uint32_t node_idx) const;
+    /// 2026-09-09 audit P0: the symmetry the canonical hand space may use is
+    /// the one the BOARD, both RANGES and the node LOCKS all share. Returned
+    /// by value-into-member so the pointers stay valid for the call.
+    const IsoConstraints& iso_constraints() const {
+        iso_constraints_.oop_weights = &config_.oop_range_weights;
+        iso_constraints_.ip_weights  = &config_.ip_range_weights;
+        iso_constraints_.node_locks  = &config_.node_locks;
+        return iso_constraints_;
+    }
+    mutable IsoConstraints iso_constraints_;
+    /// Σ over card-compatible ORIGINAL hand pairs of oop × ip reach on the
+    /// root board — the mass every conditional expectation divides by.
+    double legal_joint_mass() const;
     std::vector<float> cpu_ev_traverse(uint32_t node_idx, int perspective,
                                         std::vector<float>& reach_oop,
                                         std::vector<float>& reach_ip,
                                         std::map<uint32_t, std::vector<float>>* out_node_values = nullptr,
                                         const std::set<uint32_t>* visible_filter = nullptr,
-                                        std::map<uint32_t, float>* out_node_opp_reach = nullptr) const;
+                                        std::map<uint32_t, std::vector<float>>* out_node_opp_compat = nullptr) const;
     void compute_combo_evs();
 
     // ---- Helpers ----
@@ -910,6 +1037,7 @@ inline SolverContext Solver::make_context() {
     ctx.matchup_showdown_count_per_runout = &matchup_showdown_count_per_runout_;
     ctx.matchup_original_ranks_per_runout = &matchup_original_ranks_per_runout_;
     ctx.matchup_board_masks        = &matchup_board_masks_;
+    ctx.matchup_equity_per_runout  = &matchup_equity_per_runout_;
     ctx.ip_reach                   = &ip_reach_;
     ctx.oop_reach                  = &oop_reach_;
     ctx.resolved_locks             = &resolved_locks_;
@@ -924,13 +1052,109 @@ inline SolverContext Solver::make_context() {
 // Solve entry point
 // ============================================================================
 
+inline Solver::EnumeratedProjection Solver::project_enumerated_tree(
+    const FlatGameTree& collapsed,
+    const std::vector<std::array<uint8_t, 4>>& range_perms) const
+{
+    EnumeratedProjection p;
+    const uint32_t N = collapsed.total_nodes;
+    if (N == 0) return p;
+
+    // Canonical runouts exactly as GameTreeBuilder enumerates them (same
+    // board-fixing ∩ range/lock-preserving permutation set): K_t turn cards,
+    // K_tr = Σ over the turn cards of that turn board's canonical river cards.
+    const CanonicalRunouts turns = enumerate_canonical_runouts(
+        config_.board.data(), config_.board_size, &range_perms);
+    const uint64_t K_t = turns.reps.size();
+    uint64_t K_tr = 0;
+    std::set<std::vector<uint8_t>> river_sigs;
+    for (const auto& t : turns.reps) {
+        Card b4[MAX_BOARD_CARDS];
+        for (uint8_t i = 0; i < config_.board_size; ++i) b4[i] = config_.board[i];
+        b4[config_.board_size] = t.card;
+        const uint8_t bs4 = static_cast<uint8_t>(config_.board_size + 1);
+        const CanonicalRunouts rivers =
+            enumerate_canonical_runouts(b4, bs4, &range_perms);
+        K_tr += rivers.reps.size();
+        for (const auto& r : rivers.reps) {
+            std::vector<uint8_t> sig(b4, b4 + bs4);
+            sig.push_back(r.card);
+            std::sort(sig.begin(), sig.end());
+            river_sigs.insert(std::move(sig));
+        }
+    }
+
+    // Multiplicity of a collapsed node in the enumerated tree, by chance depth
+    // (chance nodes above it): the flop part appears once, the turn part once
+    // per canonical turn card, the river part once per canonical (turn, river)
+    // pair. A chance node sits at its parent's depth and is one node in either
+    // tree — only its child count changes (1 → K_t at the turn chance; summed
+    // over the turn cards a river chance is reached under, K_tr).
+    const uint64_t mult[3] = {1u, K_t, K_tr};
+
+    std::vector<uint8_t>  cdepth(N, 0);   // chance depth
+    std::vector<uint32_t> level(N, 0);    // depth from root (value-row layout)
+    std::vector<uint64_t> nt_width;       // enumerated non-terminals per level
+    uint64_t terminals = 0;
+    bool showdown_d[3] = {false, false, false};
+    std::vector<uint32_t> stack;
+    stack.reserve(64);
+    stack.push_back(0u);
+    while (!stack.empty()) {
+        const uint32_t n = stack.back();
+        stack.pop_back();
+        const auto nt = static_cast<NodeType>(collapsed.node_types[n]);
+        const uint8_t d = cdepth[n] > 2 ? 2 : cdepth[n];
+        const uint64_t m = mult[d];
+        const uint8_t na = collapsed.num_children[n];
+        p.nodes += m;
+        if (level[n] >= nt_width.size()) nt_width.resize(level[n] + 1, 0);
+        if (nt == NodeType::TERMINAL) {
+            terminals += m;
+            if (static_cast<TerminalType>(collapsed.terminal_types[n]) ==
+                TerminalType::SHOWDOWN) {
+                showdown_d[d] = true;
+            }
+        } else {
+            nt_width[level[n]] += m;
+        }
+        if (nt == NodeType::PLAYER_OOP || nt == NodeType::PLAYER_IP) {
+            p.player_nodes += m;
+            p.player_slots += m * na;
+            p.stats.total_edges += m * na;
+        } else if (nt == NodeType::CHANCE) {
+            p.stats.total_edges += (d == 0) ? K_t : (d == 1 ? K_tr : m * na);
+        } else {
+            p.stats.total_edges += m * na;
+        }
+        const uint32_t off = collapsed.children_offset[n];
+        for (uint8_t a = 0; a < na; ++a) {
+            const uint32_t ch = collapsed.children[off + a];
+            cdepth[ch] = static_cast<uint8_t>(
+                cdepth[n] + (nt == NodeType::CHANCE ? 1 : 0));
+            level[ch] = level[n] + 1;
+            stack.push_back(ch);
+        }
+    }
+    p.stats.total_nodes = p.nodes;
+    p.stats.value_rows  = gpu_value_rows_from_widths(terminals, nt_width);
+    // Root board + one per canonical turn board + distinct 5-card boards
+    // (turn A / river B and turn B / river A share a signature).
+    p.tables = 1 + K_t + static_cast<uint64_t>(river_sigs.size());
+    // Partial-board tables carrying a showdown: the flop table when a flop
+    // all-in can be called, every turn table when a turn all-in can.
+    p.equity_tables = (showdown_d[0] ? 1u : 0u) + (showdown_d[1] ? K_t : 0u);
+    return p;
+}
+
 inline Solver::EnumeratedFit Solver::check_enumerated_fit(
     BackendType planned, uint64_t tables, uint64_t player_nodes,
     uint64_t player_slots, uint64_t host_matchup,
-    bool device_dense_upload) const
+    bool device_dense_upload, uint64_t equity_tables,
+    const TreeStats& stats) const
 {
     const uint64_t nc      = iso_.num_canonical;
-    const uint64_t total_n = tree_.total_nodes;
+    const uint64_t total_n = stats.total_nodes;
 
     // Host PEAK core (P1-1), charged on BOTH backends: the matchup tables
     // and the 2× finalized strategy live in host RAM even when CFR runs on
@@ -943,7 +1167,8 @@ inline Solver::EnumeratedFit Solver::check_enumerated_fit(
     uint64_t host_needed = host_matchup
         + memory_budget::bytes_for_live_final_strategy(
               bytes_for_final_strategy(player_slots, nc, player_nodes),
-              planned == BackendType::GPU)
+              planned == BackendType::GPU,
+              host_probe_copies(planned))
         + memory_budget::kHostProcessOverheadBytes;
 
     uint64_t device_needed = 0, device_budget = 0;
@@ -957,9 +1182,9 @@ inline Solver::EnumeratedFit Solver::check_enumerated_fit(
         // 0 probe (no device / driver failure) skips the device check and
         // leaves it to the existing prepare error paths.
         device_needed = bytes_for_gpu_device_total(
-            total_n, tree_.total_edges, player_slots, tables, nc,
+            total_n, stats.total_edges, player_slots, tables, nc,
             device_dense_upload, gpu_materializes_strategy(),
-            gpu_value_rows(tree_));
+            stats.value_rows, equity_tables);
         device_budget = config_.memory_budget.gpu_bytes > 0
             ? config_.memory_budget.gpu_bytes
             : static_cast<uint64_t>(
@@ -967,7 +1192,8 @@ inline Solver::EnumeratedFit Solver::check_enumerated_fit(
         host_needed +=
             memory_budget::bytes_for_gpu_host_overhead(device_needed);
     } else {
-        host_needed += bytes_for_cpu_state_compact(player_slots, nc);
+        host_needed += bytes_for_cpu_state_compact(
+            player_slots, nc, cpu_materializes_strategy());
         if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
             host_needed += bytes_for_levelized_cpu_extra(total_n, nc);
         }
@@ -1007,7 +1233,8 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     // flop/turn/river board cards already in config_, so reordering is safe.
     stage_start = Clock::now();
     iso_ = forced_iso_ ? *forced_iso_
-                       : compute_isomorphism(config_.board.data(), config_.board_size);
+                       : compute_isomorphism(config_.board.data(), config_.board_size,
+                                             &iso_constraints());
     auto stage_end = Clock::now();
     timing.isomorphism_ms = elapsed_since(stage_start, stage_end);
 
@@ -1026,18 +1253,80 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     compact_index_space();
     stage_end = Clock::now();
     timing.reach_init_ms = elapsed_since(stage_start, stage_end);
+    // 2026-09-09 audit: a solve with no card-compatible hand pair would
+    // report every EV as 0/0 and a perfectly "converged" 0% exploitability.
+    // Refuse it up front (decomposition subgames opt out — see the flag).
+    if (!config_.allow_unreachable_ranges && legal_joint_mass() <= 0.0) {
+        throw std::runtime_error(
+            "No card-compatible matchup between the OOP and IP ranges on this "
+            "board (every OOP hand shares a card with every IP hand, or a "
+            "range is empty). Nothing to solve.");
+    }
 
     // Step 2: tree (now with memory-budget-aware runout cap)
     stage_start = Clock::now();
+    const TerminalRepresentationPlan step2_plan =
+        plan_terminal_representation(config_, iso_);
+    const bool step2_host_dense = host_dense_matchup_required(
+        step2_plan, iso_, oop_reach_, ip_reach_);
     GameTreeBuilder builder(config_);
     builder.set_memory_policy(
         iso_.num_canonical,
         config_.memory_budget,
         matchup_bytes_per_cell(config_, iso_),
-        host_dense_matchup_required(
-            plan_terminal_representation(config_, iso_),
-            iso_, oop_reach_, ip_reach_));
-    tree_ = builder.build();
+        step2_host_dense);
+    // ① collapse gate, PROJECTED (2026-09-10). The measured gate further
+    // down needs the ENUMERATED tree built first — 1.1M–27.6M nodes (5–6 s)
+    // plus precompute over ~1,225 rank tables (3 s) on a rainbow flop that
+    // is then thrown away: ~90% of a Fast-mode solve's wall time once the
+    // GPU iterations take 0.6 s. The collapsed tree costs milliseconds and
+    // determines the enumerated one exactly (project_enumerated_tree), so
+    // price that first and skip the enumerated build when it cannot fit.
+    // The measured gate stays the authority on every tree that IS built —
+    // it also sees the REFINED terminal plan, whose only possible move
+    // (RankBlockerOnly → dense) adds bytes, so this pre-check can only
+    // ever skip a build the measured gate would have collapsed anyway.
+    std::string state_gate_diag;
+    bool projected_collapse = false;
+    if (config_.board_size == 3) {
+        GameTreeBuilder probe(config_);
+        probe.set_memory_policy(
+            iso_.num_canonical,
+            config_.memory_budget,
+            matchup_bytes_per_cell(config_, iso_),
+            step2_host_dense);
+        probe.set_force_runout_collapse(true);
+        FlatGameTree collapsed = probe.build();
+        const EnumeratedProjection proj =
+            project_enumerated_tree(collapsed, probe.range_perms());
+        BackendType planned = backend_type_;
+        if (planned == BackendType::AUTO) {
+            planned = should_auto_select_gpu(config_, proj.nodes, proj.tables)
+                      ? BackendType::GPU : BackendType::CPU;
+        }
+        const EnumeratedFit fit = check_enumerated_fit(
+            planned, proj.tables, proj.player_nodes, proj.player_slots,
+            estimated_host_matchup_bytes(proj.tables, step2_host_dense,
+                                         proj.equity_tables),
+            step2_plan.device_dense_upload, proj.equity_tables, proj.stats);
+        if (!fit.fits) {
+            char buf[320];
+            snprintf(buf, sizeof(buf),
+                "Enumerated runout tree needs ~%.2f GB %s "
+                "(N=%llu nodes, nc=%u, tables=%llu) but only %.2f GB is available - "
+                "collapsed runouts instead (turn/river equity approximated).",
+                static_cast<double>(fit.needed) / (1024.0 * 1024.0 * 1024.0),
+                fit.label,
+                static_cast<unsigned long long>(proj.nodes),
+                static_cast<unsigned>(iso_.num_canonical),
+                static_cast<unsigned long long>(proj.tables),
+                static_cast<double>(fit.budget) / (1024.0 * 1024.0 * 1024.0));
+            state_gate_diag = buf;
+            tree_ = std::move(collapsed);
+            projected_collapse = true;
+        }
+    }
+    if (!projected_collapse) tree_ = builder.build();
     stage_end = Clock::now();
     timing.tree_build_ms = elapsed_since(stage_start, stage_end);
     timing.tree_nodes = tree_.total_nodes;
@@ -1102,7 +1391,6 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     // re-lists the same canonical runouts) and would collapse boards that
     // actually fit. The wasted precompute on a gated board is bounded by
     // the builder's own matchup cap (≤ host_bytes/2).
-    std::string state_gate_diag;
     if (!tree_.runout_approximated && config_.board_size == 3) {
         const uint64_t nc      = iso_.num_canonical;
         const uint64_t tables  = std::max<uint64_t>(matchup_ev_per_runout_.size(), 1);
@@ -1127,7 +1415,8 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
 
         const EnumeratedFit fit = check_enumerated_fit(
             planned, tables, player_n, player_slots, host_matchup_bytes(),
-            terminal_plan_.device_dense_upload);
+            terminal_plan_.device_dense_upload, matchup_equity_count(),
+            tree_stats(tree_));
         if (!fit.fits) {
             const uint64_t shown_needed = fit.needed;
             const uint64_t shown_budget = fit.budget;
@@ -1204,7 +1493,8 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         }
         // A4-host inc 3: the honest host cost of the tables as built.
         comp_matchup = host_matchup_bytes();
-        comp_cpu_state = bytes_for_cpu_state_compact(gate_player_slots, nc);
+        comp_cpu_state = bytes_for_cpu_state_compact(
+            gate_player_slots, nc, cpu_materializes_strategy());
         // v1.7.0: levelized backend pre-allocates 3 × total_nodes × nc
         // floats (reach_oop_, reach_ip_, value_) on top of the reference
         // state. Only counted into the final footprint on CPU backends.
@@ -1225,7 +1515,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             total_n, tree_.total_edges, gate_player_slots,
             matchup_ev_per_runout_.size(), nc,
             terminal_plan_.device_dense_upload, gpu_materializes_strategy(),
-            gpu_value_rows_est);
+            gpu_value_rows_est, matchup_equity_count());
         // Peak-host lifetime terms (P1-1): finalize holds TWO materialized
         // strategy copies on every backend.
         comp_final_strategy = bytes_for_final_strategy(
@@ -1264,11 +1554,10 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         e.device_total_bytes     = (final_be == BackendType::GPU) ? comp_device_total : 0;
         e.final_strategy_bytes   = comp_final_strategy;
         e.gpu_backend            = (final_be == BackendType::GPU);
-        // Same predicate as the iteration loop's `exploit_early_stop`: a probe
-        // calls finalize(), which on GPU materializes a whole extra strategy
-        // copy on the host well before the real finalize does.
-        e.exploit_probe_runs     = config_.compute_exploitability
-                                && config_.target_exploitability > 0.0f;
+        // A HOST-side probe calls finalize(), which materializes a whole
+        // extra strategy copy well before the real finalize does; GPU
+        // probes are device-only since 2026-09-10 (see host_probe_copies).
+        e.exploit_probe_runs     = host_probe_copies(final_be);
         e.flat_tree_bytes        = memory_budget::bytes_for_flat_tree(
             tree_.total_nodes, tree_.total_edges)
             + ((final_be == BackendType::GPU)
@@ -1452,6 +1741,17 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         }
     }
 
+    // 2026-09-09 audit P0: build the partial-board equity tables now — after
+    // every gate has accepted THIS tree (a collapsed rebuild or a budget
+    // reject must never pay for them, and its message must be the one the
+    // user sees) and before the backend uploads them.
+    {
+        const auto eq_start = Clock::now();
+        build_equity_tables();
+        timing.precompute_matchups_ms += elapsed_since(eq_start, Clock::now());
+    }
+
+    stage_start = Clock::now();
     SolverContext ctx = make_context();
     backend_->prepare(ctx);
     stage_end = Clock::now();
@@ -1538,8 +1838,24 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             (t + 1) >= next_exp_check &&
             (t + 1) < config_.max_iterations) {
             const auto probe_start = Clock::now();
-            backend_->finalize();
-            strategy_ = backend_->strategy();
+            // 2026-09-10: a GPU probe is answered from device state (see
+            // ISolverBackend::finalize_for_probe) — no 75 MB strategy
+            // download, no host normalize. strategy_ is cleared so the CPU
+            // fallbacks inside compute_exploitability() can never read a
+            // stale copy; the real finalize() after the loop rebuilds it.
+            // force_cpu_postsolve routes the probe through the CPU traversals,
+            // which need the host strategy: the full finalize() + copy then.
+            bool device_probe = false;
+            if (!config_.force_cpu_postsolve) {
+                device_probe = backend_->finalize_for_probe();
+            } else {
+                backend_->finalize();
+            }
+            if (device_probe) {
+                strategy_.clear();
+            } else {
+                strategy_ = backend_->strategy();
+            }
             solved_ = true;
             const float exploit_pct = compute_exploitability();
             const auto probe_end = Clock::now();
@@ -1609,6 +1925,9 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             progress_cb(t + 1, 0.0f, elapsed);
         }
     }
+    // The GPU backend no longer waits per iteration; drain the queue here
+    // so iterations_ms is the device's time, not the host's enqueue time.
+    backend_->synchronize();
     if (early_stop_reason.empty() &&
         actual_iterations_run_ >= config_.max_iterations) {
         early_stop_reason = "iter_cap";
@@ -1753,11 +2072,13 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         // copy (adds the category byte and, under signed compression, the
         // int8 count matrix). PR-4: zero when the refined plan says the
         // rank-blocker serves every terminal (no dense upload happens).
-        r.estimated_gpu_matchup_bytes    = terminal_plan_.device_dense_upload
+        r.estimated_gpu_matchup_bytes    = (terminal_plan_.device_dense_upload
             ? bytes_for_matchup_tables(
                   matchup_ev_per_runout_.size(), iso_.num_canonical,
                   2ULL * sizeof(float))
-            : 0;
+            : 0)
+            + bytes_for_equity_tables(matchup_equity_count(), iso_.num_canonical);
+        r.matchup_equity_tables          = matchup_equity_count();
         r.terminal_representation        = terminal_plan_.label();
         r.host_dense_matchup             = matchup_dense_materialized_;
         r.estimated_strategy_tree_bytes  = gate_est.strategy_tree_ev_bytes;
@@ -1881,7 +2202,8 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
 // standard`. Picks the GPU rate when AUTO would select GPU (so the user
 // sees the right number BEFORE backend allocation).
 inline SolveResources Solver::estimate_only() {
-    iso_ = compute_isomorphism(config_.board.data(), config_.board_size);
+    iso_ = compute_isomorphism(config_.board.data(), config_.board_size,
+                               &iso_constraints());
 
     // A4-host inc 3/4: the reaches decide whether the matchup tables are
     // dense or rank-only, which both the builder's runout gate and the byte
@@ -1891,6 +2213,12 @@ inline SolveResources Solver::estimate_only() {
     // B1b inc 2: same order as solve(), so the preview prices the index space
     // the solve will actually allocate.
     compact_index_space();
+    if (!config_.allow_unreachable_ranges && legal_joint_mass() <= 0.0) {
+        throw std::runtime_error(
+            "No card-compatible matchup between the OOP and IP ranges on this "
+            "board (every OOP hand shares a card with every IP hand, or a "
+            "range is empty). Nothing to solve.");
+    }
     const TerminalRepresentationPlan est_plan =
         plan_terminal_representation(config_, iso_);
     const bool est_host_dense =
@@ -1902,7 +2230,37 @@ inline SolveResources Solver::estimate_only() {
         config_.memory_budget,
         matchup_bytes_per_cell(config_, iso_),
         est_host_dense);
-    tree_ = builder.build();
+    // Projected ① gate — same pre-check as solve() Step 2, so the preview
+    // skips the same enumerated builds the solve skips (and prices the
+    // same collapsed tree). See project_enumerated_tree().
+    bool projected_collapse = false;
+    if (config_.board_size == 3) {
+        GameTreeBuilder probe(config_);
+        probe.set_memory_policy(
+            iso_.num_canonical,
+            config_.memory_budget,
+            matchup_bytes_per_cell(config_, iso_),
+            est_host_dense);
+        probe.set_force_runout_collapse(true);
+        FlatGameTree collapsed = probe.build();
+        const EnumeratedProjection proj =
+            project_enumerated_tree(collapsed, probe.range_perms());
+        BackendType planned = backend_type_;
+        if (planned == BackendType::AUTO) {
+            planned = should_auto_select_gpu(config_, proj.nodes, proj.tables)
+                      ? BackendType::GPU : BackendType::CPU;
+        }
+        const EnumeratedFit fit = check_enumerated_fit(
+            planned, proj.tables, proj.player_nodes, proj.player_slots,
+            estimated_host_matchup_bytes(proj.tables, est_host_dense,
+                                         proj.equity_tables),
+            est_plan.device_dense_upload, proj.equity_tables, proj.stats);
+        if (!fit.fits) {
+            tree_ = std::move(collapsed);
+            projected_collapse = true;
+        }
+    }
+    if (!projected_collapse) tree_ = builder.build();
 
     SolveResources r;
     r.canonical_combos = board_canonical_combos();
@@ -1911,6 +2269,7 @@ inline SolveResources Solver::estimate_only() {
     uint32_t player_nodes = 0;
     uint64_t player_slots = 0;   // Σ num_children over player nodes (B1a compact)
     uint64_t matchup_tables_exact = 1;
+    uint64_t equity_tables_exact  = 0;
 
     // Counting is a lambda because the ① mirror below may rebuild the tree
     // collapsed and everything downstream must describe THAT tree.
@@ -1955,6 +2314,27 @@ inline SolveResources Solver::estimate_only() {
             sigs.insert(std::move(sig));
         }
         matchup_tables_exact += static_cast<uint64_t>(sigs.size());
+
+        // 2026-09-09 audit: equity tables — one per distinct board signature
+        // that is short of the river AND has a showdown terminal (called
+        // pre-river all-ins; every showdown of a collapsed tree). Same
+        // signature rule precompute_matchups() uses.
+        std::set<std::vector<uint8_t>> eq_sigs;
+        for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
+            if (static_cast<NodeType>(tree_.node_types[n]) != NodeType::TERMINAL) continue;
+            if (static_cast<TerminalType>(tree_.terminal_types[n]) != TerminalType::SHOWDOWN) continue;
+            std::vector<uint8_t> sig;
+            sig.reserve(static_cast<size_t>(config_.board_size) + 2);
+            for (uint8_t i = 0; i < config_.board_size; ++i) sig.push_back(config_.board[i]);
+            for (uint32_t a = n; a != 0u; a = tree_.parent_indices[a]) {
+                uint8_t dc = tree_.dealt_card[a];
+                if (dc != 0xFFu) sig.push_back(dc);
+            }
+            if (sig.size() >= 5) continue;
+            std::sort(sig.begin(), sig.end());
+            eq_sigs.insert(std::move(sig));
+        }
+        equity_tables_exact = static_cast<uint64_t>(eq_sigs.size());
     };
     recount_tree();
 
@@ -1971,10 +2351,12 @@ inline SolveResources Solver::estimate_only() {
                       ? BackendType::GPU : BackendType::CPU;
         }
         const uint64_t est_matchup_host =
-            estimated_host_matchup_bytes(matchup_tables_exact, est_host_dense);
+            estimated_host_matchup_bytes(matchup_tables_exact, est_host_dense,
+                                         equity_tables_exact);
         const EnumeratedFit fit = check_enumerated_fit(
             planned, matchup_tables_exact, player_nodes, player_slots,
-            est_matchup_host, est_plan.device_dense_upload);
+            est_matchup_host, est_plan.device_dense_upload, equity_tables_exact,
+            tree_stats(tree_));
         if (!fit.fits) {
             GameTreeBuilder collapsed_builder(config_);
             collapsed_builder.set_memory_policy(
@@ -2003,9 +2385,12 @@ inline SolveResources Solver::estimate_only() {
     // too); the static plan can only be optimistic on the rare
     // no-valid-blocker-metadata edge, which the backend pre-flight guards.
     r.host_dense_matchup             = est_host_dense;
+    r.matchup_equity_tables          = static_cast<uint32_t>(equity_tables_exact);
     r.estimated_matchup_bytes        =
-        estimated_host_matchup_bytes(matchup_count_est, est_host_dense);
-    r.estimated_cpu_state_bytes      = bytes_for_cpu_state_compact(player_slots, nc);
+        estimated_host_matchup_bytes(matchup_count_est, est_host_dense,
+                                     equity_tables_exact);
+    r.estimated_cpu_state_bytes      = bytes_for_cpu_state_compact(
+        player_slots, nc, cpu_materializes_strategy());
     // v1.7.0: include the levelized backend's extra reach/value buffers in
     // the pre-solve estimate too, so the UI's ETA banner doesn't say "this
     // fits in 4 GB" right before the host gate rejects on the real solve.
@@ -2017,13 +2402,13 @@ inline SolveResources Solver::estimate_only() {
     r.estimated_gpu_state_bytes      = bytes_for_gpu_state_compact(
         total_n, player_slots, nc, gpu_materializes_strategy(),
         gpu_value_rows_est);
-    r.estimated_gpu_matchup_bytes    = est_plan.device_dense_upload
+    r.estimated_gpu_matchup_bytes    = (est_plan.device_dense_upload
         ? bytes_for_matchup_tables(matchup_count_est, nc, 2ULL * sizeof(float))
-        : 0;
+        : 0) + bytes_for_equity_tables(equity_tables_exact, nc);
     r.estimated_device_total_bytes   = bytes_for_gpu_device_total(
         total_n, tree_.total_edges, player_slots, matchup_count_est, nc,
         est_plan.device_dense_upload, gpu_materializes_strategy(),
-        gpu_value_rows_est);
+        gpu_value_rows_est, equity_tables_exact);
 
     // Output plan (review round 2): only price the navigation cache + full
     // JSON when the caller will emit them.
@@ -2140,8 +2525,8 @@ inline SolveResources Solver::estimate_only() {
         player_slots, nc, player_nodes);
     gate_est.gpu_backend            = gpu_final;
     // Mirrors build_footprint() in solve() — see the note there.
-    gate_est.exploit_probe_runs     = config_.compute_exploitability
-                                   && config_.target_exploitability > 0.0f;
+    gate_est.exploit_probe_runs     = host_probe_copies(
+        gpu_final ? BackendType::GPU : BackendType::CPU);
     gate_est.flat_tree_bytes        = memory_budget::bytes_for_flat_tree(
         tree_.total_nodes, tree_.total_edges)
         + (gpu_final ? memory_budget::bytes_for_gpu_host_index_tables(
@@ -2307,6 +2692,163 @@ inline void compute_matchup_for_board(
     }
 }
 
+/// 2026-09-09 audit P0: the EQUITY matrix for a showdown that happens BEFORE
+/// the river — a called all-in on the flop or turn, or every showdown of a
+/// collapsed tree (whose "river" is still the flop board).
+///
+/// Every other showdown representation (category/valid, signed count, rank
+/// blocker) is built from the CURRENT board's best-5 ranks, which settles a
+/// flop all-in as if no more cards were dealt — a flush draw is scored as a
+/// pure loser. This table instead scores every pair of ORIGINAL hands over
+/// every completion of the board that neither hand blocks:
+///
+///   eq[ci, cj] = Σ_{oi∈ci, oj∈cj, oi∩oj=∅} Σ_{completions r ∌ oi,oj} sign(oi, oj | board ∪ r)
+///                ───────────────────────────────────────────────────────────
+///                              |ci| · |cj| · C(52 − board − 4, to_come)
+///
+/// i.e. exactly ev·valid in the dense tables' convention (ev = expected
+/// win − lose over the runouts the pair can actually see, valid = fraction of
+/// the canonical pair's original pairs that are card-compatible on the current
+/// board), because every base-compatible pair sees the same number of legal
+/// completions, C(R − 4, k). The terminal kernels consume it as a plain
+/// coefficient · reach dot product scaled by (half_pot − rake/2), plus the
+/// fold blocker's compatibility sum × (−rake/2) on raked solves; see
+/// SolverContext::matchup_equity_per_runout.
+///
+/// Cost: (#live originals)² pair comparisons per completion — 1,176
+/// completions on a flop, 44–45 on a turn — parallelized over completions with
+/// per-thread accumulators. Antisymmetry halves the pair loop.
+inline void compute_equity_matchup_for_board(
+    const IsomorphismMapping& iso,
+    const Card* board_cards,
+    uint8_t board_size,
+    std::vector<float>& out_equity)
+{
+    const uint16_t nc = iso.num_canonical;
+    const std::size_t cells = static_cast<std::size_t>(nc) * nc;
+    out_equity.assign(cells, 0.0f);
+    if (nc == 0 || board_size >= 5 || board_size < 3) return;
+
+    auto& eval = get_evaluator();
+    const auto& combo_table = get_combo_table();
+    const CardMask board_mask = board_to_mask(board_cards, board_size);
+    const int to_come = 5 - static_cast<int>(board_size);
+
+    // Live originals: compaction already dropped the classes nobody holds;
+    // within a class, an original blocked by THIS board contributes nothing
+    // (and still counts in |ci| — the same convention as the dense `valid`).
+    struct Orig { uint16_t ci; CardMask mask; Card c0, c1; };
+    std::vector<Orig> live;
+    live.reserve(NUM_COMBOS);
+    for (uint16_t c = 0; c < nc; ++c) {
+        for (uint16_t oi : iso.canonical_to_originals[c]) {
+            const Combo& cb = combo_table[oi];
+            if (cb.conflicts_with(board_mask)) continue;
+            live.push_back({c, card_to_mask(cb.cards[0]) | card_to_mask(cb.cards[1]),
+                            cb.cards[0], cb.cards[1]});
+        }
+    }
+    const std::size_t n = live.size();
+    if (n == 0) return;
+
+    // Every completion of the board (1 or 2 cards; 0xFF = no second card).
+    std::vector<std::array<Card, 2>> completions;
+    for (Card r1 = 0; r1 < NUM_CARDS; ++r1) {
+        if (board_mask & card_to_mask(r1)) continue;
+        if (to_come == 1) { completions.push_back({r1, 0xFFu}); continue; }
+        for (Card r2 = static_cast<Card>(r1 + 1); r2 < NUM_CARDS; ++r2) {
+            if (board_mask & card_to_mask(r2)) continue;
+            completions.push_back({r1, r2});
+        }
+    }
+
+    // 2026-09-10: per completion, hand a's sign against every b > a is
+    // accumulated over ORIGINAL pairs in int16 by
+    // cpu_simd::equity_sign_accumulate (16 lanes per step). Integer
+    // arithmetic, so the table is bit-identical to the scalar pair loop this
+    // replaces — which scattered two int32 adds per (a, b) into canonical cells
+    // and cost ~1.9 s per rainbow flop. Card compatibility does not depend on
+    // the completion, so it is applied once in the reduction below. Rows are
+    // padded to 16 lanes; padded lanes are never alive.
+    const std::size_t n_pad = (n + 15) & ~static_cast<std::size_t>(15);
+    std::vector<int32_t> pair_acc(n * n, 0);   // upper triangle, all threads
+    #if defined(_OPENMP)
+    #pragma omp parallel
+    #endif
+    {
+        std::vector<int16_t> local(n * n_pad, 0);
+        std::vector<int16_t> ranks(n_pad, 0);
+        std::vector<int16_t> alive(n_pad, 0);
+        #if defined(_OPENMP)
+        #pragma omp for schedule(dynamic, 4)
+        #endif
+        for (int64_t k = 0; k < static_cast<int64_t>(completions.size()); ++k) {
+            const Card r1 = completions[static_cast<std::size_t>(k)][0];
+            const Card r2 = completions[static_cast<std::size_t>(k)][1];
+            CardMask cmask = card_to_mask(r1);
+            Card full[5];
+            for (uint8_t i = 0; i < board_size; ++i) full[i] = board_cards[i];
+            full[board_size] = r1;
+            if (r2 != 0xFFu) { full[board_size + 1] = r2; cmask |= card_to_mask(r2); }
+            for (std::size_t i = 0; i < n; ++i) {
+                if (live[i].mask & cmask) { alive[i] = 0; ranks[i] = 0; continue; }
+                alive[i] = static_cast<int16_t>(-1);
+                // Ranks are [1, 7462] (hand_evaluator.h): exact in int16.
+                ranks[i] = static_cast<int16_t>(eval.evaluate(
+                    live[i].c0, live[i].c1, full[0], full[1], full[2], full[3], full[4]));
+            }
+            for (std::size_t a = 0; a + 1 < n; ++a) {
+                if (!alive[a]) continue;
+                cpu_simd::equity_sign_accumulate(
+                    ranks.data(), alive.data(), local.data() + a * n_pad,
+                    a + 1, n, ranks[a]);
+            }
+        }
+        #if defined(_OPENMP)
+        #pragma omp critical
+        #endif
+        {
+            for (std::size_t a = 0; a + 1 < n; ++a) {
+                const int16_t* row = local.data() + a * n_pad;
+                int32_t* dst = pair_acc.data() + a * n;
+                for (std::size_t b = a + 1; b < n; ++b) dst[b] += row[b];
+            }
+        }
+    }
+
+    // Reduce original pairs into canonical cells (antisymmetric), dropping
+    // card-incompatible pairs.
+    std::vector<int32_t> acc(cells, 0);
+    for (std::size_t a = 0; a + 1 < n; ++a) {
+        const int32_t* row = pair_acc.data() + a * n;
+        const CardMask ma = live[a].mask;
+        const std::size_t row_a = static_cast<std::size_t>(live[a].ci) * nc;
+        for (std::size_t b = a + 1; b < n; ++b) {
+            const int32_t s = row[b];
+            if (s == 0 || (ma & live[b].mask)) continue;
+            acc[row_a + live[b].ci] += s;
+            acc[static_cast<std::size_t>(live[b].ci) * nc + live[a].ci] -= s;
+        }
+    }
+
+    // Normalize by the canonical pair's original-pair count and the number of
+    // completions every base-compatible pair sees.
+    const double remaining = static_cast<double>(52 - board_size);
+    const double completions_per_pair = (to_come == 1)
+        ? (remaining - 4.0)
+        : (remaining - 4.0) * (remaining - 5.0) * 0.5;
+    for (uint16_t ci = 0; ci < nc; ++ci) {
+        const double wi = static_cast<double>(iso.canonical_weights[ci]);
+        for (uint16_t cj = 0; cj < nc; ++cj) {
+            const std::size_t idx = static_cast<std::size_t>(ci) * nc + cj;
+            if (acc[idx] == 0) continue;
+            const double denom = wi * static_cast<double>(iso.canonical_weights[cj])
+                               * completions_per_pair;
+            out_equity[idx] = static_cast<float>(static_cast<double>(acc[idx]) / denom);
+        }
+    }
+}
+
 inline void Solver::precompute_matchups(bool force_dense) {
     uint16_t nc = iso_.num_canonical;
     auto& eval = get_evaluator();
@@ -2343,6 +2885,8 @@ inline void Solver::precompute_matchups(bool force_dense) {
     matchup_showdown_count_per_runout_.clear();
     matchup_original_ranks_per_runout_.clear();
     matchup_board_masks_.clear();
+    matchup_equity_per_runout_.clear();
+    matchup_board_size_per_runout_.clear();
     std::map<std::vector<uint8_t>, int32_t> sig_to_idx;
 
     std::vector<int32_t>& matchup_idx = tree_.matchup_idx;
@@ -2455,6 +2999,8 @@ inline void Solver::precompute_matchups(bool force_dense) {
             showdown_coeff, showdown_count, build_showdown_coeff, original_ranks,
             build_dense);
         matchup_board_masks_.push_back(board_to_mask(sig.data(), bs));
+        matchup_board_size_per_runout_.push_back(bs);
+        matchup_equity_per_runout_.emplace_back();   // filled after the walk
         // Under the blocker path these three stay EMPTY, but an entry is
         // still pushed per table: matchup_ev_per_runout_.size() is the
         // deduplicated table COUNT that estimators, gates, telemetry and the
@@ -2492,6 +3038,23 @@ inline void Solver::precompute_matchups(bool force_dense) {
                 child_runouts.push_back(tree_.dealt_card[child]);
             }
             stk.push_back({child, std::move(child_runouts)});
+        }
+    }
+
+    // 2026-09-09 audit P0: MARK every partial-board table that carries a
+    // SHOWDOWN terminal — a called pre-river all-in, or every showdown of a
+    // collapsed tree — as needing an equity matrix. None of the other
+    // showdown representations can express "cards still to come". The
+    // matrices are built by build_equity_tables() once the gates have
+    // accepted the tree; here only the count is fixed, for the estimators.
+    matchup_equity_needed_.assign(matchup_ev_per_runout_.size(), 0);
+    for (uint32_t n = 0; n < tree_.total_nodes; ++n) {
+        if (static_cast<NodeType>(tree_.node_types[n]) != NodeType::TERMINAL) continue;
+        if (static_cast<TerminalType>(tree_.terminal_types[n]) != TerminalType::SHOWDOWN) continue;
+        const int32_t mi = matchup_idx[n];
+        if (mi < 0 || static_cast<std::size_t>(mi) >= matchup_equity_needed_.size()) continue;
+        if (matchup_board_size_per_runout_[static_cast<std::size_t>(mi)] < 5) {
+            matchup_equity_needed_[static_cast<std::size_t>(mi)] = 1;
         }
     }
 
@@ -2546,6 +3109,49 @@ inline void Solver::precompute_matchups(bool force_dense) {
     }
 }
 
+inline void Solver::build_equity_tables() {
+    const uint16_t nc = iso_.num_canonical;
+    const std::size_t cells = static_cast<std::size_t>(nc) * nc;
+    if (matchup_equity_per_runout_.size() != matchup_equity_needed_.size()) {
+        matchup_equity_per_runout_.assign(matchup_equity_needed_.size(), {});
+    }
+    // Second line of defence behind the peak-host gate (which already prices
+    // the needed count): never allocate past the matchup share of the budget.
+    const uint64_t per_table_bytes = matchup_dense_materialized_
+        ? bytes_for_matchup_tables(1, nc, matchup_bytes_per_cell(config_, iso_))
+        : bytes_for_matchup_rank_tables(1);
+    const uint64_t matchup_byte_cap = (config_.memory_budget.host_bytes > 0)
+        ? (config_.memory_budget.host_bytes / 2ULL)
+        : (3ULL * 1024 * 1024 * 1024);
+    const uint64_t already =
+        static_cast<uint64_t>(matchup_ev_per_runout_.size()) * per_table_bytes;
+    uint64_t equity_bytes = 0;
+    for (std::size_t t = 0; t < matchup_equity_needed_.size(); ++t) {
+        if (!matchup_equity_needed_[t]) continue;
+        equity_bytes += bytes_for_equity_tables(1, nc);
+        if (matchup_equity_per_runout_[t].size() == cells) continue;  // built earlier
+        if (already + equity_bytes > matchup_byte_cap) {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                "precompute_matchups would allocate %.2f GB including the "
+                "all-in equity tables (cap %.2f GB, nc=%u). Raise "
+                "--host-memory-mb.",
+                static_cast<double>(already + equity_bytes) / (1024.0 * 1024.0 * 1024.0),
+                static_cast<double>(matchup_byte_cap) / (1024.0 * 1024.0 * 1024.0),
+                static_cast<unsigned>(nc));
+            throw std::runtime_error(buf);
+        }
+        // Recover the board from its mask (sorted card order, same as sig).
+        const CardMask mask = matchup_board_masks_[t];
+        Card board[MAX_BOARD_CARDS];
+        uint8_t bs = 0;
+        for (Card c = 0; c < NUM_CARDS && bs < MAX_BOARD_CARDS; ++c) {
+            if (mask & card_to_mask(c)) board[bs++] = c;
+        }
+        compute_equity_matchup_for_board(iso_, board, bs, matchup_equity_per_runout_[t]);
+    }
+}
+
 // ============================================================================
 // Node locks
 // ============================================================================
@@ -2596,7 +3202,7 @@ inline std::vector<float> Solver::cpu_ev_traverse(
     std::vector<float>& reach_oop, std::vector<float>& reach_ip,
     std::map<uint32_t, std::vector<float>>* out_node_values,
     const std::set<uint32_t>* visible_filter,
-    std::map<uint32_t, float>* out_node_opp_reach) const
+    std::map<uint32_t, std::vector<float>>* out_node_opp_compat) const
 {
     // Helper: write the per-combo values to the out-map (if requested) and
     // then return them. Used at every return point so the map records every
@@ -2610,21 +3216,23 @@ inline std::vector<float> Solver::cpu_ev_traverse(
     // 8-deep tree where only a few hundred nodes get emitted.
     uint16_t nc = iso_.num_canonical;
     auto record = [&](std::vector<float>&& vals) -> std::vector<float> {
-        if (out_node_values || out_node_opp_reach) {
+        if (out_node_values || out_node_opp_compat) {
             const bool keep = (visible_filter == nullptr) ||
                               (visible_filter->find(node_idx) != visible_filter->end());
             if (keep && out_node_values) (*out_node_values)[node_idx] = vals;
-            // Capture the OPPONENT's reach mass at this node so the caller can
-            // normalize the (counterfactual) values into conditional "chips per
-            // hand" — i.e. EV given the node is reached, the PIO convention.
-            // Normalizing by the ROOT opponent reach instead makes EVs shrink
-            // with depth by P(opponent reaches node).
-            if (keep && out_node_opp_reach) {
+            // Capture, PER HAND, the opponent reach mass at this node that is
+            // card-compatible with that hand on this node's board, so the
+            // caller can normalize the (counterfactual) values into conditional
+            // "chips per hand" — EV given the node is reached AND given the
+            // hands can both be dealt, the PIO convention. A scalar mass over
+            // the whole opponent range (pre-2026-09) understated every hand by
+            // its blocker share (~8% on a flop) and did so unevenly across hands.
+            if (keep && out_node_opp_compat) {
                 const auto& opp = (perspective == 0) ? reach_ip : reach_oop;
-                float s = 0.0f;
-                for (uint16_t c = 0; c < nc; ++c)
-                    s += opp[c] * static_cast<float>(iso_.canonical_weights[c]);
-                (*out_node_opp_reach)[node_idx] = s;
+                std::vector<float> compat(nc, 0.0f);
+                fold_blocker::compatible_opponent_mass(
+                    iso_, board_mask_at(node_idx), opp.data(), compat.data());
+                (*out_node_opp_compat)[node_idx] = std::move(compat);
             }
         }
         return std::move(vals);
@@ -2632,166 +3240,8 @@ inline std::vector<float> Solver::cpu_ev_traverse(
     auto nt = static_cast<NodeType>(tree_.node_types[node_idx]);
 
     if (nt == NodeType::TERMINAL) {
-        std::vector<float> values(nc, 0.0f);
-        auto tt = static_cast<TerminalType>(tree_.terminal_types[node_idx]);
-        float half_pot = tree_.pots[node_idx] / 2.0f;
-
-        // Phase 1: pick per-runout matchup table.
-        int32_t mi = (node_idx < tree_.matchup_idx.size()) ? tree_.matchup_idx[node_idx] : 0;
-        const auto& m_ev = (mi >= 0 && static_cast<size_t>(mi) < matchup_ev_per_runout_.size())
-            ? matchup_ev_per_runout_[mi] : matchup_ev_;
-        const auto& m_valid = (mi >= 0 && static_cast<size_t>(mi) < matchup_valid_per_runout_.size())
-            ? matchup_valid_per_runout_[mi] : matchup_valid_;
-        // Fused ev·valid fast path (half the showdown read bytes); see the
-        // matching block in cpu_best_response_traverse. nullptr ⇒ unfused.
-        const float* evxv = (!matchup_ev_valid_per_runout_.empty() &&
-                             mi >= 0 &&
-                             static_cast<size_t>(mi) < matchup_ev_valid_per_runout_.size() &&
-                             !matchup_ev_valid_per_runout_[mi].empty())
-            ? matchup_ev_valid_per_runout_[mi].data() : nullptr;
-
-        // A4-host inc 1: blocker path — see cpu_best_response_traverse.
-        if (postsolve_blocker_enabled()) {
-            if (postsolve_terminal_blocker(node_idx, perspective, tt, half_pot,
-                                           mi, reach_oop, reach_ip, values)) {
-                return record(std::move(values));
-            }
-            // inc 3: the dense fallback below would read tables that were
-            // never built. Unreachable (every node carries a valid
-            // matchup_idx), but silence here means out-of-bounds reads.
-            if (!matchup_dense_materialized_) {
-                throw std::runtime_error(
-                    "postsolve EV sweep fell back to the dense tables, which "
-                    "this solve never materialized (A4-host inc 3)");
-            }
-        }
-
-        if (tt == TerminalType::SHOWDOWN) {
-            if (perspective == 0) {
-                std::vector<float> weighted_ip(nc, 0.0f);
-                for (uint16_t cj = 0; cj < nc; ++cj) {
-                    weighted_ip[cj] = reach_ip[cj] *
-                        static_cast<float>(iso_.canonical_weights[cj]);
-                }
-                detail::postsolve_parallel_for(
-                    static_cast<uint32_t>(nc),
-                    config_.parallel_postsolve,
-                    config_.postsolve_threads,
-                    [&](uint32_t cidx) {
-                        uint16_t c = static_cast<uint16_t>(cidx);
-                        const size_t base = static_cast<size_t>(c) * nc;
-                        float val = 0.0f;
-                        if (evxv) {
-                            const float* row = evxv + base;
-                            for (uint16_t cj = 0; cj < nc; ++cj)
-                                val += weighted_ip[cj] * row[cj];
-                        } else {
-                            for (uint16_t cj = 0; cj < nc; ++cj)
-                                val += weighted_ip[cj] * m_ev[base + cj] * m_valid[base + cj];
-                        }
-                        values[c] = val * half_pot;
-                    });
-            } else {
-                // IP traverser: values[c] = Σ_ci weighted_oop[ci] · (−m_ev[ci,c]) · m_valid[ci,c].
-                // The natural loop fixes c and sweeps ci, so m_ev[ci*nc + c] is
-                // COLUMN-strided — a fresh cache line on nearly every one of the
-                // nc² accesses. Restructure into a row-major accumulate: stream
-                // each matrix row ci contiguously, scaled by its (negated)
-                // reach, into the output. Parallelize over disjoint output
-                // blocks (writes never collide) and skip zero-reach rows
-                // (sparse ranges). Same result up to float add order; ~16× less
-                // cache-line traffic and the inner loop vectorizes.
-                std::vector<float> weighted_oop(nc, 0.0f);
-                for (uint16_t ci = 0; ci < nc; ++ci) {
-                    weighted_oop[ci] = reach_oop[ci] *
-                        static_cast<float>(iso_.canonical_weights[ci]);
-                }
-                constexpr uint32_t blk = 32;
-                const uint32_t nblocks = (static_cast<uint32_t>(nc) + blk - 1) / blk;
-                detail::postsolve_parallel_for(
-                    nblocks,
-                    config_.parallel_postsolve,
-                    config_.postsolve_threads,
-                    [&](uint32_t b) {
-                        const uint32_t c0 = b * blk;
-                        const uint32_t c1 = std::min<uint32_t>(nc, c0 + blk);
-                        for (uint16_t ci = 0; ci < nc; ++ci) {
-                            float s = weighted_oop[ci];
-                            if (s == 0.0f) continue;
-                            s *= half_pot;
-                            const size_t base = static_cast<size_t>(ci) * nc;
-                            if (evxv) {
-                                const float* row = evxv + base;
-                                for (uint32_t c = c0; c < c1; ++c)
-                                    values[c] -= s * row[c];
-                            } else {
-                                const float* ev_row = &m_ev[base];
-                                const float* va_row = &m_valid[base];
-                                for (uint32_t c = c0; c < c1; ++c)
-                                    values[c] -= s * ev_row[c] * va_row[c];
-                            }
-                        }
-                    });
-            }
-        } else {
-            uint32_t parent = tree_.parent_indices[node_idx];
-            float unmatched_bet = (parent < tree_.total_nodes)
-                ? tree_.bet_into[parent] : 0.0f;
-            float gain = (tree_.pots[node_idx] - unmatched_bet) * 0.5f;
-
-            float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
-            float sign = (perspective == 0) ? sign_oop : -sign_oop;
-            if (perspective == 0) {
-                std::vector<float> weighted_ip(nc, 0.0f);
-                for (uint16_t cj = 0; cj < nc; ++cj) {
-                    weighted_ip[cj] = reach_ip[cj] *
-                        static_cast<float>(iso_.canonical_weights[cj]);
-                }
-                detail::postsolve_parallel_for(
-                    static_cast<uint32_t>(nc),
-                    config_.parallel_postsolve,
-                    config_.postsolve_threads,
-                    [&](uint32_t cidx) {
-                        uint16_t c = static_cast<uint16_t>(cidx);
-                        float opp_total = 0.0f;
-                        for (uint16_t cj = 0; cj < nc; ++cj) {
-                            size_t idx = static_cast<size_t>(c) * nc + cj;
-                            opp_total += weighted_ip[cj] * m_valid[idx];
-                        }
-                        values[c] = sign * gain * opp_total;
-                    });
-            } else {
-                // IP traverser fold terminal: values[c] = sign·gain·Σ_ci
-                // weighted_oop[ci]·m_valid[ci,c]. Same column-stride problem as
-                // the showdown branch — restructure to a row-major accumulate
-                // over disjoint output blocks with a zero-reach skip.
-                std::vector<float> weighted_oop(nc, 0.0f);
-                for (uint16_t ci = 0; ci < nc; ++ci) {
-                    weighted_oop[ci] = reach_oop[ci] *
-                        static_cast<float>(iso_.canonical_weights[ci]);
-                }
-                const float sg = sign * gain;
-                constexpr uint32_t blk = 32;
-                const uint32_t nblocks = (static_cast<uint32_t>(nc) + blk - 1) / blk;
-                detail::postsolve_parallel_for(
-                    nblocks,
-                    config_.parallel_postsolve,
-                    config_.postsolve_threads,
-                    [&](uint32_t b) {
-                        const uint32_t c0 = b * blk;
-                        const uint32_t c1 = std::min<uint32_t>(nc, c0 + blk);
-                        for (uint16_t ci = 0; ci < nc; ++ci) {
-                            float s = weighted_oop[ci];
-                            if (s == 0.0f) continue;
-                            s *= sg;
-                            const float* va_row = &m_valid[static_cast<size_t>(ci) * nc];
-                            for (uint32_t c = c0; c < c1; ++c) {
-                                values[c] += s * va_row[c];
-                            }
-                        }
-                    });
-            }
-        }
+        std::vector<float> values;
+        postsolve_terminal_values(node_idx, perspective, reach_oop, reach_ip, values);
         return record(std::move(values));
     }
 
@@ -2812,14 +3262,15 @@ inline std::vector<float> Solver::cpu_ev_traverse(
             if (weight == 0) weight = 1;
             std::vector<float> child_vals = cpu_ev_traverse(
                 child, perspective, reach_oop, reach_ip, out_node_values,
-                visible_filter, out_node_opp_reach);
+                visible_filter, out_node_opp_compat);
             for (uint16_t c = 0; c < nc; ++c) {
                 avg[c] += static_cast<float>(weight) * child_vals[c];
             }
             total_weight += weight;
         }
         if (total_weight > 0) {
-            float inv = 1.0f / static_cast<float>(total_weight);
+            // Conditional on both players' hole cards — see types.h.
+            float inv = 1.0f / static_cast<float>(chance_runout_denominator(total_weight));
             for (uint16_t c = 0; c < nc; ++c) avg[c] *= inv;
         }
         return record(std::move(avg));
@@ -2839,7 +3290,7 @@ inline std::vector<float> Solver::cpu_ev_traverse(
             uint32_t child = tree_.children[action_offset + a];
             std::vector<float> child_vals =
                 cpu_ev_traverse(child, perspective, reach_oop, reach_ip,
-                                out_node_values, visible_filter, out_node_opp_reach);
+                                out_node_values, visible_filter, out_node_opp_compat);
             for (uint16_t c = 0; c < nc; ++c) {
                 node_vals[c] += strat[a * nc + c] * child_vals[c];
             }
@@ -2855,7 +3306,7 @@ inline std::vector<float> Solver::cpu_ev_traverse(
             }
             std::vector<float> child_vals =
                 cpu_ev_traverse(child, perspective, reach_oop, reach_ip,
-                                out_node_values, visible_filter, out_node_opp_reach);
+                                out_node_values, visible_filter, out_node_opp_compat);
             for (uint16_t c = 0; c < nc; ++c) acting_reach[c] = saved[c];
             for (uint16_t c = 0; c < nc; ++c) node_vals[c] += child_vals[c];
         }
@@ -2873,7 +3324,7 @@ inline void Solver::compute_combo_evs() {
     std::vector<float> oop_evs_raw;
     if (!config_.force_cpu_postsolve &&
         backend_ && backend_->supports_gpu_postsolve()) {
-        oop_evs_raw = backend_->compute_combo_evs_gpu();
+        oop_evs_raw = backend_->compute_combo_evs_gpu(/*perspective=*/0);
     }
     if (oop_evs_raw.size() != nc) {
         auto r_oop = oop_reach_;
@@ -2881,13 +3332,17 @@ inline void Solver::compute_combo_evs() {
         oop_evs_raw = cpu_ev_traverse(0, 0, r_oop, r_ip);
     }
 
-    float total_ip_weight = 0.0f;
-    for (uint16_t cj = 0; cj < nc; ++cj) {
-        total_ip_weight += ip_reach_[cj] * static_cast<float>(iso_.canonical_weights[cj]);
-    }
-    float scale = (total_ip_weight > 1e-6f) ? (1.0f / total_ip_weight) : 0.0f;
+    // Conditional EV per hand (PIO convention): the raw value is a sum over
+    // the IP hands that can be dealt alongside c, so divide by THAT mass —
+    // not by the whole IP range, which counts hands sharing a card with c
+    // and so understated every EV by the hand's blocker share (~8% on a
+    // flop, unevenly across hands). 2026-09-09 audit P0.
+    std::vector<float> compat(nc, 0.0f);
+    fold_blocker::compatible_opponent_mass(
+        iso_, board_to_mask(config_.board.data(), config_.board_size),
+        ip_reach_.data(), compat.data());
     for (uint16_t c = 0; c < nc; ++c) {
-        const float v = oop_evs_raw[c] * scale;
+        const float v = (compat[c] > 0.0f) ? (oop_evs_raw[c] / compat[c]) : 0.0f;
         // The GPU postsolve path can hand back non-finite raw values on
         // run-to-run noise; keep ev_ finite so downstream consumers
         // (analyze_combo, JSON) never see inf/nan.
@@ -2899,56 +3354,257 @@ inline void Solver::compute_combo_evs() {
 // Exploitability via per-combo Best Response
 // ============================================================================
 
-inline bool Solver::postsolve_terminal_blocker(
-    uint32_t node_idx, int self_player, TerminalType tt, float half_pot,
-    int32_t mi,
+inline CardMask Solver::board_mask_at(uint32_t node_idx) const {
+    const int32_t mi = (node_idx < tree_.matchup_idx.size()) ? tree_.matchup_idx[node_idx] : 0;
+    if (mi >= 0 && static_cast<std::size_t>(mi) < matchup_board_masks_.size()) {
+        return matchup_board_masks_[static_cast<std::size_t>(mi)];
+    }
+    return board_to_mask(config_.board.data(), config_.board_size);
+}
+
+inline double Solver::legal_joint_mass() const {
+    return fold_blocker::legal_joint_mass(
+        iso_, board_to_mask(config_.board.data(), config_.board_size),
+        oop_reach_, ip_reach_);
+}
+
+// ============================================================================
+// Postsolve terminal evaluation — shared by the EV and best-response sweeps
+// ============================================================================
+//
+// One body for both sweeps. Their terminal blocks used to be line-for-line
+// duplicates, and the 2026-09-09 audit found the same defects in both: payoffs
+// were UNRAKED while the CFR kernels solved the raked game (so the "best
+// response" was measured against a different game than the strategy), and
+// the fold rake base was the whole pot instead of the matched pot. The payoff
+// model here is the one every CFR kernel uses (types.h: terminal_rake;
+// cpu_backend.h / cpu_backend_levelized.h / eval_kernel.cu compute the same
+// numbers), so BR and CFR now agree on the game.
+//
+// Showdown, in the linear form the fractional-equity tables need:
+//
+//   payoff_self(ev) = A·ev_self + B,   A = half_pot − rake/2,  B = −rake/2
+//
+// reproduces win = half_pot − rake, lose = −half_pot, tie = −rake/2 at
+// ev ∈ {+1, −1, 0} exactly; rake == 0 gives A = half_pot, B = 0 and the
+// pre-audit arithmetic bit-for-bit. `ev` is OOP-oriented in every table, so
+// ev_self = −ev from the IP perspective.
+inline void Solver::postsolve_terminal_values(
+    uint32_t node_idx, int self_player,
     const std::vector<float>& reach_oop, const std::vector<float>& reach_ip,
     std::vector<float>& values) const
 {
     const uint16_t nc = iso_.num_canonical;
-    if (mi < 0) return false;
-    const std::size_t m = static_cast<std::size_t>(mi);
-    if (m >= matchup_original_ranks_per_runout_.size() ||
-        m >= matchup_board_masks_.size()) {
-        return false;
-    }
+    values.assign(nc, 0.0f);
+    const auto tt = static_cast<TerminalType>(tree_.terminal_types[node_idx]);
+    const float pot_total = tree_.pots[node_idx];
+    const float half_pot  = pot_total * 0.5f;
 
-    // Weighted opponent reach — mirrors the dense loops verbatim. Under the
-    // RankBlockerOnly gate every canonical weight is 1, so this equals the
-    // raw reach; keeping the multiply makes the replaced expression obvious.
-    const auto& opp = (self_player == 0) ? reach_ip : reach_oop;
+    const int32_t mi = (node_idx < tree_.matchup_idx.size()) ? tree_.matchup_idx[node_idx] : 0;
+    const std::size_t m = (mi >= 0) ? static_cast<std::size_t>(mi) : 0u;
+    const bool have_board_mask = m < matchup_board_masks_.size();
+    const bool have_rank_table = m < matchup_original_ranks_per_runout_.size();
+    const bool have_dense = matchup_dense_materialized_
+        && m < matchup_valid_per_runout_.size()
+        && matchup_valid_per_runout_[m].size() == static_cast<std::size_t>(nc) * nc;
+
+    const auto& opp_reach = (self_player == 0) ? reach_ip : reach_oop;
+    // Dense tables hold per-canonical-PAIR fractions, so the opponent side is
+    // weighted by its orbit size. The blockers weight each original
+    // themselves and take the RAW reach.
     std::vector<float> opp_w(nc);
     for (uint16_t j = 0; j < nc; ++j) {
-        opp_w[j] = opp[j] * static_cast<float>(iso_.canonical_weights[j]);
+        opp_w[j] = opp_reach[j] * static_cast<float>(iso_.canonical_weights[j]);
     }
 
-    if (tt == TerminalType::SHOWDOWN) {
-        // Postsolve showdown is UNRAKED: win/lose = ±half_pot, tie = 0, for
-        // BOTH perspectives. The dense IP branch negates an OOP-oriented ev
-        // matrix; the blocker scores SELF-vs-opponent by rank directly,
-        // which absorbs that sign — validated by the flag-on-vs-off
-        // self-check regression, not by inspection alone.
+    if (tt != TerminalType::SHOWDOWN) {
+        // Fold: the winner collects only the MATCHED pot — the uncalled bet
+        // goes back to the bettor — and pays the rake on that matched pot.
+        const uint32_t parent = tree_.parent_indices[node_idx];
+        const float unmatched_bet =
+            (parent < tree_.total_nodes) ? tree_.bet_into[parent] : 0.0f;
+        const float matched_pot = pot_total - unmatched_bet;
+        const float fold_rake =
+            terminal_rake(matched_pot, config_.rake_rate, config_.rake_cap);
+        const float gain = matched_pot * 0.5f;
+        const bool self_wins = (self_player == 0)
+            ? (tt == TerminalType::FOLD_IP)
+            : (tt == TerminalType::FOLD_OOP);
+        const float self_payoff = self_wins ? (gain - fold_rake) : -gain;
+
+        // valid is pure card compatibility, so the fold blocker computes the
+        // identical reduction from the board mask alone (any iso, any range).
+        if (have_board_mask) {
+            fold_blocker::fold_dense(
+                iso_, matchup_board_masks_[m], opp_reach.data(),
+                /*skip_mask=*/nullptr, self_payoff, values.data(), nc);
+            return;
+        }
+        if (!have_dense) {
+            throw std::runtime_error(
+                "postsolve fold terminal has neither a board mask nor dense "
+                "tables (matchup table " + std::to_string(m) + ")");
+        }
+        const auto& m_valid = matchup_valid_per_runout_[m];
+        if (self_player == 0) {
+            detail::postsolve_parallel_for(
+                static_cast<uint32_t>(nc),
+                config_.parallel_postsolve,
+                config_.postsolve_threads,
+                [&](uint32_t cidx) {
+                    const uint16_t c = static_cast<uint16_t>(cidx);
+                    const size_t base = static_cast<size_t>(c) * nc;
+                    float opp_total = 0.0f;
+                    for (uint16_t cj = 0; cj < nc; ++cj)
+                        opp_total += opp_w[cj] * m_valid[base + cj];
+                    values[c] = self_payoff * opp_total;
+                });
+        } else {
+            for (uint16_t ci = 0; ci < nc; ++ci) {
+                const float sc = opp_w[ci] * self_payoff;
+                if (sc == 0.0f) continue;
+                const float* va_row = &m_valid[static_cast<size_t>(ci) * nc];
+                for (uint16_t c = 0; c < nc; ++c) values[c] += sc * va_row[c];
+            }
+        }
+        return;
+    }
+
+    // ---- Showdown ----
+    const float rake   = terminal_rake(pot_total, config_.rake_rate, config_.rake_cap);
+    const float win_p  = half_pot - rake;
+    const float lose_p = -half_pot;
+    const float tie_p  = -0.5f * rake;
+    const float A      = half_pot - 0.5f * rake;   // (win − lose) / 2
+    const float B      = -0.5f * rake;             // (win + lose) / 2 == tie
+
+    // 2026-09-09 audit P0: a showdown with cards still to come is settled on
+    // the equity table — never on the current board's ranks. Same linear
+    // payoff, eq already carries the compatibility fraction; the B term needs
+    // the plain compatibility sum, which the fold blocker provides.
+    if (m < matchup_equity_per_runout_.size() &&
+        matchup_equity_per_runout_[m].size() == static_cast<std::size_t>(nc) * nc) {
+        const float* eq = matchup_equity_per_runout_[m].data();
+        if (self_player == 0) {
+            detail::postsolve_parallel_for(
+                static_cast<uint32_t>(nc),
+                config_.parallel_postsolve,
+                config_.postsolve_threads,
+                [&](uint32_t cidx) {
+                    const uint16_t c = static_cast<uint16_t>(cidx);
+                    const float* row = eq + static_cast<size_t>(c) * nc;
+                    float s1 = 0.0f;
+                    for (uint16_t cj = 0; cj < nc; ++cj) s1 += opp_w[cj] * row[cj];
+                    values[c] = s1 * A;
+                });
+        } else {
+            for (uint16_t ci = 0; ci < nc; ++ci) {
+                const float w = opp_w[ci];
+                if (w == 0.0f) continue;
+                const float sa = w * A;
+                const float* row = eq + static_cast<size_t>(ci) * nc;
+                for (uint16_t c = 0; c < nc; ++c) values[c] -= sa * row[c];
+            }
+        }
+        if (B != 0.0f && have_board_mask) {
+            std::vector<float> compat(nc, 0.0f);
+            fold_blocker::fold_dense(iso_, matchup_board_masks_[m], opp_reach.data(),
+                                     /*skip_mask=*/nullptr, B, compat.data(), nc);
+            for (uint16_t c = 0; c < nc; ++c) values[c] += compat[c];
+        }
+        return;
+    }
+
+    // A4-host inc 1/2: rank-blocker showdown on RankBlockerOnly plans (its
+    // payoffs are the raked ones now, same as the CFR kernels).
+    if (postsolve_blocker_enabled() && have_rank_table) {
         static thread_local showdown_rank_blocker::Scratch scratch;
         showdown_rank_blocker::showdown_dense_singleton(
             iso_, matchup_original_ranks_per_runout_[m], opp_w.data(),
             /*skip_mask=*/nullptr, values.data(), nc,
-            /*win_p=*/half_pot, /*lose_p=*/-half_pot, /*tie_p=*/0.0f,
-            scratch);
-        return true;
+            win_p, lose_p, tie_p, scratch);
+        return;
+    }
+    if (!have_dense) {
+        // inc 3: the dense fallback would read tables that were never built.
+        throw std::runtime_error(
+            "postsolve showdown fell back to the dense tables, which this "
+            "solve never materialized (A4-host inc 3; matchup table "
+            + std::to_string(m) + ")");
     }
 
-    // Fold: values[c] = sign · gain · Σ_j opp_w[j] · valid[c,j], where valid
-    // is pure card-compatibility — exactly fold_blocker's contract.
-    const uint32_t parent = tree_.parent_indices[node_idx];
-    const float unmatched_bet =
-        (parent < tree_.total_nodes) ? tree_.bet_into[parent] : 0.0f;
-    const float gain = (tree_.pots[node_idx] - unmatched_bet) * 0.5f;
-    const float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
-    const float sign = (self_player == 0) ? sign_oop : -sign_oop;
-    fold_blocker::fold_dense(
-        iso_, matchup_board_masks_[m], opp_w.data(), /*skip_mask=*/nullptr,
-        /*self_payoff=*/sign * gain, values.data(), nc);
-    return true;
+    const auto& m_ev    = matchup_ev_per_runout_[m];
+    const auto& m_valid = matchup_valid_per_runout_[m];
+    // Fused ev·valid fast path (half the showdown read bytes). nullptr ⇒
+    // multiply on the fly.
+    const float* evxv = (m < matchup_ev_valid_per_runout_.size() &&
+                         matchup_ev_valid_per_runout_[m].size() == m_ev.size())
+        ? matchup_ev_valid_per_runout_[m].data() : nullptr;
+    const bool raked = (B != 0.0f);
+
+    if (self_player == 0) {
+        // values[c] = A·Σ_j opp_w[j]·ev[c,j]·valid[c,j] + B·Σ_j opp_w[j]·valid[c,j]
+        detail::postsolve_parallel_for(
+            static_cast<uint32_t>(nc),
+            config_.parallel_postsolve,
+            config_.postsolve_threads,
+            [&](uint32_t cidx) {
+                const uint16_t c = static_cast<uint16_t>(cidx);
+                const size_t base = static_cast<size_t>(c) * nc;
+                float s1 = 0.0f;
+                if (evxv) {
+                    const float* row = evxv + base;
+                    for (uint16_t cj = 0; cj < nc; ++cj) s1 += opp_w[cj] * row[cj];
+                } else {
+                    for (uint16_t cj = 0; cj < nc; ++cj)
+                        s1 += opp_w[cj] * m_ev[base + cj] * m_valid[base + cj];
+                }
+                float v = s1 * A;
+                if (raked) {
+                    float s2 = 0.0f;
+                    for (uint16_t cj = 0; cj < nc; ++cj) s2 += opp_w[cj] * m_valid[base + cj];
+                    v += s2 * B;
+                }
+                values[c] = v;
+            });
+    } else {
+        // IP: values[c] = −A·Σ_ci opp_w[ci]·ev[ci,c]·valid[ci,c] + B·Σ_ci opp_w[ci]·valid[ci,c].
+        // The natural loop fixes c and sweeps ci, so ev[ci*nc + c] is
+        // COLUMN-strided. Restructure into a row-major accumulate: stream each
+        // matrix row ci contiguously, scaled by its reach, into the output.
+        // Parallelize over disjoint output blocks (writes never collide) and
+        // skip zero-reach rows (sparse ranges).
+        constexpr uint32_t blk = 32;
+        const uint32_t nblocks = (static_cast<uint32_t>(nc) + blk - 1) / blk;
+        detail::postsolve_parallel_for(
+            nblocks,
+            config_.parallel_postsolve,
+            config_.postsolve_threads,
+            [&](uint32_t b) {
+                const uint32_t c0 = b * blk;
+                const uint32_t c1 = std::min<uint32_t>(nc, c0 + blk);
+                for (uint16_t ci = 0; ci < nc; ++ci) {
+                    const float w = opp_w[ci];
+                    if (w == 0.0f) continue;
+                    const float sa = w * A;
+                    const size_t base = static_cast<size_t>(ci) * nc;
+                    if (evxv) {
+                        const float* row = evxv + base;
+                        for (uint32_t c = c0; c < c1; ++c) values[c] -= sa * row[c];
+                    } else {
+                        const float* ev_row = &m_ev[base];
+                        const float* va_row = &m_valid[base];
+                        for (uint32_t c = c0; c < c1; ++c)
+                            values[c] -= sa * ev_row[c] * va_row[c];
+                    }
+                    if (raked) {
+                        const float sb = w * B;
+                        const float* va_row = &m_valid[base];
+                        for (uint32_t c = c0; c < c1; ++c) values[c] += sb * va_row[c];
+                    }
+                }
+            });
+    }
 }
 
 inline std::vector<float> Solver::cpu_best_response_traverse(
@@ -2959,168 +3615,8 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
     auto nt = static_cast<NodeType>(tree_.node_types[node_idx]);
 
     if (nt == NodeType::TERMINAL) {
-        std::vector<float> values(nc, 0.0f);
-        auto tt = static_cast<TerminalType>(tree_.terminal_types[node_idx]);
-        float half_pot = tree_.pots[node_idx] / 2.0f;
-
-        // Phase 1: per-runout matchup table.
-        int32_t mi = (node_idx < tree_.matchup_idx.size()) ? tree_.matchup_idx[node_idx] : 0;
-        const auto& m_ev = (mi >= 0 && static_cast<size_t>(mi) < matchup_ev_per_runout_.size())
-            ? matchup_ev_per_runout_[mi] : matchup_ev_;
-        const auto& m_valid = (mi >= 0 && static_cast<size_t>(mi) < matchup_valid_per_runout_.size())
-            ? matchup_valid_per_runout_[mi] : matchup_valid_;
-        // Fused ev·valid fast path: when precompute built it (postsolve + budget
-        // ok), the showdown reads one 4B/cell matrix instead of ev+valid (8B) —
-        // halves the bandwidth on this memory-bound pass. nullptr ⇒ unfused.
-        const float* evxv = (!matchup_ev_valid_per_runout_.empty() &&
-                             mi >= 0 &&
-                             static_cast<size_t>(mi) < matchup_ev_valid_per_runout_.size() &&
-                             !matchup_ev_valid_per_runout_[mi].empty())
-            ? matchup_ev_valid_per_runout_[mi].data() : nullptr;
-
-        // A4-host inc 1: blocker path (flag-gated, RankBlockerOnly plans
-        // only). Falls through to the dense loops when disabled or when
-        // this runout lacks blocker inputs.
-        if (postsolve_blocker_enabled()) {
-            if (postsolve_terminal_blocker(node_idx, player, tt, half_pot, mi,
-                                           reach_oop, reach_ip, values)) {
-                return values;
-            }
-            // inc 3: see the matching guard in cpu_ev_traverse.
-            if (!matchup_dense_materialized_) {
-                throw std::runtime_error(
-                    "postsolve best-response sweep fell back to the dense "
-                    "tables, which this solve never materialized "
-                    "(A4-host inc 3)");
-            }
-        }
-
-        if (tt == TerminalType::SHOWDOWN) {
-            if (player == 0) {
-                std::vector<float> weighted_ip(nc, 0.0f);
-                for (uint16_t cj = 0; cj < nc; ++cj) {
-                    weighted_ip[cj] = reach_ip[cj] *
-                        static_cast<float>(iso_.canonical_weights[cj]);
-                }
-                detail::postsolve_parallel_for(
-                    static_cast<uint32_t>(nc),
-                    config_.parallel_postsolve,
-                    config_.postsolve_threads,
-                    [&](uint32_t cidx) {
-                        uint16_t c = static_cast<uint16_t>(cidx);
-                        const size_t base = static_cast<size_t>(c) * nc;
-                        float val = 0.0f;
-                        if (evxv) {
-                            const float* row = evxv + base;
-                            for (uint16_t cj = 0; cj < nc; ++cj)
-                                val += weighted_ip[cj] * row[cj];
-                        } else {
-                            for (uint16_t cj = 0; cj < nc; ++cj)
-                                val += weighted_ip[cj] * m_ev[base + cj] * m_valid[base + cj];
-                        }
-                        values[c] = val * half_pot;
-                    });
-            } else {
-                // IP traverser: values[c] = Σ_ci weighted_oop[ci] · (−m_ev[ci,c]) · m_valid[ci,c].
-                // The natural loop fixes c and sweeps ci, so m_ev[ci*nc + c] is
-                // COLUMN-strided — a fresh cache line on nearly every one of the
-                // nc² accesses. Restructure into a row-major accumulate: stream
-                // each matrix row ci contiguously, scaled by its (negated)
-                // reach, into the output. Parallelize over disjoint output
-                // blocks (writes never collide) and skip zero-reach rows
-                // (sparse ranges). Same result up to float add order; ~16× less
-                // cache-line traffic and the inner loop vectorizes.
-                std::vector<float> weighted_oop(nc, 0.0f);
-                for (uint16_t ci = 0; ci < nc; ++ci) {
-                    weighted_oop[ci] = reach_oop[ci] *
-                        static_cast<float>(iso_.canonical_weights[ci]);
-                }
-                constexpr uint32_t blk = 32;
-                const uint32_t nblocks = (static_cast<uint32_t>(nc) + blk - 1) / blk;
-                detail::postsolve_parallel_for(
-                    nblocks,
-                    config_.parallel_postsolve,
-                    config_.postsolve_threads,
-                    [&](uint32_t b) {
-                        const uint32_t c0 = b * blk;
-                        const uint32_t c1 = std::min<uint32_t>(nc, c0 + blk);
-                        for (uint16_t ci = 0; ci < nc; ++ci) {
-                            float s = weighted_oop[ci];
-                            if (s == 0.0f) continue;
-                            s *= half_pot;
-                            const size_t base = static_cast<size_t>(ci) * nc;
-                            if (evxv) {
-                                const float* row = evxv + base;
-                                for (uint32_t c = c0; c < c1; ++c)
-                                    values[c] -= s * row[c];
-                            } else {
-                                const float* ev_row = &m_ev[base];
-                                const float* va_row = &m_valid[base];
-                                for (uint32_t c = c0; c < c1; ++c)
-                                    values[c] -= s * ev_row[c] * va_row[c];
-                            }
-                        }
-                    });
-            }
-        } else {
-            uint32_t parent = tree_.parent_indices[node_idx];
-            float unmatched_bet = (parent < tree_.total_nodes)
-                ? tree_.bet_into[parent] : 0.0f;
-            float gain = (tree_.pots[node_idx] - unmatched_bet) * 0.5f;
-
-            float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
-            float sign = (player == 0) ? sign_oop : -sign_oop;
-            if (player == 0) {
-                std::vector<float> weighted_ip(nc, 0.0f);
-                for (uint16_t cj = 0; cj < nc; ++cj) {
-                    weighted_ip[cj] = reach_ip[cj] *
-                        static_cast<float>(iso_.canonical_weights[cj]);
-                }
-                detail::postsolve_parallel_for(
-                    static_cast<uint32_t>(nc),
-                    config_.parallel_postsolve,
-                    config_.postsolve_threads,
-                    [&](uint32_t cidx) {
-                        uint16_t c = static_cast<uint16_t>(cidx);
-                        float opp_total = 0.0f;
-                        for (uint16_t cj = 0; cj < nc; ++cj) {
-                            size_t idx = static_cast<size_t>(c) * nc + cj;
-                            opp_total += weighted_ip[cj] * m_valid[idx];
-                        }
-                        values[c] = sign * gain * opp_total;
-                    });
-            } else {
-                // IP traverser fold terminal: values[c] = sign·gain·Σ_ci
-                // weighted_oop[ci]·m_valid[ci,c]. Same column-stride problem as
-                // the showdown branch — restructure to a row-major accumulate
-                // over disjoint output blocks with a zero-reach skip.
-                std::vector<float> weighted_oop(nc, 0.0f);
-                for (uint16_t ci = 0; ci < nc; ++ci) {
-                    weighted_oop[ci] = reach_oop[ci] *
-                        static_cast<float>(iso_.canonical_weights[ci]);
-                }
-                const float sg = sign * gain;
-                constexpr uint32_t blk = 32;
-                const uint32_t nblocks = (static_cast<uint32_t>(nc) + blk - 1) / blk;
-                detail::postsolve_parallel_for(
-                    nblocks,
-                    config_.parallel_postsolve,
-                    config_.postsolve_threads,
-                    [&](uint32_t b) {
-                        const uint32_t c0 = b * blk;
-                        const uint32_t c1 = std::min<uint32_t>(nc, c0 + blk);
-                        for (uint16_t ci = 0; ci < nc; ++ci) {
-                            float s = weighted_oop[ci];
-                            if (s == 0.0f) continue;
-                            s *= sg;
-                            const float* va_row = &m_valid[static_cast<size_t>(ci) * nc];
-                            for (uint32_t c = c0; c < c1; ++c) {
-                                values[c] += s * va_row[c];
-                            }
-                        }
-                    });
-            }
-        }
+        std::vector<float> values;
+        postsolve_terminal_values(node_idx, player, reach_oop, reach_ip, values);
         return values;
     }
 
@@ -3145,7 +3641,8 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
             total_weight += weight;
         }
         if (total_weight > 0) {
-            float inv = 1.0f / static_cast<float>(total_weight);
+            // Conditional on both players' hole cards — see types.h.
+            float inv = 1.0f / static_cast<float>(chance_runout_denominator(total_weight));
             for (uint16_t c = 0; c < nc; ++c) avg[c] *= inv;
         }
         return avg;
@@ -3197,16 +3694,34 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
 }
 
 inline float Solver::compute_exploitability() {
-    if (!solved_ || strategy_.empty()) return 0.0f;
+    if (!solved_) return 0.0f;
     uint16_t nc = iso_.num_canonical;
+    // A GPU probe (finalize_for_probe) leaves strategy_ empty on purpose:
+    // the device passes need no host strategy. Only the CPU traversals
+    // below do, and they materialize it on demand.
+    const bool gpu_postsolve = !config_.force_cpu_postsolve &&
+        backend_ && backend_->supports_gpu_postsolve();
+    auto ensure_host_strategy = [&]() {
+        if (strategy_.empty() && backend_) {
+            backend_->finalize();
+            strategy_ = backend_->strategy();
+        }
+    };
+    // Never answer 0 for want of a host strategy: a probe reads 0 as
+    // "target met" and stops the solve (GpuPostsolveParity caught exactly
+    // that with force_cpu_postsolve on a GPU solve, 2026-09-10).
+    if (strategy_.empty()) {
+        if (!backend_) return 0.0f;
+        if (!gpu_postsolve) ensure_host_strategy();
+        if (strategy_.empty() && !gpu_postsolve) return 0.0f;
+    }
 
     std::vector<float> br_oop_per_combo;
     std::vector<float> br_ip_per_combo;
 
     // Prefer GPU postsolve. Both BR vectors must be size==nc to count as a
     // success — anything else falls back to CPU traversal.
-    if (!config_.force_cpu_postsolve &&
-        backend_ && backend_->supports_gpu_postsolve()) {
+    if (gpu_postsolve) {
         br_oop_per_combo = backend_->compute_best_response_gpu(0);
         br_ip_per_combo  = backend_->compute_best_response_gpu(1);
     }
@@ -3214,6 +3729,7 @@ inline float Solver::compute_exploitability() {
                    br_ip_per_combo.size()  == nc);
 
     if (!gpu_ok) {
+        ensure_host_strategy();
         if (config_.parallel_postsolve) {
             auto oop_future = std::async(std::launch::async, [&]() {
                 auto r_oop = oop_reach_;
@@ -3238,21 +3754,53 @@ inline float Solver::compute_exploitability() {
         }
     }
 
-    float br_oop_total = 0.0f, br_ip_total = 0.0f;
-    float total_oop_w = 0.0f,  total_ip_w  = 0.0f;
-    for (uint16_t c = 0; c < nc; ++c) {
-        float w = static_cast<float>(iso_.canonical_weights[c]);
-        br_oop_total += oop_reach_[c] * w * br_oop_per_combo[c];
-        br_ip_total  += ip_reach_[c]  * w * br_ip_per_combo[c];
-        total_oop_w  += oop_reach_[c] * w;
-        total_ip_w   += ip_reach_[c]  * w;
+    // Exploitability = ½ Σ_p (BR_p − EV_p), every term an expectation over
+    // the LEGAL joint deal (card-compatible hand pairs). The per-combo BR /
+    // EV values are counterfactual sums over the opponent's compatible
+    // hands, so Σ_c reach·w·value is a sum over legal pairs and the right
+    // denominator is the legal joint mass — not the product of the two
+    // unconditional range masses, which counts pairs that share a card and
+    // understated the number by ~8-9% (2026-09-09 audit P0).
+    //
+    // Rake: EV_OOP + EV_IP = −E[rake] ≠ 0, so the zero-sum shortcut
+    // (BR_OOP + BR_IP)/2 is only valid unraked. With rake the EV terms are
+    // computed under the SAME raked payoff model as the BR sweep.
+    const double mass = legal_joint_mass();
+    if (mass <= 0.0) {
+        if (config_.allow_unreachable_ranges) return 0.0f;
+        throw std::runtime_error(
+            "exploitability is undefined: the OOP and IP ranges have no "
+            "card-compatible hand pair on this board");
     }
-
-    float denom = total_oop_w * total_ip_w;
-    float avg_oop = (denom > 1e-6f) ? (br_oop_total / denom) : 0.0f;
-    float avg_ip  = (denom > 1e-6f) ? (br_ip_total  / denom) : 0.0f;
-    float exploit_chips = (avg_oop + avg_ip) / 2.0f;
-    float exploit = exploit_chips / std::max(config_.pot, 1.0f) * 100.0f;
+    double br_oop_total = 0.0, br_ip_total = 0.0;
+    for (uint16_t c = 0; c < nc; ++c) {
+        const double w = static_cast<double>(iso_.canonical_weights[c]);
+        br_oop_total += static_cast<double>(oop_reach_[c]) * w * br_oop_per_combo[c];
+        br_ip_total  += static_cast<double>(ip_reach_[c])  * w * br_ip_per_combo[c];
+    }
+    double ev_total = 0.0;
+    const bool raked = config_.rake_rate > 0.0f && config_.rake_cap > 0.0f;
+    if (raked) {
+        for (int p = 0; p < 2; ++p) {
+            std::vector<float> ev_raw;
+            if (gpu_ok) ev_raw = backend_->compute_combo_evs_gpu(p);
+            if (ev_raw.size() != nc) {
+                ensure_host_strategy();
+                auto r_oop = oop_reach_;
+                auto r_ip  = ip_reach_;
+                ev_raw = cpu_ev_traverse(0, p, r_oop, r_ip);
+            }
+            const auto& reach = (p == 0) ? oop_reach_ : ip_reach_;
+            for (uint16_t c = 0; c < nc; ++c) {
+                ev_total += static_cast<double>(reach[c])
+                          * static_cast<double>(iso_.canonical_weights[c])
+                          * ev_raw[c];
+            }
+        }
+    }
+    const double exploit_chips = (br_oop_total + br_ip_total - ev_total) / (2.0 * mass);
+    const float exploit = static_cast<float>(
+        exploit_chips / std::max(static_cast<double>(config_.pot), 1.0) * 100.0);
     return std::max(0.0f, exploit);
 }
 
@@ -3861,11 +4409,12 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
     // gets values for the visible-or-all set — depending on ev_mode.
     std::map<uint32_t, std::vector<float>> node_vals_oop;
     std::map<uint32_t, std::vector<float>> node_vals_ip;
-    // Opponent reach mass at each recorded node, per perspective. Used to
-    // normalize EVs into conditional "chips per hand" (PIO convention) rather
-    // than counterfactual values that shrink with depth.
-    std::map<uint32_t, float> node_opp_oop;  // OOP-acting nodes → IP reach there
-    std::map<uint32_t, float> node_opp_ip;   // IP-acting nodes  → OOP reach there
+    // Per-hand card-compatible opponent reach mass at each recorded node, per
+    // perspective. Used to normalize EVs into conditional "chips per hand"
+    // (PIO convention) rather than counterfactual values that shrink with
+    // depth and with the hand's blocker share.
+    std::map<uint32_t, std::vector<float>> node_opp_oop;  // OOP-acting nodes → IP compat mass there
+    std::map<uint32_t, std::vector<float>> node_opp_ip;   // IP-acting nodes  → OOP compat mass there
     if (need_evs) {
         const std::set<uint32_t>* filter = nullptr;
         if (ev_mode == StrategyTreeEvMode::VISIBLE) {
@@ -3897,8 +4446,8 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
         const std::vector<float>& vals = it->second;
         const auto& opp_map = acting_is_ip ? node_opp_ip : node_opp_oop;
         auto oit = opp_map.find(node);
-        float opp_mass = (oit != opp_map.end()) ? oit->second : 0.0f;
-        float norm = (opp_mass > 1e-6f) ? (1.0f / opp_mass) : 0.0f;
+        const std::vector<float>* compat =
+            (oit != opp_map.end()) ? &oit->second : nullptr;
 
         const auto& reach = acting_is_ip ? ip_reach_ : oop_reach_;
         const auto& combo_table = get_combo_table();
@@ -3909,9 +4458,14 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
             if (ci == UINT16_MAX) continue;
             float r = (ci < reach.size()) ? reach[ci] : 0.0f;
             if (r <= 0.0f) continue;
+            // Per-hand conditional normalizer: the opponent mass that can be
+            // dealt alongside THIS hand at this node. A hand no opponent hand
+            // is compatible with has no conditional EV — skip it.
+            const float mass = (compat && ci < compat->size()) ? (*compat)[ci] : 0.0f;
+            if (mass <= 0.0f) continue;
             std::string label = combo_to_grid_label(combo_table[i]);
             float v = (ci < vals.size()) ? vals[ci] : 0.0f;
-            sum_w_val[label] += r * v * norm;
+            sum_w_val[label] += r * (v / mass);
             sum_w[label]     += r;
         }
         std::vector<std::pair<std::string, float>> out_pairs;

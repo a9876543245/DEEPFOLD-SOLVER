@@ -1823,6 +1823,32 @@ static void showdown_oop_signed_count_zero_rake_8row_no_skip(
     }
 }
 
+static void equity_sign_accumulate(
+    const int16_t* ranks, const int16_t* alive, int16_t* acc,
+    std::size_t begin, std::size_t end, int16_t ra)
+{
+    const __m256i vra = _mm256_set1_epi16(ra);
+    std::size_t b = begin;
+    for (; b + 16 <= end; b += 16) {
+        const __m256i rb = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(ranks + b));
+        // Compare masks are 0 / −1, so gt − lt ∈ {−1, 0, +1}:
+        //   ra < rb → a is stronger → +1 ; ra > rb → −1 ; tie → 0.
+        const __m256i lt = _mm256_cmpgt_epi16(rb, vra);
+        const __m256i gt = _mm256_cmpgt_epi16(vra, rb);
+        __m256i sgn = _mm256_sub_epi16(gt, lt);
+        sgn = _mm256_and_si256(sgn, _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(alive + b)));
+        __m256i* pa = reinterpret_cast<__m256i*>(acc + b);
+        _mm256_storeu_si256(pa, _mm256_add_epi16(_mm256_loadu_si256(pa), sgn));
+    }
+    for (; b < end; ++b) {
+        const int16_t rb = ranks[b];
+        const int16_t sgn = static_cast<int16_t>((ra < rb) - (ra > rb));
+        acc[b] = static_cast<int16_t>(acc[b] + (sgn & alive[b]));
+    }
+}
+
 }  // namespace deepsolver::cpu_simd::avx2_impl
 
 namespace deepsolver::cpu_simd {
@@ -1864,6 +1890,7 @@ const Kernels avx2_kernels = {
     &avx2_impl::showdown_oop_full_active2,
     &avx2_impl::showdown_ip_full_active2,
     &avx2_impl::showdown_oop_full_batch,
+    &avx2_impl::equity_sign_accumulate,
 };
 
 }  // namespace deepsolver::cpu_simd

@@ -159,11 +159,24 @@ elseif(CASE STREQUAL "singleton_device_estimate")
       "device-total estimate ${dev} still prices the dense upload the "
       "rank-blocker skips (state ${gstate}, honest bound ${bound})")
   endif()
+  # 2026-09-09 audit: the DENSE upload is still 0 under rank_blocker_only,
+  # but the turn's called all-in is a partial-board showdown, so exactly ONE
+  # equity table (nc² floats) is uploaded on every plan — the rank blocker
+  # cannot settle a hand with a card still to come. The estimate must price
+  # that table and nothing else.
   string(JSON gmatch GET "${out}" resources estimated_gpu_matchup_bytes)
-  if(NOT gmatch EQUAL 0)
+  string(JSON eq_tables GET "${out}" resources matchup_equity_tables)
+  string(JSON live GET "${out}" resources live_combos)
+  if(NOT eq_tables EQUAL 1)
     message(FATAL_ERROR
-      "estimated_gpu_matchup_bytes must be 0 under rank_blocker_only, "
-      "got ${gmatch}")
+      "expected exactly one equity table (the turn all-in showdown), got "
+      "${eq_tables}")
+  endif()
+  math(EXPR eq_bytes "${eq_tables} * ${live} * ${live} * 4")
+  if(NOT gmatch EQUAL ${eq_bytes})
+    message(FATAL_ERROR
+      "estimated_gpu_matchup_bytes must equal the equity tables alone "
+      "(${eq_bytes}) under rank_blocker_only, got ${gmatch}")
   endif()
   message(STATUS "singleton_device_estimate: plan-aware device estimate OK")
 
@@ -269,11 +282,21 @@ elseif(CASE STREQUAL "host_dense_matchup_skip")
   endif()
   string(JSON mbytes GET "${wide_out}" resources estimated_matchup_bytes)
   # 49 tables × nc² × 9 B is half a gigabyte; the rank tables are ~130 KB.
-  # Anything above 1 MiB means the estimate still prices the dense tables.
-  if(mbytes GREATER 1048576)
+  # 2026-09-09 audit: the turn all-in showdown adds ONE nc² equity table
+  # (built on every plan). Anything above rank tables + that table + 1 MiB
+  # means the estimate still prices the dense tables.
+  string(JSON eq_tables GET "${wide_out}" resources matchup_equity_tables)
+  string(JSON wide_live GET "${wide_out}" resources live_combos)
+  if(NOT eq_tables EQUAL 1)
+    message(FATAL_ERROR
+      "expected exactly one equity table on the turn (its all-in showdown), "
+      "got ${eq_tables}")
+  endif()
+  math(EXPR mbytes_cap "1048576 + ${eq_tables} * ${wide_live} * ${wide_live} * 4")
+  if(mbytes GREATER ${mbytes_cap})
     message(FATAL_ERROR
       "estimated_matchup_bytes ${mbytes} still prices dense tables the "
-      "solve no longer builds")
+      "solve no longer builds (cap ${mbytes_cap} incl. the equity table)")
   endif()
 
   # Asymmetric: OOP holds 3 canonical combos, IP holds the full default
@@ -353,20 +376,27 @@ elseif(CASE STREQUAL "rainbow_gate_enumerates")
   #
   # Both directions are pinned, because a build that simply never collapses
   # would pass a one-sided test and then OOM:
-  #   24 GB budget → enumerates (state 16.3 GB + 2× strategy fits)
+  #   40 GB budget → enumerates
   #    6 GB budget → still collapses (it does not)
   # On v2.4.0 BOTH report the collapsed tree's 216 player nodes.
+  #
+  # 2026-09-09 audit: the corrected betting tree (stack ownership, raise
+  # increments, min-raise) is deeper — the enumerated rainbow flop is now
+  # 1,105,818 nodes / 460,058 player nodes, priced at 35.3 GB peak host on
+  # the CPU (25.1 GB state + 2× strategy + 50 equity tables). The "big"
+  # budget moved from 24 GB to 40 GB accordingly; it is an estimate, nothing
+  # is allocated.
   execute_process(
     COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c --iterations 200
-            --estimate-only --backend cpu --host-memory-mb 24000
+            --estimate-only --backend cpu --host-memory-mb 40000
     OUTPUT_VARIABLE big_out RESULT_VARIABLE big_rc ERROR_VARIABLE big_err)
   if(NOT big_rc EQUAL 0)
-    message(FATAL_ERROR "estimate at 24 GB failed rc=${big_rc}: ${big_err}")
+    message(FATAL_ERROR "estimate at 40 GB failed rc=${big_rc}: ${big_err}")
   endif()
   string(JSON big_nodes GET "${big_out}" resources player_nodes)
   if(big_nodes LESS 10000)
     message(FATAL_ERROR
-      "rainbow flop still collapses at a 24 GB budget (player_nodes "
+      "rainbow flop still collapses at a 40 GB budget (player_nodes "
       "${big_nodes}) - the builder is still charging the dense matchup "
       "price the blockers never pay")
   endif()
@@ -418,9 +448,19 @@ elseif(CASE STREQUAL "peak_host_model")
   #     the flat 2× the enumerated rainbow priced 8.27 GB and got collapsed
   #     at an 8 GB budget; the honest 1.5× prices 6.96 GB against a 6.19 GB
   #     measured peak, so it must ENUMERATE there.
+  #
+  #     2026-09-09 audit: the corrected betting tree is 1,105,818 nodes; one
+  #     finalized-strategy copy is ~4.8 GB and the GPU peak-host estimate is
+  #     17.46 GB (1.5 copies + the probe copy + CUDA host overhead). Under
+  #     the old flat 2× it would price ~19.9 GB, so an 18.5 GB budget keeps
+  #     the discrimination: enumerate under 1.5×, collapse under 2×. The
+  #     device total is 29.8 GB, which a real card's free-VRAM probe would
+  #     refuse — pin an explicit VRAM budget so this stays a HOST-model test
+  #     (nothing is allocated on an --estimate-only run).
   execute_process(
     COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c --iterations 200
-            --estimate-only --backend gpu --host-memory-mb 8000
+            --estimate-only --backend gpu --host-memory-mb 18500
+            --gpu-memory-mb 40000
     OUTPUT_VARIABLE gpu_out RESULT_VARIABLE gpu_rc ERROR_VARIABLE gpu_err)
   if(NOT gpu_rc EQUAL 0)
     message(FATAL_ERROR "gpu estimate failed rc=${gpu_rc}: ${gpu_err}")
@@ -428,12 +468,12 @@ elseif(CASE STREQUAL "peak_host_model")
   string(JSON gpu_nodes GET "${gpu_out}" resources player_nodes)
   if(gpu_nodes LESS 10000)
     message(FATAL_ERROR
-      "rainbow flop collapses on GPU at an 8 GB budget (player_nodes "
+      "rainbow flop collapses on GPU at an 18.5 GB budget (player_nodes "
       "${gpu_nodes}) - the host model is still charging a finalized-strategy "
       "copy that a GPU solve never holds")
   endif()
   message(STATUS
-    "peak_host_model: matchup ${dense_matchup} B incl. fused, GPU 8 GB "
+    "peak_host_model: matchup ${dense_matchup} B incl. fused, GPU 18.5 GB "
     "budget enumerates ${gpu_nodes} player nodes")
 
 elseif(CASE STREQUAL "gpu_strat_buffer")
@@ -562,6 +602,102 @@ elseif(CASE STREQUAL "peak_host_not_under")
   message(STATUS
     "peak_host_not_under: enumerated, live ${ph_live}/${ph_nc}, "
     "estimate +${ph_margin}% over measured peak RSS")
+
+elseif(CASE STREQUAL "cpu_strat_buffer")
+  # The CPU port of B1a increment 3. LevelizedCpuBackend derives the
+  # regret-matched strategy inside each consumer instead of keeping a third
+  # strat-shaped array, so a default solve allocates TWO, not three. Two cases
+  # still keep it, and both are pinned here because dropping the buffer
+  # unconditionally is silently wrong in each:
+  #
+  #   - node locks: the override is a WRITE into a materialized row;
+  #   - the STANDARD dcfr schedule: it enables compute_strategy()'s block
+  #     specialization, which writes only the ACTIVE lanes, while
+  #     kEnableBlockTraversal is false so the dense consumers still read the
+  #     rest. Only a persistent buffer holds those lanes.
+  #
+  # Every assertion is on allocated_state_bytes (backend truth) and its
+  # estimate. Equality is the real subject: the Phase 0 contract says the CPU
+  # state estimate EQUALS the allocation, so Solver::cpu_materializes_strategy()
+  # must predict the backend's decision, not bound it.
+  #
+  # Red on v2.7.0: there the default solve allocates three arrays too, so
+  # standard == default and the GREATER check below fails.
+  set(csb_common --pot 100 --stack 500 --board AsKd7c2h --iterations 3
+                 --exploitability 0 --backend cpu --postsolve none
+                 --no-strategy-tree --no-progress)
+
+  execute_process(
+    COMMAND ${EXE} ${csb_common}
+    OUTPUT_VARIABLE derived_out RESULT_VARIABLE derived_rc
+    ERROR_VARIABLE derived_err)
+  if(NOT derived_rc EQUAL 0)
+    message(FATAL_ERROR "default CPU solve failed rc=${derived_rc}: ${derived_err}")
+  endif()
+  string(JSON derived_state GET "${derived_out}" resources allocated_state_bytes)
+  string(JSON derived_est   GET "${derived_out}" resources estimated_cpu_state_bytes)
+
+  execute_process(
+    COMMAND ${EXE} ${csb_common} --dcfr-schedule standard
+    OUTPUT_VARIABLE std_out RESULT_VARIABLE std_rc ERROR_VARIABLE std_err)
+  if(NOT std_rc EQUAL 0)
+    message(FATAL_ERROR "STANDARD-schedule solve failed rc=${std_rc}: ${std_err}")
+  endif()
+  string(JSON std_state GET "${std_out}" resources allocated_state_bytes)
+  string(JSON std_est   GET "${std_out}" resources estimated_cpu_state_bytes)
+
+  execute_process(
+    COMMAND ${EXE} ${csb_common}
+            --node-locks "[{\"history\":\"\",\"combo\":\"AhKh\",\"strategy\":[1,0,0,0]}]"
+    OUTPUT_VARIABLE lock_out RESULT_VARIABLE lock_rc ERROR_VARIABLE lock_err)
+  if(NOT lock_rc EQUAL 0)
+    message(FATAL_ERROR "locked CPU solve failed rc=${lock_rc}: ${lock_err}")
+  endif()
+  string(JSON lock_state GET "${lock_out}" resources allocated_state_bytes)
+  string(JSON lock_est   GET "${lock_out}" resources estimated_cpu_state_bytes)
+
+  if(NOT std_state GREATER derived_state)
+    message(FATAL_ERROR
+      "STANDARD-schedule solve (${std_state} B) does not allocate more CPU "
+      "state than the default one (${derived_state} B) - the default solve is "
+      "still keeping a current_strategy buffer it no longer reads")
+  endif()
+  if(NOT lock_state GREATER derived_state)
+    message(FATAL_ERROR
+      "node-locked solve (${lock_state} B) does not allocate more CPU state "
+      "than the unlocked one (${derived_state} B) - the lock override has no "
+      "materialized row to write into")
+  endif()
+  # One strat-shaped array is the whole difference. Anything larger means these
+  # solves differ in more than the strategy buffer and this stopped testing it.
+  math(EXPR csb_delta "${std_state} - ${derived_state}")
+  math(EXPR csb_bound "${derived_state} / 4")
+  if(csb_delta GREATER ${csb_bound})
+    message(FATAL_ERROR
+      "STANDARD-vs-default CPU state differs by ${csb_delta} B, more than the "
+      "single strat buffer this test is about (state ${derived_state} B)")
+  endif()
+  # The contract: estimate == allocation, in BOTH regimes.
+  if(NOT derived_est EQUAL derived_state)
+    message(FATAL_ERROR
+      "derived-path CPU state estimate ${derived_est} B != allocation "
+      "${derived_state} B - cpu_materializes_strategy() disagrees with the "
+      "backend")
+  endif()
+  if(NOT std_est EQUAL std_state)
+    message(FATAL_ERROR
+      "STANDARD-path CPU state estimate ${std_est} B != allocation "
+      "${std_state} B")
+  endif()
+  if(NOT lock_est EQUAL lock_state)
+    message(FATAL_ERROR
+      "locked-path CPU state estimate ${lock_est} B != allocation "
+      "${lock_state} B")
+  endif()
+  message(STATUS
+    "cpu_strat_buffer: derived ${derived_state} B, standard ${std_state} B, "
+    "locked ${lock_state} B (+${csb_delta} B = the materialized strategy); "
+    "estimate == allocation in all three")
 
 else()
   message(FATAL_ERROR "unknown CASE: ${CASE}")

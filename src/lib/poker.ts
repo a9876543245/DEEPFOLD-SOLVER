@@ -286,6 +286,11 @@ export interface SolveResources {
    *  full-range solve. Optional — older `.dsolver` files predate it. */
   live_combos?: number;
   player_nodes: number;
+  /** 2026-09-09 audit: runout tables short of the river that carry a
+   *  showdown (called pre-river all-ins), each an nc² equity matrix. Their
+   *  bytes are inside `estimated_matchup_bytes`. Optional — older engines
+   *  and `.dsolver` files predate it. */
+  matchup_equity_tables?: number;
   estimated_matchup_bytes: number;
   estimated_cpu_state_bytes: number;
   estimated_gpu_state_bytes: number;

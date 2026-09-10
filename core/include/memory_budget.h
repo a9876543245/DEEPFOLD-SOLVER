@@ -81,6 +81,14 @@ constexpr uint64_t kMatchupBytesPerCell = kBaseMatchupBytesPerCell;
 /// bytes_for_cpu_state_compact.
 constexpr uint64_t kCpuStateArraysPerNode = 3;
 
+/// ...unless the levelized backend derives the regret-matched strategy on
+/// demand instead of keeping it (the CPU port of GPU B1a increment 3). Then
+/// only regrets + strategy_sum are resident. LevelizedCpuBackend decides from
+/// the config — node locks or a non-POSTFLOP_STYLE schedule keep the buffer —
+/// and Solver::cpu_materializes_strategy() mirrors that decision, so this
+/// stays estimate == allocation to the byte rather than a conservative bound.
+constexpr uint64_t kCpuStateArraysPerNodeDerived = 2;
+
 /// LevelizedCpuBackend pads every nc-wide row up to a SIMD lane multiple
 /// (action_stride_ = round_up_to_lane(nc)). MUST stay equal to
 /// LevelizedCpuBackend::kActionLane — the estimator mirrors the backend's
@@ -189,6 +197,11 @@ constexpr double kFinalStrategyCopiesGpu = 1.5;
 /// This only became visible after B1b inc 2 shrank every nc-scaled term — the
 /// old over-charge was hiding a full strategy copy, and on the 627k rainbow
 /// that showed up as a 17.9% UNDER-estimate on the gate the solve has to pass.
+///
+/// 2026-09-10: GpuBackend::finalize_for_probe() answers probes from device
+/// state, so this copy exists only when the probe is routed through the
+/// CPU traversals (force_cpu_postsolve). Solver::host_probe_copies() is the
+/// one predicate every host-peak site charges it through.
 constexpr double kFinalStrategyProbeCopiesGpu = 1.0;
 inline uint64_t bytes_for_live_final_strategy(uint64_t one_copy_bytes,
                                               bool gpu_backend,
@@ -318,6 +331,15 @@ inline uint64_t bytes_for_matchup_tables(
          * bytes_per_cell;
 }
 
+/// 2026-09-09 audit: partial-board showdown EQUITY tables — one nc² float
+/// matrix per runout table whose board is short of the river and carries a
+/// showdown terminal (see SolverContext::matchup_equity_per_runout). Held on
+/// the host always and uploaded to the device on GPU solves regardless of
+/// the dense-upload decision (the rank blocker cannot represent them).
+inline uint64_t bytes_for_equity_tables(uint64_t equity_tables, uint64_t nc) {
+    return equity_tables * nc * nc * sizeof(float);
+}
+
 /// Lane-rounded row width the levelized CPU backend actually allocates for
 /// every nc-wide row (mirrors LevelizedCpuBackend::round_up_to_lane).
 inline uint64_t cpu_lane_stride(uint64_t nc) {
@@ -340,9 +362,11 @@ inline uint64_t cpu_lane_stride(uint64_t nc) {
 /// caused false host-gate collapses. Any caller still passing MAX_ACTIONS
 /// now fails to compile instead of silently mis-estimating.
 inline uint64_t bytes_for_cpu_state_compact(uint64_t player_action_slots,
-                                            uint64_t nc) {
+                                            uint64_t nc,
+                                            bool materialize_strategy) {
     return player_action_slots * cpu_lane_stride(nc)
-         * memory_budget::kCpuStateArraysPerNode
+         * (materialize_strategy ? memory_budget::kCpuStateArraysPerNode
+                                 : memory_budget::kCpuStateArraysPerNodeDerived)
          * sizeof(float);
 }
 
@@ -447,12 +471,14 @@ inline uint64_t bytes_for_gpu_device_total(uint64_t total_nodes,
                                            uint64_t nc,
                                            bool device_dense_upload,
                                            bool materialize_strategy,
-                                           uint64_t value_rows) {
+                                           uint64_t value_rows,
+                                           uint64_t equity_tables = 0) {
     const uint64_t state   = bytes_for_gpu_state_compact(
         total_nodes, player_action_slots, nc, materialize_strategy, value_rows);
-    const uint64_t matchup = device_dense_upload
+    // The equity tables ride along whatever the dense-upload decision is.
+    const uint64_t matchup = (device_dense_upload
         ? bytes_for_matchup_tables(matchup_tables, nc, 2ULL * sizeof(float))
-        : 0ULL;
+        : 0ULL) + bytes_for_equity_tables(equity_tables, nc);
     const uint64_t tree    = 24ULL * total_nodes + 5ULL * total_edges;
     const uint64_t levels  = 4ULL * total_nodes + 4096ULL;
     const uint64_t reserve = 8ULL * 1024ULL * 1024ULL + (state + matchup) / 32ULL;

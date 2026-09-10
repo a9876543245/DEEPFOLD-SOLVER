@@ -172,6 +172,21 @@ struct SolverContext {
     /// matchup_valid matrix.
     const std::vector<CardMask>* matchup_board_masks = nullptr;
 
+    /// 2026-09-09 audit P0: partial-board showdown tables. For every runout
+    /// table whose board has fewer than 5 cards AND carries a SHOWDOWN
+    /// terminal (a called pre-river all-in, or every showdown of a collapsed
+    /// tree), precompute builds the EQUITY matrix eq[ci,cj] = ev·valid, ev
+    /// being the expected (win − lose) over every completion of the board
+    /// neither hand blocks (compute_equity_matchup_for_board). An empty inner
+    /// vector means "full board / not needed" — use the rank blocker or the
+    /// category/valid tables there. Kernels MUST check this before any other
+    /// showdown route: category, signed-count and rank-blocker are all built
+    /// from the CURRENT board's best-5 ranks and are wrong while cards are
+    /// still to come. Terminal value = (half_pot − rake/2)·Σ_j opp_w·eq[c,j]
+    /// + (−rake/2)·Σ_j opp_w·valid[c,j], the same linear payoff every dense
+    /// path uses. Always materialized, whatever the TerminalRepresentationPlan.
+    const std::vector<std::vector<float>>* matchup_equity_per_runout = nullptr;
+
     /// Per-canonical-combo reach probabilities derived from range weights.
     const std::vector<float>*    ip_reach      = nullptr;
     const std::vector<float>*    oop_reach     = nullptr;
@@ -250,6 +265,26 @@ public:
     /// After this call, strategy() returns valid data.
     virtual void finalize() = 0;
 
+    /// Cheapest way to make the postsolve passes valid for a MID-SOLVE
+    /// exploitability probe. Default: the full finalize(), after which the
+    /// caller copies strategy() out. A backend whose postsolve passes read
+    /// the averaged strategy straight from its own state (GPU: strategy_sum
+    /// normalized on the fly) overrides this to skip the host download /
+    /// normalize / copy that finalize() exists for — 52–92 ms per probe
+    /// against ~2 ms of best-response passes on a 16.9k-node collapsed
+    /// rainbow, 23% of a targeted solve's wall time (2026-09-10). Returns
+    /// true when NO host strategy was materialized, i.e. strategy() is not
+    /// to be trusted until the next real finalize().
+    virtual bool finalize_for_probe() { finalize(); return false; }
+
+    /// Block until every iteration queued so far has finished executing.
+    /// Solver::solve() calls it once after the iteration loop, so that
+    /// timing.iterations_ms covers the device's work and not just the
+    /// host's enqueuing (2026-09-10: GpuBackend::iterate no longer
+    /// synchronizes per iteration). Default: nothing — CPU backends are
+    /// synchronous.
+    virtual void synchronize() {}
+
     /// Averaged final strategy per node, per (action, canonical_combo).
     /// Layout: strategy[node_idx][action * num_canonical + canonical_combo]
     ///         ∈ [0, 1], rows sum to 1 over actions for each combo.
@@ -326,10 +361,12 @@ public:
     /// produce meaningful results. Solver checks this before dispatching.
     virtual bool supports_gpu_postsolve() const { return false; }
 
-    /// OOP-perspective per-combo EV at root, before the 1/total_ip_weight
-    /// scaling applied by Solver::compute_combo_evs(). Empty on backends
-    /// that don't support GPU postsolve.
-    virtual std::vector<float> compute_combo_evs_gpu() { return {}; }
+    /// Per-combo counterfactual EV at root from `perspective` (0 = OOP,
+    /// 1 = IP) under the averaged strategy, BEFORE the per-hand conditional
+    /// normalization Solver::compute_combo_evs() applies. Empty on backends
+    /// that don't support GPU postsolve. The IP perspective exists for the
+    /// raked exploitability formula (BR − EV summed over both players).
+    virtual std::vector<float> compute_combo_evs_gpu(int /*perspective*/) { return {}; }
 
     /// Per-combo best-response value at root for the given player
     /// (0 = OOP, 1 = IP). Empty on backends that don't support GPU postsolve.

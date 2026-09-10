@@ -202,7 +202,9 @@ if(BUILD_TESTS)
     add_executable(test_evaluator tests/test_evaluator.cpp src/hand_evaluator.cpp)
     target_include_directories(test_evaluator PRIVATE include)
     if(MSVC)
-        target_compile_options(test_evaluator PRIVATE /W4 /O2 /EHsc)
+        target_compile_options(test_evaluator PRIVATE /W4 /O2 /EHsc /UNDEBUG)
+    else()
+        target_compile_options(test_evaluator PRIVATE -UNDEBUG)
     endif()
     add_test(NAME HandEvaluator COMMAND test_evaluator)
     set_tests_properties(HandEvaluator PROPERTIES LABELS "smoke" TIMEOUT 30)
@@ -210,7 +212,9 @@ if(BUILD_TESTS)
     add_executable(test_tree tests/test_tree.cpp)
     target_include_directories(test_tree PRIVATE include)
     if(MSVC)
-        target_compile_options(test_tree PRIVATE /W4 /O2 /EHsc)
+        target_compile_options(test_tree PRIVATE /W4 /O2 /EHsc /UNDEBUG)
+    else()
+        target_compile_options(test_tree PRIVATE -UNDEBUG)
     endif()
     add_test(NAME GameTree COMMAND test_tree)
     set_tests_properties(GameTree PROPERTIES LABELS "smoke" TIMEOUT 30)
@@ -252,6 +256,29 @@ if(BUILD_TESTS)
         COMMAND test_solver --suite=all)
     set_tests_properties(SolverCorrectness PROPERTIES
         LABELS "stress" TIMEOUT 600)
+
+    # ----------------------------------------------------------------
+    # Game-model oracles (2026-09-09 correctness audit). Independent
+    # brute-force enumeration of opponent hands × runouts × 7-card ranks
+    # checks the solver's conditional EVs, raked payoffs, chance
+    # conditioning, all-in runout equity and exploitability denominators
+    # against the actual game rather than against another backend. Every
+    # test failed on the pre-audit engine.
+    # ----------------------------------------------------------------
+    add_executable(test_oracle
+        tests/test_oracle.cpp
+        src/hand_evaluator.cpp
+        src/backend_factory.cpp
+        ${CPU_KERNEL_SOURCES}
+    )
+    target_include_directories(test_oracle PRIVATE include)
+    if(MSVC)
+        target_compile_options(test_oracle PRIVATE /W4 /O2 /EHsc)
+        target_link_options(test_oracle PRIVATE "/STACK:16777216")
+    endif()
+    add_test(NAME SolverOracle COMMAND test_oracle)
+    set_tests_properties(SolverOracle PROPERTIES
+        LABELS "smoke;correctness" TIMEOUT 300)
 
     # ----------------------------------------------------------------
     # Cross-config parity (v1.6.0+): reference vs levelized, scalar vs
@@ -432,11 +459,16 @@ if(BUILD_TESTS)
     # fused ev·valid table (211 MB on a full postsolve) does not apply and
     # the margin here is unchanged. With postsolve on, the same board now
     # estimates 2.70 GB against a 2.76 GB measured peak.
+    # 2026-09-09 audit: the corrected betting tree (stack ownership, raise
+    # increments, min-raise) enumerates to 325,029 nodes here (was ~185k),
+    # priced at 3.66 GB peak host (2.16 GB state + 528 MB dense tables +
+    # 24 equity tables + 2× strategy). Budget raised 2.9 → 4.0 GB so the
+    # board still ENUMERATES; CliMonoStateGateCollapse keeps the other side.
     add_test(NAME CliMonoStateGateFits
         COMMAND deepsolver_core
             --pot 100 --stack 500 --board Ah9h4h
             --iterations 5 --backend cpu --postsolve none
-            --host-memory-mb 2900 --no-strategy-tree)
+            --host-memory-mb 4000 --no-strategy-tree)
     set_tests_properties(CliMonoStateGateFits PROPERTIES
         LABELS "smoke;memory" TIMEOUT 120
         PASS_REGULAR_EXPRESSION "\"runout_approximated\": false")
@@ -480,6 +512,19 @@ if(BUILD_TESTS)
             -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=host_dense_matchup_skip
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
     set_tests_properties(CliHostDenseMatchupSkip PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 120)
+
+    # CPU port of B1a inc 3: a default (POSTFLOP_STYLE, unlocked) CPU solve
+    # derives the regret-matched strategy in each consumer and must allocate
+    # ONE strat-shaped array less than the two regimes that still materialize
+    # it (node locks / STANDARD schedule). Also pins estimate == allocation in
+    # all three, which is the property that keeps the host gate exact rather
+    # than conservative. Red on v2.7.0: all three allocate three arrays.
+    add_test(NAME CliCpuStratBuffer
+        COMMAND ${CMAKE_COMMAND}
+            -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=cpu_strat_buffer
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+    set_tests_properties(CliCpuStratBuffer PROPERTIES
         LABELS "smoke;memory" TIMEOUT 120)
 
     # A4-host inc 4: the builder's runout gate must price the tables the

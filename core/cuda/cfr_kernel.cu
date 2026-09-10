@@ -44,6 +44,17 @@ constexpr uint8_t NT_PLAYER_IP  = 1;
 constexpr uint8_t NT_CHANCE     = 2;
 constexpr uint8_t NT_TERMINAL   = 3;
 
+// Mirror of types.h::chance_runout_denominator — keep in sync. The chance
+// children's weights sum to the undealt-card count given the BOARD; every
+// legal matchup removes 4 more cards (both hole hands), so the conditional
+// probability of a runout is weight / (total − 4). The collapsed single-child
+// fallback (total 1) keeps 1/1; a real deal always totals ≥ 44.
+constexpr uint32_t kChanceHoleCardsExcluded = 4;
+__device__ __forceinline__ uint32_t chance_runout_denominator(uint32_t total_w) {
+    if (total_w > kChanceHoleCardsExcluded) return total_w - kChanceHoleCardsExcluded;
+    return total_w == 0 ? 1u : total_w;
+}
+
 // ============================================================================
 // B1a increment 3: strategy sources
 //
@@ -353,7 +364,7 @@ __global__ void aggregate_node_values_kernel(
             total_w += w;
         }
         node_values[node_idx] = (total_w > 0)
-            ? (acc / static_cast<float>(total_w)) : 0.0f;
+            ? (acc / static_cast<float>(chance_runout_denominator(total_w))) : 0.0f;
         return;
     }
 

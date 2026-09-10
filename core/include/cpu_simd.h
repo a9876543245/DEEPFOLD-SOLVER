@@ -288,6 +288,20 @@ struct Kernels {
         const float* lose_p_array,
         const float* tie_p_array,
         std::size_t c_lo, std::size_t c_hi);
+
+    // 2026-09-10: equity-table build inner loop (solver.h::
+    // compute_equity_matchup_for_board). For b in [begin, end):
+    //     acc[b] += alive[b] ? sign(ranks[b] − ra) : 0
+    // sign = +1 when ra < ranks[b] (hand a is stronger — lower rank wins),
+    // −1 when ra > ranks[b], 0 on a tie; alive[b] is an all-ones/all-zeros
+    // int16 mask. int16 throughout: ranks are [1, 7462] and a partial board
+    // has at most C(49,2) = 1176 completions, so nothing can overflow.
+    // Integer arithmetic → scalar and AVX2 are bit-identical.
+    void (*equity_sign_accumulate)(const int16_t* ranks,
+                                   const int16_t* alive,
+                                   int16_t* acc,
+                                   std::size_t begin, std::size_t end,
+                                   int16_t ra);
 };
 
 // Defined in cpu_kernels_scalar.cpp / cpu_kernels_avx2.cpp.
@@ -605,6 +619,13 @@ inline void showdown_oop_full_batch(
         category_matrix, valid_matrix, n, num_terminals,
         opp_reach_w_array, skip_mask, out_array,
         win_p_array, lose_p_array, tie_p_array, c_lo, c_hi);
+}
+
+inline void equity_sign_accumulate(
+    const int16_t* ranks, const int16_t* alive, int16_t* acc,
+    std::size_t begin, std::size_t end, int16_t ra)
+{
+    kernels().equity_sign_accumulate(ranks, alive, acc, begin, end, ra);
 }
 
 }  // namespace deepsolver::cpu_simd

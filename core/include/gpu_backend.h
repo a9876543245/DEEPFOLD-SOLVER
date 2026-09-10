@@ -54,20 +54,23 @@ public:
     bool supports_warm_start() const override { return true; }
     void iterate(int iteration) override;
     void finalize() override;
+    bool finalize_for_probe() override;
+    void synchronize() override;
     const std::vector<std::vector<float>>& strategy() const override { return strategy_; }
     const char* name() const override { return name_.c_str(); }
 
     // GPU postsolve fast paths. Both reuse the device buffers already
     // populated by iterate()+finalize() (averaged strategy lives in
     // current_strategy after finalize, root reach in reach.{oop,ip}_reach).
-    //   compute_combo_evs_gpu():    OOP-perspective per-combo EV at root,
-    //                               returned in canonical-combo order, length nc.
-    //                               Caller applies the same 1/total_ip_weight
-    //                               scaling that compute_combo_evs() does on CPU.
+    //   compute_combo_evs_gpu(perspective): per-combo counterfactual EV at
+    //                               root for perspective ∈ {0=OOP, 1=IP},
+    //                               returned in canonical-combo order, length
+    //                               nc. Caller applies the same conditional
+    //                               normalization compute_combo_evs() does on CPU.
     //   compute_best_response_gpu(player): per-combo BR value at root for
     //                               player ∈ {0=OOP, 1=IP}, length nc.
     bool supports_gpu_postsolve() const override { return true; }
-    std::vector<float> compute_combo_evs_gpu() override;
+    std::vector<float> compute_combo_evs_gpu(int perspective) override;
     std::vector<float> compute_best_response_gpu(int player) override;
 
     // Measured device-memory telemetry (benchmark-truth PR-1): exact

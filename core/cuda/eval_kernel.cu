@@ -347,6 +347,11 @@ __global__ void terminal_level_kernel(
     int perspective,
     float rake_rate,
     float rake_cap,
+    // 2026-09-09 audit P0: partial-board showdown equity tables, packed
+    // [num_equity_tables × nc × nc]; equity_slot[mi] = slot or −1. See
+    // SolverContext::matchup_equity_per_runout.
+    const float* __restrict__ equity_concat,
+    const int32_t* __restrict__ equity_slot,
     float* __restrict__ node_values)
 {
     // 64-bit launch index: level_nodes × nc can exceed INT32_MAX on the
@@ -381,6 +386,36 @@ __global__ void terminal_level_kernel(
 
     uint8_t tt = terminal_types[n];
     if (tt == TT_SHOWDOWN) {
+        // 2026-09-09 audit P0: cards still to come → settle on the equity
+        // table (expected win − lose over every remaining runout × compat),
+        // linear payoff A·eq + B·valid with A = half_pot − rake/2, B = −rake/2.
+        const int32_t eq_slot = (equity_slot != nullptr) ? equity_slot[mi] : -1;
+        if (eq_slot >= 0) {
+            const float* eq = equity_concat + static_cast<size_t>(eq_slot) * per_table;
+            const float A = half_pot - 0.5f * rake;
+            const float B = -0.5f * rake;
+            float s1 = 0.0f, s2 = 0.0f;
+            if (perspective == 0) {
+                for (int k = 0; k < num_opp_live; ++k) {
+                    const int cj = opp_live[k];
+                    const size_t idx = static_cast<size_t>(c) * num_canonical + cj;
+                    const float w = reach_opp[cj] * canonical_weights[cj];
+                    s1 += w * eq[idx];
+                    if (B != 0.0f) s2 += w * matchup_valid[idx];
+                }
+                out_values[c] = A * s1 + B * s2;
+            } else {
+                for (int k = 0; k < num_opp_live; ++k) {
+                    const int ci = opp_live[k];
+                    const size_t idx = static_cast<size_t>(ci) * num_canonical + c;
+                    const float w = reach_opp[ci] * canonical_weights[ci];
+                    s1 += w * eq[idx];
+                    if (B != 0.0f) s2 += w * matchup_valid[idx];
+                }
+                out_values[c] = -A * s1 + B * s2;
+            }
+            return;
+        }
         // Per-pair payoff: branch on signed matchup_ev. m_ev is OOP-perspective
         // (+1 = OOP wins, -1 = OOP loses, 0 = tie).
         float val = 0.0f;
@@ -418,7 +453,11 @@ __global__ void terminal_level_kernel(
     uint32_t parent = parent_indices[n];
     float unmatched = bet_into[parent];
     float matched_pot = pot_total - unmatched;
-    float fold_win_gain  = matched_pot * 0.5f - rake;
+    // Fold rake base = the MATCHED pot (uncalled bet returned first) — mirrors
+    // types.h::terminal_rake and the CPU kernels.
+    float fold_rake = fminf(matched_pot * rake_rate, rake_cap);
+    if (fold_rake < 0.0f) fold_rake = 0.0f;
+    float fold_win_gain  = matched_pot * 0.5f - fold_rake;
     float fold_lose_loss = -matched_pot * 0.5f;
 
     // FOLD_OOP = OOP folded → IP wins. FOLD_IP = IP folded → OOP wins.
@@ -502,7 +541,11 @@ __global__ void rank_blocker_terminal_kernel(
     uint16_t max_bucket_count,
     int perspective,
     float rake_rate,
-    float rake_cap)
+    float rake_cap,
+    // 2026-09-09 audit P0: partial-board showdown equity tables (see
+    // terminal_level_kernel). Singleton iso ⇒ every canonical weight is 1.
+    const float* __restrict__ equity_concat,
+    const int32_t* __restrict__ equity_slot)
 {
     const uint32_t blk = blockIdx.x;
     if (blk >= num_level_nodes) return;
@@ -584,11 +627,18 @@ __global__ void rank_blocker_terminal_kernel(
 
     const uint8_t tt = terminal_types[n];
     const bool is_showdown = (tt == TT_SHOWDOWN);
+    const int32_t eq_slot = (is_showdown && equity_slot != nullptr) ? equity_slot[mi] : -1;
+    const float* __restrict__ eq = (eq_slot >= 0)
+        ? equity_concat + static_cast<size_t>(eq_slot) * static_cast<size_t>(nc) * nc
+        : nullptr;
 
     // Fold self-payoff (matches terminal_level_kernel / CPU fold_self_payoff).
     const uint32_t parent = parent_indices[n];
     const float matched_pot = pot_total - bet_into[parent];
-    const float fold_win_gain  = matched_pot * 0.5f - rake;
+    // Fold rake base = the MATCHED pot — see terminal_level_kernel.
+    float fold_rake = fminf(matched_pot * rake_rate, rake_cap);
+    if (fold_rake < 0.0f) fold_rake = 0.0f;
+    const float fold_win_gain  = matched_pot * 0.5f - fold_rake;
     const float fold_lose_loss = -matched_pot * 0.5f;
     const bool i_win = ((perspective == 0 && tt == TT_FOLD_IP) ||
                         (perspective == 1 && tt == TT_FOLD_OOP));
@@ -604,7 +654,38 @@ __global__ void rank_blocker_terminal_kernel(
         const uint32_t lo0 = card_off[k0], hi0 = card_off[k0 + 1];
         const uint32_t lo1 = card_off[k1], hi1 = card_off[k1 + 1];
 
-        if (is_showdown) {
+        if (eq != nullptr) {
+            // Equity showdown: A·Σ_j reach[j]·eq[c,j] (OOP) or −A·Σ_ci reach[ci]·eq[ci,c]
+            // (IP), plus B × the card-compatible opponent mass on raked solves —
+            // the same compatibility sum the fold branch below computes.
+            const float A = half_pot - 0.5f * rake;
+            const float B = -0.5f * rake;
+            float s1 = 0.0f;
+            if (perspective == 0) {
+                const float* row = eq + static_cast<size_t>(c) * nc;
+                for (int j = 0; j < nc; ++j) s1 += reach_opp[j] * row[j];
+            } else {
+                for (int ci = 0; ci < nc; ++ci) {
+                    s1 += reach_opp[ci] * eq[static_cast<size_t>(ci) * nc + c];
+                }
+                s1 = -s1;
+            }
+            float val = A * s1;
+            if (B != 0.0f) {
+                float opp_total = total;
+                for (uint32_t k = lo0; k < hi0; ++k) {
+                    const uint16_t o = card_list[k];
+                    if (mbucket[o] != kRbNoBucket) opp_total -= reach_opp[o];
+                }
+                for (uint32_t k = lo1; k < hi1; ++k) {
+                    const uint16_t o = card_list[k];
+                    if (mbucket[o] != kRbNoBucket) opp_total -= reach_opp[o];
+                }
+                opp_total += reach_opp[c];
+                val += B * opp_total;
+            }
+            out_values[c] = val;
+        } else if (is_showdown) {
             float stronger = s_prefix[b];
             float weaker   = total - s_prefix[b + 1];
             float same     = s_total[b];
@@ -698,6 +779,8 @@ void launch_terminal_level(
     int perspective,
     float rake_rate,
     float rake_cap,
+    const float* d_equity_concat,
+    const int32_t* d_equity_slot,
     float* d_node_values)
 {
     const int block = 256;
@@ -713,7 +796,7 @@ void launch_terminal_level(
         d_matchup_ev_concat, d_matchup_valid_concat,
         d_canonical_weights, num_runouts,
         d_reach_opp_base, d_opp_live, num_opp_live, nc, perspective,
-        rake_rate, rake_cap, d_node_values);
+        rake_rate, rake_cap, d_equity_concat, d_equity_slot, d_node_values);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -740,6 +823,8 @@ void launch_rank_blocker_terminal_level(
     int perspective,
     float rake_rate,
     float rake_cap,
+    const float* d_equity_concat,
+    const int32_t* d_equity_slot,
     float* d_node_values)
 {
     if (num_level_nodes == 0) return;
@@ -757,7 +842,407 @@ void launch_rank_blocker_terminal_level(
         d_combo_bucket, d_bucket_count,
         d_combo_card0, d_combo_card1, d_card_off, d_card_list,
         num_runouts, d_reach_opp_base, d_node_values,
-        nc, max_bucket_count, perspective, rake_rate, rake_cap);
+        nc, max_bucket_count, perspective, rake_rate, rake_cap,
+        d_equity_concat, d_equity_slot);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ============================================================================
+// 2026-09-10: batched partial-board (equity) showdowns — one GEMM per pass.
+//
+// A SHOWDOWN terminal whose table still has cards to come settles on the
+// equity matrix E (win − lose over every completion × compat; antisymmetric:
+// E[j][c] = −E[c][j]). Per terminal that is
+//     OOP: out[c] =  A·Σ_j E[c][j]·w[j]
+//     IP : out[c] = −A·Σ_j E[j][c]·w[j] = A·Σ_j E[c][j]·w[j]
+// — the SAME product for both traversers, with w = reach_opp ⊙ weights and
+// A = half_pot − rake/2. The per-terminal branches in the two kernels above
+// stream the whole nc² table once per terminal; a collapsed full-menu rainbow
+// flop has ~4.8k such terminals on ONE table, which measured 35 ms/iteration
+// on an RTX 5090 (27× the pre-audit iteration). Batched, every group is one
+// GEMM  OUT[M×nc] = W[M×nc]·Eᵀ  with 64×64×16 shared-memory tiling and 4×4
+// outputs per thread — the whole tree's equity terminals in ONE launch, tiles
+// indexed through EquityTile. Deterministic: fixed summation order, no
+// atomics (CliGpuLockDeterminism).
+//
+// Raked solves add B·compat[c] (B = −rake/2, compat = card-compatible
+// opponent mass, exactly what the per-terminal branches add): on rank-blocker
+// boards via equity_rb_compat_add_kernel (card lists), on dense boards as a
+// second GEMM against the per-runout `valid` table (coef_kind 1, accumulate).
+// ============================================================================
+
+constexpr int kEqTileM   = 64;   // terminals per tile (EquityTile span cap)
+constexpr int kEqTileN   = 64;   // hands per tile
+constexpr int kEqTileK   = 16;   // K step
+constexpr int kEqThreads = 256;  // 16×16 threads × 4×4 outputs
+// Row stride of the shared tiles: 68 keeps float4 reads 16-byte aligned and
+// limits the transposed store (16 k values into one column) to a 2-way bank
+// conflict; a stride of 64 would make it 16-way.
+constexpr int kEqSmemStride = kEqTileM + 4;
+
+__global__ void equity_showdown_gemm_kernel(
+    const EquityTile* __restrict__ tiles,
+    const uint32_t* __restrict__ eq_terminal_order,
+    const float* __restrict__ pots,
+    const uint32_t* __restrict__ value_row,
+    const float* __restrict__ matrix_concat,
+    int index_by_runout,          // 0: matrix_concat[eq_slot]; 1: matrix_concat[mi]
+    const float* __restrict__ canonical_weights,
+    const float* __restrict__ reach_opp_base,
+    uint16_t num_canonical,
+    float rake_rate,
+    float rake_cap,
+    int coef_kind,                // 0: A = half_pot − rake/2; 1: B = −rake/2
+    int accumulate,               // 0: out = coef·acc; 1: out += coef·acc
+    float* __restrict__ node_values)
+{
+    const EquityTile tile = tiles[blockIdx.x];
+    const int nc = static_cast<int>(num_canonical);
+    const int c0 = static_cast<int>(blockIdx.y) * kEqTileN;
+    const int M  = static_cast<int>(tile.t_end - tile.t_begin);
+    const size_t per_table = static_cast<size_t>(nc) * nc;
+    const float* __restrict__ mat = matrix_concat
+        + static_cast<size_t>(index_by_runout ? tile.mi : tile.eq_slot) * per_table;
+
+    __shared__ __align__(16) float Ws[kEqTileK][kEqSmemStride];   // [k][terminal]
+    __shared__ __align__(16) float Ms[kEqTileK][kEqSmemStride];   // [k][hand]
+    __shared__ uint32_t s_node[kEqTileM];
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int tx = tid & 15;
+    const int ty = tid >> 4;
+    for (int t = tid; t < kEqTileM; t += kEqThreads) {
+        s_node[t] = (t < M) ? eq_terminal_order[tile.t_begin + t] : 0u;
+    }
+    __syncthreads();
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    }
+
+    for (int k0 = 0; k0 < nc; k0 += kEqTileK) {
+        // Cooperative loads. Element e ∈ [0, 1024): k = e & 15 varies fastest
+        // so 16 consecutive threads read 64 contiguous bytes of one row;
+        // r = e >> 4 is the terminal (W) or the hand (matrix).
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int e  = tid + i * kEqThreads;
+            const int k  = e & (kEqTileK - 1);
+            const int r  = e >> 4;
+            const int kk = k0 + k;
+            float w = 0.0f;
+            if (r < M && kk < nc) {
+                const uint32_t n = s_node[r];
+                w = reach_opp_base[static_cast<size_t>(n) * nc + kk]
+                  * canonical_weights[kk];
+            }
+            Ws[k][r] = w;
+            float m = 0.0f;
+            const int cc = c0 + r;
+            if (cc < nc && kk < nc) {
+                m = mat[static_cast<size_t>(cc) * nc + kk];
+            }
+            Ms[k][r] = m;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < kEqTileK; ++k) {
+            const float4 a4 = *reinterpret_cast<const float4*>(&Ws[k][ty * 4]);
+            const float4 b4 = *reinterpret_cast<const float4*>(&Ms[k][tx * 4]);
+            const float a[4] = {a4.x, a4.y, a4.z, a4.w};
+            const float b[4] = {b4.x, b4.y, b4.z, b4.w};
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int t = ty * 4 + i;
+        if (t >= M) continue;
+        const uint32_t n = s_node[t];
+        const float pot_total = pots[n];
+        float rake = fminf(pot_total * rake_rate, rake_cap);
+        if (rake < 0.0f) rake = 0.0f;
+        const float coef = (coef_kind == 0) ? (pot_total * 0.5f - 0.5f * rake)
+                                            : (-0.5f * rake);
+        float* __restrict__ out =
+            node_values + static_cast<size_t>(value_row[n]) * nc;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int c = c0 + tx * 4 + j;
+            if (c >= nc) continue;
+            const float v = coef * acc[i][j];
+            out[c] = accumulate ? (out[c] + v) : v;
+        }
+    }
+}
+
+/// Raked equity showdowns on rank-blocker boards: out[c] += B·compat[c] with
+/// compat[c] = Σ_{o valid, o ∩ c = ∅} reach[o] — the same card-list sum the
+/// per-terminal rank_blocker_terminal_kernel adds (weights are 1 on singleton
+/// iso). One block per terminal; a fixed-tree block reduction keeps it
+/// deterministic. Hands blocked by the board keep the GEMM's exact 0.
+__global__ void equity_rb_compat_add_kernel(
+    const uint32_t* __restrict__ eq_terminal_order,
+    uint32_t num_eq_terminals,
+    const float* __restrict__ pots,
+    const int32_t* __restrict__ matchup_idx,
+    const uint32_t* __restrict__ value_row,
+    const uint16_t* __restrict__ combo_bucket,
+    const uint8_t* __restrict__ combo_card0,
+    const uint8_t* __restrict__ combo_card1,
+    const uint32_t* __restrict__ card_off,
+    const uint16_t* __restrict__ card_list,
+    uint32_t num_runouts,
+    const float* __restrict__ reach_opp_base,
+    uint16_t num_canonical,
+    float rake_rate,
+    float rake_cap,
+    float* __restrict__ node_values)
+{
+    const uint32_t blk = blockIdx.x;
+    if (blk >= num_eq_terminals) return;
+    const uint32_t n = eq_terminal_order[blk];
+    const int nc = static_cast<int>(num_canonical);
+    const int tid = static_cast<int>(threadIdx.x);
+
+    int32_t mi = matchup_idx[n];
+    if (mi < 0 || static_cast<uint32_t>(mi) >= num_runouts) mi = 0;
+    const uint16_t* __restrict__ mbucket = combo_bucket + static_cast<size_t>(mi) * nc;
+    const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(n) * nc;
+    float* __restrict__ out_values =
+        node_values + static_cast<size_t>(value_row[n]) * nc;
+
+    const float pot_total = pots[n];
+    float rake = fminf(pot_total * rake_rate, rake_cap);
+    if (rake < 0.0f) rake = 0.0f;
+    const float B = -0.5f * rake;
+    if (B == 0.0f) return;   // uniform across the block
+
+    __shared__ float s_red[kRbBlock];
+    float local = 0.0f;
+    for (int o = tid; o < nc; o += blockDim.x) {
+        if (mbucket[o] != kRbNoBucket) local += reach_opp[o];
+    }
+    s_red[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        __syncthreads();
+    }
+    const float total = s_red[0];
+
+    for (int c = tid; c < nc; c += blockDim.x) {
+        if (mbucket[c] == kRbNoBucket) continue;
+        const uint8_t k0 = combo_card0[c];
+        const uint8_t k1 = combo_card1[c];
+        float opp_total = total;
+        for (uint32_t k = card_off[k0]; k < card_off[k0 + 1]; ++k) {
+            const uint16_t o = card_list[k];
+            if (mbucket[o] != kRbNoBucket) opp_total -= reach_opp[o];
+        }
+        for (uint32_t k = card_off[k1]; k < card_off[k1 + 1]; ++k) {
+            const uint16_t o = card_list[k];
+            if (mbucket[o] != kRbNoBucket) opp_total -= reach_opp[o];
+        }
+        opp_total += reach_opp[c];   // undo the double subtraction of c
+        out_values[c] += B * opp_total;
+    }
+}
+
+void launch_equity_showdown_gemm(
+    const EquityTile* d_tiles,
+    uint32_t num_tiles,
+    const uint32_t* d_eq_terminal_order,
+    const float* d_pots,
+    const uint32_t* d_value_row,
+    const float* d_matrix_concat,
+    int index_by_runout,
+    const float* d_canonical_weights,
+    const float* d_reach_opp_base,
+    uint16_t nc,
+    float rake_rate,
+    float rake_cap,
+    int coef_kind,
+    int accumulate,
+    float* d_node_values)
+{
+    if (num_tiles == 0 || nc == 0) return;
+    const dim3 grid(num_tiles, (static_cast<unsigned>(nc) + kEqTileN - 1) / kEqTileN);
+    equity_showdown_gemm_kernel<<<grid, kEqThreads>>>(
+        d_tiles, d_eq_terminal_order, d_pots, d_value_row,
+        d_matrix_concat, index_by_runout, d_canonical_weights,
+        d_reach_opp_base, nc, rake_rate, rake_cap, coef_kind, accumulate,
+        d_node_values);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_equity_rb_compat_add(
+    const uint32_t* d_eq_terminal_order,
+    uint32_t num_eq_terminals,
+    const float* d_pots,
+    const int32_t* d_matchup_idx,
+    const uint32_t* d_value_row,
+    const uint16_t* d_combo_bucket,
+    const uint8_t* d_combo_card0,
+    const uint8_t* d_combo_card1,
+    const uint32_t* d_card_off,
+    const uint16_t* d_card_list,
+    uint32_t num_runouts,
+    const float* d_reach_opp_base,
+    uint16_t nc,
+    float rake_rate,
+    float rake_cap,
+    float* d_node_values)
+{
+    if (num_eq_terminals == 0) return;
+    equity_rb_compat_add_kernel<<<num_eq_terminals, kRbBlock>>>(
+        d_eq_terminal_order, num_eq_terminals, d_pots, d_matchup_idx,
+        d_value_row, d_combo_bucket, d_combo_card0, d_combo_card1,
+        d_card_off, d_card_list, num_runouts, d_reach_opp_base, nc,
+        rake_rate, rake_cap, d_node_values);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ============================================================================
+// 2026-09-10: dedicated FOLD terminal kernel for rank-blocker boards.
+//
+// rank_blocker_terminal_kernel handled folds too, but a fold needs none of
+// its rank machinery: the value is self_payoff × (card-compatible opponent
+// mass), and that mass is total − S[card0] − S[card1] + reach[c], with S[card]
+// the reach of every board-valid opponent hand holding that card. The old
+// fold branch still scattered every hand into rank buckets, ran the prefix
+// scan, and then walked both card lists (~92 gathers) for EVERY self hand:
+// 0.39 ms per launch on the 4,820 folds of a full-menu collapsed rainbow, 28%
+// of the iteration. Here the 52 per-card sums are built once per terminal
+// (two 64-bit fixed-point atomics per opponent hand — integer adds commute,
+// so the result is order-independent, same trick as the rank buckets), the
+// total is half their sum (every hand lands in exactly two bins), and each
+// self hand costs three loads. Deterministic. Dense-plan (iso) boards keep
+// terminal_level_kernel's fold branch: their compatibility is fractional per
+// canonical class and needs the per-original data only the dense path has.
+// ============================================================================
+
+constexpr int kFoldBlock = 256;
+constexpr int kFoldNumCards = 52;   // types.h NUM_CARDS is not visible here
+
+__global__ void fold_blocker_terminal_kernel(
+    const uint8_t* __restrict__ terminal_types,
+    const float* __restrict__ pots,
+    const uint32_t* __restrict__ parent_indices,
+    const float* __restrict__ bet_into,
+    const int32_t* __restrict__ matchup_idx,
+    const uint32_t* __restrict__ value_row,
+    const uint32_t* __restrict__ fold_terminal_order,
+    uint32_t num_fold_terminals,
+    const uint16_t* __restrict__ combo_bucket,   // [num_runouts * nc]; kRbNoBucket = blocked by the board
+    const uint8_t* __restrict__ combo_card0,     // [nc]
+    const uint8_t* __restrict__ combo_card1,     // [nc]
+    uint32_t num_runouts,
+    const float* __restrict__ reach_opp_base,    // [N * nc]
+    uint16_t num_canonical,
+    int perspective,
+    float rake_rate,
+    float rake_cap,
+    float* __restrict__ node_values)
+{
+    const uint32_t blk = blockIdx.x;
+    if (blk >= num_fold_terminals) return;
+    const uint32_t n = fold_terminal_order[blk];
+    const int nc = static_cast<int>(num_canonical);
+    const int tid = static_cast<int>(threadIdx.x);
+
+    int32_t mi = matchup_idx[n];
+    if (mi < 0 || static_cast<uint32_t>(mi) >= num_runouts) mi = 0;
+    const uint16_t* __restrict__ mbucket = combo_bucket + static_cast<size_t>(mi) * nc;
+    const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(n) * nc;
+    float* __restrict__ out_values =
+        node_values + static_cast<size_t>(value_row[n]) * nc;
+
+    __shared__ unsigned long long s_acc[kFoldNumCards];
+    __shared__ float s_card[kFoldNumCards];
+    __shared__ unsigned long long s_total_q;
+    for (int k = tid; k < kFoldNumCards; k += kFoldBlock) s_acc[k] = 0ull;
+    __syncthreads();
+    for (int o = tid; o < nc; o += kFoldBlock) {
+        if (mbucket[o] == kRbNoBucket) continue;
+        const float r = reach_opp[o];
+        if (r == 0.0f) continue;
+        const unsigned long long q = __float2ull_rn(r * kRbFixedScale);
+        if (q == 0ull) continue;
+        atomicAdd(&s_acc[combo_card0[o]], q);
+        atomicAdd(&s_acc[combo_card1[o]], q);
+    }
+    __syncthreads();
+    if (tid < kFoldNumCards) {
+        s_card[tid] = static_cast<float>(
+            __ull2double_rn(s_acc[tid]) * kRbFixedInvScale);
+    }
+    if (tid == 0) {
+        unsigned long long t = 0ull;
+        for (int k = 0; k < kFoldNumCards; ++k) t += s_acc[k];
+        s_total_q = t;   // every hand was added to exactly two bins
+    }
+    __syncthreads();
+    const float total = static_cast<float>(
+        __ull2double_rn(s_total_q / 2ull) * kRbFixedInvScale);
+
+    // Fold payoff (matches terminal_level_kernel / CPU fold_self_payoff).
+    const float pot_total = pots[n];
+    const uint32_t parent = parent_indices[n];
+    const float matched_pot = pot_total - bet_into[parent];
+    float fold_rake = fminf(matched_pot * rake_rate, rake_cap);
+    if (fold_rake < 0.0f) fold_rake = 0.0f;
+    const float fold_win_gain  = matched_pot * 0.5f - fold_rake;
+    const float fold_lose_loss = -matched_pot * 0.5f;
+    const uint8_t tt = terminal_types[n];
+    const bool i_win = ((perspective == 0 && tt == TT_FOLD_IP) ||
+                        (perspective == 1 && tt == TT_FOLD_OOP));
+    const float self_payoff = i_win ? fold_win_gain : fold_lose_loss;
+
+    for (int c = tid; c < nc; c += kFoldBlock) {
+        if (mbucket[c] == kRbNoBucket) { out_values[c] = 0.0f; continue; }
+        // c sits in both of its card bins: subtracted twice, belongs out once.
+        const float compat = total - s_card[combo_card0[c]] - s_card[combo_card1[c]]
+                           + reach_opp[c];
+        out_values[c] = self_payoff * compat;
+    }
+}
+
+void launch_fold_blocker_terminals(
+    const uint8_t* d_terminal_types,
+    const float* d_pots,
+    const uint32_t* d_parent_indices,
+    const float* d_bet_into,
+    const int32_t* d_matchup_idx,
+    const uint32_t* d_value_row,
+    const uint32_t* d_fold_terminal_order,
+    uint32_t num_fold_terminals,
+    const uint16_t* d_combo_bucket,
+    const uint8_t* d_combo_card0,
+    const uint8_t* d_combo_card1,
+    uint32_t num_runouts,
+    const float* d_reach_opp_base,
+    uint16_t nc,
+    int perspective,
+    float rake_rate,
+    float rake_cap,
+    float* d_node_values)
+{
+    if (num_fold_terminals == 0) return;
+    fold_blocker_terminal_kernel<<<num_fold_terminals, kFoldBlock>>>(
+        d_terminal_types, d_pots, d_parent_indices, d_bet_into, d_matchup_idx,
+        d_value_row, d_fold_terminal_order, num_fold_terminals,
+        d_combo_bucket, d_combo_card0, d_combo_card1, num_runouts,
+        d_reach_opp_base, nc, perspective, rake_rate, rake_cap, d_node_values);
     CUDA_CHECK(cudaGetLastError());
 }
 
