@@ -472,13 +472,17 @@ inline uint64_t bytes_for_gpu_device_total(uint64_t total_nodes,
                                            bool device_dense_upload,
                                            bool materialize_strategy,
                                            uint64_t value_rows,
-                                           uint64_t equity_tables = 0) {
+                                           uint64_t equity_tables = 0,
+                                           uint64_t signed_count_tables = 0) {
     const uint64_t state   = bytes_for_gpu_state_compact(
         total_nodes, player_action_slots, nc, materialize_strategy, value_rows);
-    // The equity tables ride along whatever the dense-upload decision is.
+    // The equity tables ride along whatever the dense-upload decision is;
+    // 2026-09-11: so do the int8 signed pair-count tables on SignedCount
+    // boards (signed_count_showdown_gemm_kernel), nc*nc bytes each.
     const uint64_t matchup = (device_dense_upload
         ? bytes_for_matchup_tables(matchup_tables, nc, 2ULL * sizeof(float))
-        : 0ULL) + bytes_for_equity_tables(equity_tables, nc);
+        : 0ULL) + bytes_for_equity_tables(equity_tables, nc)
+        + signed_count_tables * nc * nc;
     const uint64_t tree    = 24ULL * total_nodes + 5ULL * total_edges;
     const uint64_t levels  = 4ULL * total_nodes + 4096ULL;
     const uint64_t reserve = 8ULL * 1024ULL * 1024ULL + (state + matchup) / 32ULL;

@@ -835,6 +835,34 @@ static void showdown_ip_signed_zero_rake(
     }
 }
 
+// Masked tail helpers for the signed-count kernels (2026-09-11). Every lane of
+// every row goes through the same fmadd, so the fused both-traverser kernel is
+// bit-identical to the two single kernels by construction — no scalar `s += a*b`
+// whose contraction MSVC may decide differently per loop shape.
+static inline __m256i sc_tail_mask(std::size_t rem) {
+    return _mm256_cmpgt_epi32(
+        _mm256_set1_epi32(static_cast<int>(rem)),
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+}
+// 8 int8 counts as floats.
+static inline __m256 sc_load8(const int8_t* row) {
+    return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+        _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row))));
+}
+// Tail: one 8-byte load, lanes >= rem zeroed by `bytemask` (sc_tail_bytes).
+// Reads 8 bytes from `row`, so every signed-count table carries 8 bytes of
+// zero slack past nc*nc (precompute_matchups pads it; tests/benches too).
+static inline __m256 sc_load_tail(const int8_t* row, __m128i bytemask) {
+    const __m128i c8 = _mm_and_si128(
+        _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row)), bytemask);
+    return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(c8));
+}
+static inline __m128i sc_tail_bytes(std::size_t rem) {
+    return _mm_cmpgt_epi8(
+        _mm_set1_epi8(static_cast<char>(rem)),
+        _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 8, 8, 8, 8));
+}
+
 static void showdown_oop_signed_count_zero_rake_8row_no_skip(
     const int8_t* signed_count_matrix,
     const float* opp_reach,
@@ -850,38 +878,37 @@ static void showdown_oop_signed_count_zero_rake(
     float* out, std::size_t n,
     float win_p)
 {
-    static constexpr bool kOopSignedCountEightRow = true;
-    if constexpr (kOopSignedCountEightRow) {
-        if (!skip_mask) {
-            showdown_oop_signed_count_zero_rake_8row_no_skip(
-                signed_count_matrix, opp_reach, inv_weights, out, n, win_p);
-            return;
-        }
+    if (!skip_mask) {
+        showdown_oop_signed_count_zero_rake_8row_no_skip(
+            signed_count_matrix, opp_reach, inv_weights, out, n, win_p);
+        return;
     }
-
+    // Masked: same per-row arithmetic as the 8-row kernel (so the fused kernel
+    // can zero skipped rows after the fact and stay bit-identical); skipped
+    // rows just do not run.
+    const std::size_t n8 = n & ~static_cast<std::size_t>(7);
+    const std::size_t rem = n - n8;
+    const __m256i tail = sc_tail_mask(rem);
+    const __m128i tailb = sc_tail_bytes(rem);
     for (std::size_t c = 0; c < n; ++c) {
-        if (skip_mask && skip_mask[c]) {
+        if (skip_mask[c]) {
             out[c] = 0.0f;
             continue;
         }
         const int8_t* count_row = signed_count_matrix + c * n;
         __m256 acc = _mm256_setzero_ps();
         std::size_t i = 0;
-        for (; i + 8 <= n; i += 8) {
-            __m128i count8 = _mm_loadl_epi64(
-                reinterpret_cast<const __m128i*>(count_row + i));
-            __m256 count = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(count8));
-            __m256 reach = _mm256_loadu_ps(opp_reach + i);
-            acc = _mm256_fmadd_ps(count, reach, acc);
+        for (; i < n8; i += 8) {
+            const __m256 reach = _mm256_loadu_ps(opp_reach + i);
+            acc = _mm256_fmadd_ps(sc_load8(count_row + i), reach, acc);
         }
-        float sum = hsum256(acc);
-        for (; i < n; ++i) {
-            sum += static_cast<float>(count_row[i]) * opp_reach[i];
+        if (rem) {
+            const __m256 reach = _mm256_maskload_ps(opp_reach + i, tail);
+            acc = _mm256_fmadd_ps(sc_load_tail(count_row + i, tailb), reach, acc);
         }
-        out[c] = sum * win_p * inv_weights[c];
+        out[c] = hsum256(acc) * win_p * inv_weights[c];
     }
 }
-
 static void showdown_ip_signed_count_zero_rake(
     const int8_t* signed_count_matrix,
     const float* opp_reach,
@@ -890,6 +917,10 @@ static void showdown_ip_signed_count_zero_rake(
     float* out, std::size_t n,
     float win_p)
 {
+    const std::size_t n8 = n & ~static_cast<std::size_t>(7);
+    const std::size_t rem = n - n8;
+    const __m256i tail = sc_tail_mask(rem);
+    const __m128i tailb = sc_tail_bytes(rem);
     {
         std::size_t i = 0;
         const __m256 z = _mm256_setzero_ps();
@@ -897,44 +928,24 @@ static void showdown_ip_signed_count_zero_rake(
         for (; i < n; ++i) out[i] = 0.0f;
     }
 
+    // Every lane accumulates the same way with or without a skip mask; masked
+    // lanes are zeroed in the final scaling pass. (The fused kernel relies on
+    // this to stay bit-identical.)
     for (std::size_t ci = 0; ci < n; ++ci) {
         const float scale = -opp_reach[ci] * win_p;
         if (scale == 0.0f) continue;
         const __m256 vscale = _mm256_set1_ps(scale);
         const int8_t* count_row = signed_count_matrix + ci * n;
         std::size_t i = 0;
-        if (skip_mask) {
-            const __m256i vzero_i = _mm256_setzero_si256();
-            for (; i + 8 <= n; i += 8) {
-                __m128i skip8 = _mm_loadl_epi64(
-                    reinterpret_cast<const __m128i*>(skip_mask + i));
-                __m256i skip32 = _mm256_cvtepu8_epi32(skip8);
-                __m256 keep = _mm256_castsi256_ps(
-                    _mm256_cmpeq_epi32(skip32, vzero_i));
-                __m128i count8 = _mm_loadl_epi64(
-                    reinterpret_cast<const __m128i*>(count_row + i));
-                __m256 count = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(count8));
-                __m256 contrib = _mm256_and_ps(_mm256_mul_ps(count, vscale), keep);
-                __m256 ov = _mm256_loadu_ps(out + i);
-                _mm256_storeu_ps(out + i, _mm256_add_ps(ov, contrib));
-            }
-            for (; i < n; ++i) {
-                if (!skip_mask[i]) {
-                    out[i] += static_cast<float>(count_row[i]) * scale;
-                }
-            }
-            continue;
-        }
-        for (; i + 8 <= n; i += 8) {
-            __m128i count8 = _mm_loadl_epi64(
-                reinterpret_cast<const __m128i*>(count_row + i));
-            __m256 count = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(count8));
+        for (; i < n8; i += 8) {
             __m256 ov = _mm256_loadu_ps(out + i);
-            ov = _mm256_fmadd_ps(count, vscale, ov);
+            ov = _mm256_fmadd_ps(sc_load8(count_row + i), vscale, ov);
             _mm256_storeu_ps(out + i, ov);
         }
-        for (; i < n; ++i) {
-            out[i] += static_cast<float>(count_row[i]) * scale;
+        if (rem) {
+            __m256 ov = _mm256_maskload_ps(out + i, tail);
+            ov = _mm256_fmadd_ps(sc_load_tail(count_row + i, tailb), vscale, ov);
+            _mm256_maskstore_ps(out + i, tail, ov);
         }
     }
 
@@ -962,9 +973,7 @@ static void showdown_ip_signed_count_zero_rake(
         _mm256_storeu_ps(out + i, _mm256_mul_ps(ov, iw));
     }
     for (; i < n; ++i) out[i] *= inv_weights[i];
-}
-
-static void showdown_oop_full_active(
+}static void showdown_oop_full_active(
     const uint8_t* category_matrix, const float* valid_matrix,
     const float* opp_reach_w,
     const uint16_t* active_indices, std::size_t active_count,
@@ -1721,8 +1730,12 @@ static void showdown_oop_signed_count_zero_rake_8row_no_skip(
     float* out, std::size_t n,
     float win_p)
 {
-    std::size_t c = 0;
     const __m128 vwin = _mm_set1_ps(win_p);
+    const std::size_t n8 = n & ~static_cast<std::size_t>(7);
+    const std::size_t rem = n - n8;
+    const __m256i tail = sc_tail_mask(rem);
+    const __m128i tailb = sc_tail_bytes(rem);
+    std::size_t c = 0;
     for (; c + 8 <= n; c += 8) {
         const int8_t* row0 = signed_count_matrix + (c + 0) * n;
         const int8_t* row1 = signed_count_matrix + (c + 1) * n;
@@ -1741,62 +1754,32 @@ static void showdown_oop_signed_count_zero_rake_8row_no_skip(
         __m256 acc6 = _mm256_setzero_ps();
         __m256 acc7 = _mm256_setzero_ps();
         std::size_t i = 0;
-        for (; i + 8 <= n; i += 8) {
+        for (; i < n8; i += 8) {
             const __m256 reach = _mm256_loadu_ps(opp_reach + i);
-            __m128i count8 = _mm_loadl_epi64(
-                reinterpret_cast<const __m128i*>(row0 + i));
-            __m256 count = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(count8));
-            acc0 = _mm256_fmadd_ps(count, reach, acc0);
-            count8 = _mm_loadl_epi64(
-                reinterpret_cast<const __m128i*>(row1 + i));
-            count = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(count8));
-            acc1 = _mm256_fmadd_ps(count, reach, acc1);
-            count8 = _mm_loadl_epi64(
-                reinterpret_cast<const __m128i*>(row2 + i));
-            count = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(count8));
-            acc2 = _mm256_fmadd_ps(count, reach, acc2);
-            count8 = _mm_loadl_epi64(
-                reinterpret_cast<const __m128i*>(row3 + i));
-            count = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(count8));
-            acc3 = _mm256_fmadd_ps(count, reach, acc3);
-            count8 = _mm_loadl_epi64(
-                reinterpret_cast<const __m128i*>(row4 + i));
-            count = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(count8));
-            acc4 = _mm256_fmadd_ps(count, reach, acc4);
-            count8 = _mm_loadl_epi64(
-                reinterpret_cast<const __m128i*>(row5 + i));
-            count = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(count8));
-            acc5 = _mm256_fmadd_ps(count, reach, acc5);
-            count8 = _mm_loadl_epi64(
-                reinterpret_cast<const __m128i*>(row6 + i));
-            count = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(count8));
-            acc6 = _mm256_fmadd_ps(count, reach, acc6);
-            count8 = _mm_loadl_epi64(
-                reinterpret_cast<const __m128i*>(row7 + i));
-            count = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(count8));
-            acc7 = _mm256_fmadd_ps(count, reach, acc7);
+            acc0 = _mm256_fmadd_ps(sc_load8(row0 + i), reach, acc0);
+            acc1 = _mm256_fmadd_ps(sc_load8(row1 + i), reach, acc1);
+            acc2 = _mm256_fmadd_ps(sc_load8(row2 + i), reach, acc2);
+            acc3 = _mm256_fmadd_ps(sc_load8(row3 + i), reach, acc3);
+            acc4 = _mm256_fmadd_ps(sc_load8(row4 + i), reach, acc4);
+            acc5 = _mm256_fmadd_ps(sc_load8(row5 + i), reach, acc5);
+            acc6 = _mm256_fmadd_ps(sc_load8(row6 + i), reach, acc6);
+            acc7 = _mm256_fmadd_ps(sc_load8(row7 + i), reach, acc7);
         }
-        float s0 = hsum256(acc0);
-        float s1 = hsum256(acc1);
-        float s2 = hsum256(acc2);
-        float s3 = hsum256(acc3);
-        float s4 = hsum256(acc4);
-        float s5 = hsum256(acc5);
-        float s6 = hsum256(acc6);
-        float s7 = hsum256(acc7);
-        for (; i < n; ++i) {
-            const float reach = opp_reach[i];
-            s0 += static_cast<float>(row0[i]) * reach;
-            s1 += static_cast<float>(row1[i]) * reach;
-            s2 += static_cast<float>(row2[i]) * reach;
-            s3 += static_cast<float>(row3[i]) * reach;
-            s4 += static_cast<float>(row4[i]) * reach;
-            s5 += static_cast<float>(row5[i]) * reach;
-            s6 += static_cast<float>(row6[i]) * reach;
-            s7 += static_cast<float>(row7[i]) * reach;
+        if (rem) {
+            const __m256 reach = _mm256_maskload_ps(opp_reach + i, tail);
+            acc0 = _mm256_fmadd_ps(sc_load_tail(row0 + i, tailb), reach, acc0);
+            acc1 = _mm256_fmadd_ps(sc_load_tail(row1 + i, tailb), reach, acc1);
+            acc2 = _mm256_fmadd_ps(sc_load_tail(row2 + i, tailb), reach, acc2);
+            acc3 = _mm256_fmadd_ps(sc_load_tail(row3 + i, tailb), reach, acc3);
+            acc4 = _mm256_fmadd_ps(sc_load_tail(row4 + i, tailb), reach, acc4);
+            acc5 = _mm256_fmadd_ps(sc_load_tail(row5 + i, tailb), reach, acc5);
+            acc6 = _mm256_fmadd_ps(sc_load_tail(row6 + i, tailb), reach, acc6);
+            acc7 = _mm256_fmadd_ps(sc_load_tail(row7 + i, tailb), reach, acc7);
         }
-        const __m128 sum_lo = _mm_setr_ps(s0, s1, s2, s3);
-        const __m128 sum_hi = _mm_setr_ps(s4, s5, s6, s7);
+        const __m128 sum_lo = _mm_setr_ps(hsum256(acc0), hsum256(acc1),
+                                          hsum256(acc2), hsum256(acc3));
+        const __m128 sum_hi = _mm_setr_ps(hsum256(acc4), hsum256(acc5),
+                                          hsum256(acc6), hsum256(acc7));
         const __m128 iw_lo = _mm_loadu_ps(inv_weights + c);
         const __m128 iw_hi = _mm_loadu_ps(inv_weights + c + 4);
         _mm_storeu_ps(out + c,
@@ -1808,21 +1791,219 @@ static void showdown_oop_signed_count_zero_rake_8row_no_skip(
         const int8_t* count_row = signed_count_matrix + c * n;
         __m256 acc = _mm256_setzero_ps();
         std::size_t i = 0;
-        for (; i + 8 <= n; i += 8) {
-            __m128i count8 = _mm_loadl_epi64(
-                reinterpret_cast<const __m128i*>(count_row + i));
-            __m256 count = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(count8));
-            __m256 reach = _mm256_loadu_ps(opp_reach + i);
-            acc = _mm256_fmadd_ps(count, reach, acc);
+        for (; i < n8; i += 8) {
+            const __m256 reach = _mm256_loadu_ps(opp_reach + i);
+            acc = _mm256_fmadd_ps(sc_load8(count_row + i), reach, acc);
         }
-        float sum = hsum256(acc);
-        for (; i < n; ++i) {
-            sum += static_cast<float>(count_row[i]) * opp_reach[i];
+        if (rem) {
+            const __m256 reach = _mm256_maskload_ps(opp_reach + i, tail);
+            acc = _mm256_fmadd_ps(sc_load_tail(count_row + i, tailb), reach, acc);
         }
-        out[c] = sum * win_p * inv_weights[c];
+        out[c] = hsum256(acc) * win_p * inv_weights[c];
     }
 }
 
+static void showdown_dual_signed_count_zero_rake(
+    const int8_t* signed_count_matrix,
+    const float* reach_oop,
+    const float* reach_ip,
+    const float* inv_weights,
+    const uint8_t* skip_oop,
+    const uint8_t* skip_ip,
+    float* out_oop, float* out_ip,
+    std::size_t n, float win_p)
+{
+    // Fused twin of showdown_oop_signed_count_zero_rake (8-row, no skip) and
+    // showdown_ip_signed_count_zero_rake (no skip): each int8 row is converted
+    // once and feeds both accumulations. Per output lane the fmadd sequence is
+    // exactly the singles' (rows ascend inside a block, blocks ascend, the tail
+    // lanes use the same masked helpers), so the results are bit-identical;
+    // test_cpu_kernels pins that.
+    const std::size_t n8 = n & ~static_cast<std::size_t>(7);
+    const std::size_t rem = n - n8;
+    const __m256i tail = sc_tail_mask(rem);
+    const __m128i tailb = sc_tail_bytes(rem);
+    {
+        std::size_t i = 0;
+        const __m256 z = _mm256_setzero_ps();
+        for (; i + 8 <= n; i += 8) _mm256_storeu_ps(out_ip + i, z);
+        for (; i < n; ++i) out_ip[i] = 0.0f;
+    }
+    const __m128 vwin = _mm_set1_ps(win_p);
+    std::size_t c = 0;
+    for (; c + 8 <= n; c += 8) {
+        const int8_t* row0 = signed_count_matrix + (c + 0) * n;
+        const int8_t* row1 = signed_count_matrix + (c + 1) * n;
+        const int8_t* row2 = signed_count_matrix + (c + 2) * n;
+        const int8_t* row3 = signed_count_matrix + (c + 3) * n;
+        const int8_t* row4 = signed_count_matrix + (c + 4) * n;
+        const int8_t* row5 = signed_count_matrix + (c + 5) * n;
+        const int8_t* row6 = signed_count_matrix + (c + 6) * n;
+        const int8_t* row7 = signed_count_matrix + (c + 7) * n;
+        const float sc0 = -reach_oop[c + 0] * win_p;
+        const float sc1 = -reach_oop[c + 1] * win_p;
+        const float sc2 = -reach_oop[c + 2] * win_p;
+        const float sc3 = -reach_oop[c + 3] * win_p;
+        const float sc4 = -reach_oop[c + 4] * win_p;
+        const float sc5 = -reach_oop[c + 5] * win_p;
+        const float sc6 = -reach_oop[c + 6] * win_p;
+        const float sc7 = -reach_oop[c + 7] * win_p;
+        const bool l0 = (sc0 != 0.0f), l1 = (sc1 != 0.0f), l2 = (sc2 != 0.0f), l3 = (sc3 != 0.0f);
+        const bool l4 = (sc4 != 0.0f), l5 = (sc5 != 0.0f), l6 = (sc6 != 0.0f), l7 = (sc7 != 0.0f);
+        const __m256 vs0 = _mm256_set1_ps(sc0), vs1 = _mm256_set1_ps(sc1);
+        const __m256 vs2 = _mm256_set1_ps(sc2), vs3 = _mm256_set1_ps(sc3);
+        const __m256 vs4 = _mm256_set1_ps(sc4), vs5 = _mm256_set1_ps(sc5);
+        const __m256 vs6 = _mm256_set1_ps(sc6), vs7 = _mm256_set1_ps(sc7);
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+        __m256 acc4 = _mm256_setzero_ps();
+        __m256 acc5 = _mm256_setzero_ps();
+        __m256 acc6 = _mm256_setzero_ps();
+        __m256 acc7 = _mm256_setzero_ps();
+        std::size_t i = 0;
+        for (; i < n8; i += 8) {
+            const __m256 reach = _mm256_loadu_ps(reach_ip + i);
+            __m256 o = _mm256_loadu_ps(out_ip + i);
+            __m256 k;
+            k = sc_load8(row0 + i); acc0 = _mm256_fmadd_ps(k, reach, acc0); if (l0) o = _mm256_fmadd_ps(k, vs0, o);
+            k = sc_load8(row1 + i); acc1 = _mm256_fmadd_ps(k, reach, acc1); if (l1) o = _mm256_fmadd_ps(k, vs1, o);
+            k = sc_load8(row2 + i); acc2 = _mm256_fmadd_ps(k, reach, acc2); if (l2) o = _mm256_fmadd_ps(k, vs2, o);
+            k = sc_load8(row3 + i); acc3 = _mm256_fmadd_ps(k, reach, acc3); if (l3) o = _mm256_fmadd_ps(k, vs3, o);
+            k = sc_load8(row4 + i); acc4 = _mm256_fmadd_ps(k, reach, acc4); if (l4) o = _mm256_fmadd_ps(k, vs4, o);
+            k = sc_load8(row5 + i); acc5 = _mm256_fmadd_ps(k, reach, acc5); if (l5) o = _mm256_fmadd_ps(k, vs5, o);
+            k = sc_load8(row6 + i); acc6 = _mm256_fmadd_ps(k, reach, acc6); if (l6) o = _mm256_fmadd_ps(k, vs6, o);
+            k = sc_load8(row7 + i); acc7 = _mm256_fmadd_ps(k, reach, acc7); if (l7) o = _mm256_fmadd_ps(k, vs7, o);
+            _mm256_storeu_ps(out_ip + i, o);
+        }
+        if (rem) {
+            const __m256 reach = _mm256_maskload_ps(reach_ip + i, tail);
+            __m256 o = _mm256_maskload_ps(out_ip + i, tail);
+            __m256 k;
+            k = sc_load_tail(row0 + i, tailb); acc0 = _mm256_fmadd_ps(k, reach, acc0); if (l0) o = _mm256_fmadd_ps(k, vs0, o);
+            k = sc_load_tail(row1 + i, tailb); acc1 = _mm256_fmadd_ps(k, reach, acc1); if (l1) o = _mm256_fmadd_ps(k, vs1, o);
+            k = sc_load_tail(row2 + i, tailb); acc2 = _mm256_fmadd_ps(k, reach, acc2); if (l2) o = _mm256_fmadd_ps(k, vs2, o);
+            k = sc_load_tail(row3 + i, tailb); acc3 = _mm256_fmadd_ps(k, reach, acc3); if (l3) o = _mm256_fmadd_ps(k, vs3, o);
+            k = sc_load_tail(row4 + i, tailb); acc4 = _mm256_fmadd_ps(k, reach, acc4); if (l4) o = _mm256_fmadd_ps(k, vs4, o);
+            k = sc_load_tail(row5 + i, tailb); acc5 = _mm256_fmadd_ps(k, reach, acc5); if (l5) o = _mm256_fmadd_ps(k, vs5, o);
+            k = sc_load_tail(row6 + i, tailb); acc6 = _mm256_fmadd_ps(k, reach, acc6); if (l6) o = _mm256_fmadd_ps(k, vs6, o);
+            k = sc_load_tail(row7 + i, tailb); acc7 = _mm256_fmadd_ps(k, reach, acc7); if (l7) o = _mm256_fmadd_ps(k, vs7, o);
+            _mm256_maskstore_ps(out_ip + i, tail, o);
+        }
+        const __m128 sum_lo = _mm_setr_ps(hsum256(acc0), hsum256(acc1),
+                                          hsum256(acc2), hsum256(acc3));
+        const __m128 sum_hi = _mm_setr_ps(hsum256(acc4), hsum256(acc5),
+                                          hsum256(acc6), hsum256(acc7));
+        const __m128 iw_lo = _mm_loadu_ps(inv_weights + c);
+        const __m128 iw_hi = _mm_loadu_ps(inv_weights + c + 4);
+        _mm_storeu_ps(out_oop + c,
+            _mm_mul_ps(_mm_mul_ps(sum_lo, vwin), iw_lo));
+        _mm_storeu_ps(out_oop + c + 4,
+            _mm_mul_ps(_mm_mul_ps(sum_hi, vwin), iw_hi));
+    }
+    for (; c < n; ++c) {
+        const int8_t* count_row = signed_count_matrix + c * n;
+        const float scale = -reach_oop[c] * win_p;
+        const bool live = (scale != 0.0f);
+        const __m256 vscale = _mm256_set1_ps(scale);
+        __m256 acc = _mm256_setzero_ps();
+        std::size_t i = 0;
+        for (; i < n8; i += 8) {
+            const __m256 k = sc_load8(count_row + i);
+            acc = _mm256_fmadd_ps(k, _mm256_loadu_ps(reach_ip + i), acc);
+            if (live) {
+                __m256 o = _mm256_loadu_ps(out_ip + i);
+                _mm256_storeu_ps(out_ip + i, _mm256_fmadd_ps(k, vscale, o));
+            }
+        }
+        if (rem) {
+            const __m256 k = sc_load_tail(count_row + i, tailb);
+            acc = _mm256_fmadd_ps(k, _mm256_maskload_ps(reach_ip + i, tail), acc);
+            if (live) {
+                __m256 o = _mm256_maskload_ps(out_ip + i, tail);
+                _mm256_maskstore_ps(out_ip + i, tail, _mm256_fmadd_ps(k, vscale, o));
+            }
+        }
+        out_oop[c] = hsum256(acc) * win_p * inv_weights[c];
+    }
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 ov = _mm256_loadu_ps(out_ip + i);
+        const __m256 iw = _mm256_loadu_ps(inv_weights + i);
+        _mm256_storeu_ps(out_ip + i, _mm256_mul_ps(ov, iw));
+    }
+    for (; i < n; ++i) out_ip[i] *= inv_weights[i];
+    // Skip masks: same outputs the single kernels produce for masked rows /
+    // lanes (they accumulate everything and zero afterwards too).
+    if (skip_oop) {
+        for (std::size_t c = 0; c < n; ++c) if (skip_oop[c]) out_oop[c] = 0.0f;
+    }
+    if (skip_ip) {
+        for (std::size_t k = 0; k < n; ++k) if (skip_ip[k]) out_ip[k] = 0.0f;
+    }
+}
+// blocked53 lookup without gathers (AMD gathers are microcoded): the 56-float
+// table sits in 7 registers; per lane pick chunk idx>>3 via compare+blend and
+// the element idx&7 via permutevar8x32. ~14 uops for 8 lookups vs one gather's
+// ~20; measured 121 ns vs 151 ns per fold call at nc 125.
+static inline __m256 fold_lookup56(const __m256* chunks, __m256i idx) {
+    const __m256i off = _mm256_and_si256(idx, _mm256_set1_epi32(7));
+    const __m256i chunk = _mm256_srli_epi32(idx, 3);
+    __m256 res = _mm256_permutevar8x32_ps(chunks[0], off);
+    for (int c = 1; c < 7; ++c) {
+        const __m256 v = _mm256_permutevar8x32_ps(chunks[c], off);
+        const __m256 sel = _mm256_castsi256_ps(
+            _mm256_cmpeq_epi32(chunk, _mm256_set1_epi32(c)));
+        res = _mm256_blendv_ps(res, v, sel);
+    }
+    return res;
+}
+
+// Precomputed fold terminal, 8 canonical lanes per step: looks up the two
+// per-card opponent masses of every slot, adds ((total - b0) - b1) + r in the
+// same order fold_blocker::combo_value does, divides by the bucket size.
+// Empty slots (card 52) leave the accumulator untouched via blendv.
+static void fold_dense_slots(
+    const uint8_t* slot_c0, const uint8_t* slot_c1,
+    std::size_t slot_stride, std::size_t num_slots,
+    const float* denom, const float* blocked53, float total,
+    const float* opp_reach, float self_payoff, float* out, std::size_t n)
+{
+    // blocked53 has 53 entries; the 7th chunk reads 3 floats past it, so
+    // callers hand over a 56-float buffer (fold_dense_precomputed does).
+    __m256 chunks[7];
+    for (int c = 0; c < 7; ++c) chunks[c] = _mm256_loadu_ps(blocked53 + 8 * c);
+    const __m256 vtotal = _mm256_set1_ps(total);
+    const __m256 vpay = _mm256_set1_ps(self_payoff);
+    const __m256i vempty = _mm256_set1_epi32(52);
+    for (std::size_t ci = 0; ci < n; ci += 8) {
+        const std::size_t rem = n - ci;
+        const bool full = rem >= 8;
+        const __m256i lanes = full ? _mm256_set1_epi32(-1) : sc_tail_mask(rem);
+        const __m256 r = full ? _mm256_loadu_ps(opp_reach + ci)
+                              : _mm256_maskload_ps(opp_reach + ci, lanes);
+        __m256 acc = _mm256_setzero_ps();
+        for (std::size_t s = 0; s < num_slots; ++s) {
+            const __m256i i0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                reinterpret_cast<const __m128i*>(slot_c0 + s * slot_stride + ci)));
+            const __m256i i1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                reinterpret_cast<const __m128i*>(slot_c1 + s * slot_stride + ci)));
+            const __m256i valid = _mm256_cmpgt_epi32(vempty, i0);
+            const __m256 b0 = fold_lookup56(chunks, i0);
+            const __m256 b1 = fold_lookup56(chunks, i1);
+            const __m256 term = _mm256_add_ps(
+                _mm256_sub_ps(_mm256_sub_ps(vtotal, b0), b1), r);
+            acc = _mm256_blendv_ps(acc, _mm256_add_ps(acc, term),
+                                   _mm256_castsi256_ps(valid));
+        }
+        const __m256 d = full ? _mm256_loadu_ps(denom + ci)
+                              : _mm256_maskload_ps(denom + ci, lanes);
+        const __m256 v = _mm256_mul_ps(vpay, _mm256_div_ps(acc, d));
+        if (full) _mm256_storeu_ps(out + ci, v);
+        else      _mm256_maskstore_ps(out + ci, lanes, v);
+    }
+}
 static void equity_sign_accumulate(
     const int16_t* ranks, const int16_t* alive, int16_t* acc,
     std::size_t begin, std::size_t end, int16_t ra)
@@ -1881,6 +2062,8 @@ const Kernels avx2_kernels = {
     &avx2_impl::showdown_ip_signed_zero_rake,
     &avx2_impl::showdown_oop_signed_count_zero_rake,
     &avx2_impl::showdown_ip_signed_count_zero_rake,
+    &avx2_impl::showdown_dual_signed_count_zero_rake,
+    &avx2_impl::fold_dense_slots,
     &avx2_impl::showdown_oop_full_active,
     &avx2_impl::showdown_ip_full_active,
     &avx2_impl::showdown_oop_full_active_runs,

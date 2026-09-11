@@ -52,6 +52,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -60,6 +61,9 @@
 
 #ifdef _OPENMP
 #  include <omp.h>
+#endif
+#if defined(_MSC_VER)
+#  include <intrin.h>
 #endif
 
 namespace deepsolver {
@@ -388,8 +392,26 @@ private:
     // OMP threads add into their own slot without a synchronization point
     // on the inner-most hot path. Held in seconds; phase_backward_*_ms()
     // converts to ms ? thread-sum (= CPU-seconds across all workers).
+    // One cache line per thread (stride kAccStride doubles): every terminal
+    // adds to its slot, so adjacent slots would false-share across cores.
+    static constexpr std::size_t kAccStride = 8;
     std::vector<double> showdown_acc_per_thread_;
     std::vector<double> fold_acc_per_thread_;
+
+    // Terminal-path clock. Two to four reads per terminal on ~1.9M terminals
+    // per iteration: rdtsc (~7 ns) instead of omp_get_wtime (~19 ns). Scaled
+    // to seconds with a 2 ms calibration against omp_get_wtime at prepare().
+    double tsc_seconds_per_tick_ = 0.0;
+    inline double tclock() const {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+        return static_cast<double>(__rdtsc()) * tsc_seconds_per_tick_;
+#elif defined(_OPENMP)
+        return omp_get_wtime();
+#else
+        return 0.0;
+#endif
+    }
+    void calibrate_tclock();
 
     // v1.8.1+ out-of-range skip masks. Built once in prepare() from the
     // root reach vectors. mask[c] = 1 means "this combo is 0-reach from
@@ -425,6 +447,41 @@ private:
     bool showdown_rank_blocker_supported_ = false;
     bool showdown_signed_coeff_supported_ = false;
     bool fold_precomputed_enabled_ = false;
+
+    // ---- 2026-09-11 CPU B3: depth-first traversal state (see iterate_dfs) ----
+    struct DfsArena {
+        float* base = nullptr;
+        std::size_t cap = 0;
+        std::size_t top = 0;
+        float* alloc(std::size_t n) {
+            if (top + n > cap) throw std::runtime_error("DFS arena overflow");
+            float* p = base + top;
+            top += n;
+            return p;
+        }
+    };
+    static constexpr std::size_t kDfsSubtreesPerThread = 32;
+    static constexpr uint32_t kNoCutSlot = 0xFFFFFFFFu;
+    bool  dfs_enabled_ = false;
+    bool  dfs_decay_and_add_ = false;
+    bool  dfs_zero_scratch_[2] = {false, false};
+    bool  dfs_dual_showdown_ = false;   // both traversers route to the signed-count kernel, no skip masks
+    float dfs_sw_ = 1.0f;
+    float dfs_pos_disc_ = 1.0f;
+    float dfs_neg_disc_ = 1.0f;
+    std::vector<uint32_t> dfs_cut_;        // subtree roots of the parallel phase, largest first
+    std::vector<uint32_t> dfs_cut_slot_;   // node -> index in dfs_cut_, kNoCutSlot elsewhere
+    std::vector<float>    dfs_cut_rows_;   // per cut node: reach_oop, reach_ip, value_oop, value_ip
+    std::vector<float>    dfs_arena_storage_;  // cpu_threads_effective_ x dfs_arena_floats_
+    std::vector<float>    dfs_root_rows_;      // padded root reach (2 rows) + root value sink (2 rows)
+    std::size_t dfs_arena_floats_ = 0;
+    uint32_t    dfs_trunk_nodes_ = 0;
+    // DEEPSOLVER_DFS_LIVE_STATS=1 (debug): showdown work if terminals ran on
+    // live lanes only — per terminal, and per nearest chance ancestor.
+    bool dfs_live_stats_ = false;
+    int  dfs_dbg_skip_ = 0;   // DEEPSOLVER_DFS_DBG_SKIP: 1 all terminals, 2 showdown kernel, 3 fold terminals (timing experiments only)
+    struct DfsLiveStat { double full = 0, per_terminal = 0, per_chance = 0, terminals = 0; uint32_t chance_oop = 0, chance_ip = 0; };
+    std::vector<DfsLiveStat> dfs_live_stat_;   // per thread
 
     // Active sparse terminals only need to produce values for root-range
     // combos: subsequent sparse traversal reads exactly those lanes, and
@@ -907,8 +964,38 @@ private:
     // path; the materialized path discounts in its own pass.
     void backward_pass(int traverser, int iteration);
 
-    // Per-node terminal payoff helper. Writes nc floats to `out`.
-    void evaluate_terminal(uint32_t node_idx, int traverser, float* out);
+    // Per-node terminal payoff helper. Writes row_stride_ floats to `out` from
+    // the opponent's reach row `opp_reach` (the level sweeps pass the flat row,
+    // the depth-first visit its stack row).
+    void evaluate_terminal(uint32_t node_idx, int traverser,
+                           const float* opp_reach, float* out);
+
+    // 2026-09-11 CPU B3 depth-first traversal — design and bit-exactness
+    // argument in the block comment above iterate_dfs().
+    static float* dfs_align64(float* p);
+    inline float* dfs_cut_row(uint32_t slot) {
+        return dfs_align64(dfs_cut_rows_.data())
+             + static_cast<std::size_t>(slot) * 4 * row_stride_;
+    }
+    void dfs_configure();
+    void dfs_trunk_forward(uint32_t n, const float* r_oop, const float* r_ip,
+                           DfsArena& arena);
+    void dfs_visit(uint32_t n, const float* r_oop, const float* r_ip,
+                   float* out_oop, float* out_ip, DfsArena& arena,
+                   uint32_t tid, bool trunk);
+    void iterate_dfs(int iteration);
+    /// Fused both-traverser showdown for the depth-first visit: zero-rake
+    /// signed-count terminals without skip masks / active lists. Returns false
+    /// when the terminal must go through evaluate_terminal() per traverser.
+    bool evaluate_terminal_dual(uint32_t node_idx, const float* r_oop,
+                                const float* r_ip, float* out_oop,
+                                float* out_ip, uint32_t tid);
+    /// Fold half of evaluate_terminal_dual(): both traversers through
+    /// fold_blocker::fold_dense_precomputed with one prologue.
+    bool evaluate_fold_dual(uint32_t node_idx, TerminalType tt, int32_t mi,
+                            const float* r_oop, const float* r_ip,
+                            float* out_oop, float* out_ip, uint32_t tid);
+    void dfs_state_hash_report() const;
 
     // Returns base offset of node n's nc-wide row in a flat [N ? nc] array.
     inline std::size_t row_off(uint32_t n) const {
@@ -1002,6 +1089,7 @@ inline void LevelizedCpuBackend::build_level_schedule() {
 
 inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     ctx_ = ctx;
+    dfs_enabled_ = false;
     const uint16_t nc = ctx.iso->num_canonical;
     const uint32_t N = ctx.tree->total_nodes;
 
@@ -1069,10 +1157,8 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     }
 
     // Per-node flat buffers ??N ? nc floats each.
-    const std::size_t flat_sz = static_cast<std::size_t>(N) * row_stride_;
-    reach_oop_.assign(flat_sz, 0.0f);
-    reach_ip_.assign(flat_sz, 0.0f);
-    value_.assign(flat_sz, 0.0f);
+    // (allocated at the end of prepare(), after dfs_configure() decided
+    // whether the level sweeps run at all — see there.)
 
     // Regret-matching scratch, one row per thread: the derived path runs
     // derive_strategy_row() inside the OMP-parallel node loops.
@@ -1106,8 +1192,8 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     // POST_OPTIMIZATION_REVIEW Sec 4.2: per-thread showdown/fold accumulators.
     // Sized to cpu_threads_effective_ so evaluate_terminal() can index by
     // omp_get_thread_num() without bounds checks. Reset to 0 each prepare().
-    showdown_acc_per_thread_.assign(cpu_threads_effective_, 0.0);
-    fold_acc_per_thread_.assign(cpu_threads_effective_, 0.0);
+    showdown_acc_per_thread_.assign(cpu_threads_effective_ * kAccStride, 0.0);
+    fold_acc_per_thread_.assign(cpu_threads_effective_ * kAccStride, 0.0);
 
     // v1.8.1+ build the out-of-range skip masks from root reach.
     // mask[c] = 1 iff that combo has 0-reach at root (i.e. excluded
@@ -1388,6 +1474,41 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
         batch_lose_payoff_.assign(max_showdown_group_size_, 0.0f);
         batch_tie_payoff_.assign(max_showdown_group_size_, 0.0f);
     }
+
+    dfs_configure();
+    calibrate_tclock();
+
+    // The three full-tree flats (reach_oop_, reach_ip_, value_: N x row_stride_
+    // floats each) exist for the level sweeps only; the depth-first visit
+    // keeps those rows on per-thread stacks. Solver::cpu_uses_level_flats()
+    // mirrors this for the estimators.
+    if (dfs_enabled_) {
+        std::vector<float>().swap(reach_oop_);
+        std::vector<float>().swap(reach_ip_);
+        std::vector<float>().swap(value_);
+    } else {
+        const std::size_t flat_sz = static_cast<std::size_t>(N) * row_stride_;
+        reach_oop_.assign(flat_sz, 0.0f);
+        reach_ip_.assign(flat_sz, 0.0f);
+        value_.assign(flat_sz, 0.0f);
+    }
+}
+
+inline void LevelizedCpuBackend::calibrate_tclock() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86)) && defined(_OPENMP)
+    const double w0 = omp_get_wtime();
+    const unsigned long long c0 = __rdtsc();
+    double w1 = w0;
+    unsigned long long c1 = c0;
+    do {
+        w1 = omp_get_wtime();
+        c1 = __rdtsc();
+    } while (w1 - w0 < 0.002);
+    tsc_seconds_per_tick_ = (c1 > c0)
+        ? (w1 - w0) / static_cast<double>(c1 - c0) : 0.0;
+#else
+    tsc_seconds_per_tick_ = 0.0;
+#endif
 }
 
 // ============================================================================
@@ -1626,7 +1747,7 @@ inline void LevelizedCpuBackend::apply_dcfr_discount(int iteration) {
 // ============================================================================
 
 inline void LevelizedCpuBackend::evaluate_terminal(
-    uint32_t node_idx, int traverser, float* out)
+    uint32_t node_idx, int traverser, const float* opp_reach, float* out)
 {
     const auto& tree = *ctx_.tree;
     const uint16_t nc = ctx_.iso->num_canonical;
@@ -1742,9 +1863,6 @@ inline void LevelizedCpuBackend::evaluate_terminal(
     // every terminal visit ??under OMP that's hundreds of mallocs per iter
     // contending on the heap allocator. Now we slot into a fixed buffer
     // sized to cpu_threads_effective_ ? nc in prepare().
-    const float* opp_reach = (traverser == 0)
-        ? &reach_ip_[row_off(node_idx)]
-        : &reach_oop_[row_off(node_idx)];
     const bool use_signed_coeff_showdown =
         tt == TerminalType::SHOWDOWN
         && use_signed_coeff_showdown_for_traverser(traverser)
@@ -1792,7 +1910,7 @@ inline void LevelizedCpuBackend::evaluate_terminal(
         int eq_tid = 0;
 #ifdef _OPENMP
         eq_tid = omp_get_thread_num();
-        const double _eq_t0 = omp_get_wtime();
+        const double _eq_t0 = tclock();
 #endif
         float* opp_w = terminal_scratch_for_thread(eq_tid);
         cpu_simd::vec_copy(opp_w, opp_reach, nc);
@@ -1818,7 +1936,7 @@ inline void LevelizedCpuBackend::evaluate_terminal(
             const uint32_t _safe = (eq_tid < 0
                 || static_cast<uint32_t>(eq_tid) >= cpu_threads_effective_)
                     ? 0u : static_cast<uint32_t>(eq_tid);
-            showdown_acc_per_thread_[_safe] += omp_get_wtime() - _eq_t0;
+            showdown_acc_per_thread_[_safe * kAccStride] += tclock() - _eq_t0;
         }
 #endif
         return;
@@ -1830,7 +1948,7 @@ inline void LevelizedCpuBackend::evaluate_terminal(
         && kFoldBlockerShortcutEnabled
         && (!use_active_list || use_active_fold_blocker)) {
 #ifdef _OPENMP
-        const double _fb_t0 = omp_get_wtime();
+        const double _fb_t0 = tclock();
 #endif
         if (use_active_fold_blocker) {
             if constexpr (kFoldBlockerPrecomputedEnabled) {
@@ -1876,12 +1994,12 @@ inline void LevelizedCpuBackend::evaluate_terminal(
         }
 #ifdef _OPENMP
         {
-            const double _et_dt = omp_get_wtime() - _fb_t0;
+            const double _et_dt = tclock() - _fb_t0;
             const int _et_tid = omp_get_thread_num();
             const uint32_t _et_safe = (_et_tid < 0
                 || static_cast<uint32_t>(_et_tid) >= cpu_threads_effective_)
                     ? 0u : static_cast<uint32_t>(_et_tid);
-            fold_acc_per_thread_[_et_safe] += _et_dt;
+            fold_acc_per_thread_[_et_safe * kAccStride] += _et_dt;
         }
 #endif
         return;
@@ -1942,7 +2060,7 @@ inline void LevelizedCpuBackend::evaluate_terminal(
     // for tiny terminals ??but called once per terminal, the noise averages
     // out across the iter loop and the per-call overhead is well under 1%.
 #ifdef _OPENMP
-    const double _et_t0 = omp_get_wtime();
+    const double _et_t0 = tclock();
 #endif
     if (tt == TerminalType::SHOWDOWN) {
         // v1.8.0 P3-8 spike: full-matrix kernels fold the per-c outer loop
@@ -2204,15 +2322,15 @@ inline void LevelizedCpuBackend::evaluate_terminal(
 
 #ifdef _OPENMP
     {
-        const double _et_dt = omp_get_wtime() - _et_t0;
+        const double _et_dt = tclock() - _et_t0;
         const int _et_tid = omp_get_thread_num();
         const uint32_t _et_safe = (_et_tid < 0
             || static_cast<uint32_t>(_et_tid) >= cpu_threads_effective_)
                 ? 0u : static_cast<uint32_t>(_et_tid);
         if (tt == TerminalType::SHOWDOWN) {
-            showdown_acc_per_thread_[_et_safe] += _et_dt;
+            showdown_acc_per_thread_[_et_safe * kAccStride] += _et_dt;
         } else {
-            fold_acc_per_thread_[_et_safe] += _et_dt;
+            fold_acc_per_thread_[_et_safe * kAccStride] += _et_dt;
         }
     }
 #endif
@@ -2270,7 +2388,7 @@ inline void LevelizedCpuBackend::process_showdown_group_oop(
     // (best-effort ??finer per-thread breakdown isn't needed for the
     // diagnostic and would require timing inside each c-slice).
 #ifdef _OPENMP
-    const double _bg_t0 = omp_get_wtime();
+    const double _bg_t0 = tclock();
 #endif
 
     // Single OMP region per group: each thread (a) gathers a slice of
@@ -2363,7 +2481,7 @@ inline void LevelizedCpuBackend::process_showdown_group_oop(
 
 #ifdef _OPENMP
     {
-        const double _bg_dt = omp_get_wtime() - _bg_t0;
+        const double _bg_dt = tclock() - _bg_t0;
         // Charge against thread 0 ??the OMP region above stays inside the
         // batch kernel call so we can't easily attribute per-thread cost
         // without instrumenting the kernel internals.
@@ -2621,7 +2739,10 @@ inline void LevelizedCpuBackend::backward_pass(int traverser, int iteration) {
         float* out = &value_[row_off(n)];
 
         if (nt == NodeType::TERMINAL) {
-            evaluate_terminal(n, traverser, out);
+            evaluate_terminal(
+                n, traverser,
+                (traverser == 0) ? &reach_ip_[row_off(n)] : &reach_oop_[row_off(n)],
+                out);
             return;
         }
 
@@ -2893,17 +3014,17 @@ inline void LevelizedCpuBackend::backward_pass(int traverser, int iteration) {
                             / static_cast<std::size_t>(nthr);
                         const std::size_t c_hi = (nc_sz * static_cast<std::size_t>(tid + 1))
                             / static_cast<std::size_t>(nthr);
-                        const double _bg_t0 = omp_get_wtime();
+                        const double _bg_t0 = tclock();
                         cpu_simd::showdown_oop_full_batch(
                             cat_ptr, valid_ptr, nc_sz, M,
                             batch_reach_ptrs_.data(), skip_mask, batch_out_ptrs_.data(),
                             batch_win_payoff_.data(), batch_lose_payoff_.data(),
                             batch_tie_payoff_.data(), c_lo, c_hi);
-                        const double _bg_dt = omp_get_wtime() - _bg_t0;
+                        const double _bg_dt = tclock() - _bg_t0;
                         const uint32_t safe_tid =
                             (tid < 0 || static_cast<uint32_t>(tid) >= cpu_threads_effective_)
                                 ? 0u : static_cast<uint32_t>(tid);
-                        showdown_acc_per_thread_[safe_tid] += _bg_dt;
+                        showdown_acc_per_thread_[safe_tid * kAccStride] += _bg_dt;
 
                         if (row_stride_ > ctx_.iso->num_canonical) {
                             #pragma omp for schedule(static)
@@ -2991,6 +3112,11 @@ inline void LevelizedCpuBackend::iterate(int iteration) {
     //
     // The saving is the whole third strategy-shaped array (-17% of CPU state)
     // plus the two full sweeps over it. GPU B1a increment 3 is the template.
+    if (dfs_enabled_) {
+        iterate_dfs(iteration);
+        return;
+    }
+
     const double t0 = now();
     if (materialize_strategy_) compute_strategy();
     const double t1 = now();
@@ -3019,6 +3145,557 @@ inline void LevelizedCpuBackend::iterate(int iteration) {
 }
 
 // ============================================================================
+// 2026-09-11 CPU B3: depth-first traversal.
+//
+// The level sweeps above stream every node's reach and value row through the
+// N x nc flats three times per iteration (forward, backward OOP, backward IP)
+// and pay an OMP dispatch per node. On the Pio-anchor 3-bet tree (3.04M
+// nodes, live 125) that is ~21 GB of DRAM traffic per iteration for 3 GB of
+// CFR state. The depth-first visit below computes exactly the same numbers
+// with the reach and value rows on a per-thread stack, so the only DRAM
+// stream left per iteration is regrets_ / strategy_sum_ (read + write once).
+//
+// Bit-identical to the sweeps, by construction:
+//   - every node runs the same kernels in the same order on the same inputs:
+//     reach = parent reach x strat (vec_mul), strategy_sum via vec_decay_add /
+//     vec_reach_weighted_strat_sum, node value via vec_fmadd /
+//     vec_add_in_place / vec_axpy + scale, discount then vec_regret_update,
+//     terminals via evaluate_terminal();
+//   - the sweeps derive every strategy from PRE-update regrets (forward pass,
+//     and backward pass before the node's own update); the DFS derives each
+//     node's strategy once, before descending, from the same regrets, since
+//     a node's regrets change only in its own visit after the children
+//     returned;
+//   - chance-node row copies become pointer passing (a memcpy'd row reads
+//     identically to its source).
+//
+// Parallelism (MSVC ships OpenMP 2.0, so no tasks): prepare() cuts the tree
+// into subtrees of at most N / (kDfsSubtreesPerThread x threads) nodes by
+// descending from the root. Each iteration is then
+//   1. trunk forward  - serial descent to the cut nodes storing their reach
+//                       rows (the trunk is a few hundred nodes);
+//   2. subtrees       - `omp parallel for schedule(dynamic)` over the cut
+//                       nodes, largest first, each a full depth-first visit on
+//                       its thread's arena;
+//   3. trunk backward - serial visit of the trunk; cut nodes return their
+//                       stored value rows, the trunk's own strategy_sum /
+//                       regret updates happen here.
+// The cut-node reach of step 1 and step 3 is the same computation on the same
+// regrets (step 2 touches only subtree nodes), so the stored rows equal what
+// step 3 recomputes on its way down.
+//
+// Engages only on the derived-strategy path with dense traversal for both
+// players (the sparse / block kernels have no DFS twin yet); otherwise
+// prepare() leaves dfs_enabled_ false and the sweeps run unchanged. Phase
+// timers: trunk forward -> phase_forward_pass_ms_, subtrees ->
+// phase_backward_pass_oop_ms_, trunk backward -> phase_backward_pass_ip_ms_.
+// ============================================================================
+
+inline float* LevelizedCpuBackend::dfs_align64(float* p) {
+    auto u = reinterpret_cast<std::uintptr_t>(p);
+    u = (u + 63u) & ~static_cast<std::uintptr_t>(63u);
+    return reinterpret_cast<float*>(u);
+}
+
+inline void LevelizedCpuBackend::dfs_configure() {
+    const auto& tree = *ctx_.tree;
+    const uint32_t N = tree.total_nodes;
+    // Decided from the config alone (the CLI applies DEEPSOLVER_CPU_TRAVERSAL
+    // to the config) so Solver::cpu_uses_level_flats() predicts it exactly.
+    const bool requested = (ctx_.config != nullptr) && ctx_.config->cpu_dfs_traversal;
+    dfs_enabled_ = requested && N > 0 && !materialize_strategy_;
+    if (dfs_enabled_) {
+        // The depth-first visit runs the dense kernels. The narrow-range
+        // sparse traversal is a level-sweep optimization with no DFS twin, and
+        // B1b compaction already removed the root-dead lanes it targeted.
+        oop_use_sparse_traversal_ = false;
+        ip_use_sparse_traversal_ = false;
+    }
+    if (!dfs_enabled_) {
+        std::vector<uint32_t>().swap(dfs_cut_);
+        std::vector<uint32_t>().swap(dfs_cut_slot_);
+        std::vector<float>().swap(dfs_cut_rows_);
+        std::vector<float>().swap(dfs_arena_storage_);
+        std::vector<float>().swap(dfs_root_rows_);
+        dfs_arena_floats_ = 0;
+        dfs_trunk_nodes_ = 0;
+        return;
+    }
+    dfs_decay_and_add_ = (ctx_.config->dcfr_schedule ==
+                          SolverConfig::DcfrSchedule::POSTFLOP_STYLE);
+    {
+        const char* st = std::getenv("DEEPSOLVER_DFS_LIVE_STATS");
+        dfs_live_stats_ = (st != nullptr && st[0] == '1');
+        const char* dbg = std::getenv("DEEPSOLVER_DFS_DBG_SKIP");
+        dfs_dbg_skip_ = (dbg != nullptr) ? std::atoi(dbg) : 0;
+        dfs_live_stat_.assign(std::max<std::size_t>(1, cpu_threads_effective_), DfsLiveStat{});
+    }
+    dfs_zero_scratch_[0] = use_sparse_opp_reach_build_for_traverser(0);
+    dfs_zero_scratch_[1] = use_sparse_opp_reach_build_for_traverser(1);
+    // Same routing evaluate_terminal() would take for BOTH traversers on a
+    // full-board showdown: the signed-coeff path (implies no active list and
+    // no rank blocker). The out-of-range skip masks go to the fused kernel.
+    dfs_dual_showdown_ =
+        use_signed_coeff_showdown_for_traverser(0)
+        && use_signed_coeff_showdown_for_traverser(1);
+    const std::size_t S = row_stride_;
+
+    // Subtree sizes and per-thread arena need, leaves first (node_order_ is
+    // height-ascending, so every child is finished before its parent).
+    std::vector<uint32_t> sub(N, 1);
+    std::vector<std::size_t> need(N, 0);
+    for (uint32_t idx = 0; idx < N; ++idx) {
+        const uint32_t n = node_order_[idx];
+        const uint8_t nch = tree.num_children[n];
+        const auto nt = static_cast<NodeType>(tree.node_types[n]);
+        if (nt == NodeType::TERMINAL || nch == 0) continue;
+        uint32_t total = 1;
+        std::size_t child_need = 0;
+        const uint32_t off = tree.children_offset[n];
+        for (uint8_t k = 0; k < nch; ++k) {
+            const uint32_t c = tree.children[off + k];
+            total += sub[c];
+            child_need = std::max(child_need, need[c]);
+        }
+        sub[n] = total;
+        // chance: 2 value rows per child; player: strat row + 2 value rows per
+        // action + one child reach row.
+        const std::size_t frame = (nt == NodeType::CHANCE)
+            ? static_cast<std::size_t>(2) * nch * S
+            : (static_cast<std::size_t>(3) * nch + 1) * S;
+        need[n] = frame + child_need;
+    }
+    // Root is node 0 (GameTreeBuilder convention). Round the per-thread span
+    // to 16 floats so every thread's base stays 64-byte aligned.
+    dfs_arena_floats_ = ((need[0] + 2 * S) + 15u) & ~static_cast<std::size_t>(15u);
+
+    // Cut: descend from the root while a subtree is bigger than the target.
+    dfs_cut_.clear();
+    dfs_cut_slot_.assign(N, kNoCutSlot);
+    dfs_trunk_nodes_ = 0;
+    const std::size_t threads = std::max<std::size_t>(1, cpu_threads_effective_);
+    if (threads > 1) {
+        const uint32_t target = static_cast<uint32_t>(std::max<std::size_t>(
+            1, static_cast<std::size_t>(N) / (kDfsSubtreesPerThread * threads)));
+        std::vector<uint32_t> stack;
+        stack.push_back(0);
+        while (!stack.empty()) {
+            const uint32_t n = stack.back();
+            stack.pop_back();
+            const uint8_t nch = tree.num_children[n];
+            const auto nt = static_cast<NodeType>(tree.node_types[n]);
+            if (nt == NodeType::TERMINAL || nch == 0 || sub[n] <= target) {
+                dfs_cut_.push_back(n);
+                continue;
+            }
+            ++dfs_trunk_nodes_;
+            const uint32_t off = tree.children_offset[n];
+            for (uint8_t k = 0; k < nch; ++k) stack.push_back(tree.children[off + k]);
+        }
+        // Largest subtrees first so dynamic scheduling balances the tail.
+        std::stable_sort(dfs_cut_.begin(), dfs_cut_.end(),
+                         [&](uint32_t a, uint32_t b) { return sub[a] > sub[b]; });
+        for (std::size_t i = 0; i < dfs_cut_.size(); ++i) {
+            dfs_cut_slot_[dfs_cut_[i]] = static_cast<uint32_t>(i);
+        }
+    }
+    dfs_cut_rows_.assign(dfs_cut_.size() * 4 * S + 16, 0.0f);
+    dfs_arena_storage_.assign(threads * dfs_arena_floats_ + 16, 0.0f);
+    dfs_root_rows_.assign(4 * S + 16, 0.0f);
+}
+
+inline void LevelizedCpuBackend::dfs_trunk_forward(
+    uint32_t n, const float* r_oop, const float* r_ip, DfsArena& arena)
+{
+    const auto& tree = *ctx_.tree;
+    const std::size_t S = row_stride_;
+    const uint32_t slot = dfs_cut_slot_[n];
+    if (slot != kNoCutSlot) {
+        float* rows = dfs_cut_row(slot);
+        std::memcpy(rows,     r_oop, sizeof(float) * S);
+        std::memcpy(rows + S, r_ip,  sizeof(float) * S);
+        return;
+    }
+    // Trunk nodes are never terminals and always have children (those are
+    // cut nodes by construction).
+    const auto nt = static_cast<NodeType>(tree.node_types[n]);
+    const uint8_t nch = tree.num_children[n];
+    const uint32_t off = tree.children_offset[n];
+    if (nt == NodeType::CHANCE) {
+        for (uint8_t k = 0; k < nch; ++k) {
+            dfs_trunk_forward(tree.children[off + k], r_oop, r_ip, arena);
+        }
+        return;
+    }
+    const int acting = tree.active_player[n];
+    const std::size_t mark = arena.top;
+    float* strat = arena.alloc(static_cast<std::size_t>(nch) * S);
+    derive_strategy_row(n, strat, 0u);
+    float* child_reach = arena.alloc(S);
+    const float* acting_reach = (acting == 0) ? r_oop : r_ip;
+    for (uint8_t a = 0; a < nch; ++a) {
+        cpu_simd::vec_mul(child_reach, acting_reach,
+                          strat + static_cast<std::size_t>(a) * S, S);
+        if (acting == 0) {
+            dfs_trunk_forward(tree.children[off + a], child_reach, r_ip, arena);
+        } else {
+            dfs_trunk_forward(tree.children[off + a], r_oop, child_reach, arena);
+        }
+    }
+    arena.top = mark;
+}
+
+inline void LevelizedCpuBackend::dfs_visit(
+    uint32_t n, const float* r_oop, const float* r_ip,
+    float* out_oop, float* out_ip, DfsArena& arena, uint32_t tid, bool trunk)
+{
+    const auto& tree = *ctx_.tree;
+    const std::size_t S = row_stride_;
+    const auto nt = static_cast<NodeType>(tree.node_types[n]);
+
+    if (nt == NodeType::TERMINAL) {
+        if (dfs_dbg_skip_ == 1 || (dfs_dbg_skip_ == 3 &&
+            static_cast<TerminalType>(tree.terminal_types[n]) != TerminalType::SHOWDOWN)) {
+            cpu_simd::vec_set_zero(out_oop, S);
+            cpu_simd::vec_set_zero(out_ip, S);
+            return;
+        }
+        // The sparse opponent-reach build fills only the opponent's active
+        // lanes of this thread's scratch; the sweeps zero it once per backward
+        // pass, here the opponent alternates per call.
+        if (dfs_live_stats_ &&
+            static_cast<TerminalType>(tree.terminal_types[n]) == TerminalType::SHOWDOWN) {
+            const uint16_t ncs = ctx_.iso->num_canonical;
+            uint32_t lo = 0, li = 0;
+            for (uint16_t c = 0; c < ncs; ++c) { lo += (r_oop[c] != 0.0f); li += (r_ip[c] != 0.0f); }
+            DfsLiveStat& st = dfs_live_stat_[tid < dfs_live_stat_.size() ? tid : 0];
+            st.full += static_cast<double>(ncs) * ncs;
+            st.per_terminal += static_cast<double>(lo) * li;
+            st.per_chance += static_cast<double>(st.chance_oop) * st.chance_ip;
+            st.terminals += 1.0;
+        }
+        if (evaluate_terminal_dual(n, r_oop, r_ip, out_oop, out_ip, tid)) return;
+        const uint16_t nc = ctx_.iso->num_canonical;
+        if (dfs_zero_scratch_[0]) {
+            cpu_simd::vec_set_zero(terminal_scratch_for_thread(static_cast<int>(tid)), nc);
+        }
+        evaluate_terminal(n, 0, r_ip, out_oop);
+        if (dfs_zero_scratch_[1]) {
+            cpu_simd::vec_set_zero(terminal_scratch_for_thread(static_cast<int>(tid)), nc);
+        }
+        evaluate_terminal(n, 1, r_oop, out_ip);
+        return;
+    }
+    if (trunk) {
+        const uint32_t slot = dfs_cut_slot_[n];
+        if (slot != kNoCutSlot) {
+            const float* rows = dfs_cut_row(slot);
+            std::memcpy(out_oop, rows + 2 * S, sizeof(float) * S);
+            std::memcpy(out_ip,  rows + 3 * S, sizeof(float) * S);
+            return;
+        }
+    }
+    const uint8_t nch = tree.num_children[n];
+    if (nch == 0) {
+        cpu_simd::vec_set_zero(out_oop, S);
+        cpu_simd::vec_set_zero(out_ip, S);
+        return;
+    }
+    const uint32_t off = tree.children_offset[n];
+    const std::size_t mark = arena.top;
+
+    if (nt == NodeType::CHANCE) {
+        uint32_t saved_oop = 0, saved_ip = 0;
+        if (dfs_live_stats_) {
+            DfsLiveStat& st = dfs_live_stat_[tid < dfs_live_stat_.size() ? tid : 0];
+            saved_oop = st.chance_oop; saved_ip = st.chance_ip;
+            const uint16_t ncs = ctx_.iso->num_canonical;
+            uint32_t lo = 0, li = 0;
+            for (uint16_t c = 0; c < ncs; ++c) { lo += (r_oop[c] != 0.0f); li += (r_ip[c] != 0.0f); }
+            st.chance_oop = lo; st.chance_ip = li;
+        }
+        float* cv = arena.alloc(static_cast<std::size_t>(2) * nch * S);
+        for (uint8_t k = 0; k < nch; ++k) {
+            float* cv_k = cv + static_cast<std::size_t>(2) * k * S;
+            dfs_visit(tree.children[off + k], r_oop, r_ip, cv_k, cv_k + S,
+                      arena, tid, trunk);
+        }
+        if (dfs_live_stats_) {
+            DfsLiveStat& st = dfs_live_stat_[tid < dfs_live_stat_.size() ? tid : 0];
+            st.chance_oop = saved_oop; st.chance_ip = saved_ip;
+        }
+        cpu_simd::vec_set_zero(out_oop, S);
+        cpu_simd::vec_set_zero(out_ip, S);
+        uint32_t total_weight = 0;
+        for (uint8_t k = 0; k < nch; ++k) {
+            const uint32_t child = tree.children[off + k];
+            uint32_t weight = (child < tree.runout_weight.size())
+                                ? tree.runout_weight[child] : 1;
+            if (weight == 0) weight = 1;
+            const float* cv_k = cv + static_cast<std::size_t>(2) * k * S;
+            cpu_simd::vec_axpy(out_oop, static_cast<float>(weight), cv_k, S);
+            cpu_simd::vec_axpy(out_ip,  static_cast<float>(weight), cv_k + S, S);
+            total_weight += weight;
+        }
+        if (total_weight > 0) {
+            // Conditional on both players' hole cards — see types.h.
+            const float inv = 1.0f / static_cast<float>(
+                chance_runout_denominator(total_weight));
+            cpu_simd::vec_scale_in_place(out_oop, inv, S);
+            cpu_simd::vec_scale_in_place(out_ip,  inv, S);
+        }
+        arena.top = mark;
+        return;
+    }
+
+    // Player node: the strategy once, from pre-update regrets.
+    const int acting = tree.active_player[n];
+    float* strat = arena.alloc(static_cast<std::size_t>(nch) * S);
+    derive_strategy_row(n, strat, tid);
+    const float* acting_reach = (acting == 0) ? r_oop : r_ip;
+    for (uint8_t a = 0; a < nch; ++a) {
+        const float* strat_a = strat + static_cast<std::size_t>(a) * S;
+        if (dfs_decay_and_add_) {
+            cpu_simd::vec_decay_add(strategy_sum_ptr(n, a), dfs_sw_, strat_a, S);
+        } else {
+            cpu_simd::vec_reach_weighted_strat_sum(
+                strategy_sum_ptr(n, a), dfs_sw_, acting_reach, strat_a, S);
+        }
+    }
+    float* cv = arena.alloc(static_cast<std::size_t>(2) * nch * S);
+    float* child_reach = arena.alloc(S);
+    for (uint8_t a = 0; a < nch; ++a) {
+        const float* strat_a = strat + static_cast<std::size_t>(a) * S;
+        float* cv_a = cv + static_cast<std::size_t>(2) * a * S;
+        cpu_simd::vec_mul(child_reach, acting_reach, strat_a, S);
+        if (acting == 0) {
+            dfs_visit(tree.children[off + a], child_reach, r_ip, cv_a, cv_a + S,
+                      arena, tid, trunk);
+        } else {
+            dfs_visit(tree.children[off + a], r_oop, child_reach, cv_a, cv_a + S,
+                      arena, tid, trunk);
+        }
+    }
+    // Acting player's side: node value, fused discount, regret update.
+    float* out_self  = (acting == 0) ? out_oop : out_ip;
+    float* out_other = (acting == 0) ? out_ip  : out_oop;
+    const std::size_t self_off  = (acting == 0) ? 0 : S;
+    const std::size_t other_off = S - self_off;
+    cpu_simd::vec_set_zero(out_self, S);
+    for (uint8_t a = 0; a < nch; ++a) {
+        cpu_simd::vec_fmadd(out_self, strat + static_cast<std::size_t>(a) * S,
+                            cv + static_cast<std::size_t>(2) * a * S + self_off, S);
+    }
+    discount_node_regrets(n, dfs_pos_disc_, dfs_neg_disc_);
+    for (uint8_t a = 0; a < nch; ++a) {
+        cpu_simd::vec_regret_update(
+            regret_ptr(n, a), cv + static_cast<std::size_t>(2) * a * S + self_off,
+            out_self, S);
+    }
+    // Other player's side: the acting strategy is already in the reach.
+    cpu_simd::vec_set_zero(out_other, S);
+    for (uint8_t a = 0; a < nch; ++a) {
+        cpu_simd::vec_add_in_place(
+            out_other, cv + static_cast<std::size_t>(2) * a * S + other_off, S);
+    }
+    arena.top = mark;
+}
+
+inline void LevelizedCpuBackend::iterate_dfs(int iteration) {
+    auto now = []() -> double {
+        #if defined(_OPENMP)
+        return omp_get_wtime();
+        #else
+        return 0.0;
+        #endif
+    };
+    const uint16_t nc = ctx_.iso->num_canonical;
+    const std::size_t S = row_stride_;
+    compute_dcfr_factors(iteration, *ctx_.config, dfs_pos_disc_, dfs_neg_disc_, dfs_sw_);
+
+    float* root = dfs_align64(dfs_root_rows_.data());
+    float* root_oop = root;
+    float* root_ip  = root + S;
+    std::memcpy(root_oop, ctx_.oop_reach->data(), sizeof(float) * nc);
+    std::memcpy(root_ip,  ctx_.ip_reach->data(),  sizeof(float) * nc);
+    if (S > nc) {
+        std::fill(root_oop + nc, root_oop + S, 0.0f);
+        std::fill(root_ip + nc,  root_ip + S,  0.0f);
+    }
+    float* arena_base = dfs_align64(dfs_arena_storage_.data());
+
+    const double t0 = now();
+    DfsArena trunk_arena{arena_base, dfs_arena_floats_, 0};
+    if (!dfs_cut_.empty()) dfs_trunk_forward(0, root_oop, root_ip, trunk_arena);
+    const double t1 = now();
+
+    if (!dfs_cut_.empty()) {
+        const int64_t ncut = static_cast<int64_t>(dfs_cut_.size());
+        #if defined(_OPENMP)
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(static_cast<int>(cpu_threads_effective_))
+        #endif
+        for (int64_t i = 0; i < ncut; ++i) {
+            const uint32_t tid = scratch_tid();
+            DfsArena arena{arena_base + static_cast<std::size_t>(tid) * dfs_arena_floats_,
+                           dfs_arena_floats_, 0};
+            float* rows = dfs_cut_row(static_cast<uint32_t>(i));
+            dfs_visit(dfs_cut_[static_cast<std::size_t>(i)], rows, rows + S,
+                      rows + 2 * S, rows + 3 * S, arena, tid, false);
+        }
+    }
+    const double t2 = now();
+
+    trunk_arena.top = 0;
+    dfs_visit(0, root_oop, root_ip, root + 2 * S, root + 3 * S, trunk_arena, 0u, true);
+    const double t3 = now();
+
+    phase_forward_pass_ms_      += (t1 - t0) * 1000.0;
+    phase_backward_pass_oop_ms_ += (t2 - t1) * 1000.0;
+    phase_backward_pass_ip_ms_  += (t3 - t2) * 1000.0;
+}
+
+inline bool LevelizedCpuBackend::evaluate_terminal_dual(
+    uint32_t node_idx, const float* r_oop, const float* r_ip,
+    float* out_oop, float* out_ip, uint32_t tid)
+{
+    const auto& tree = *ctx_.tree;
+    const auto tt = static_cast<TerminalType>(tree.terminal_types[node_idx]);
+    const int32_t mi = (node_idx < tree.matchup_idx.size())
+        ? tree.matchup_idx[node_idx] : 0;
+    if (tt != TerminalType::SHOWDOWN) {
+        return evaluate_fold_dual(node_idx, tt, mi, r_oop, r_ip, out_oop, out_ip, tid);
+    }
+    if (!dfs_dual_showdown_) return false;
+    const uint16_t nc = ctx_.iso->num_canonical;
+    // Partial-board (all-in) showdowns settle on the EQUITY table, which is
+    // evaluate_terminal()'s first route; leave them to it.
+    if (ctx_.matchup_equity_per_runout && mi >= 0 &&
+        static_cast<std::size_t>(mi) < ctx_.matchup_equity_per_runout->size() &&
+        (*ctx_.matchup_equity_per_runout)[mi].size() ==
+            static_cast<std::size_t>(nc) * nc) {
+        return false;
+    }
+    const std::vector<int8_t>* table = nullptr;
+    if (ctx_.matchup_showdown_count_per_runout && mi >= 0 &&
+        static_cast<std::size_t>(mi) < ctx_.matchup_showdown_count_per_runout->size()) {
+        table = &(*ctx_.matchup_showdown_count_per_runout)[mi];
+    } else {
+        table = ctx_.matchup_showdown_count;
+    }
+    if (table == nullptr || table->size() < static_cast<std::size_t>(nc) * nc) {
+        return false;
+    }
+    const float pot_total = tree.pots[node_idx];
+    const float half_pot  = pot_total * 0.5f;
+    const float rake = terminal_rake(pot_total, ctx_.config->rake_rate,
+                                     ctx_.config->rake_cap);
+    const float win_payoff  = half_pot - rake;
+    const float lose_payoff = -half_pot;
+    const float tie_payoff  = -0.5f * rake;
+    if (!(tie_payoff == 0.0f && lose_payoff == -win_payoff)) return false;
+#ifdef _OPENMP
+    const double _t0 = tclock();
+#endif
+    if (dfs_dbg_skip_ == 2) {
+        cpu_simd::vec_set_zero(out_oop, row_stride_);
+        cpu_simd::vec_set_zero(out_ip, row_stride_);
+    } else {
+        // evaluate_terminal()'s skip masks: traverser 0 skips out-of-range
+        // OOP rows whenever any exist, traverser 1 only when IP is mostly
+        // out of range (ip_use_terminal_output_skip_).
+        cpu_simd::showdown_dual_signed_count_zero_rake(
+            table->data(), r_oop, r_ip, canonical_inv_weights_f_.data(),
+            oop_has_out_of_range_ ? oop_out_of_range_mask_.data() : nullptr,
+            ip_use_terminal_output_skip_ ? ip_out_of_range_mask_.data() : nullptr,
+            out_oop, out_ip, nc, win_payoff);
+    }
+    for (std::size_t i = nc; i < row_stride_; ++i) {
+        out_oop[i] = 0.0f;
+        out_ip[i]  = 0.0f;
+    }
+#ifdef _OPENMP
+    {
+        const uint32_t safe = (tid < cpu_threads_effective_) ? tid : 0u;
+        showdown_acc_per_thread_[safe * kAccStride] += tclock() - _t0;
+    }
+#endif
+    return true;
+}
+
+inline bool LevelizedCpuBackend::evaluate_fold_dual(
+    uint32_t node_idx, TerminalType tt, int32_t mi,
+    const float* r_oop, const float* r_ip,
+    float* out_oop, float* out_ip, uint32_t tid)
+{
+    // Mirrors evaluate_terminal()'s fold route for BOTH traversers: the
+    // precomputed dense fold blocker, taken when neither side uses an active
+    // list and this runout (or the fallback) has valid metadata. Anything
+    // else goes back to the per-traverser calls.
+    if constexpr (!(kFoldBlockerShortcutEnabled && kFoldBlockerPrecomputedEnabled)) {
+        return false;
+    }
+    if (!fold_precomputed_enabled_ || oop_use_terminal_active_list_
+        || ip_use_terminal_active_list_) {
+        return false;
+    }
+    const fold_blocker::Metadata* meta = nullptr;
+    if (mi >= 0 && static_cast<std::size_t>(mi) < fold_metadata_per_runout_.size()
+        && fold_metadata_per_runout_[static_cast<std::size_t>(mi)].valid) {
+        meta = &fold_metadata_per_runout_[static_cast<std::size_t>(mi)];
+    } else if (fold_fallback_metadata_.valid) {
+        meta = &fold_fallback_metadata_;
+    }
+    if (meta == nullptr) return false;
+    const auto& tree = *ctx_.tree;
+    // Same payoff arithmetic as evaluate_terminal()'s fold_self_payoff().
+    const float pot_total = tree.pots[node_idx];
+    const uint32_t parent = tree.parent_indices[node_idx];
+    const float unmatched_bet = (parent < tree.total_nodes) ? tree.bet_into[parent] : 0.0f;
+    const float matched_pot = pot_total - unmatched_bet;
+    const float fold_win_gain = matched_pot * 0.5f
+        - terminal_rake(matched_pot, ctx_.config->rake_rate, ctx_.config->rake_cap);
+    const float fold_lose_loss = -matched_pot * 0.5f;
+    const float sign_oop = (tt == TerminalType::FOLD_OOP) ? -1.0f : 1.0f;
+    const float pay_oop = (sign_oop > 0) ? fold_win_gain : fold_lose_loss;
+    const float pay_ip  = (sign_oop < 0) ? fold_win_gain : fold_lose_loss;
+    const uint8_t* skip_oop = oop_has_out_of_range_ ? oop_out_of_range_mask_.data() : nullptr;
+    const uint8_t* skip_ip  = ip_use_terminal_output_skip_ ? ip_out_of_range_mask_.data() : nullptr;
+#ifdef _OPENMP
+    const double _t0 = tclock();
+#endif
+    fold_blocker::fold_dense_precomputed(*meta, r_ip, skip_oop, pay_oop, out_oop, row_stride_);
+    fold_blocker::fold_dense_precomputed(*meta, r_oop, skip_ip, pay_ip, out_ip, row_stride_);
+#ifdef _OPENMP
+    {
+        const uint32_t safe = (tid < cpu_threads_effective_) ? tid : 0u;
+        fold_acc_per_thread_[safe * kAccStride] += tclock() - _t0;
+    }
+#endif
+    return true;
+}
+
+// DEEPSOLVER_STATE_HASH=1: FNV-1a over the CFR state at finalize(), so two
+// runs (level vs dfs, or two builds) can be compared bit for bit from the
+// command line. Debug only; off by default.
+inline void LevelizedCpuBackend::dfs_state_hash_report() const {
+    const char* env = std::getenv("DEEPSOLVER_STATE_HASH");
+    if (env == nullptr || env[0] != '1') return;
+    auto fnv1a = [](const std::vector<float>& v) -> unsigned long long {
+        unsigned long long h = 1469598103934665603ull;
+        const auto* p = reinterpret_cast<const uint32_t*>(v.data());
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            h ^= static_cast<unsigned long long>(p[i]);
+            h *= 1099511628211ull;
+        }
+        return h;
+    };
+    std::fprintf(stderr,
+                 "state_hash traversal=%s regrets=%016llx strategy_sum=%016llx\n",
+                 dfs_enabled_ ? "dfs" : "level",
+                 fnv1a(regrets_), fnv1a(strategy_sum_));
+}
+
+// ============================================================================
 // Pruning-opportunity diagnostic (DEEPSOLVER_PRUNE_STATS=1)
 //
 // Sizes the CFR-family lever this engine does not have: skipping subtrees
@@ -3043,6 +3720,7 @@ inline void LevelizedCpuBackend::iterate(int iteration) {
 inline void LevelizedCpuBackend::report_prune_opportunity() const {
     const char* env = std::getenv("DEEPSOLVER_PRUNE_STATS");
     if (env == nullptr || env[0] == '0' || env[0] == '\0') return;
+    if (dfs_enabled_) return;  // the flats are never written under DFS
     const uint32_t N = ctx_.tree->total_nodes;
     if (N == 0 || reach_oop_.empty() || reach_ip_.empty()) return;
     const uint16_t nc = ctx_.iso->num_canonical;
@@ -3144,6 +3822,19 @@ inline void LevelizedCpuBackend::finalize() {
     const uint16_t nc = ctx_.iso->num_canonical;
     const uint32_t N = ctx_.tree->total_nodes;
     report_prune_opportunity();
+    dfs_state_hash_report();
+    if (dfs_live_stats_) {
+        DfsLiveStat t;
+        for (const auto& st : dfs_live_stat_) {
+            t.full += st.full; t.per_terminal += st.per_terminal;
+            t.per_chance += st.per_chance; t.terminals += st.terminals;
+        }
+        if (t.full > 0.0) {
+            std::fprintf(stderr,
+                "dfs_live_stats showdown_visits=%.0f work_per_terminal_live=%.3f work_per_chance_live=%.3f (fractions of nc^2)\n",
+                t.terminals, t.per_terminal / t.full, t.per_chance / t.full);
+        }
+    }
     strategy_.assign(N, {});
 
     auto finalize_node = [&](uint32_t i) {

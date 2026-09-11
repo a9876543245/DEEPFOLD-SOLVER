@@ -1085,6 +1085,142 @@ void launch_equity_showdown_gemm(
     CUDA_CHECK(cudaGetLastError());
 }
 
+
+// ---------------------------------------------------------------------------
+// 2026-09-11: full-board showdowns on SignedCount boards as ONE GEMM per
+// traverser pass. Same tiling as equity_showdown_gemm_kernel; the matrix is
+// the int8 signed pair-count table of the terminal's runout (mi), W is the
+// RAW opponent reach, and the epilogue scales by win_p and 1/canonical_weight:
+//   out[t][c] = win_p_t * inv_w[c] * sum_k S_mi[c][k] * reach_opp[t][k]
+// which is exactly what terminal_level_kernel's category branch computes on
+// these boards (payoff * valid * weight folds to +-count / |orbit_c|), and
+// what the CPU signed-count kernels compute. S is antisymmetric, so the same
+// product form serves both traversers with that traverser's opponent reach.
+// Zero-rake boards only (the plan picks SignedCount only then); the rake
+// terms are kept in the coefficient so a raked table would still be exact.
+// ---------------------------------------------------------------------------
+__global__ void signed_count_showdown_gemm_kernel(
+    const EquityTile* __restrict__ tiles,         // eq_slot unused; mi = runout
+    const uint32_t* __restrict__ terminal_order,
+    const float* __restrict__ pots,
+    const uint32_t* __restrict__ value_row,
+    const int8_t* __restrict__ count_concat,      // [num_runouts x nc x nc]
+    const float* __restrict__ canonical_weights,
+    const float* __restrict__ reach_opp_base,
+    uint16_t num_canonical,
+    float rake_rate,
+    float rake_cap,
+    float* __restrict__ node_values)
+{
+    const EquityTile tile = tiles[blockIdx.x];
+    const int nc = static_cast<int>(num_canonical);
+    const int c0 = static_cast<int>(blockIdx.y) * kEqTileN;
+    const int M  = static_cast<int>(tile.t_end - tile.t_begin);
+    const size_t per_table = static_cast<size_t>(nc) * nc;
+    const int8_t* __restrict__ mat = count_concat + static_cast<size_t>(tile.mi) * per_table;
+
+    __shared__ __align__(16) float Ws[kEqTileK][kEqSmemStride];   // [k][terminal]
+    __shared__ __align__(16) float Ms[kEqTileK][kEqSmemStride];   // [k][hand]
+    __shared__ uint32_t s_node[kEqTileM];
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int tx = tid & 15;
+    const int ty = tid >> 4;
+    for (int t = tid; t < kEqTileM; t += kEqThreads) {
+        s_node[t] = (t < M) ? terminal_order[tile.t_begin + t] : 0u;
+    }
+    __syncthreads();
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    }
+
+    for (int k0 = 0; k0 < nc; k0 += kEqTileK) {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int e  = tid + i * kEqThreads;
+            const int k  = e & (kEqTileK - 1);
+            const int r  = e >> 4;
+            const int kk = k0 + k;
+            float w = 0.0f;
+            if (r < M && kk < nc) {
+                const uint32_t n = s_node[r];
+                w = reach_opp_base[static_cast<size_t>(n) * nc + kk];
+            }
+            Ws[k][r] = w;
+            float m = 0.0f;
+            const int cc = c0 + r;
+            if (cc < nc && kk < nc) {
+                m = static_cast<float>(mat[static_cast<size_t>(cc) * nc + kk]);
+            }
+            Ms[k][r] = m;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < kEqTileK; ++k) {
+            const float4 a4 = *reinterpret_cast<const float4*>(&Ws[k][ty * 4]);
+            const float4 b4 = *reinterpret_cast<const float4*>(&Ms[k][tx * 4]);
+            const float a[4] = {a4.x, a4.y, a4.z, a4.w};
+            const float b[4] = {b4.x, b4.y, b4.z, b4.w};
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int t = ty * 4 + i;
+        if (t >= M) continue;
+        const uint32_t n = s_node[t];
+        const float pot_total = pots[n];
+        float rake = fminf(pot_total * rake_rate, rake_cap);
+        if (rake < 0.0f) rake = 0.0f;
+        const float win_p = pot_total * 0.5f - rake;
+        float* __restrict__ out =
+            node_values + static_cast<size_t>(value_row[n]) * nc;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int c = c0 + tx * 4 + j;
+            if (c >= nc) continue;
+            const float w = canonical_weights[c];
+            const float inv_w = (w > 0.0f) ? (1.0f / w) : 0.0f;
+            out[c] = (win_p * acc[i][j]) * inv_w;
+        }
+    }
+}
+
+void launch_signed_count_showdown_gemm(
+    const EquityTile* d_tiles,
+    uint32_t num_tiles,
+    const uint32_t* d_terminal_order,
+    const float* d_pots,
+    const uint32_t* d_value_row,
+    const int8_t* d_count_concat,
+    const float* d_canonical_weights,
+    const float* d_reach_opp_base,
+    uint16_t nc,
+    float rake_rate,
+    float rake_cap,
+    float* d_node_values)
+{
+    if (num_tiles == 0 || nc == 0) return;
+    const dim3 grid(num_tiles, (static_cast<unsigned>(nc) + kEqTileN - 1) / kEqTileN);
+    signed_count_showdown_gemm_kernel<<<grid, kEqThreads>>>(
+        d_tiles, d_terminal_order, d_pots, d_value_row, d_count_concat,
+        d_canonical_weights, d_reach_opp_base, nc, rake_rate, rake_cap,
+        d_node_values);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+
+
 void launch_equity_rb_compat_add(
     const uint32_t* d_eq_terminal_order,
     uint32_t num_eq_terminals,
@@ -1243,6 +1379,144 @@ void launch_fold_blocker_terminals(
         d_value_row, d_fold_terminal_order, num_fold_terminals,
         d_combo_bucket, d_combo_card0, d_combo_card1, num_runouts,
         d_reach_opp_base, nc, perspective, rake_rate, rake_cap, d_node_values);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ============================================================================
+// 2026-09-11: FOLD terminals on iso (SignedCount) boards. GPU twin of
+// fold_blocker::fold_dense_precomputed: a canonical class holds several
+// originals, so the per-card opponent mass is built over every board-valid
+// original of every opponent hand (two 64-bit fixed-point atomics each,
+// order-independent like the rank-blocker kernel), and each self hand sums
+// (total - S[card0] - S[card1] + reach_opp[c]) over ITS board-valid originals
+// and divides by its orbit size — exactly the dense category kernel's
+// payoff * valid * weight for a fold, without streaming the nc^2 valid table
+// once per terminal.
+// ============================================================================
+__global__ void iso_fold_terminal_kernel(
+    const uint8_t* __restrict__ terminal_types,
+    const float* __restrict__ pots,
+    const uint32_t* __restrict__ parent_indices,
+    const float* __restrict__ bet_into,
+    const int32_t* __restrict__ matchup_idx,
+    const uint32_t* __restrict__ value_row,
+    const uint32_t* __restrict__ fold_terminal_order,
+    uint32_t num_fold_terminals,
+    const uint32_t* __restrict__ orig_off,        // [nc + 1] CSR into the original lists
+    const uint8_t* __restrict__ orig_card0,       // [total originals]
+    const uint8_t* __restrict__ orig_card1,       // [total originals]
+    const float* __restrict__ orbit_denom,        // [nc] max(1, |originals|)
+    const unsigned long long* __restrict__ board_masks,  // [num_runouts]
+    uint32_t num_runouts,
+    const float* __restrict__ reach_opp_base,     // [N * nc]
+    uint16_t num_canonical,
+    int perspective,
+    float rake_rate,
+    float rake_cap,
+    float* __restrict__ node_values)
+{
+    const uint32_t blk = blockIdx.x;
+    if (blk >= num_fold_terminals) return;
+    const uint32_t n = fold_terminal_order[blk];
+    const int nc = static_cast<int>(num_canonical);
+    const int tid = static_cast<int>(threadIdx.x);
+
+    int32_t mi = matchup_idx[n];
+    if (mi < 0 || static_cast<uint32_t>(mi) >= num_runouts) mi = 0;
+    const unsigned long long bm = board_masks[mi];
+    const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(n) * nc;
+    float* __restrict__ out_values =
+        node_values + static_cast<size_t>(value_row[n]) * nc;
+
+    __shared__ unsigned long long s_acc[kFoldNumCards];
+    __shared__ float s_card[kFoldNumCards];
+    __shared__ unsigned long long s_total_q;
+    for (int k = tid; k < kFoldNumCards; k += kFoldBlock) s_acc[k] = 0ull;
+    __syncthreads();
+    for (int o = tid; o < nc; o += kFoldBlock) {
+        const float r = reach_opp[o];
+        if (r == 0.0f) continue;
+        const unsigned long long q = __float2ull_rn(r * kRbFixedScale);
+        if (q == 0ull) continue;
+        const uint32_t pb = orig_off[o], pe = orig_off[o + 1];
+        for (uint32_t p = pb; p < pe; ++p) {
+            const int c0 = orig_card0[p], c1 = orig_card1[p];
+            if (((1ull << c0) | (1ull << c1)) & bm) continue;
+            atomicAdd(&s_acc[c0], q);
+            atomicAdd(&s_acc[c1], q);
+        }
+    }
+    __syncthreads();
+    if (tid < kFoldNumCards) {
+        s_card[tid] = static_cast<float>(
+            __ull2double_rn(s_acc[tid]) * kRbFixedInvScale);
+    }
+    if (tid == 0) {
+        unsigned long long t = 0ull;
+        for (int k = 0; k < kFoldNumCards; ++k) t += s_acc[k];
+        s_total_q = t;   // every board-valid original landed in exactly two bins
+    }
+    __syncthreads();
+    const float total = static_cast<float>(
+        __ull2double_rn(s_total_q / 2ull) * kRbFixedInvScale);
+
+    // Fold payoff (matches terminal_level_kernel / CPU fold_self_payoff).
+    const float pot_total = pots[n];
+    const uint32_t parent = parent_indices[n];
+    const float matched_pot = pot_total - bet_into[parent];
+    float fold_rake = fminf(matched_pot * rake_rate, rake_cap);
+    if (fold_rake < 0.0f) fold_rake = 0.0f;
+    const float fold_win_gain  = matched_pot * 0.5f - fold_rake;
+    const float fold_lose_loss = -matched_pot * 0.5f;
+    const uint8_t tt = terminal_types[n];
+    const bool i_win = ((perspective == 0 && tt == TT_FOLD_IP) ||
+                        (perspective == 1 && tt == TT_FOLD_OOP));
+    const float self_payoff = i_win ? fold_win_gain : fold_lose_loss;
+
+    for (int c = tid; c < nc; c += kFoldBlock) {
+        const float r_c = reach_opp[c];
+        float acc = 0.0f;
+        const uint32_t pb = orig_off[c], pe = orig_off[c + 1];
+        for (uint32_t p = pb; p < pe; ++p) {
+            const int c0 = orig_card0[p], c1 = orig_card1[p];
+            if (((1ull << c0) | (1ull << c1)) & bm) continue;
+            // the identical original sits in both card bins: subtracted twice,
+            // belongs out once (fold_blocker::combo_value)
+            acc += ((total - s_card[c0]) - s_card[c1]) + r_c;
+        }
+        out_values[c] = self_payoff * (acc / orbit_denom[c]);
+    }
+}
+
+void launch_iso_fold_terminals(
+    const uint8_t* d_terminal_types,
+    const float* d_pots,
+    const uint32_t* d_parent_indices,
+    const float* d_bet_into,
+    const int32_t* d_matchup_idx,
+    const uint32_t* d_value_row,
+    const uint32_t* d_fold_terminal_order,
+    uint32_t num_fold_terminals,
+    const uint32_t* d_orig_off,
+    const uint8_t* d_orig_card0,
+    const uint8_t* d_orig_card1,
+    const float* d_orbit_denom,
+    const unsigned long long* d_board_masks,
+    uint32_t num_runouts,
+    const float* d_reach_opp_base,
+    uint16_t nc,
+    int perspective,
+    float rake_rate,
+    float rake_cap,
+    float* d_node_values)
+{
+    if (num_fold_terminals == 0) return;
+    iso_fold_terminal_kernel<<<num_fold_terminals, kFoldBlock>>>(
+        d_terminal_types, d_pots, d_parent_indices, d_bet_into, d_matchup_idx,
+        d_value_row, d_fold_terminal_order, num_fold_terminals,
+        d_orig_off, d_orig_card0, d_orig_card1, d_orbit_denom, d_board_masks,
+        num_runouts, d_reach_opp_base, nc, perspective, rake_rate, rake_cap,
+        d_node_values);
     CUDA_CHECK(cudaGetLastError());
 }
 

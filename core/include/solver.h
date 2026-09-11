@@ -803,16 +803,16 @@ private:
     /// answered differently from the solve, the UI would price a tree the
     /// solve never builds.
     ///
-    /// Charges the host PEAK core (matchup + CPU state on CPU backends + 2×
-    /// finalized strategy + process/CUDA overhead) and, on GPU, the device
-    /// total. Output caches stay out: they are bounded and auto-reducible,
-    /// and excluding them keeps this from collapsing a tree the pre-backend
-    /// hard gate would have accepted.
+    /// Charges the host PEAK exactly as the pre-backend hard gate does
+    /// (matchup + CPU state on CPU backends + finalized-strategy copies +
+    /// process/CUDA overhead + flat tree + output caches) and, on GPU, the
+    /// device total. Since 2026-09-10 the two gates price the same terms:
+    /// a tree this gate passes cannot be thrown out by the hard gate.
     EnumeratedFit check_enumerated_fit(
         BackendType planned, uint64_t tables, uint64_t player_nodes,
         uint64_t player_slots, uint64_t host_matchup,
         bool device_dense_upload, uint64_t equity_tables,
-        const TreeStats& stats) const;
+        uint64_t signed_count_tables, const TreeStats& stats) const;
 
     /// Does a mid-loop exploitability probe materialize a HOST strategy
     /// copy on this backend? Since 2026-09-10 the GPU answers probes from
@@ -876,6 +876,26 @@ private:
         }
         return !config_.node_locks.empty()
             || config_.dcfr_schedule != SolverConfig::DcfrSchedule::POSTFLOP_STYLE;
+    }
+
+    /// Does the CPU backend allocate the three N x nc level-sweep flats
+    /// (reach_oop_, reach_ip_, value_)? Only the levelized backend has them,
+    /// and only when it actually runs the level sweeps: the depth-first
+    /// traversal (config.cpu_dfs_traversal, derived-strategy path) keeps those
+    /// rows on per-thread stacks. Mirrors LevelizedCpuBackend::dfs_configure().
+    /// 2026-09-11: on SignedCount boards the GPU also uploads the int8 signed
+    /// pair-count tables (signed_count_showdown_gemm_kernel), one per matchup
+    /// table at nc*nc bytes; on every other plan that upload does not exist.
+    static uint64_t signed_count_device_tables(
+        const TerminalRepresentationPlan& plan, uint64_t tables) {
+        return plan.representation == TerminalRepresentation::SignedCount ? tables : 0;
+    }
+
+    bool cpu_uses_level_flats() const {
+        if (config_.cpu_backend_kind != SolverConfig::CpuBackendKind::LEVELIZED) {
+            return false;
+        }
+        return !(config_.cpu_dfs_traversal && !cpu_materializes_strategy());
     }
 
     /// Same accounting as host_matchup_bytes() but for a PREDICTED table
@@ -1151,7 +1171,7 @@ inline Solver::EnumeratedFit Solver::check_enumerated_fit(
     BackendType planned, uint64_t tables, uint64_t player_nodes,
     uint64_t player_slots, uint64_t host_matchup,
     bool device_dense_upload, uint64_t equity_tables,
-    const TreeStats& stats) const
+    uint64_t signed_count_tables, const TreeStats& stats) const
 {
     const uint64_t nc      = iso_.num_canonical;
     const uint64_t total_n = stats.total_nodes;
@@ -1170,6 +1190,28 @@ inline Solver::EnumeratedFit Solver::check_enumerated_fit(
               planned == BackendType::GPU,
               host_probe_copies(planned))
         + memory_budget::kHostProcessOverheadBytes;
+    // 2026-09-10: the same flat-tree and output-cache terms the pre-backend
+    // hard gate charges (build_footprint / total_host_bytes). Without them
+    // this gate said "fits" up to ~230 MB past the budget and the hard gate
+    // then threw instead of collapsing — 7 bundle spots at 6.05–6.12 GB vs
+    // the 6.00 GB default died that way. The cache estimate mirrors
+    // build_footprint exactly (same cap rule, same floor).
+    host_needed += memory_budget::bytes_for_flat_tree(stats.total_nodes, stats.total_edges)
+        + ((planned == BackendType::GPU)
+               ? memory_budget::bytes_for_gpu_host_index_tables(stats.total_nodes)
+               : 0);
+    if (config_.emit_strategy_tree) {
+        const uint64_t ev_cache_cap =
+            config_.memory_budget.strategy_tree_max_nodes > 0
+                ? std::min<uint64_t>(player_nodes,
+                                     config_.memory_budget.strategy_tree_max_nodes)
+                : player_nodes;
+        host_needed += bytes_for_strategy_tree_ev_cache(ev_cache_cap, nc)
+            + bytes_for_json_response(std::min<uint64_t>(
+                  player_nodes, config_.memory_budget.strategy_tree_max_nodes));
+    } else {
+        host_needed += memory_budget::kNoTreeJsonFloorBytes;
+    }
 
     uint64_t device_needed = 0, device_budget = 0;
     if (planned == BackendType::GPU) {
@@ -1184,7 +1226,7 @@ inline Solver::EnumeratedFit Solver::check_enumerated_fit(
         device_needed = bytes_for_gpu_device_total(
             total_n, stats.total_edges, player_slots, tables, nc,
             device_dense_upload, gpu_materializes_strategy(),
-            stats.value_rows, equity_tables);
+            stats.value_rows, equity_tables, signed_count_tables);
         device_budget = config_.memory_budget.gpu_bytes > 0
             ? config_.memory_budget.gpu_bytes
             : static_cast<uint64_t>(
@@ -1194,7 +1236,7 @@ inline Solver::EnumeratedFit Solver::check_enumerated_fit(
     } else {
         host_needed += bytes_for_cpu_state_compact(
             player_slots, nc, cpu_materializes_strategy());
-        if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
+        if (cpu_uses_level_flats()) {
             host_needed += bytes_for_levelized_cpu_extra(total_n, nc);
         }
     }
@@ -1308,7 +1350,8 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             planned, proj.tables, proj.player_nodes, proj.player_slots,
             estimated_host_matchup_bytes(proj.tables, step2_host_dense,
                                          proj.equity_tables),
-            step2_plan.device_dense_upload, proj.equity_tables, proj.stats);
+            step2_plan.device_dense_upload, proj.equity_tables,
+            signed_count_device_tables(step2_plan, proj.tables), proj.stats);
         if (!fit.fits) {
             char buf[320];
             snprintf(buf, sizeof(buf),
@@ -1416,6 +1459,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         const EnumeratedFit fit = check_enumerated_fit(
             planned, tables, player_n, player_slots, host_matchup_bytes(),
             terminal_plan_.device_dense_upload, matchup_equity_count(),
+            signed_count_device_tables(terminal_plan_, tables),
             tree_stats(tree_));
         if (!fit.fits) {
             const uint64_t shown_needed = fit.needed;
@@ -1498,7 +1542,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         // v1.7.0: levelized backend pre-allocates 3 × total_nodes × nc
         // floats (reach_oop_, reach_ip_, value_) on top of the reference
         // state. Only counted into the final footprint on CPU backends.
-        if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
+        if (cpu_uses_level_flats()) {
             comp_cpu_state += bytes_for_levelized_cpu_extra(total_n, nc);
         }
         const uint64_t gpu_value_rows_est = gpu_value_rows(tree_);
@@ -1515,7 +1559,8 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             total_n, tree_.total_edges, gate_player_slots,
             matchup_ev_per_runout_.size(), nc,
             terminal_plan_.device_dense_upload, gpu_materializes_strategy(),
-            gpu_value_rows_est, matchup_equity_count());
+            gpu_value_rows_est, matchup_equity_count(),
+            signed_count_device_tables(terminal_plan_, matchup_ev_per_runout_.size()));
         // Peak-host lifetime terms (P1-1): finalize holds TWO materialized
         // strategy copies on every backend.
         comp_final_strategy = bytes_for_final_strategy(
@@ -2077,7 +2122,9 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
                   matchup_ev_per_runout_.size(), iso_.num_canonical,
                   2ULL * sizeof(float))
             : 0)
-            + bytes_for_equity_tables(matchup_equity_count(), iso_.num_canonical);
+            + bytes_for_equity_tables(matchup_equity_count(), iso_.num_canonical)
+            + signed_count_device_tables(terminal_plan_, matchup_ev_per_runout_.size())
+                  * static_cast<uint64_t>(iso_.num_canonical) * iso_.num_canonical;
         r.matchup_equity_tables          = matchup_equity_count();
         r.terminal_representation        = terminal_plan_.label();
         r.host_dense_matchup             = matchup_dense_materialized_;
@@ -2254,7 +2301,8 @@ inline SolveResources Solver::estimate_only() {
             planned, proj.tables, proj.player_nodes, proj.player_slots,
             estimated_host_matchup_bytes(proj.tables, est_host_dense,
                                          proj.equity_tables),
-            est_plan.device_dense_upload, proj.equity_tables, proj.stats);
+            est_plan.device_dense_upload, proj.equity_tables,
+            signed_count_device_tables(est_plan, proj.tables), proj.stats);
         if (!fit.fits) {
             tree_ = std::move(collapsed);
             projected_collapse = true;
@@ -2356,6 +2404,7 @@ inline SolveResources Solver::estimate_only() {
         const EnumeratedFit fit = check_enumerated_fit(
             planned, matchup_tables_exact, player_nodes, player_slots,
             est_matchup_host, est_plan.device_dense_upload, equity_tables_exact,
+            signed_count_device_tables(est_plan, matchup_tables_exact),
             tree_stats(tree_));
         if (!fit.fits) {
             GameTreeBuilder collapsed_builder(config_);
@@ -2394,7 +2443,7 @@ inline SolveResources Solver::estimate_only() {
     // v1.7.0: include the levelized backend's extra reach/value buffers in
     // the pre-solve estimate too, so the UI's ETA banner doesn't say "this
     // fits in 4 GB" right before the host gate rejects on the real solve.
-    if (config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED) {
+    if (cpu_uses_level_flats()) {
         r.estimated_cpu_state_bytes += bytes_for_levelized_cpu_extra(total_n, nc);
     }
     r.terminal_representation        = est_plan.label();
@@ -2404,11 +2453,13 @@ inline SolveResources Solver::estimate_only() {
         gpu_value_rows_est);
     r.estimated_gpu_matchup_bytes    = (est_plan.device_dense_upload
         ? bytes_for_matchup_tables(matchup_count_est, nc, 2ULL * sizeof(float))
-        : 0) + bytes_for_equity_tables(equity_tables_exact, nc);
+        : 0) + bytes_for_equity_tables(equity_tables_exact, nc)
+        + signed_count_device_tables(est_plan, matchup_count_est) * nc * nc;
     r.estimated_device_total_bytes   = bytes_for_gpu_device_total(
         total_n, tree_.total_edges, player_slots, matchup_count_est, nc,
         est_plan.device_dense_upload, gpu_materializes_strategy(),
-        gpu_value_rows_est, equity_tables_exact);
+        gpu_value_rows_est, equity_tables_exact,
+        signed_count_device_tables(est_plan, matchup_count_est));
 
     // Output plan (review round 2): only price the navigation cache + full
     // JSON when the caller will emit them.
@@ -2598,7 +2649,10 @@ inline void compute_matchup_for_board(
         out_category.assign(static_cast<size_t>(nc) * nc, 0u);
         out_showdown_coeff.clear();
         if (build_showdown_coeff) {
-            out_showdown_count.assign(static_cast<size_t>(nc) * nc, 0);
+            // +8 bytes of zero slack: the AVX2 signed-count kernels load each
+            // row's tail with one 8-byte load (cpu_kernels_avx2.cpp,
+            // sc_load_tail), so the last row must be readable 8 bytes past nc*nc.
+            out_showdown_count.assign(static_cast<size_t>(nc) * nc + 8, 0);
         } else {
             out_showdown_count.clear();
         }

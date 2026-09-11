@@ -356,6 +356,61 @@ static void showdown_ip_signed_count_zero_rake(
     }
 }
 
+// Fused twin of the two signed-count kernels above: same loops, same
+// operation order per output lane, one pass over the matrix.
+static void showdown_dual_signed_count_zero_rake(
+    const int8_t* signed_count_matrix,
+    const float* reach_oop,
+    const float* reach_ip,
+    const float* inv_weights,
+    const uint8_t* skip_oop,
+    const uint8_t* skip_ip,
+    float* out_oop, float* out_ip,
+    std::size_t n, float win_p)
+{
+    for (std::size_t i = 0; i < n; ++i) out_ip[i] = 0.0f;
+    for (std::size_t c = 0; c < n; ++c) {
+        const int8_t* count_row = signed_count_matrix + c * n;
+        if (skip_oop && skip_oop[c]) {
+            out_oop[c] = 0.0f;
+        } else {
+            float sum = 0.0f;
+            for (std::size_t i = 0; i < n; ++i) {
+                sum += static_cast<float>(count_row[i]) * reach_ip[i];
+            }
+            out_oop[c] = sum * win_p * inv_weights[c];
+        }
+        const float scale = -reach_oop[c] * win_p;
+        if (scale == 0.0f) continue;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (skip_ip && skip_ip[i]) continue;
+            out_ip[i] += static_cast<float>(count_row[i]) * scale;
+        }
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        out_ip[i] = (skip_ip && skip_ip[i]) ? 0.0f : out_ip[i] * inv_weights[i];
+    }
+}
+
+static void fold_dense_slots(
+    const uint8_t* slot_c0, const uint8_t* slot_c1,
+    std::size_t slot_stride, std::size_t num_slots,
+    const float* denom, const float* blocked53, float total,
+    const float* opp_reach, float self_payoff, float* out, std::size_t n)
+{
+    for (std::size_t ci = 0; ci < n; ++ci) {
+        float acc = 0.0f;
+        const float r = opp_reach[ci];
+        for (std::size_t s = 0; s < num_slots; ++s) {
+            const uint8_t c0 = slot_c0[s * slot_stride + ci];
+            if (c0 == 52u) continue;
+            const uint8_t c1 = slot_c1[s * slot_stride + ci];
+            acc += ((total - blocked53[c0]) - blocked53[c1]) + r;
+        }
+        out[ci] = self_payoff * (acc / denom[ci]);
+    }
+}
+
 static void showdown_oop_full_active(
     const uint8_t* category_matrix, const float* valid_matrix,
     const float* opp_reach_w,
@@ -710,6 +765,8 @@ const Kernels scalar_kernels = {
     &scalar_impl::showdown_ip_signed_zero_rake,
     &scalar_impl::showdown_oop_signed_count_zero_rake,
     &scalar_impl::showdown_ip_signed_count_zero_rake,
+    &scalar_impl::showdown_dual_signed_count_zero_rake,
+    &scalar_impl::fold_dense_slots,
     &scalar_impl::showdown_oop_full_active,
     &scalar_impl::showdown_ip_full_active,
     &scalar_impl::showdown_oop_full_active_runs,

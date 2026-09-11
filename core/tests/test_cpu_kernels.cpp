@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <sstream>
@@ -1149,7 +1150,7 @@ static std::vector<float> derive_signed_coeff(
 static std::vector<int8_t> derive_signed_count(
     const std::vector<float>& ev, const std::vector<float>& valid)
 {
-    std::vector<int8_t> count(ev.size(), 0);
+    std::vector<int8_t> count(ev.size() + 8, 0);   // +8: kernel tail-load slack
     for (std::size_t i = 0; i < ev.size(); ++i) {
         const uint8_t cat = cat_byte(ev[i], valid[i]);
         if (cat == 1u) count[i] = static_cast<int8_t>(valid[i]);
@@ -1596,6 +1597,105 @@ static void test_showdown_oop_full_batch() {
 // reference, the scalar kernel and the AVX2 kernel must agree bit for bit —
 // including the unaligned `begin` offsets and the <16-lane tails the caller
 // produces (begin = a + 1 for every hand a).
+// 2026-09-11: the fused both-traverser signed-count kernel must reproduce
+// the two single kernels bit for bit (scalar vs scalar, AVX2 vs AVX2). Zero
+// reach lanes exercise the skipped-row branch; n = 125 has the anchor's tail.
+static void test_showdown_dual_signed_count() {
+    static const std::vector<std::size_t> kLens = {1, 5, 7, 8, 13, 16, 32, 125, 200};
+    std::uniform_int_distribution<int> dcount(-4, 4);
+    std::uniform_real_distribution<float> dreach(0.0f, 1.0f);
+    std::uniform_real_distribution<float> dinv(0.25f, 1.0f);
+    for (auto n : kLens) {
+        std::vector<int8_t> counts(n * n + 8, 0);   // +8: kernel tail-load slack
+        for (std::size_t i = 0; i < n * n; ++i) counts[i] = static_cast<int8_t>(dcount(rng()));
+        std::vector<float> r_oop(n), r_ip(n), inv_w(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            r_oop[i] = (dreach(rng()) < 0.25f) ? 0.0f : dreach(rng());
+            r_ip[i]  = (dreach(rng()) < 0.25f) ? 0.0f : dreach(rng());
+            inv_w[i] = dinv(rng());
+        }
+        const float win_p = 37.5f;
+        std::vector<uint8_t> skip_oop(n, 0), skip_ip(n, 0);
+        for (std::size_t i = 0; i < n; ++i) {
+            skip_oop[i] = (dreach(rng()) < 0.3f) ? 1u : 0u;
+            skip_ip[i]  = (dreach(rng()) < 0.3f) ? 1u : 0u;
+        }
+        auto check = [&](const cpu_simd::Kernels& k, const char* label,
+                         const uint8_t* m_oop, const uint8_t* m_ip) {
+            std::vector<float> ref_oop(n, -1.0f), ref_ip(n, -1.0f);
+            std::vector<float> d_oop(n, -1.0f), d_ip(n, -1.0f);
+            k.showdown_oop_signed_count_zero_rake(
+                counts.data(), r_ip.data(), inv_w.data(), m_oop,
+                ref_oop.data(), n, win_p);
+            k.showdown_ip_signed_count_zero_rake(
+                counts.data(), r_oop.data(), inv_w.data(), m_ip,
+                ref_ip.data(), n, win_p);
+            k.showdown_dual_signed_count_zero_rake(
+                counts.data(), r_oop.data(), r_ip.data(), inv_w.data(),
+                m_oop, m_ip, d_oop.data(), d_ip.data(), n, win_p);
+            const std::string where = std::string(" (") + label
+                + (m_oop ? ", masked" : "") + ", n=" + std::to_string(n) + ")";
+            if (std::memcmp(ref_oop.data(), d_oop.data(), n * sizeof(float)) != 0) {
+                fail("showdown_dual_signed_count_zero_rake oop != singles" + where);
+            }
+            if (std::memcmp(ref_ip.data(), d_ip.data(), n * sizeof(float)) != 0) {
+                fail("showdown_dual_signed_count_zero_rake ip != singles" + where);
+            }
+        };
+        check(scalar_kernels, "scalar", nullptr, nullptr);
+        check(avx2_kernels, "avx2", nullptr, nullptr);
+        check(scalar_kernels, "scalar", skip_oop.data(), skip_ip.data());
+        check(avx2_kernels, "avx2", skip_oop.data(), skip_ip.data());
+    }
+}
+
+// 2026-09-11: fold_dense_slots (scalar and AVX2) against the bucket-loop form
+// it replaces, on random slot layouts with 1..3 originals per canonical.
+static void test_fold_dense_slots() {
+    static const std::vector<std::size_t> kLens = {1, 5, 8, 13, 125, 200};
+    std::uniform_int_distribution<int> dcard(0, 51);
+    std::uniform_int_distribution<int> dsz(1, 3);
+    std::uniform_real_distribution<float> dreach(0.0f, 1.0f);
+    for (auto n : kLens) {
+        const std::size_t stride = (n + 7u) & ~static_cast<std::size_t>(7u);
+        const std::size_t slots = 3;
+        std::vector<uint8_t> c0(slots * stride, 52u), c1(slots * stride, 52u);
+        std::vector<float> denom(n), reach(n), blocked(53, 0.0f);
+        for (std::size_t ci = 0; ci < n; ++ci) {
+            const int sz = dsz(rng());
+            denom[ci] = static_cast<float>(sz);
+            for (int s2 = 0; s2 < sz; ++s2) {
+                c0[s2 * stride + ci] = static_cast<uint8_t>(dcard(rng()));
+                c1[s2 * stride + ci] = static_cast<uint8_t>(dcard(rng()));
+            }
+            reach[ci] = (dreach(rng()) < 0.3f) ? 0.0f : dreach(rng());
+        }
+        for (std::size_t k = 0; k < 52; ++k) blocked[k] = dreach(rng()) * 3.0f;
+        const float total = 17.25f, pay = -6.5f;
+        std::vector<float> ref(n), sc(n), av(n);
+        for (std::size_t ci = 0; ci < n; ++ci) {
+            float acc = 0.0f;
+            for (std::size_t s2 = 0; s2 < slots; ++s2) {
+                const uint8_t a = c0[s2 * stride + ci];
+                if (a == 52u) continue;
+                acc += total - blocked[a] - blocked[c1[s2 * stride + ci]] + reach[ci];
+            }
+            ref[ci] = pay * (acc / denom[ci]);
+        }
+        scalar_kernels.fold_dense_slots(c0.data(), c1.data(), stride, slots, denom.data(),
+                                        blocked.data(), total, reach.data(), pay, sc.data(), n);
+        avx2_kernels.fold_dense_slots(c0.data(), c1.data(), stride, slots, denom.data(),
+                                      blocked.data(), total, reach.data(), pay, av.data(), n);
+        assert_arrays_close(sc, ref, kTolAccumulate.abs_, kTolAccumulate.rel_,
+                            "fold_dense_slots (scalar vs bucket form)");
+        assert_arrays_close(av, ref, kTolAccumulate.abs_, kTolAccumulate.rel_,
+                            "fold_dense_slots (avx2 vs bucket form)");
+        if (std::memcmp(sc.data(), av.data(), n * sizeof(float)) != 0) {
+            fail("fold_dense_slots scalar != avx2 bitwise (n=" + std::to_string(n) + ")");
+        }
+    }
+}
+
 static void test_equity_sign_accumulate() {
     static const std::vector<std::size_t> kLens =
         {1, 7, 8, 15, 16, 17, 33, 200, 1176, 1185};
@@ -2040,6 +2140,8 @@ int main(int /*argc*/, char* /*argv*/[]) {
     RUN_TEST(test_equity_sign_accumulate);
     RUN_TEST(test_edge_case_zero_input);
     RUN_TEST(test_edge_case_all_invalid_showdown);
+    RUN_TEST(test_showdown_dual_signed_count);
+    RUN_TEST(test_fold_dense_slots);
 
     std::cout << "\n=== " << g_tests_passed << " / " << g_tests_run
               << " tests passed ===\n";

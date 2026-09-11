@@ -179,6 +179,7 @@ struct CLIArgs {
     // 0 to A/B against the old per-level parallel-region path.
     int cpu_persistent_omp = 1;
     int cpu_showdown_batch = 0;
+    std::string cpu_traversal = "dfs";
 
     // Sprint 1 (market-beating plan): per-solve memory budget overrides.
     // Default 0 = use the SolverConfig defaults (6 GB host, 100 MB JSON,
@@ -349,6 +350,8 @@ CLIArgs parse_args(int argc, char* argv[]) {
         } else if (arg == "--cpu-showdown-batch" && i + 1 < argc) {
             std::string v = argv[++i];
             args.cpu_showdown_batch = (v == "1" || v == "true" || v == "True") ? 1 : 0;
+        } else if (arg == "--cpu-traversal" && i + 1 < argc) {
+            args.cpu_traversal = argv[++i];
         } else if (arg == "--include-scalar") {
             args.include_scalar = 1;
         } else if (arg == "--benchmark-case" && i + 1 < argc) {
@@ -454,6 +457,13 @@ Arguments:
   --cpu-showdown-batch <0|1>
                            Experimental levelized CPU A/B knob. Default 0.
                            Forces OOP level-0 showdown group batching when 1.
+  --cpu-traversal <dfs|level>
+                           Levelized only. dfs (default) = one depth-first
+                           visit per iteration with reach/value rows on a
+                           per-thread stack (bit-identical to the level
+                           sweeps, 2.7-3.4x faster on enumerated trees, no
+                           N x nc flats); level = the three level sweeps.
+                           DEEPSOLVER_CPU_TRAVERSAL=dfs|level overrides.
   --help, -h               Show this help message
 
 Output:
@@ -1724,6 +1734,20 @@ int main(int argc, char* argv[]) {
         // Production default is on; --cpu-persistent-omp 0 keeps an A/B escape hatch.
         config.cpu_persistent_omp = (args.cpu_persistent_omp != 0);
         config.cpu_showdown_batch = (args.cpu_showdown_batch != 0);
+        {
+            std::string trav = args.cpu_traversal;
+            for (char& ch : trav)
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            config.cpu_dfs_traversal = (trav == "dfs");
+            // Env override for A/B runs and test sweeps. Applied to the config
+            // (not inside the backend) so the memory estimators see the same
+            // decision the backend makes.
+            if (const char* env = std::getenv("DEEPSOLVER_CPU_TRAVERSAL");
+                env != nullptr && env[0] != '\0') {
+                const std::string e(env);
+                config.cpu_dfs_traversal = (e == "dfs" || e == "1");
+            }
+        }
 
         // v1.4.0 Phase 2: apply --cpu-simd policy. set_policy() is idempotent
         // and re-resolves the kernel table on next call to kernels(). Done

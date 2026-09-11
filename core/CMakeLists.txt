@@ -837,6 +837,16 @@ if(BUILD_TESTS)
         set_tests_properties(CliPeakHostNotUnder PROPERTIES
             LABELS "smoke;gpu;memory" TIMEOUT 180)
 
+        # 2026-09-11: signed-count GEMM + iso fold kernel vs the dense per-
+        # terminal kernel on the same reach (DEEPSOLVER_RB_SELFCHECK), on a
+        # two-tone board where both new kernels engage.
+        add_test(NAME CliGpuIsoTerminalSelfcheck
+            COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=gpu_iso_terminal_selfcheck
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+        set_tests_properties(CliGpuIsoTerminalSelfcheck PROPERTIES
+            LABELS "smoke;gpu" TIMEOUT 180)
+
         # ----------------------------------------------------------------
         # Stage 3: GPU subgame streaming validation. SAME source as the CPU
         # `Decomposition` test, but compiled WITH DEEPSOLVER_USE_CUDA + the

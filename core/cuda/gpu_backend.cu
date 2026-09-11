@@ -187,6 +187,45 @@ void launch_equity_showdown_gemm(
     int accumulate,
     float* d_node_values);
 
+// 2026-09-11: batched full-board showdowns on SignedCount boards
+// (eval_kernel.cu::signed_count_showdown_gemm_kernel).
+void launch_signed_count_showdown_gemm(
+    const EquityTile* d_tiles,
+    uint32_t num_tiles,
+    const uint32_t* d_terminal_order,
+    const float* d_pots,
+    const uint32_t* d_value_row,
+    const int8_t* d_count_concat,
+    const float* d_canonical_weights,
+    const float* d_reach_opp_base,
+    uint16_t nc,
+    float rake_rate,
+    float rake_cap,
+    float* d_node_values);
+
+// 2026-09-11: fold kernel for iso (SignedCount) boards (eval_kernel.cu).
+void launch_iso_fold_terminals(
+    const uint8_t* d_terminal_types,
+    const float* d_pots,
+    const uint32_t* d_parent_indices,
+    const float* d_bet_into,
+    const int32_t* d_matchup_idx,
+    const uint32_t* d_value_row,
+    const uint32_t* d_fold_terminal_order,
+    uint32_t num_fold_terminals,
+    const uint32_t* d_orig_off,
+    const uint8_t* d_orig_card0,
+    const uint8_t* d_orig_card1,
+    const float* d_orbit_denom,
+    const unsigned long long* d_board_masks,
+    uint32_t num_runouts,
+    const float* d_reach_opp_base,
+    uint16_t nc,
+    int perspective,
+    float rake_rate,
+    float rake_cap,
+    float* d_node_values);
+
 // 2026-09-10: dedicated fold kernel for rank-blocker boards (eval_kernel.cu).
 void launch_fold_blocker_terminals(
     const uint8_t* d_terminal_types,
@@ -294,6 +333,23 @@ struct DeviceMatchup {
     // Host copy of equity_slot so prepare() can split the equity showdowns
     // out of the per-terminal launch (see DeviceEquityBatch).
     std::vector<int32_t> host_equity_slot;
+
+    // 2026-09-11: per-runout int8 signed pair-count tables, packed
+    // [num_runouts x nc x nc], on SignedCount boards. Feeds the batched
+    // full-board showdown GEMM (signed_count_showdown_gemm_kernel); null on
+    // every other plan.
+    int8_t*   signed_count       = nullptr;
+    bool      signed_count_valid = false;
+
+    // 2026-09-11: iso fold blocker (iso_fold_terminal_kernel): every
+    // canonical's originals as a CSR of card pairs, its orbit size, and one
+    // board mask per runout. Built on SignedCount boards.
+    uint32_t*           iso_orig_off   = nullptr;  // [nc + 1]
+    uint8_t*            iso_orig_card0 = nullptr;  // [total originals]
+    uint8_t*            iso_orig_card1 = nullptr;  // [total originals]
+    float*              iso_denom      = nullptr;  // [nc]
+    unsigned long long* iso_board_mask = nullptr;  // [num_runouts]
+    bool                iso_fold_valid = false;
 };
 
 /// Per-player root-level reach probabilities, on device.
@@ -509,7 +565,8 @@ static DeviceMatchup upload_matchup(
     const std::vector<std::vector<float>>& valid_per_runout,
     const std::vector<uint16_t>& weights,
     bool materialize_dense,
-    const std::vector<std::vector<float>>* equity_per_runout = nullptr)
+    const std::vector<std::vector<float>>* equity_per_runout = nullptr,
+    const std::vector<std::vector<int8_t>>* count_per_runout = nullptr)
 {
     DeviceMatchup dm;
     dm.num_canonical = static_cast<uint16_t>(weights.size());
@@ -517,6 +574,27 @@ static DeviceMatchup upload_matchup(
 
     size_t per_table = static_cast<size_t>(dm.num_canonical) * dm.num_canonical;
     size_t total     = per_table * dm.num_runouts;
+
+    // 2026-09-11: the int8 signed pair-count tables (SignedCount plan). All
+    // runouts or nothing: the GEMM indexes by mi, so a missing table would
+    // read another runout's counts.
+    if (count_per_runout != nullptr && per_table > 0 &&
+        count_per_runout->size() >= dm.num_runouts) {
+        bool complete = true;
+        for (uint32_t r = 0; r < dm.num_runouts && complete; ++r) {
+            complete = (*count_per_runout)[r].size() >= per_table;
+        }
+        if (complete) {
+            CUDA_CHECK(cudaMalloc(&dm.signed_count, total * sizeof(int8_t)));
+            for (uint32_t r = 0; r < dm.num_runouts; ++r) {
+                CUDA_CHECK(cudaMemcpy(
+                    dm.signed_count + static_cast<size_t>(r) * per_table,
+                    (*count_per_runout)[r].data(), per_table * sizeof(int8_t),
+                    cudaMemcpyHostToDevice));
+            }
+            dm.signed_count_valid = true;
+        }
+    }
 
     // 2026-09-09 audit P0: equity tables for partial-board showdowns. Packed
     // by slot so only the tables that exist cost VRAM; independent of the
@@ -691,6 +769,43 @@ static void upload_rank_blocker(
     dm.rb_valid = true;
 }
 
+/// 2026-09-11: per-original card data for iso_fold_terminal_kernel. Mirrors
+/// fold_blocker::build_metadata minus the per-runout board filtering, which
+/// the kernel does itself against `board_masks[mi]`.
+static void upload_iso_fold(
+    DeviceMatchup& dm,
+    const IsomorphismMapping& iso,
+    const std::vector<CardMask>& board_masks)
+{
+    const uint16_t nc = iso.num_canonical;
+    if (nc == 0 || board_masks.size() != dm.num_runouts) return;
+    const auto& combo_table = get_combo_table();
+    std::vector<uint32_t> off(static_cast<size_t>(nc) + 1u, 0u);
+    std::vector<uint8_t> card0, card1;
+    std::vector<float> denom(nc, 1.0f);
+    for (uint16_t c = 0; c < nc; ++c) {
+        off[c] = static_cast<uint32_t>(card0.size());
+        const auto& originals = iso.canonical_to_originals[c];
+        denom[c] = static_cast<float>(std::max<size_t>(size_t{1}, originals.size()));
+        for (uint16_t oi : originals) {
+            card0.push_back(static_cast<uint8_t>(combo_table[oi].cards[0]));
+            card1.push_back(static_cast<uint8_t>(combo_table[oi].cards[1]));
+        }
+    }
+    off[nc] = static_cast<uint32_t>(card0.size());
+    if (card0.empty()) return;
+    std::vector<unsigned long long> masks(board_masks.size());
+    for (size_t r = 0; r < board_masks.size(); ++r) {
+        masks[r] = static_cast<unsigned long long>(board_masks[r]);
+    }
+    dm.iso_orig_off   = upload_vector(off);
+    dm.iso_orig_card0 = upload_vector(card0);
+    dm.iso_orig_card1 = upload_vector(card1);
+    dm.iso_denom      = upload_vector(denom);
+    dm.iso_board_mask = upload_vector(masks);
+    dm.iso_fold_valid = true;
+}
+
 /// Predict, before the dense upload, whether upload_rank_blocker() will end up
 /// setting rb_valid=true. Must mirror its early-returns EXACTLY (same iso check,
 /// same size match, same "at least one valid runout") -- if this says yes but
@@ -725,6 +840,14 @@ static void free_matchup(DeviceMatchup& dm) {
     free_device(dm.rb_card_list);
     free_device(dm.equity);
     free_device(dm.equity_slot);
+    free_device(dm.signed_count);
+    dm.signed_count_valid = false;
+    free_device(dm.iso_orig_off);
+    free_device(dm.iso_orig_card0);
+    free_device(dm.iso_orig_card1);
+    free_device(dm.iso_denom);
+    free_device(dm.iso_board_mask);
+    dm.iso_fold_valid = false;
     dm.num_equity_tables = 0;
     dm.host_equity_slot.clear();
     dm.rb_max_bucket_count = 0;
@@ -953,6 +1076,7 @@ static void run_terminal_pass(const DeviceTree& tree,
                               const DeviceMatchup& mu,
                               const DeviceLevels& lv,
                               const DeviceEquityBatch& eb,
+                              const DeviceEquityBatch& scb,
                               const DeviceReach& reach,
                               const uint32_t* d_value_row,
                               const float* reach_opp_base,
@@ -1001,8 +1125,24 @@ static void run_terminal_pass(const DeviceTree& tree,
             mu.rb_combo_bucket, mu.rb_combo_card0, mu.rb_combo_card1,
             mu.num_runouts, reach_opp_base, nc, traverser,
             cfg.rake_rate, cfg.rake_cap, nv);
+    } else if (mu.iso_fold_valid && lv.num_folds > 0) {
+        // 2026-09-11: iso (SignedCount) boards
+        launch_iso_fold_terminals(
+            tree.terminal_types, tree.pots, tree.parent_indices,
+            tree.bet_into, tree.matchup_idx, d_value_row,
+            lv.fold_order, lv.num_folds,
+            mu.iso_orig_off, mu.iso_orig_card0, mu.iso_orig_card1,
+            mu.iso_denom, mu.iso_board_mask, mu.num_runouts,
+            reach_opp_base, nc, traverser, cfg.rake_rate, cfg.rake_cap, nv);
     }
     run_equity_batch(tree, mu, eb, d_value_row, reach_opp_base, nc, cfg, nv);
+    // 2026-09-11: full-board showdowns on SignedCount boards, one GEMM.
+    if (scb.num_tiles > 0 && mu.signed_count_valid) {
+        launch_signed_count_showdown_gemm(
+            scb.tiles, scb.num_tiles, scb.terminal_order, tree.pots,
+            d_value_row, mu.signed_count, mu.canonical_weights,
+            reach_opp_base, nc, cfg.rake_rate, cfg.rake_cap, nv);
+    }
 }
 
 // ---- Solver state allocation ----
@@ -1160,6 +1300,7 @@ struct GpuBackend::Impl {
     DeviceSolverState state{};
     DeviceLevels      levels{};
     DeviceEquityBatch eqbatch{};
+    DeviceEquityBatch scbatch{};   // 2026-09-11: full-board showdowns, SignedCount boards
     DeviceNodeLocks   locks{};
 
     // Host-side copies of level schedule (for iterating on host to launch per-terminal kernels)
@@ -1228,6 +1369,7 @@ struct GpuBackend::Impl {
         free_locks(locks);
         free_levels(levels);
         free_equity_batch(eqbatch);
+        free_equity_batch(scbatch);
         free_reach(reach);
         free_matchup(matchup);
         free_tree(tree);
@@ -1284,6 +1426,7 @@ void GpuBackend::prepare(const SolverContext& ctx) {
     free_locks(impl_->locks);
     free_levels(impl_->levels);
     free_equity_batch(impl_->eqbatch);
+    free_equity_batch(impl_->scbatch);
     free_reach(impl_->reach);
     free_matchup(impl_->matchup);
     free_tree(impl_->tree);
@@ -1351,10 +1494,35 @@ void GpuBackend::prepare(const SolverContext& ctx) {
                         ") - the memory gates priced the wrong footprint.");
                 }
             }
+            // 2026-09-11: on SignedCount boards the full-board showdowns run
+            // as a GEMM over the int8 count tables (DEEPSOLVER_GPU_SC_GEMM=0
+            // keeps them on the per-terminal dense kernel for A/B).
+            const std::vector<std::vector<int8_t>>* count_tables = nullptr;
+            {
+                const char* sc_env = std::getenv("DEEPSOLVER_GPU_SC_GEMM");
+                const bool sc_enabled = !(sc_env != nullptr && sc_env[0] == '0');
+                if (sc_enabled && ctx.terminal_plan != nullptr &&
+                    ctx.terminal_plan->representation ==
+                        TerminalRepresentation::SignedCount) {
+                    count_tables = ctx.matchup_showdown_count_per_runout;
+                }
+            }
             impl_->matchup = upload_matchup(
                 *ctx.matchup_ev_per_runout, *ctx.matchup_valid_per_runout,
                 ctx.iso->canonical_weights, materialize_dense,
-                ctx.matchup_equity_per_runout);
+                ctx.matchup_equity_per_runout, count_tables);
+            // 2026-09-11: folds on SignedCount boards take the iso blocker
+            // kernel (DEEPSOLVER_GPU_ISO_FOLD=0 keeps them on the dense kernel).
+            {
+                const char* if_env = std::getenv("DEEPSOLVER_GPU_ISO_FOLD");
+                const bool if_enabled = !(if_env != nullptr && if_env[0] == '0');
+                if (if_enabled && ctx.terminal_plan != nullptr &&
+                    ctx.terminal_plan->representation ==
+                        TerminalRepresentation::SignedCount &&
+                    ctx.matchup_board_masks != nullptr) {
+                    upload_iso_fold(impl_->matchup, *ctx.iso, *ctx.matchup_board_masks);
+                }
+            }
         } else {
             // Legacy single-table path (Phase 0/1 callers): no per-runout rank
             // tables, so the rank-blocker never activates -- keep dense.
@@ -1485,6 +1653,9 @@ void GpuBackend::prepare(const SolverContext& ctx) {
             std::vector<uint32_t> plain_terminals;
             std::vector<uint32_t> fold_terminals;   // rb boards only
             std::vector<EqTerm> eq_terms;
+            // 2026-09-11: full-board showdowns on SignedCount boards, grouped
+            // by runout for signed_count_showdown_gemm_kernel.
+            std::vector<EqTerm> sc_terms;
             plain_terminals.reserve(terminals.size());
             for (uint32_t n : terminals) {
                 int32_t slot = -1;
@@ -1504,10 +1675,14 @@ void GpuBackend::prepare(const SolverContext& ctx) {
                 }
                 if (slot >= 0) {
                     eq_terms.push_back({slot, mi, n});
-                } else if (impl_->matchup.rb_valid &&
+                } else if (impl_->matchup.signed_count_valid &&
+                           static_cast<TerminalType>(ctx.tree->terminal_types[n]) ==
+                               TerminalType::SHOWDOWN) {
+                    sc_terms.push_back({mi, mi, n});
+                } else if ((impl_->matchup.rb_valid || impl_->matchup.iso_fold_valid) &&
                            static_cast<TerminalType>(ctx.tree->terminal_types[n]) !=
                                TerminalType::SHOWDOWN) {
-                    fold_terminals.push_back(n);   // fold_blocker_terminal_kernel
+                    fold_terminals.push_back(n);   // fold_blocker_terminal_kernel / iso_fold_terminal_kernel
                 } else {
                     plain_terminals.push_back(n);
                 }
@@ -1543,6 +1718,43 @@ void GpuBackend::prepare(const SolverContext& ctx) {
             impl_->eqbatch.tiles          = upload_vector(eq_tiles);
             impl_->eqbatch.num_tiles      =
                 static_cast<uint32_t>(eq_tiles.size());
+            std::stable_sort(sc_terms.begin(), sc_terms.end(),
+                             [](const EqTerm& a, const EqTerm& b) {
+                                 return a.mi < b.mi;
+                             });
+            std::vector<uint32_t> sc_order;
+            std::vector<gpu::EquityTile> sc_tiles;
+            sc_order.reserve(sc_terms.size());
+            for (const EqTerm& t : sc_terms) sc_order.push_back(t.n);
+            for (size_t i = 0; i < sc_terms.size();) {
+                size_t j = i;
+                while (j < sc_terms.size() && j - i < 64 &&
+                       sc_terms[j].mi == sc_terms[i].mi) {
+                    ++j;
+                }
+                sc_tiles.push_back({sc_terms[i].mi, sc_terms[i].mi,
+                                    static_cast<uint32_t>(i),
+                                    static_cast<uint32_t>(j)});
+                i = j;
+            }
+            impl_->scbatch.terminal_order = upload_vector(sc_order);
+            impl_->scbatch.num_terminals  =
+                static_cast<uint32_t>(sc_order.size());
+            impl_->scbatch.tiles          = upload_vector(sc_tiles);
+            impl_->scbatch.num_tiles      =
+                static_cast<uint32_t>(sc_tiles.size());
+            // DEEPSOLVER_GPU_TERMINAL_STATS=1: how the terminals were routed.
+            if (std::getenv("DEEPSOLVER_GPU_TERMINAL_STATS") != nullptr) {
+                std::fprintf(stderr,
+                    "[GPU-TERMINALS] total=%zu plain=%zu rb_folds=%zu equity_gemm=%zu (%zu tiles) "
+                    "signed_count_gemm=%zu (%zu tiles) rb_valid=%d signed_count_valid=%d iso_fold_valid=%d plan=%s\n",
+                    terminals.size(), plain_terminals.size(), fold_terminals.size(),
+                    eq_order.size(), eq_tiles.size(), sc_order.size(), sc_tiles.size(),
+                    impl_->matchup.rb_valid ? 1 : 0,
+                    impl_->matchup.signed_count_valid ? 1 : 0,
+                    impl_->matchup.iso_fold_valid ? 1 : 0,
+                    ctx.terminal_plan ? ctx.terminal_plan->label() : "none");
+            }
 
             // B3 inc 1: the value buffer's row map. node_values was [N][nc];
             // it is now a two-region buffer and every consumer indexes through
@@ -1659,6 +1871,7 @@ void GpuBackend::prepare(const SolverContext& ctx) {
         free_locks(impl_->locks);
         free_levels(impl_->levels);
         free_equity_batch(impl_->eqbatch);
+    free_equity_batch(impl_->scbatch);
         free_reach(impl_->reach);
         free_matchup(impl_->matchup);
         free_tree(impl_->tree);
@@ -1913,7 +2126,7 @@ void GpuBackend::iterate(int iteration) {
         // they do not need to be interleaved with the level sweep, and
         // keeping them out of it is what keeps the depth-keyed schedule
         // from paying 9-13× the launch overhead on small trees.
-        run_terminal_pass(I.tree, I.matchup, I.levels, I.eqbatch, I.reach,
+        run_terminal_pass(I.tree, I.matchup, I.levels, I.eqbatch, I.scbatch, I.reach,
                           I.state.value_row, reach_opp_base, nc, traverser,
                           *I.config, nv);
 
@@ -1981,14 +2194,17 @@ void GpuBackend::iterate(int iteration) {
     };
 
     // Deterministic kernel-vs-kernel self-check (env DEEPSOLVER_RB_SELFCHECK).
-    // Runs the dense terminal kernel and the rank-blocker kernel on the SAME
-    // reach into separate buffers and reports the max divergence. Their only
-    // legitimate difference is FP summation order (~ULP); a large diff means a
-    // structural bug (indexing / category / per-runout slice). One-shot.
+    // Runs the dense terminal kernel and the PRODUCTION terminal pass on the
+    // SAME reach into separate buffers and reports the max divergence. Their
+    // only legitimate difference is FP summation order (~ULP); a large diff
+    // means a structural bug (indexing / category / per-runout slice).
+    // One-shot. 2026-09-11: also covers SignedCount boards, whose production
+    // pass is the signed-count GEMM + the iso fold kernel.
     static const bool kRbSelfCheck =
         (std::getenv("DEEPSOLVER_RB_SELFCHECK") != nullptr);
-    if (kRbSelfCheck && iteration == 0 && I.matchup.rb_valid &&
-        I.levels.num_levels > 0) {
+    if (kRbSelfCheck && iteration == 0 && I.levels.num_levels > 0 &&
+        (I.matchup.rb_valid || I.matchup.signed_count_valid ||
+         I.matchup.iso_fold_valid)) {
         // B3 inc 1: these mirror node_values, so they are value-row shaped.
         const size_t span = I.state.value_rows * nc;
         float* d_dense = alloc_device_zero<float>(span);
@@ -2018,7 +2234,7 @@ void GpuBackend::iterate(int iteration) {
             // The other side is the PRODUCTION terminal pass (rank-blocker
             // showdowns + fold kernel + equity GEMM over the production
             // lists), so a drifted production launch shows up here.
-            run_terminal_pass(I.tree, I.matchup, I.levels, I.eqbatch, I.reach,
+            run_terminal_pass(I.tree, I.matchup, I.levels, I.eqbatch, I.scbatch, I.reach,
                               I.state.value_row, reach_opp, nc, trav,
                               *I.config, d_rb);
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -2027,7 +2243,7 @@ void GpuBackend::iterate(int iteration) {
                                   cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(hr.data(), d_rb, span * sizeof(float),
                                   cudaMemcpyDeviceToHost));
-            double max_abs = 0.0, sum_ref = 0.0;
+            double max_abs = 0.0, sum_ref = 0.0, max_dense = 0.0;
             uint32_t worst_node = 0; uint16_t worst_c = 0;
             for (uint32_t k = start; k < start + count; ++k) {
                 uint32_t n2 = I.host_node_order[k];
@@ -2039,18 +2255,21 @@ void GpuBackend::iterate(int iteration) {
                     double d = std::fabs(static_cast<double>(hd[idx]) - hr[idx]);
                     sum_ref += std::fabs(static_cast<double>(hd[idx]));
                     if (d > max_abs) { max_abs = d; worst_node = n2; worst_c = c; }
+                    const double ad = std::fabs(static_cast<double>(hd[idx]));
+                    if (ad > max_dense) max_dense = ad;
                 }
             }
             std::fprintf(stderr,
                 "[RB-SELFCHECK] trav=%d nc=%u runouts=%u maxB=%u terminals=%u "
-                "eq_gemm=%u folds=%u "
+                "eq_gemm=%u sc_gemm=%u folds=%u "
                 "max_abs_diff=%.6g (node=%u combo=%u dense=%.6g rb=%.6g) "
-                "sum|dense|=%.6g\n",
+                "max_abs_diff_rel=%.3g sum|dense|=%.6g\n",
                 trav, static_cast<unsigned>(nc),
                 static_cast<unsigned>(I.matchup.num_runouts),
                 static_cast<unsigned>(I.matchup.rb_max_bucket_count),
                 static_cast<unsigned>(count),
                 static_cast<unsigned>(I.eqbatch.num_terminals),
+                static_cast<unsigned>(I.scbatch.num_terminals),
                 static_cast<unsigned>(I.levels.num_folds), max_abs,
                 static_cast<unsigned>(worst_node),
                 static_cast<unsigned>(worst_c),
@@ -2058,7 +2277,10 @@ void GpuBackend::iterate(int iteration) {
                     hd[static_cast<size_t>(I.host_value_row[worst_node]) * nc + worst_c]),
                 static_cast<double>(
                     hr[static_cast<size_t>(I.host_value_row[worst_node]) * nc + worst_c]),
-                sum_ref);
+                // relative to the largest dense value of the pass: a lane near
+                // zero is a cancellation of O(max) terms, so its own ratio
+                // says nothing; a structural bug is O(1) on this scale.
+                max_abs / std::max(1.0, max_dense), sum_ref);
         }
         cudaFree(d_dense);
         cudaFree(d_rb);
@@ -2277,7 +2499,7 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
     //    node_values directly (sum-mode for EV, max-at-traverser for BR).
     float* reach_opp_base = (traverser == 0) ? state.reach_scratch_ip
                                               : state.reach_scratch_oop;
-    run_terminal_pass(tree, matchup, levels, eqbatch, reach, state.value_row,
+    run_terminal_pass(tree, matchup, levels, eqbatch, scbatch, reach, state.value_row,
                       reach_opp_base, nc, traverser, *config, state.node_values);
 
     const uint32_t num_levels = levels.num_levels;

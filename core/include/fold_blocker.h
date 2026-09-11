@@ -21,6 +21,7 @@
 
 #include "card.h"
 #include "isomorphism.h"
+#include "cpu_simd.h"
 
 #include <array>
 #include <algorithm>
@@ -37,6 +38,14 @@ struct Metadata {
     std::vector<uint8_t> bucket_card0;
     std::vector<uint8_t> bucket_card1;
     std::vector<float> bucket_denom;
+    // 2026-09-11 vector layout of the same buckets (cpu_simd::fold_dense_slots):
+    //   owner[p]          canonical index of live original p (flat accumulate)
+    //   slot_card0/1      [num_slots][slot_stride], 52 marks an empty slot
+    std::vector<uint16_t> owner;
+    std::vector<uint8_t> slot_card0;
+    std::vector<uint8_t> slot_card1;
+    std::size_t slot_stride = 0;
+    std::size_t num_slots = 0;
 };
 
 inline Metadata build_metadata(
@@ -72,10 +81,29 @@ inline Metadata build_metadata(
             if (mask & board_mask) continue;
             metadata.bucket_card0.push_back(c0);
             metadata.bucket_card1.push_back(c1);
+            metadata.owner.push_back(c);
         }
     }
     metadata.bucket_offsets[nc] =
         static_cast<uint32_t>(metadata.bucket_card0.size());
+    // Slot layout: slot s of canonical c is its s-th live original.
+    metadata.slot_stride = (static_cast<std::size_t>(nc) + 7u) & ~static_cast<std::size_t>(7u);
+    metadata.num_slots = 0;
+    for (uint16_t c = 0; c < nc; ++c) {
+        const std::size_t sz = metadata.bucket_offsets[c + 1u] - metadata.bucket_offsets[c];
+        if (sz > metadata.num_slots) metadata.num_slots = sz;
+    }
+    metadata.slot_card0.assign(metadata.num_slots * metadata.slot_stride, 52u);
+    metadata.slot_card1.assign(metadata.num_slots * metadata.slot_stride, 52u);
+    for (uint16_t c = 0; c < nc; ++c) {
+        const uint32_t begin = metadata.bucket_offsets[c];
+        const uint32_t end = metadata.bucket_offsets[c + 1u];
+        for (uint32_t p = begin; p < end; ++p) {
+            const std::size_t at = static_cast<std::size_t>(p - begin) * metadata.slot_stride + c;
+            metadata.slot_card0[at] = metadata.bucket_card0[p];
+            metadata.slot_card1[at] = metadata.bucket_card1[p];
+        }
+    }
     metadata.valid = metadata.bucket_offsets.size() ==
             static_cast<std::size_t>(nc) + 1u
         && metadata.bucket_card0.size() == metadata.bucket_card1.size()
@@ -83,27 +111,28 @@ inline Metadata build_metadata(
     return metadata;
 }
 
+// Flat over the live originals (same order as the bucket loop it replaces,
+// so bit-identical), which removes the data-dependent inner loop that
+// mispredicted on every bucket. Zero reach is still skipped: on a river
+// most hands are dead and the three dependent adds per original are the
+// whole cost.
+// `blocked_by_card` needs NUM_CARDS + 1 entries; [52] stays 0 for the empty
+// slot of the vector kernel.
 inline void accumulate_opponent(
     const Metadata& metadata,
     const float* opp_reach,
-    std::array<float, NUM_CARDS>& blocked_by_card,
+    float* blocked_by_card,
     float& total_reach)
 {
-    blocked_by_card.fill(0.0f);
+    for (std::size_t k = 0; k <= NUM_CARDS; ++k) blocked_by_card[k] = 0.0f;
     total_reach = 0.0f;
-    const uint16_t nc = metadata.num_canonical;
-    for (uint16_t cj = 0; cj < nc; ++cj) {
-        const float r = opp_reach[cj];
+    const std::size_t total_originals = metadata.owner.size();
+    for (std::size_t p = 0; p < total_originals; ++p) {
+        const float r = opp_reach[metadata.owner[p]];
         if (r == 0.0f) continue;
-        const uint32_t begin = metadata.bucket_offsets[cj];
-        const uint32_t end = metadata.bucket_offsets[static_cast<std::size_t>(cj) + 1u];
-        for (uint32_t p = begin; p < end; ++p) {
-            const uint8_t c0 = metadata.bucket_card0[p];
-            const uint8_t c1 = metadata.bucket_card1[p];
-            total_reach += r;
-            blocked_by_card[c0] += r;
-            blocked_by_card[c1] += r;
-        }
+        total_reach += r;
+        blocked_by_card[metadata.bucket_card0[p]] += r;
+        blocked_by_card[metadata.bucket_card1[p]] += r;
     }
 }
 
@@ -164,17 +193,27 @@ inline void fold_dense_precomputed(
     std::size_t out_stride)
 {
     const uint16_t nc = metadata.num_canonical;
-    std::array<float, NUM_CARDS> blocked_by_card{};
+    alignas(32) float blocked_by_card[56];   // 53 used, 56 readable (vector lookup)
     float total_reach = 0.0f;
     accumulate_opponent(metadata, opp_reach, blocked_by_card, total_reach);
 
-    for (uint16_t ci = 0; ci < nc; ++ci) {
-        if (skip_mask != nullptr && skip_mask[ci]) {
-            out[ci] = 0.0f;
-            continue;
+    if (skip_mask == nullptr && !metadata.slot_card0.empty()) {
+        cpu_simd::fold_dense_slots(
+            metadata.slot_card0.data(), metadata.slot_card1.data(),
+            metadata.slot_stride, metadata.num_slots,
+            metadata.bucket_denom.data(), blocked_by_card, total_reach,
+            opp_reach, self_payoff, out, nc);
+    } else {
+        std::array<float, NUM_CARDS> blocked{};
+        for (std::size_t k = 0; k < NUM_CARDS; ++k) blocked[k] = blocked_by_card[k];
+        for (uint16_t ci = 0; ci < nc; ++ci) {
+            if (skip_mask != nullptr && skip_mask[ci]) {
+                out[ci] = 0.0f;
+                continue;
+            }
+            out[ci] = self_payoff * combo_value(
+                metadata, opp_reach, blocked, total_reach, ci);
         }
-        out[ci] = self_payoff * combo_value(
-            metadata, opp_reach, blocked_by_card, total_reach, ci);
     }
     for (std::size_t i = nc; i < out_stride; ++i) {
         out[i] = 0.0f;

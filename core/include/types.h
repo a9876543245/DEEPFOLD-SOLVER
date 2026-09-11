@@ -415,6 +415,17 @@ struct SolverConfig {
     /// usually faster when available; this exists for controlled A/B profiling.
     bool cpu_showdown_batch = false;
 
+    /// 2026-09-11 CPU B3: depth-first traversal for the levelized backend.
+    /// One subtree-local visit per iteration replaces the three level sweeps
+    /// (forward + two backward), so reach and value rows live on a per-thread
+    /// stack instead of streaming through the N x nc flats. Bit-identical to
+    /// the sweeps (same kernels, same per-node operation order). Engages only
+    /// on the derived-strategy path with dense traversal; otherwise the backend
+    /// keeps the level sweeps. Default on (2.7-3.4x on enumerated trees, and
+    /// the three N x nc flats are gone); `--cpu-traversal level` is the A/B
+    /// escape hatch, DEEPSOLVER_CPU_TRAVERSAL=dfs|level overrides at the CLI.
+    bool cpu_dfs_traversal = true;
+
     /// Sprint 1 (market-beating plan): the host RAM / GPU VRAM / JSON /
     /// strategy-tree budget that gates every large allocation in the solve
     /// pipeline. Defaults are sane (6 GB host, 100 MB JSON, 2000 emitted

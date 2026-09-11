@@ -60,6 +60,7 @@ function parseArgs(argv) {
     dryRun: false,
     resume: false,
     shard: null,             // {k, n}: solve plan indices with i % n == k
+    hostMemoryMb: 0,         // >0: pass --host-memory-mb (bundle machine budget)
     sizings: ['standard', 'lite'],
     stacksBb: ['default'],   // 'default' = use the matchup's defaultStack
     limit: 0,
@@ -82,6 +83,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '--dry-run')        out.dryRun = true;
     else if (a === '--resume')    out.resume = true;
+    else if (a === '--host-memory-mb') out.hostMemoryMb = parseInt(argv[++i], 10);
     else if (a === '--shard') {
       const m = String(argv[++i]).match(/^(\d+)\/(\d+)$/);
       if (!m || Number(m[1]) >= Number(m[2])) throw new Error('--shard expects k/n with k < n');
@@ -243,6 +245,7 @@ function solveOne(exe, spot) {
       '--strategy-tree-max-nodes', String(args.maxTreeNodes),
       '--backend',       (exe === CUDA_EXE) ? 'cuda' : 'cpu',
     ];
+    if (args.hostMemoryMb > 0) cmdArgs.push('--host-memory-mb', String(args.hostMemoryMb));
     const child = spawn(exe, cmdArgs, { windowsHide: true });
     let stdout = '';
     let stderr = '';

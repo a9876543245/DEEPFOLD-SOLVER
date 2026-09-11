@@ -173,6 +173,36 @@ struct Kernels {
                                                 const uint8_t* skip_mask,
                                                 float* out, std::size_t n,
                                                 float win_p);
+    /// Both traversers of one zero-rake signed-count showdown in ONE sweep of
+    /// the int8 matrix (2026-09-11, depth-first terminal path). No skip masks.
+    ///   out_oop[c] = (sum_i S[c][i] * reach_ip[i]) * win_p * inv_w[c]
+    ///   out_ip[i]  = (sum_c S[c][i] * (-reach_oop[c] * win_p)) * inv_w[i]
+    /// Bit-identical to showdown_oop_signed_count_zero_rake(reach_ip, skip_oop)
+    /// followed by showdown_ip_signed_count_zero_rake(reach_oop, skip_ip): every
+    /// row is converted once and feeds both accumulations in the same order the
+    /// single kernels use; skipped rows / lanes are zeroed at the end (all
+    /// three kernels accumulate every lane the same way and zero afterwards).
+    void  (*showdown_dual_signed_count_zero_rake)(const int8_t* signed_count_matrix,
+                                                  const float* reach_oop,
+                                                  const float* reach_ip,
+                                                  const float* inv_weights,
+                                                  const uint8_t* skip_oop,
+                                                  const uint8_t* skip_ip,
+                                                  float* out_oop, float* out_ip,
+                                                  std::size_t n, float win_p);
+    /// Precomputed dense fold terminal over per-canonical card slots
+    /// (2026-09-11, fold_blocker::fold_dense_precomputed). For ci < n:
+    ///   acc = sum over slots s with slot_c0[s][ci] != 52 of
+    ///         ((total - blocked53[c0]) - blocked53[c1]) + opp_reach[ci]
+    ///   out[ci] = self_payoff * (acc / denom[ci])
+    /// Slot arrays are [num_slots][slot_stride] bytes, 52 = empty slot;
+    /// blocked53 has 53 entries with blocked53[52] == 0. Same additions in the
+    /// same order as fold_blocker::combo_value.
+    void  (*fold_dense_slots)(const uint8_t* slot_c0, const uint8_t* slot_c1,
+                              std::size_t slot_stride, std::size_t num_slots,
+                              const float* denom, const float* blocked53,
+                              float total, const float* opp_reach,
+                              float self_payoff, float* out, std::size_t n);
 
     // Active-index variants for root-range sparse terminal output. The
     // active list contains canonical output combos whose root reach is
@@ -492,6 +522,25 @@ inline void showdown_ip_signed_count_zero_rake(
 {
     kernels().showdown_ip_signed_count_zero_rake(
         signed_count_matrix, opp_reach, inv_weights, skip_mask, out, n, win_p);
+}
+inline void fold_dense_slots(
+    const uint8_t* slot_c0, const uint8_t* slot_c1,
+    std::size_t slot_stride, std::size_t num_slots,
+    const float* denom, const float* blocked53, float total,
+    const float* opp_reach, float self_payoff, float* out, std::size_t n)
+{
+    kernels().fold_dense_slots(slot_c0, slot_c1, slot_stride, num_slots, denom,
+                               blocked53, total, opp_reach, self_payoff, out, n);
+}
+inline void showdown_dual_signed_count_zero_rake(
+    const int8_t* signed_count_matrix, const float* reach_oop,
+    const float* reach_ip, const float* inv_weights,
+    const uint8_t* skip_oop, const uint8_t* skip_ip,
+    float* out_oop, float* out_ip, std::size_t n, float win_p)
+{
+    kernels().showdown_dual_signed_count_zero_rake(
+        signed_count_matrix, reach_oop, reach_ip, inv_weights,
+        skip_oop, skip_ip, out_oop, out_ip, n, win_p);
 }
 inline void showdown_oop_full_active(
     const uint8_t* category_matrix, const float* valid_matrix,

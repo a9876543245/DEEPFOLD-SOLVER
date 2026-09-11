@@ -579,17 +579,19 @@ elseif(CASE STREQUAL "peak_host_not_under")
     message(FATAL_ERROR
       "measured peak RSS ${ph_meas} B is implausibly small - telemetry broken?")
   endif()
-  # Prove the mid-loop probe actually fired: it calls finalize(), so host RSS
-  # jumps by a whole strategy copy DURING iterations. Without that jump the run
-  # never paid the cost the estimate charges, and the comparison is decoration.
+  # 2026-09-10: GPU probes are device-side (GpuBackend::finalize_for_probe),
+  # so the mid-loop probe no longer materializes a host strategy copy and the
+  # estimate charges none (Solver::host_probe_copies). Pin that: host RSS must
+  # stay flat across the iterations. A host copy sneaking back in would show up
+  # here as a jump of a whole strategy-sized allocation.
   string(JSON ph_prep GET "${ph_out}" resources measured_rss_after_prepare_bytes)
   string(JSON ph_iter GET "${ph_out}" resources measured_rss_after_iterations_bytes)
-  math(EXPR ph_prep_x2 "${ph_prep} * 2")
-  if(ph_iter LESS ph_prep_x2)
+  math(EXPR ph_prep_x15 "(${ph_prep} * 3) / 2")
+  if(ph_iter GREATER ph_prep_x15)
     message(FATAL_ERROR
-      "the exploitability probe never fired (RSS after prepare ${ph_prep} B, "
-      "after iterations ${ph_iter} B) - raise --iterations until it does, or "
-      "this fixture cannot test the probe's strategy copy")
+      "host RSS grew during the GPU iterations (after prepare ${ph_prep} B, "
+      "after iterations ${ph_iter} B) - the exploitability probe is copying "
+      "the strategy to the host again, which the estimate does not charge")
   endif()
   if(ph_est LESS ph_meas)
     math(EXPR ph_short "(${ph_meas} - ${ph_est}) / 1048576")
@@ -623,9 +625,14 @@ elseif(CASE STREQUAL "cpu_strat_buffer")
   #
   # Red on v2.7.0: there the default solve allocates three arrays too, so
   # standard == default and the GREATER check below fails.
-  set(csb_common --pot 100 --stack 500 --board AsKd7c2h --iterations 3
-                 --exploitability 0 --backend cpu --postsolve none
-                 --no-strategy-tree --no-progress)
+  # 2026-09-11: pinned to the level sweeps. The depth-first traversal (the
+  # default now) drops the three N x nc flats as well, which would swamp the
+  # one-buffer delta this test isolates; the DFS-vs-level delta is pinned
+  # separately below.
+  set(csb_base --pot 100 --stack 500 --board AsKd7c2h --iterations 3
+               --exploitability 0 --backend cpu --postsolve none
+               --no-strategy-tree --no-progress)
+  set(csb_common ${csb_base} --cpu-traversal level)
 
   execute_process(
     COMMAND ${EXE} ${csb_common}
@@ -698,6 +705,102 @@ elseif(CASE STREQUAL "cpu_strat_buffer")
     "cpu_strat_buffer: derived ${derived_state} B, standard ${std_state} B, "
     "locked ${lock_state} B (+${csb_delta} B = the materialized strategy); "
     "estimate == allocation in all three")
+
+  # 2026-09-11 CPU B3: the default (depth-first) solve keeps reach / value
+  # rows on per-thread stacks, so against the level sweeps it must allocate
+  # EXACTLY the three N x lane_stride(nc) float flats less — and its estimate
+  # must still equal its allocation (Solver::cpu_uses_level_flats()).
+  execute_process(
+    COMMAND ${EXE} ${csb_base} --cpu-traversal dfs
+    OUTPUT_VARIABLE dfs_out RESULT_VARIABLE dfs_rc ERROR_VARIABLE dfs_err)
+  if(NOT dfs_rc EQUAL 0)
+    message(FATAL_ERROR "DFS CPU solve failed rc=${dfs_rc}: ${dfs_err}")
+  endif()
+  string(JSON dfs_state GET "${dfs_out}" resources allocated_state_bytes)
+  string(JSON dfs_est   GET "${dfs_out}" resources estimated_cpu_state_bytes)
+  string(JSON dfs_nodes GET "${dfs_out}" timing tree_nodes)
+  string(JSON dfs_live  GET "${dfs_out}" resources live_combos)
+  math(EXPR dfs_stride "((${dfs_live} + 7) / 8) * 8")
+  math(EXPR dfs_flats "3 * ${dfs_nodes} * ${dfs_stride} * 4")
+  math(EXPR dfs_delta "${derived_state} - ${dfs_state}")
+  if(NOT dfs_delta EQUAL dfs_flats)
+    message(FATAL_ERROR
+      "level-vs-DFS CPU state differs by ${dfs_delta} B, expected exactly the "
+      "three level-sweep flats (${dfs_flats} B = 3 x ${dfs_nodes} nodes x "
+      "${dfs_stride} lanes x 4)")
+  endif()
+  if(NOT dfs_est EQUAL dfs_state)
+    message(FATAL_ERROR
+      "DFS-path CPU state estimate ${dfs_est} B != allocation ${dfs_state} B - "
+      "cpu_uses_level_flats() disagrees with the backend")
+  endif()
+  message(STATUS
+    "cpu_strat_buffer: dfs ${dfs_state} B = level ${derived_state} B - "
+    "${dfs_flats} B of flats; estimate == allocation")
+
+elseif(CASE STREQUAL "gpu_iso_terminal_selfcheck")
+  # 2026-09-11: on SignedCount (iso, zero-rake) boards the GPU settles the
+  # full-board showdowns with signed_count_showdown_gemm_kernel and the folds
+  # with iso_fold_terminal_kernel instead of terminal_level_kernel's per-
+  # terminal nc^2 stream (4.6x, then 1.5x, on the 3M-node Td9d6h anchor).
+  # DEEPSOLVER_RB_SELFCHECK runs the dense kernel next to the production pass
+  # on the same reach and reports the max divergence per traverser; only FP
+  # summation order may differ. Two-tone TURN board (three diamonds + a heart:
+  # clubs and spades are interchangeable, so the plan is SignedCount) with
+  # one bet size per street: it enumerates the 44 rivers, so its showdowns
+  # are full-board (a collapsed flop would settle them all on the equity
+  # table and never route here). The routing line proves both kernels
+  # actually engaged.
+  set(ENV{DEEPSOLVER_RB_SELFCHECK} "1")
+  set(ENV{DEEPSOLVER_GPU_TERMINAL_STATS} "1")
+  execute_process(
+    COMMAND ${EXE} --pot 100 --stack 500 --board Td9d6d2h
+            --flop-sizes 0.5 --turn-sizes 0.5 --river-sizes 0.5
+            --iterations 1 --exploitability 0 --backend gpu --postsolve none
+            --no-strategy-tree --no-progress --host-memory-mb 16384
+    OUTPUT_VARIABLE sc_out RESULT_VARIABLE sc_rc ERROR_VARIABLE sc_err)
+  unset(ENV{DEEPSOLVER_RB_SELFCHECK})
+  unset(ENV{DEEPSOLVER_GPU_TERMINAL_STATS})
+  if(NOT sc_rc EQUAL 0)
+    message(FATAL_ERROR "GPU iso self-check run failed rc=${sc_rc}: ${sc_err}")
+  endif()
+  string(REGEX MATCH "plan=([a-z_]+)" _ "${sc_err}")
+  if(NOT CMAKE_MATCH_1 STREQUAL "signed_count")
+    message(FATAL_ERROR
+      "fixture is not a SignedCount board (plan '${CMAKE_MATCH_1}') - the "
+      "two-tone zero-rake flop must route through the signed-count plan")
+  endif()
+  string(REGEX MATCH "signed_count_gemm=([0-9]+)" _ "${sc_err}")
+  set(sc_n "${CMAKE_MATCH_1}")
+  string(REGEX MATCH "rb_folds=([0-9]+)" _ "${sc_err}")
+  set(fold_n "${CMAKE_MATCH_1}")
+  string(REGEX MATCH "plain=([0-9]+)" _ "${sc_err}")
+  set(plain_n "${CMAKE_MATCH_1}")
+  if(NOT sc_n GREATER 0 OR NOT fold_n GREATER 0 OR NOT plain_n EQUAL 0)
+    message(FATAL_ERROR
+      "routing did not engage the new kernels (signed_count_gemm=${sc_n} "
+      "folds=${fold_n} plain=${plain_n}); stderr: ${sc_err}")
+  endif()
+  string(REGEX MATCHALL "max_abs_diff_rel=([0-9.e+-]+)" diffs "${sc_err}")
+  list(LENGTH diffs n_diffs)
+  if(NOT n_diffs EQUAL 2)
+    message(FATAL_ERROR
+      "expected one self-check line per traverser, found ${n_diffs}: ${sc_err}")
+  endif()
+  foreach(d IN LISTS diffs)
+    string(REGEX REPLACE "max_abs_diff_rel=" "" dv "${d}")
+    # Relative to the dense value (floored at one chip). FP summation order
+    # measured 7e-6 on this fixture (nc 686, |v| up to 79k) and 6e-7 on the
+    # 3M-node anchor; a structural bug is O(1).
+    if(dv GREATER 0.0001)
+      message(FATAL_ERROR
+        "GPU production terminal pass diverges from the dense kernel: "
+        "max_abs_diff_rel=${dv} (bound 1e-4); stderr: ${sc_err}")
+    endif()
+  endforeach()
+  message(STATUS
+    "gpu_iso_terminal_selfcheck: signed_count_gemm=${sc_n} folds=${fold_n} "
+    "plain=${plain_n}; ${diffs}")
 
 else()
   message(FATAL_ERROR "unknown CASE: ${CASE}")
