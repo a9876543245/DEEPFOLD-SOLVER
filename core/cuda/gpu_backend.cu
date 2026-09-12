@@ -103,7 +103,7 @@ void launch_update_strategy_sum(
     const uint8_t* d_num_children,
     const uint32_t* d_node_offset,
     uint32_t num_nodes, uint16_t nc,
-    int traverser, float strat_weight, int decay_and_add);
+    int traverser, float strat_weight, int ss_mode);
 
 void launch_showdown_terminal(
     const float* d_matchup_ev, const float* d_matchup_valid,
@@ -2006,7 +2006,7 @@ void GpuBackend::iterate(int iteration) {
     // STANDARD vs POSTFLOP_STYLE — see solver_backend.h for formulas.
     float pos_disc, neg_disc, strat_weight;
     compute_dcfr_factors(iteration, *I.config, pos_disc, neg_disc, strat_weight);
-    bool decay_and_add = dcfr_decay_and_add(*I.config);
+    const int ss_mode = dcfr_strategy_sum_mode(*I.config);
 
     // [diag] DEEPSOLVER_GPU_ITERHASH: per-phase FNV-1a hashes of device state,
     // printed to stderr, for localizing run-to-run divergence between two runs
@@ -2038,6 +2038,10 @@ void GpuBackend::iterate(int iteration) {
     const float* strat_src = I.materialize_strategy
         ? I.state.current_strategy : I.state.regrets;
 
+    // Steps 1-2 as a callable: the alternating schedule (2026-09-12) runs
+    // them again between the two traversers, on the regrets the first
+    // traverser just updated.
+    auto run_forward = [&]() {
     if (I.materialize_strategy) {
         launch_compute_strategy(
             I.state.regrets, I.state.current_strategy,
@@ -2105,6 +2109,8 @@ void GpuBackend::iterate(int iteration) {
                      hash_dev(I.state.reach_scratch_oop, nvspan),
                      hash_dev(I.state.reach_scratch_ip, nvspan));
     }
+    };
+    run_forward();
 
     // 3-5) Backward pass + regret/strategy_sum updates for each traverser.
     // Lambda since Impl is private and can't be accessed from a free function.
@@ -2148,7 +2154,7 @@ void GpuBackend::iterate(int iteration) {
             I.state.strategy_sum, strat_src, strat_src_mode, reach_own,
             I.tree.node_types, I.tree.active_player, I.tree.num_children,
             I.state.node_offset,
-            N, nc, traverser, strat_weight, decay_and_add ? 1 : 0);
+            N, nc, traverser, strat_weight, ss_mode);
     };
 
     // Backward: deepest level → root, BOTH traversers in one grid. Every child
@@ -2163,14 +2169,16 @@ void GpuBackend::iterate(int iteration) {
     // only thing that ever coupled them was sharing one node_values buffer.
     // Measured launch cost: the kernel averages 2.6 µs to RUN and 3.26 µs to
     // ISSUE.
-    auto run_backward_fused = [&]() {
+    // `first` / `count`: which traversers this pass covers (0,2 = both fused
+    // on one grid; t,1 = one traverser, its own value region).
+    auto run_backward = [&](int first, int count) {
         const auto& offsets = I.host_level_offsets;
         const uint32_t num_levels = I.levels.num_levels;
         for (int L = static_cast<int>(num_levels) - 1; L >= 0; --L) {
             uint32_t start = offsets[L];
             uint32_t end   = offsets[L + 1];
-            uint32_t count = end - start;
-            if (count == 0) continue;
+            uint32_t count_nodes = end - start;
+            if (count_nodes == 0) continue;
             const uint32_t* d_level = I.levels.node_order + start;
 
             launch_aggregate_node_values(
@@ -2178,17 +2186,17 @@ void GpuBackend::iterate(int iteration) {
                 I.tree.children_offset, I.tree.children,
                 I.tree.runout_weight,
                 I.state.node_offset, I.state.value_row,
-                d_level, count,
+                d_level, count_nodes,
                 strat_src, strat_src_mode,
-                I.state.node_values,
-                nc, /*traverser=*/0,
+                I.state.node_values + static_cast<size_t>(first) * I.state.value_span,
+                nc, first,
                 // Regret update for THIS level, fused. It used to be one sweep
                 // over all N nodes after the pass, which only worked while
                 // every value row stayed live; the window forces it per level,
                 // and a separate launch per level cost 23% of small-tree
                 // throughput. Fused it is launch-free and re-reads nothing.
                 I.state.regrets, pos_disc, neg_disc,
-                static_cast<int>(memory_budget::kGpuValueRegions),
+                count,
                 I.state.value_span);
         }
     };
@@ -2305,10 +2313,22 @@ void GpuBackend::iterate(int iteration) {
     // regret write, which is the same ordering the serialized version had:
     // traverser 1's update only ever reads its own player's slots, so
     // traverser 0's regret writes never reached it.
-    run_traverser(0);  // OOP prologue
-    run_traverser(1);  // IP prologue
-    run_backward_fused();
-    if (kIterHash) dump_traverser_hashes("fused");
+    if (I.config->alternating_updates) {
+        // 2026-09-12 alternating updates: OOP's terminals + strategy_sum +
+        // backward (regret update), then the forward pass again so IP's
+        // reach and values use OOP's new strategy, then IP's half.
+        run_traverser(0);
+        run_backward(0, 1);
+        run_forward();
+        run_traverser(1);
+        run_backward(1, 1);
+        if (kIterHash) dump_traverser_hashes("alternating");
+    } else {
+        run_traverser(0);  // OOP prologue
+        run_traverser(1);  // IP prologue
+        run_backward(0, static_cast<int>(memory_budget::kGpuValueRegions));
+        if (kIterHash) dump_traverser_hashes("fused");
+    }
 
     // 2026-09-10: no per-iteration device sync. Measured on the collapsed
     // full-menu rainbow, A/B against the synchronizing build with identical

@@ -992,11 +992,18 @@ inline void TrunkDecomposition::cfr(
     if (acting == traverser) {
         float pos, neg, sw; compute_dcfr_factors(iteration, base_cfg_, pos, neg, sw);
         std::vector<float>& acting_reach = (acting == 0) ? roop : rip;
-        if (dcfr_decay_and_add(base_cfg_)) {                 // POSTFLOP: s = s*sw + strat
+        const int ss_mode = dcfr_strategy_sum_mode(base_cfg_);
+        if (ss_mode == 1) {                                  // POSTFLOP: s = s*sw + strat
             for (uint8_t a = 0; a < na; ++a)
                 for (uint16_t c = 0; c < nc_; ++c)
                     strat_sum_[node][a * nc_ + c] =
                         strat_sum_[node][a * nc_ + c] * sw + strat[a * nc_ + c];
+        } else if (ss_mode == 2) {                           // DCFR: s = s*sw + reach*strat
+            for (uint8_t a = 0; a < na; ++a)
+                for (uint16_t c = 0; c < nc_; ++c)
+                    strat_sum_[node][a * nc_ + c] =
+                        strat_sum_[node][a * nc_ + c] * sw
+                        + acting_reach[c] * strat[a * nc_ + c];
         } else {                                             // STANDARD: s += sw*reach*strat
             for (uint8_t a = 0; a < na; ++a)
                 for (uint16_t c = 0; c < nc_; ++c)

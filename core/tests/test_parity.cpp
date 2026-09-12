@@ -601,6 +601,9 @@ static void test_parity_narrow_range_skip() {
         sc.target_exploitability = 0.0f;
         sc.exploitability_check_interval = 1000;
         sc.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
+        // The 60-iteration strict bar below was calibrated under simultaneous
+        // updates; the alternating check at the end of the fixture explains.
+        sc.alternating_updates = false;
 
         // Narrow OOP (33 combos = 2.8% of nc) against a FULL IP range, so the
         // skip mask fires on the bulk of the space and compaction stays inert.
@@ -653,6 +656,45 @@ static void test_parity_narrow_range_skip() {
     auto m_ref = strategy_map(r_ref.global_strategy);
     auto m_lvl = strategy_map(r_lvl.global_strategy);
     assert_strategy_close(m_ref, m_lvl, 0.5f, "narrow range ref vs levelized");
+
+    // Alternating updates (the default since 2026-09-12) cover ground about
+    // twice as fast per iteration, so this fixture's 60-iteration snapshot
+    // lands in the float-noise regime the simultaneous schedule only enters
+    // after ~200 iterations: measured 2026-09-12 on this exact fixture,
+    // ref/lvl AhKh EV 82.17/81.90 at 60 alternating iterations vs 0.01
+    // apart at 60 simultaneous, while both exploitabilities keep tracking
+    // (7.66/7.87% at 60, 0.21/0.20% at 2000). Not a kernel divergence: with alternating the two backends
+    // are bit-identical through iteration 10 and 0.05 chip apart by 20. So
+    // the strict bar above stays pinned to simultaneous, and the alternating
+    // structure of this path (per-player discount + re-materialization
+    // between the halves) is checked against the reference inside that
+    // window.
+    {
+        auto ca = make_cfg();
+        ca.alternating_updates = true;
+        ca.max_iterations = 10;
+        ca.cpu_backend_kind = SolverConfig::CpuBackendKind::REFERENCE;
+        Solver sa(ca);
+        auto ra = sa.solve();
+        auto akh_a = sa.analyze_combo("AhKh");
+
+        auto cb = make_cfg();
+        cb.alternating_updates = true;
+        cb.max_iterations = 10;
+        cb.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
+        Solver sb(cb);
+        auto rb = sb.solve();
+        auto akh_b = sb.analyze_combo("AhKh");
+
+        std::cout << "  narrow range alternating x10  ref ev=" << akh_a.ev
+                  << "  lvl ev=" << akh_b.ev << "\n";
+        assert_near(akh_a.ev, akh_b.ev, 0.05f,
+                    "narrow range (alternating, 10 iters): AhKh EV must match "
+                    "within 0.05 chip");
+        assert_strategy_close(strategy_map(ra.global_strategy),
+                              strategy_map(rb.global_strategy), 0.5f,
+                              "narrow range ref vs levelized (alternating, 10 iters)");
+    }
 }
 
 static void test_parity_medium_sparse_range() {
@@ -685,6 +727,9 @@ static void test_parity_medium_sparse_range() {
         sc.target_exploitability = 0.0f;
         sc.exploitability_check_interval = 1000;
         sc.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
+        // The 60-iteration strict bar below was calibrated under simultaneous
+        // updates; the alternating check at the end of the fixture explains.
+        sc.alternating_updates = false;
 
         // Active-list should fire here, but sparse traversal should not
         // (169 combos = 14.4% of nc, above the 12.5% sparse threshold).
@@ -742,6 +787,45 @@ static void test_parity_medium_sparse_range() {
     auto m_lvl = strategy_map(r_lvl.global_strategy);
     assert_strategy_close(m_ref, m_lvl, 0.5f,
                           "medium sparse ref vs levelized");
+
+    // Alternating updates (the default since 2026-09-12) cover ground about
+    // twice as fast per iteration, so this fixture's 60-iteration snapshot
+    // lands in the float-noise regime the simultaneous schedule only enters
+    // after ~200 iterations: measured 2026-09-12 on this exact fixture,
+    // ref/lvl AhKh EV 0.01 chip apart but root frequencies 0.5pp apart
+    // (exactly the bar) at 60 alternating iterations, while both exploitabilities keep tracking
+    // (2.37/2.27% at 60, 0.06/0.06% at 2000). Not a kernel divergence: with alternating the two backends
+    // are bit-identical through iteration 10 and 0.05 chip apart by 20. So
+    // the strict bar above stays pinned to simultaneous, and the alternating
+    // structure of this path (per-player discount + re-materialization
+    // between the halves) is checked against the reference inside that
+    // window.
+    {
+        auto ca = make_cfg();
+        ca.alternating_updates = true;
+        ca.max_iterations = 10;
+        ca.cpu_backend_kind = SolverConfig::CpuBackendKind::REFERENCE;
+        Solver sa(ca);
+        auto ra = sa.solve();
+        auto akh_a = sa.analyze_combo("AhKh");
+
+        auto cb = make_cfg();
+        cb.alternating_updates = true;
+        cb.max_iterations = 10;
+        cb.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
+        Solver sb(cb);
+        auto rb = sb.solve();
+        auto akh_b = sb.analyze_combo("AhKh");
+
+        std::cout << "  medium sparse alternating x10  ref ev=" << akh_a.ev
+                  << "  lvl ev=" << akh_b.ev << "\n";
+        assert_near(akh_a.ev, akh_b.ev, 0.05f,
+                    "medium sparse (alternating, 10 iters): AhKh EV must match "
+                    "within 0.05 chip");
+        assert_strategy_close(strategy_map(ra.global_strategy),
+                              strategy_map(rb.global_strategy), 0.5f,
+                              "medium sparse ref vs levelized (alternating, 10 iters)");
+    }
 }
 
 // POSTFLOP_STYLE convergence parity. Unlike STANDARD, the postflop schedule

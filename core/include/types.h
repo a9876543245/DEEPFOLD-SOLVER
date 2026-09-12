@@ -311,6 +311,16 @@ struct SolverConfig {
     enum class DcfrSchedule : uint8_t {
         STANDARD = 0,
         POSTFLOP_STYLE = 1,
+        // 2026-09-12 schedule sweep (ROADMAP Next work 1). Every value below
+        // takes POSTFLOP_STYLE's structural path (derived strategy, dense
+        // derivation); they differ only in compute_dcfr_factors() and in the
+        // strategy_sum update mode (dcfr_strategy_sum_mode()).
+        DCFR = 2,              // Brown & Sandholm DCFR(1.5, 0, 2): reach-weighted decayed average
+        POSTFLOP_NORESET = 3,  // POSTFLOP_STYLE without the pow-4 average resets
+        POSTFLOP_REACH = 4,    // POSTFLOP_STYLE with reach weighting in the decay-and-add
+        DCFR_NOREACH = 5,      // DCFR discounts, decay-and-add average without reach
+        LINEAR = 6,            // LCFR: regrets and average all discounted by t/(t+1)
+        CFRPLUS = 7,           // CFR+: regret matching+ (negatives clamped), linear average
     };
     // Default POSTFLOP_STYLE (2026-06-25): converges ~3-4× faster to a given
     // exploitability than STANDARD (flop reaches 0.5% in ~900 iters vs STANDARD
@@ -425,6 +435,16 @@ struct SolverConfig {
     /// the three N x nc flats are gone); `--cpu-traversal level` is the A/B
     /// escape hatch, DEEPSOLVER_CPU_TRAVERSAL=dfs|level overrides at the CLI.
     bool cpu_dfs_traversal = true;
+
+    /// 2026-09-12 (ROADMAP Next work 1): alternating (Gauss-Seidel) regret
+    /// updates — the IP traversal re-derives every strategy after the OOP
+    /// update instead of both traversers reading the iteration-start
+    /// strategies. This is what wasm-postflop does; POSTFLOP_STYLE copied its
+    /// discounts but ran simultaneous updates. Measured on the 3M-node 3bet
+    /// anchor: 0.5% exploitability at iteration 300 instead of 1400, for +34%
+    /// per iteration on the CPU. Every backend implements it; `--cfr-updates
+    /// simultaneous` is the A/B escape hatch.
+    bool alternating_updates = true;
 
     /// Sprint 1 (market-beating plan): the host RAM / GPU VRAM / JSON /
     /// strategy-tree budget that gates every large allocation in the solve

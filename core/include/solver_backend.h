@@ -47,7 +47,58 @@ inline void compute_dcfr_factors(
     int iteration, const SolverConfig& config,
     float& pos_disc, float& neg_disc, float& strat_weight)
 {
-    if (config.dcfr_schedule == SolverConfig::DcfrSchedule::POSTFLOP_STYLE) {
+    using Sched = SolverConfig::DcfrSchedule;
+    const Sched sched = config.dcfr_schedule;
+    // 2026-09-12 sweep variants. `t` is the 0-based iteration index, so the
+    // textbook (t/(t+1)) decays start at 0 on the first iteration (nothing
+    // accumulated yet) exactly like the accumulators they scale.
+    if (sched == Sched::DCFR || sched == Sched::DCFR_NOREACH ||
+        sched == Sched::POSTFLOP_NORESET || sched == Sched::POSTFLOP_REACH ||
+        sched == Sched::LINEAR || sched == Sched::CFRPLUS) {
+        const double t = static_cast<double>(std::max(0, iteration));
+        const double r = t / (t + 1.0);
+        if (sched == Sched::CFRPLUS) {
+            // regret matching+: keep positives, clamp negatives to 0 every
+            // iteration; average with linear weights (decay t/(t+1) = weights
+            // proportional to the iteration index).
+            pos_disc = 1.0f;
+            neg_disc = 0.0f;
+            strat_weight = static_cast<float>(r);
+            return;
+        }
+        if (sched == Sched::LINEAR) {
+            pos_disc = neg_disc = static_cast<float>(r);
+            strat_weight = static_cast<float>(r);
+            return;
+        }
+        // DCFR(alpha 1.5, beta 0): positive regrets by t^1.5/(t^1.5+1),
+        // negative ones by 1/2 — the same regret discount POSTFLOP_STYLE
+        // uses (it counts t from iteration-1; kept here so the two stay
+        // comparable on the same iteration axis).
+        const double t_alpha = static_cast<double>(std::max(0, iteration - 1));
+        const double pow_alpha = t_alpha * std::sqrt(t_alpha);
+        pos_disc = static_cast<float>(pow_alpha / (pow_alpha + 1.0));
+        neg_disc = 0.5f;
+        if (sched == Sched::POSTFLOP_REACH) {
+            // POSTFLOP's epoch-reset weight, applied with reach
+            unsigned tu = static_cast<unsigned>(std::max(0, iteration));
+            unsigned p4 = 0;
+            if (tu > 0) {
+                int hi = 0;
+                for (unsigned x = tu; x > 1; x >>= 1) ++hi;
+                p4 = 1u << (hi & ~1u);
+            }
+            const double tg = static_cast<double>(tu - p4);
+            const double rg = tg / (tg + 1.0);
+            strat_weight = static_cast<float>(rg * rg * rg);
+        } else if (sched == Sched::POSTFLOP_NORESET) {
+            strat_weight = static_cast<float>(r * r * r);   // gamma 3, no resets
+        } else {
+            strat_weight = static_cast<float>(r * r);       // DCFR gamma 2
+        }
+        return;
+    }
+    if (sched == Sched::POSTFLOP_STYLE) {
         double t_alpha = static_cast<double>(std::max(0, iteration - 1));
         double pow_alpha = t_alpha * std::sqrt(t_alpha);
         pos_disc = static_cast<float>(pow_alpha / (pow_alpha + 1.0));
@@ -76,8 +127,32 @@ inline void compute_dcfr_factors(
     }
 }
 
+/// How strategy_sum absorbs this iteration's strategy (every backend):
+///   0  s += w * reach * strat            (STANDARD, accumulative)
+///   1  s  = s * w + strat                 (POSTFLOP_STYLE family, no reach)
+///   2  s  = s * w + reach * strat         (DCFR / LINEAR: decayed, reach-weighted)
+inline int dcfr_strategy_sum_mode(const SolverConfig& config) {
+    using Sched = SolverConfig::DcfrSchedule;
+    switch (config.dcfr_schedule) {
+        case Sched::STANDARD:         return 0;
+        case Sched::POSTFLOP_STYLE:
+        case Sched::POSTFLOP_NORESET:
+        case Sched::DCFR_NOREACH:     return 1;
+        case Sched::DCFR:
+        case Sched::POSTFLOP_REACH:
+        case Sched::LINEAR:
+        case Sched::CFRPLUS:          return 2;
+    }
+    return 0;
+}
 inline bool dcfr_decay_and_add(const SolverConfig& config) {
-    return config.dcfr_schedule == SolverConfig::DcfrSchedule::POSTFLOP_STYLE;
+    return dcfr_strategy_sum_mode(config) == 1;
+}
+/// STANDARD is the only schedule that keeps the materialized current-strategy
+/// buffer on the CPU (compute_strategy()'s block specialization) — every
+/// other schedule takes the derived path.
+inline bool dcfr_materializes_strategy(const SolverConfig& config) {
+    return config.dcfr_schedule == SolverConfig::DcfrSchedule::STANDARD;
 }
 
 // ============================================================================

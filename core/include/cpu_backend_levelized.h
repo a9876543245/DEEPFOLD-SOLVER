@@ -463,7 +463,8 @@ private:
     static constexpr std::size_t kDfsSubtreesPerThread = 32;
     static constexpr uint32_t kNoCutSlot = 0xFFFFFFFFu;
     bool  dfs_enabled_ = false;
-    bool  dfs_decay_and_add_ = false;
+    bool  dfs_alternating_ = false;   // config.alternating_updates under DFS
+    int   dfs_ss_mode_ = 1;   // dcfr_strategy_sum_mode() at prepare
     bool  dfs_zero_scratch_[2] = {false, false};
     bool  dfs_dual_showdown_ = false;   // both traversers route to the signed-count kernel, no skip masks
     float dfs_sw_ = 1.0f;
@@ -950,13 +951,18 @@ private:
     // bandwidth); the kernel call is parallelized across c-slices via
     // OMP so 8 threads share the matrix-row reads.
     void process_showdown_group_oop(const std::vector<uint32_t>& group);
-    void apply_dcfr_discount(int iteration);
+    /// `player` -1 = every decision node; 0/1 = that player's nodes only
+    /// (alternating updates in the materialized shape discount each player
+    /// right before its own backward pass - see iterate()).
+    void apply_dcfr_discount(int iteration, int player = -1);
     void build_level_schedule();
 
     // One forward pass: propagate reach top-down, update strategy_sum.
     // Reach propagation is independent of traverser, so this runs ONCE
     // per iter rather than per-traverser.
-    void forward_pass(int iteration);
+    // `ss_mask`: bit p set = update player p's strategy_sum on this pass
+    // (3 = both; the alternating schedule updates one player per pass).
+    void forward_pass(int iteration, int ss_mask = 3);
 
     // One backward pass for the given traverser. Computes value_[node]
     // bottom-up, updates regrets_[node] at acting == traverser nodes.
@@ -984,6 +990,12 @@ private:
                    float* out_oop, float* out_ip, DfsArena& arena,
                    uint32_t tid, bool trunk);
     void iterate_dfs(int iteration);
+    /// Alternating (Gauss-Seidel) variant: two single-traverser visits per
+    /// iteration, the second one on the strategies the first one updated.
+    void iterate_dfs_alternating(int iteration);
+    void dfs_visit_alt(uint32_t n, int traverser, const float* r_oop,
+                       const float* r_ip, float* out, DfsArena& arena,
+                       uint32_t tid, bool trunk);
     /// Fused both-traverser showdown for the depth-first visit: zero-rake
     /// signed-count terminals without skip masks / active lists. Returns false
     /// when the terminal must go through evaluate_terminal() per traverser.
@@ -1128,7 +1140,7 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     // predicts it exactly — see the member's doc comment for both reasons.
     materialize_strategy_ =
         !ctx.config->node_locks.empty()
-        || ctx.config->dcfr_schedule != SolverConfig::DcfrSchedule::POSTFLOP_STYLE;
+        || dcfr_materializes_strategy(*ctx.config);
 
     regrets_.assign(decision_state_floats, 0.0f);
     strategy_sum_.assign(decision_state_floats, 0.0f);
@@ -1539,7 +1551,7 @@ inline void LevelizedCpuBackend::derive_strategy_row(
     const std::size_t stride = action_stride_;
     const auto& resolved_locks = *ctx_.resolved_locks;
     const bool allow_sparse_strategy =
-        (ctx_.config->dcfr_schedule != SolverConfig::DcfrSchedule::POSTFLOP_STYLE);
+        dcfr_materializes_strategy(*ctx_.config);
     const std::size_t scratch_off =
         static_cast<std::size_t>(tid) * action_stride_;
     float* const pos_sum_scratch = pos_sum_scratch_.data() + scratch_off;
@@ -1720,23 +1732,26 @@ inline void LevelizedCpuBackend::discount_node_regrets(
     }
 }
 
-inline void LevelizedCpuBackend::apply_dcfr_discount(int iteration) {
+inline void LevelizedCpuBackend::apply_dcfr_discount(int iteration, int player) {
     float pos_disc, neg_disc, strat_weight;
     compute_dcfr_factors(iteration, *ctx_.config, pos_disc, neg_disc, strat_weight);
     (void)strat_weight;
+    const auto& active_player = ctx_.tree->active_player;
 
 #if defined(_OPENMP)
     if (cpu_threads_effective_ > 1 && player_nodes_.size() >= 4096) {
         #pragma omp parallel for schedule(static) num_threads(static_cast<int>(cpu_threads_effective_))
         for (int64_t i = 0; i < static_cast<int64_t>(player_nodes_.size()); ++i) {
-            discount_node_regrets(
-                player_nodes_[static_cast<std::size_t>(i)], pos_disc, neg_disc);
+            const uint32_t n = player_nodes_[static_cast<std::size_t>(i)];
+            if (player >= 0 && static_cast<int>(active_player[n]) != player) continue;
+            discount_node_regrets(n, pos_disc, neg_disc);
         }
         return;
     }
 #endif
 
     for (uint32_t n : player_nodes_) {
+        if (player >= 0 && static_cast<int>(active_player[n]) != player) continue;
         discount_node_regrets(n, pos_disc, neg_disc);
     }
 }
@@ -2506,7 +2521,7 @@ inline void LevelizedCpuBackend::process_showdown_group_oop(
 // the children.
 // ============================================================================
 
-inline void LevelizedCpuBackend::forward_pass(int iteration) {
+inline void LevelizedCpuBackend::forward_pass(int iteration, int ss_mask) {
     const auto& tree = *ctx_.tree;
     const uint16_t nc = ctx_.iso->num_canonical;
     const uint32_t N = tree.total_nodes;
@@ -2522,8 +2537,7 @@ inline void LevelizedCpuBackend::forward_pass(int iteration) {
 
     float pos_unused, neg_unused, sw;
     compute_dcfr_factors(iteration, *ctx_.config, pos_unused, neg_unused, sw);
-    const bool decay_and_add = (ctx_.config->dcfr_schedule ==
-                                SolverConfig::DcfrSchedule::POSTFLOP_STYLE);
+    const int ss_mode = dcfr_strategy_sum_mode(*ctx_.config);
 
     // Level 0 contains terminals ??no reach propagation from there. Walk
     // levels root ??leaves (decreasing depth, level 1 inclusive).
@@ -2583,13 +2597,23 @@ inline void LevelizedCpuBackend::forward_pass(int iteration) {
         // once during the shared forward pass is equivalent and saves a
         // pass.
         const float* acting_reach = (acting == 0) ? parent_oop : parent_ip;
-        if (decay_and_add) {
+        if ((ss_mask >> acting) & 1) {
+        if (ss_mode == 1) {
             for (uint8_t a = 0; a < na; ++a) {
                 cpu_simd::vec_decay_add(
                     strategy_sum_ptr(n, a),
                     sw,
                     strat + static_cast<std::size_t>(a) * stride,
                     stride);
+            }
+        } else if (ss_mode == 2) {
+            // s = s * sw + reach * strat (two cache-hot passes)
+            for (uint8_t a = 0; a < na; ++a) {
+                float* ss = strategy_sum_ptr(n, a);
+                cpu_simd::vec_scale_in_place(ss, sw, stride);
+                cpu_simd::vec_reach_weighted_strat_sum(
+                    ss, 1.0f, acting_reach,
+                    strat + static_cast<std::size_t>(a) * stride, stride);
             }
         } else if (use_sparse_traversal_for_player(acting)) {
             for (uint8_t a = 0; a < na; ++a) {
@@ -2612,6 +2636,7 @@ inline void LevelizedCpuBackend::forward_pass(int iteration) {
                     strat + static_cast<std::size_t>(a) * stride,
                     stride);
             }
+        }
         }
 
         // Reach propagation to children.
@@ -3120,8 +3145,39 @@ inline void LevelizedCpuBackend::iterate(int iteration) {
     const double t0 = now();
     if (materialize_strategy_) compute_strategy();
     const double t1 = now();
-    if (materialize_strategy_) apply_dcfr_discount(iteration);
+    // Simultaneous: one discount sweep over both players. Alternating
+    // discounts each player right before its own backward pass (below), so
+    // the strategies re-materialized between the halves come from
+    // UNdiscounted regrets for the player not yet updated - exactly what the
+    // derived shape's fused discount sees. Keeps the two shapes bit-identical
+    // under alternating as well.
+    if (materialize_strategy_ && !ctx_.config->alternating_updates) {
+        apply_dcfr_discount(iteration);
+    }
     const double t2 = now();
+
+    if (ctx_.config->alternating_updates) {
+        // Alternating: the IP half re-derives every strategy after the OOP
+        // regret update, so its reach and values see the new OOP strategy.
+        // The forward pass runs twice (+1 sweep); each run updates one
+        // player's strategy_sum.
+        forward_pass(iteration, /*ss_mask=*/1);
+        const double ta = now();
+        if (materialize_strategy_) apply_dcfr_discount(iteration, /*player=*/0);
+        backward_pass(0, iteration);
+        if (materialize_strategy_) compute_strategy();
+        forward_pass(iteration, /*ss_mask=*/2);
+        const double tb = now();
+        if (materialize_strategy_) apply_dcfr_discount(iteration, /*player=*/1);
+        backward_pass(1, iteration);
+        const double tc = now();
+        phase_compute_strategy_ms_  += (t1 - t0) * 1000.0;
+        phase_apply_discount_ms_    += (t2 - t1) * 1000.0;
+        phase_forward_pass_ms_      += (ta - t2) * 1000.0;
+        phase_backward_pass_oop_ms_ += (tb - ta) * 1000.0;
+        phase_backward_pass_ip_ms_  += (tc - tb) * 1000.0;
+        return;
+    }
 
     // Single forward pass updates reach + strategy_sum for both traversers.
     forward_pass(iteration);
@@ -3221,8 +3277,8 @@ inline void LevelizedCpuBackend::dfs_configure() {
         dfs_trunk_nodes_ = 0;
         return;
     }
-    dfs_decay_and_add_ = (ctx_.config->dcfr_schedule ==
-                          SolverConfig::DcfrSchedule::POSTFLOP_STYLE);
+    dfs_ss_mode_ = dcfr_strategy_sum_mode(*ctx_.config);
+    dfs_alternating_ = ctx_.config->alternating_updates;
     {
         const char* st = std::getenv("DEEPSOLVER_DFS_LIVE_STATS");
         dfs_live_stats_ = (st != nullptr && st[0] == '1');
@@ -3455,8 +3511,12 @@ inline void LevelizedCpuBackend::dfs_visit(
     const float* acting_reach = (acting == 0) ? r_oop : r_ip;
     for (uint8_t a = 0; a < nch; ++a) {
         const float* strat_a = strat + static_cast<std::size_t>(a) * S;
-        if (dfs_decay_and_add_) {
+        if (dfs_ss_mode_ == 1) {
             cpu_simd::vec_decay_add(strategy_sum_ptr(n, a), dfs_sw_, strat_a, S);
+        } else if (dfs_ss_mode_ == 2) {
+            float* ss = strategy_sum_ptr(n, a);
+            cpu_simd::vec_scale_in_place(ss, dfs_sw_, S);
+            cpu_simd::vec_reach_weighted_strat_sum(ss, 1.0f, acting_reach, strat_a, S);
         } else {
             cpu_simd::vec_reach_weighted_strat_sum(
                 strategy_sum_ptr(n, a), dfs_sw_, acting_reach, strat_a, S);
@@ -3502,6 +3562,10 @@ inline void LevelizedCpuBackend::dfs_visit(
 }
 
 inline void LevelizedCpuBackend::iterate_dfs(int iteration) {
+    if (dfs_alternating_) {
+        iterate_dfs_alternating(iteration);
+        return;
+    }
     auto now = []() -> double {
         #if defined(_OPENMP)
         return omp_get_wtime();
@@ -3552,6 +3616,175 @@ inline void LevelizedCpuBackend::iterate_dfs(int iteration) {
     phase_forward_pass_ms_      += (t1 - t0) * 1000.0;
     phase_backward_pass_oop_ms_ += (t2 - t1) * 1000.0;
     phase_backward_pass_ip_ms_  += (t3 - t2) * 1000.0;
+}
+
+
+// ---------------------------------------------------------------------------
+// 2026-09-12 experiment: alternating updates. One traverser per visit; every
+// strategy is derived from the CURRENT regrets, so the IP visit runs on the
+// OOP strategies the OOP visit just updated (reach and values alike). Not
+// comparable bit-for-bit with the simultaneous visit — different algorithm.
+// ---------------------------------------------------------------------------
+inline void LevelizedCpuBackend::dfs_visit_alt(
+    uint32_t n, int traverser, const float* r_oop, const float* r_ip,
+    float* out, DfsArena& arena, uint32_t tid, bool trunk)
+{
+    const auto& tree = *ctx_.tree;
+    const std::size_t S = row_stride_;
+    const auto nt = static_cast<NodeType>(tree.node_types[n]);
+
+    if (nt == NodeType::TERMINAL) {
+        const uint16_t nc = ctx_.iso->num_canonical;
+        if (dfs_zero_scratch_[traverser]) {
+            cpu_simd::vec_set_zero(terminal_scratch_for_thread(static_cast<int>(tid)), nc);
+        }
+        evaluate_terminal(n, traverser, (traverser == 0) ? r_ip : r_oop, out);
+        return;
+    }
+    if (trunk) {
+        const uint32_t slot = dfs_cut_slot_[n];
+        if (slot != kNoCutSlot) {
+            const float* rows = dfs_cut_row(slot);
+            std::memcpy(out, rows + static_cast<std::size_t>(2 + traverser) * S, sizeof(float) * S);
+            return;
+        }
+    }
+    const uint8_t nch = tree.num_children[n];
+    if (nch == 0) {
+        cpu_simd::vec_set_zero(out, S);
+        return;
+    }
+    const uint32_t off = tree.children_offset[n];
+    const std::size_t mark = arena.top;
+
+    if (nt == NodeType::CHANCE) {
+        float* cv = arena.alloc(static_cast<std::size_t>(nch) * S);
+        for (uint8_t k = 0; k < nch; ++k) {
+            dfs_visit_alt(tree.children[off + k], traverser, r_oop, r_ip,
+                          cv + static_cast<std::size_t>(k) * S, arena, tid, trunk);
+        }
+        cpu_simd::vec_set_zero(out, S);
+        uint32_t total_weight = 0;
+        for (uint8_t k = 0; k < nch; ++k) {
+            const uint32_t child = tree.children[off + k];
+            uint32_t weight = (child < tree.runout_weight.size())
+                                ? tree.runout_weight[child] : 1;
+            if (weight == 0) weight = 1;
+            cpu_simd::vec_axpy(out, static_cast<float>(weight),
+                               cv + static_cast<std::size_t>(k) * S, S);
+            total_weight += weight;
+        }
+        if (total_weight > 0) {
+            const float inv = 1.0f / static_cast<float>(
+                chance_runout_denominator(total_weight));
+            cpu_simd::vec_scale_in_place(out, inv, S);
+        }
+        arena.top = mark;
+        return;
+    }
+
+    const int acting = tree.active_player[n];
+    float* strat = arena.alloc(static_cast<std::size_t>(nch) * S);
+    derive_strategy_row(n, strat, tid);
+    const float* acting_reach = (acting == 0) ? r_oop : r_ip;
+    if (acting == traverser) {
+        for (uint8_t a = 0; a < nch; ++a) {
+            const float* strat_a = strat + static_cast<std::size_t>(a) * S;
+            if (dfs_ss_mode_ == 1) {
+                cpu_simd::vec_decay_add(strategy_sum_ptr(n, a), dfs_sw_, strat_a, S);
+            } else if (dfs_ss_mode_ == 2) {
+                float* ss = strategy_sum_ptr(n, a);
+                cpu_simd::vec_scale_in_place(ss, dfs_sw_, S);
+                cpu_simd::vec_reach_weighted_strat_sum(ss, 1.0f, acting_reach, strat_a, S);
+            } else {
+                cpu_simd::vec_reach_weighted_strat_sum(
+                    strategy_sum_ptr(n, a), dfs_sw_, acting_reach, strat_a, S);
+            }
+        }
+    }
+    float* cv = arena.alloc(static_cast<std::size_t>(nch) * S);
+    float* child_reach = arena.alloc(S);
+    for (uint8_t a = 0; a < nch; ++a) {
+        const float* strat_a = strat + static_cast<std::size_t>(a) * S;
+        float* cv_a = cv + static_cast<std::size_t>(a) * S;
+        cpu_simd::vec_mul(child_reach, acting_reach, strat_a, S);
+        if (acting == 0) {
+            dfs_visit_alt(tree.children[off + a], traverser, child_reach, r_ip, cv_a, arena, tid, trunk);
+        } else {
+            dfs_visit_alt(tree.children[off + a], traverser, r_oop, child_reach, cv_a, arena, tid, trunk);
+        }
+    }
+    cpu_simd::vec_set_zero(out, S);
+    if (acting == traverser) {
+        for (uint8_t a = 0; a < nch; ++a) {
+            cpu_simd::vec_fmadd(out, strat + static_cast<std::size_t>(a) * S,
+                                cv + static_cast<std::size_t>(a) * S, S);
+        }
+        discount_node_regrets(n, dfs_pos_disc_, dfs_neg_disc_);
+        for (uint8_t a = 0; a < nch; ++a) {
+            cpu_simd::vec_regret_update(
+                regret_ptr(n, a), cv + static_cast<std::size_t>(a) * S, out, S);
+        }
+    } else {
+        for (uint8_t a = 0; a < nch; ++a) {
+            cpu_simd::vec_add_in_place(out, cv + static_cast<std::size_t>(a) * S, S);
+        }
+    }
+    arena.top = mark;
+}
+
+inline void LevelizedCpuBackend::iterate_dfs_alternating(int iteration) {
+    auto now = []() -> double {
+        #if defined(_OPENMP)
+        return omp_get_wtime();
+        #else
+        return 0.0;
+        #endif
+    };
+    const uint16_t nc = ctx_.iso->num_canonical;
+    const std::size_t S = row_stride_;
+    compute_dcfr_factors(iteration, *ctx_.config, dfs_pos_disc_, dfs_neg_disc_, dfs_sw_);
+
+    float* root = dfs_align64(dfs_root_rows_.data());
+    float* root_oop = root;
+    float* root_ip  = root + S;
+    std::memcpy(root_oop, ctx_.oop_reach->data(), sizeof(float) * nc);
+    std::memcpy(root_ip,  ctx_.ip_reach->data(),  sizeof(float) * nc);
+    if (S > nc) {
+        std::fill(root_oop + nc, root_oop + S, 0.0f);
+        std::fill(root_ip + nc,  root_ip + S,  0.0f);
+    }
+    float* arena_base = dfs_align64(dfs_arena_storage_.data());
+
+    for (int trav = 0; trav < 2; ++trav) {
+        const double t0 = now();
+        DfsArena trunk_arena{arena_base, dfs_arena_floats_, 0};
+        // Cut reach must be recomputed per visit: the OOP visit changed OOP's
+        // strategies, so OOP's reach into every subtree moved.
+        if (!dfs_cut_.empty()) dfs_trunk_forward(0, root_oop, root_ip, trunk_arena);
+        const double t1 = now();
+        if (!dfs_cut_.empty()) {
+            const int64_t ncut = static_cast<int64_t>(dfs_cut_.size());
+            #if defined(_OPENMP)
+            #pragma omp parallel for schedule(dynamic, 1) num_threads(static_cast<int>(cpu_threads_effective_))
+            #endif
+            for (int64_t i = 0; i < ncut; ++i) {
+                const uint32_t tid = scratch_tid();
+                DfsArena arena{arena_base + static_cast<std::size_t>(tid) * dfs_arena_floats_,
+                               dfs_arena_floats_, 0};
+                float* rows = dfs_cut_row(static_cast<uint32_t>(i));
+                dfs_visit_alt(dfs_cut_[static_cast<std::size_t>(i)], trav, rows, rows + S,
+                              rows + static_cast<std::size_t>(2 + trav) * S, arena, tid, false);
+            }
+        }
+        trunk_arena.top = 0;
+        dfs_visit_alt(0, trav, root_oop, root_ip, root + static_cast<std::size_t>(2 + trav) * S,
+                      trunk_arena, 0u, true);
+        const double t2 = now();
+        phase_forward_pass_ms_ += (t1 - t0) * 1000.0;
+        if (trav == 0) phase_backward_pass_oop_ms_ += (t2 - t1) * 1000.0;
+        else           phase_backward_pass_ip_ms_  += (t2 - t1) * 1000.0;
+    }
 }
 
 inline bool LevelizedCpuBackend::evaluate_terminal_dual(

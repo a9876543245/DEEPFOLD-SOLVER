@@ -180,6 +180,7 @@ struct CLIArgs {
     int cpu_persistent_omp = 1;
     int cpu_showdown_batch = 0;
     std::string cpu_traversal = "dfs";
+    std::string cfr_updates = "alternating";
 
     // Sprint 1 (market-beating plan): per-solve memory budget overrides.
     // Default 0 = use the SolverConfig defaults (6 GB host, 100 MB JSON,
@@ -352,6 +353,8 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.cpu_showdown_batch = (v == "1" || v == "true" || v == "True") ? 1 : 0;
         } else if (arg == "--cpu-traversal" && i + 1 < argc) {
             args.cpu_traversal = argv[++i];
+        } else if (arg == "--cfr-updates" && i + 1 < argc) {
+            args.cfr_updates = argv[++i];
         } else if (arg == "--include-scalar") {
             args.include_scalar = 1;
         } else if (arg == "--benchmark-case" && i + 1 < argc) {
@@ -464,6 +467,13 @@ Arguments:
                            sweeps, 2.7-3.4x faster on enumerated trees, no
                            N x nc flats); level = the three level sweeps.
                            DEEPSOLVER_CPU_TRAVERSAL=dfs|level overrides.
+  --cfr-updates <alternating|simultaneous>
+                           alternating (default): the IP traversal runs on the
+                           strategies the OOP update just produced (Gauss-
+                           Seidel) - ~4.7x fewer iterations to 0.5% on the 3bet
+                           anchor; simultaneous: both traversers read the
+                           iteration-start strategies (pre-3.2 behaviour).
+                           DEEPSOLVER_CFR_UPDATES overrides.
   --help, -h               Show this help message
 
 Output:
@@ -1748,6 +1758,19 @@ int main(int argc, char* argv[]) {
                 config.cpu_dfs_traversal = (e == "dfs" || e == "1");
             }
         }
+        {
+            std::string upd = args.cfr_updates;
+            for (char& ch : upd)
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (upd != "alternating" && upd != "simultaneous") {
+                throw std::invalid_argument("Invalid --cfr-updates value: " + args.cfr_updates);
+            }
+            config.alternating_updates = (upd == "alternating");
+            if (const char* env = std::getenv("DEEPSOLVER_CFR_UPDATES");
+                env != nullptr && env[0] != '\0') {
+                config.alternating_updates = (std::string(env) == "alternating");
+            }
+        }
 
         // v1.4.0 Phase 2: apply --cpu-simd policy. set_policy() is idempotent
         // and re-resolves the kernel table on next call to kernels(). Done
@@ -1770,8 +1793,22 @@ int main(int argc, char* argv[]) {
             for (char& ch : sched) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
             if (sched == "postflop" || sched == "postflop_style" || sched == "wasm") {
                 config.dcfr_schedule = SolverConfig::DcfrSchedule::POSTFLOP_STYLE;
-            } else {
+            } else if (sched == "standard") {
                 config.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
+            } else if (sched == "dcfr") {
+                config.dcfr_schedule = SolverConfig::DcfrSchedule::DCFR;
+            } else if (sched == "postflop_noreset") {
+                config.dcfr_schedule = SolverConfig::DcfrSchedule::POSTFLOP_NORESET;
+            } else if (sched == "postflop_reach") {
+                config.dcfr_schedule = SolverConfig::DcfrSchedule::POSTFLOP_REACH;
+            } else if (sched == "dcfr_noreach") {
+                config.dcfr_schedule = SolverConfig::DcfrSchedule::DCFR_NOREACH;
+            } else if (sched == "linear") {
+                config.dcfr_schedule = SolverConfig::DcfrSchedule::LINEAR;
+            } else if (sched == "cfrplus" || sched == "cfr+") {
+                config.dcfr_schedule = SolverConfig::DcfrSchedule::CFRPLUS;
+            } else {
+                throw std::invalid_argument("Invalid --dcfr-schedule value: " + args.dcfr_schedule);
             }
         }
         config.rake_rate = args.rake_rate;

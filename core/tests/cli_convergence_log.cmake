@@ -32,7 +32,10 @@ set(COMMON_ARGS
   --backend cpu --postsolve exploitability
   --no-strategy-tree --no-progress)
 
-set(INTERVAL 100)
+# 2026-09-12: alternating updates reach 0.5% on this fixture at ~150-200
+# iterations (was ~700), so a 100-iteration cadence left only 2 probes; 25
+# gives 6 before the target and still pins the cadence.
+set(INTERVAL 25)
 
 # ---- 1 + 2: the instrumented run -------------------------------------------
 execute_process(

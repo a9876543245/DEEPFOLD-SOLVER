@@ -461,7 +461,7 @@ __global__ void update_strategy_sum_kernel(
     uint16_t num_canonical,
     int traverser,
     float strat_weight,    // STANDARD: ((t+1)/(t+2))^gamma; POSTFLOP: (t'/(t'+1))^3
-    int decay_and_add)     // 0 = standard accumulative; 1 = postflop decay-and-add
+    int ss_mode)           // dcfr_strategy_sum_mode: 0 accumulate, 1 decay-add, 2 decay-add with reach
 {
     // 64-bit launch index — see compute_strategy_kernel.
     const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -489,7 +489,15 @@ __global__ void update_strategy_sum_kernel(
     // was a snapshot taken at the top of the iteration.
     StrategyRow<SRC> strat(strat_src, base, stride, na);
 
-    if (decay_and_add) {
+    if (ss_mode == 2) {
+        // DCFR / LINEAR: strategy_sum = strategy_sum * w + reach * current_strategy
+        float reach = reach_own[static_cast<size_t>(node) * num_canonical + combo];
+        for (int a = 0; a < na; ++a) {
+            float s = strat(a);
+            float old = strategy_sum[base + a * stride];
+            strategy_sum[base + a * stride] = old * strat_weight + reach * s;
+        }
+    } else if (ss_mode == 1) {
         // POSTFLOP: strategy_sum = strategy_sum * gamma_t + current_strategy
         // No reach weighting (matches postflop-solver). Epoch-reset gamma_t
         // (passed in as strat_weight) makes this an "average over recent
@@ -647,7 +655,7 @@ void launch_update_strategy_sum(
     const uint8_t* d_num_children,
     const uint32_t* d_node_offset,
     uint32_t num_nodes, uint16_t nc,
-    int traverser, float strat_weight, int decay_and_add)
+    int traverser, float strat_weight, int ss_mode)
 {
     const size_t total = static_cast<size_t>(num_nodes) * nc;
     const int grid = static_cast<int>(
@@ -657,7 +665,7 @@ void launch_update_strategy_sum(
         d_strategy_sum, d_strat_src, d_reach_own,                            \
         d_node_types, d_active_player, d_num_children, d_node_offset,        \
         num_nodes, nc,                                                       \
-        traverser, strat_weight, decay_and_add)
+        traverser, strat_weight, ss_mode)
     DEEPSOLVER_DISPATCH_STRAT_SRC(strat_src_mode, DEEPSOLVER_LAUNCH_SUM);
 #undef DEEPSOLVER_LAUNCH_SUM
 }

@@ -305,7 +305,10 @@ private:
 
     // ---- Internal methods ----
     void compute_strategy();
-    void apply_dcfr_discount(int iteration);
+    /// `player` -1 = every decision node; 0/1 = that player's nodes only
+    /// (alternating updates discount each player right before its own
+    /// traversal, after the other player's strategy was re-materialized).
+    void apply_dcfr_discount(int iteration, int player = -1);
     void cfr_traverse(uint32_t node_idx, int traverser, int iteration,
                       float* reach_oop, float* reach_ip, float* out_vals,
                       ScratchArena& arena);
@@ -558,7 +561,7 @@ inline void CpuBackend::compute_strategy() {
 // DCFR discount: r *= (r > 0) ? pos_disc : neg_disc, applied to all regrets
 // ============================================================================
 
-inline void CpuBackend::apply_dcfr_discount(int iteration) {
+inline void CpuBackend::apply_dcfr_discount(int iteration, int player) {
     float pos_disc, neg_disc, strat_weight;
     compute_dcfr_factors(iteration, *ctx_.config, pos_disc, neg_disc, strat_weight);
     (void)strat_weight;  // applied separately in cfr_traverse
@@ -567,6 +570,7 @@ inline void CpuBackend::apply_dcfr_discount(int iteration) {
     for (uint32_t n = 0; n < ctx_.tree->total_nodes; ++n) {
         auto nt = static_cast<NodeType>(ctx_.tree->node_types[n]);
         if (nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) continue;
+        if (player >= 0 && ctx_.tree->active_player[n] != player) continue;
         uint8_t na = ctx_.tree->num_children[n];
         std::size_t total = static_cast<std::size_t>(na) * nc;
         cpu_simd::vec_dcfr_discount(regrets_[n].data(), pos_disc, neg_disc, total);
@@ -1023,8 +1027,8 @@ inline void CpuBackend::cfr_traverse(
         float pos_unused, neg_unused, sw;
         compute_dcfr_factors(iteration, *ctx_.config, pos_unused, neg_unused, sw);
 
-        if (ctx_.config->dcfr_schedule ==
-            SolverConfig::DcfrSchedule::POSTFLOP_STYLE) {
+        const int ss_mode = dcfr_strategy_sum_mode(*ctx_.config);
+        if (ss_mode == 1) {
             // s = s * sw + strat
             for (uint8_t a = 0; a < na; ++a) {
                 cpu_simd::vec_decay_add(
@@ -1032,6 +1036,15 @@ inline void CpuBackend::cfr_traverse(
                     sw,
                     strat.data() + static_cast<std::size_t>(a) * nc,
                     nc);
+            }
+        } else if (ss_mode == 2) {
+            // s = s * sw + reach * strat
+            for (uint8_t a = 0; a < na; ++a) {
+                float* ss = strategy_sum_[node_idx].data() + static_cast<std::size_t>(a) * nc;
+                cpu_simd::vec_scale_in_place(ss, sw, nc);
+                cpu_simd::vec_reach_weighted_strat_sum(
+                    ss, 1.0f, acting_reach,
+                    strat.data() + static_cast<std::size_t>(a) * nc, nc);
             }
         } else {
             // s += sw * acting_reach * strat
@@ -1111,7 +1124,12 @@ inline void CpuBackend::cfr_traverse(
 
 inline void CpuBackend::iterate(int iteration) {
     compute_strategy();
-    apply_dcfr_discount(iteration);
+    // Simultaneous: one discount sweep over both players. Alternating
+    // discounts each player right before its own traversal (below), so the
+    // strategies materialized between the halves come from UNdiscounted
+    // regrets for the player not yet updated - the same regrets the
+    // levelized paths derive from, which keeps the two backends bit-consistent.
+    if (!ctx_.config->alternating_updates) apply_dcfr_discount(iteration);
 
     // Reset arenas for this iter (capacity reserved in prepare()).
     arena_oop_.reset_for_iter();
@@ -1132,6 +1150,21 @@ inline void CpuBackend::iterate(int iteration) {
     //   1            → serial (used for benchmarking / parity testing)
     const uint32_t cfg_threads = ctx_.config->cpu_threads;
     const bool run_parallel = (cfg_threads != 1);
+
+    if (ctx_.config->alternating_updates) {
+        // Alternating: serial by construction — the IP traversal reads the
+        // strategies re-materialized from OOP's just-updated regrets.
+        apply_dcfr_discount(iteration, /*player=*/0);
+        cfr_traverse(0, /*traverser=*/0, iteration,
+                     reach_oop_thread0_.data(), reach_ip_thread0_.data(),
+                     root_out_thread0_.data(), arena_oop_);
+        compute_strategy();
+        apply_dcfr_discount(iteration, /*player=*/1);
+        cfr_traverse(0, /*traverser=*/1, iteration,
+                     reach_oop_thread1_.data(), reach_ip_thread1_.data(),
+                     root_out_thread1_.data(), arena_ip_);
+        return;
+    }
 
 #if defined(_OPENMP)
     if (run_parallel) {

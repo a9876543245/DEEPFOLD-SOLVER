@@ -875,7 +875,7 @@ private:
             return true;
         }
         return !config_.node_locks.empty()
-            || config_.dcfr_schedule != SolverConfig::DcfrSchedule::POSTFLOP_STYLE;
+            || dcfr_materializes_strategy(config_);
     }
 
     /// Does the CPU backend allocate the three N x nc level-sweep flats
