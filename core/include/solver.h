@@ -39,6 +39,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <functional>
 #include <future>
 #include <iomanip>
@@ -897,6 +898,23 @@ private:
         }
         return !(config_.cpu_dfs_traversal && !cpu_materializes_strategy());
     }
+
+    /// 2026-09-24 ETA: the GPU iteration model's inputs, read off `tree_`
+    /// (memory_budget.h::GpuIterationShape). One O(N) walk; only GPU
+    /// estimates call it.
+    GpuIterationShape gpu_iteration_shape(const TerminalRepresentationPlan& plan) const;
+    /// 2026-09-24 ETA: the CPU iteration model's inputs
+    /// (memory_budget.h::CpuIterationShape) — the tree's per-iteration work
+    /// and the routes the CPU backend takes through it. Two O(N) walks.
+    CpuIterationShape cpu_iteration_shape(const std::string& backend_label_lc,
+                                          uint32_t cpu_threads_effective) const;
+    /// Seconds per CFR iteration on the named backend. solve()'s resources
+    /// block and estimate_only() both price through here, so the preview and
+    /// the solve cannot disagree about the same tree.
+    double estimated_iteration_seconds(const std::string& backend_label_lc,
+                                       int cuda_compute_capability,
+                                       uint32_t cpu_threads_effective,
+                                       const TerminalRepresentationPlan& plan) const;
 
     /// Same accounting as host_matchup_bytes() but for a PREDICTED table
     /// count / materialization decision (estimate_only, which never runs
@@ -2175,11 +2193,12 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         // pre-backend gate. Empty string means no fallback happened.
         r.fallback_reason = fallback_reason;
 
-        // v1.2.2: pre-iteration ETA. Computed from player_nodes × actions ×
-        // nc² ops per iter, divided by a backend-throughput table. Goal is
-        // distinguishing "30 seconds" from "30 minutes" — that's the
-        // wait-cliff users actually need warned about. Detail comments live
-        // in memory_budget.h beside the formulas.
+        // v1.2.2: pre-iteration ETA — seconds per iteration × the iteration
+        // cap (CPU and GPU: the measured 2026-09-24 models; ops_per_iteration
+        // stays the v1.7.1 nc² count the Exact estimator prices). Goal is distinguishing
+        // "30 seconds" from "30 minutes" — that's the wait-cliff users
+        // actually need warned about. Detail comments live in
+        // memory_budget.h beside the formulas.
         r.ops_per_iteration = ops_per_solve_iteration(
             player_nodes, MAX_ACTIONS, iso_.num_canonical);
         std::string backend_label;
@@ -2195,9 +2214,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
                        ? cuda_compute_capability() : 0;
 
         // v1.7.1: resolve cpu_threads_effective BEFORE the ETA estimate so
-        // the throughput model can take it into account. Without this,
-        // estimate_solve_seconds() defaults to hardware_concurrency() and
-        // mis-estimates --cpu-threads N solves.
+        // the CPU model prices the team that actually runs (--cpu-threads N).
         uint32_t cpu_eff = 0u;
         if (selected_backend != BackendType::GPU) {
             cpu_eff = (backend_ != nullptr) ? backend_->cpu_threads_effective() : 0u;
@@ -2210,9 +2227,11 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             }
         }
 
-        r.estimated_solve_seconds = estimate_solve_seconds(
-            player_nodes, MAX_ACTIONS, iso_.num_canonical,
-            config_.max_iterations, backend_label_lc, cc, cpu_eff);
+        const double iteration_s = estimated_iteration_seconds(
+            backend_label_lc, cc, cpu_eff, terminal_plan_);
+        r.estimated_iteration_ms  = iteration_s * 1000.0;
+        r.estimated_solve_seconds =
+            estimate_solve_seconds(iteration_s, config_.max_iterations);
 
         // v1.4.0 Phase 2: CPU mode diagnostics. Empty / 0 on GPU solves so
         // the UI can suppress the CPU-only label there.
@@ -2227,6 +2246,181 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         result.resources = std::move(r);
     }
     return result;
+}
+
+inline GpuIterationShape Solver::gpu_iteration_shape(
+    const TerminalRepresentationPlan& plan) const
+{
+    GpuIterationShape s;
+    s.nodes = tree_.total_nodes;
+    s.lanes = iso_.num_canonical;
+    if (tree_.total_nodes == 0) return s;
+    const bool dense =
+        plan.representation == TerminalRepresentation::DenseCategoryValid;
+    // Depth-first from the root, carrying the depth (the GPU launches once
+    // per depth level) and the cards dealt so far: the dense kernel takes the
+    // folds and the COMPLETE-board showdowns, while a showdown short of the
+    // river settles in the equity GEMM — the same board-signature rule
+    // precompute_matchups() uses.
+    struct Visit { uint32_t node; uint32_t depth; uint32_t dealt; };
+    std::vector<Visit> stack;
+    stack.push_back({0u, 0u, 0u});
+    while (!stack.empty()) {
+        const Visit v = stack.back();
+        stack.pop_back();
+        s.depth = std::max(s.depth, v.depth);
+        if (static_cast<NodeType>(tree_.node_types[v.node]) == NodeType::TERMINAL) {
+            if (dense &&
+                (static_cast<TerminalType>(tree_.terminal_types[v.node]) !=
+                     TerminalType::SHOWDOWN ||
+                 config_.board_size + v.dealt >= 5)) {
+                ++s.dense_terminal_rows;
+            }
+            continue;
+        }
+        const uint32_t off = tree_.children_offset[v.node];
+        for (uint32_t k = 0; k < tree_.num_children[v.node]; ++k) {
+            const uint32_t c = tree_.children[off + k];
+            const bool dealt_here =
+                c < tree_.dealt_card.size() && tree_.dealt_card[c] != 0xFFu;
+            stack.push_back({c, v.depth + 1u, v.dealt + (dealt_here ? 1u : 0u)});
+        }
+    }
+    if (dense) {
+        // Each traverser walks the OPPONENT's live list (upload_reach).
+        for (uint32_t c = 0; c < iso_.num_canonical; ++c) {
+            if (c < oop_reach_.size() && oop_reach_[c] > 0.0f) ++s.dense_opponent_lanes;
+            if (c < ip_reach_.size()  && ip_reach_[c]  > 0.0f) ++s.dense_opponent_lanes;
+        }
+    }
+    return s;
+}
+
+inline CpuIterationShape Solver::cpu_iteration_shape(
+    const std::string& backend_label_lc, uint32_t cpu_threads_effective) const
+{
+    CpuIterationShape s;
+    s.nodes = tree_.total_nodes;
+    s.lanes = iso_.num_canonical;
+    s.threads = std::max(1u, cpu_threads_effective);
+    // LevelizedCpuBackend::prepare()'s showdown route.
+    const bool zero_rake = config_.rake_rate == 0.0f && config_.rake_cap == 0.0f;
+    s.rank_blocker = showdown_rank_blocker::supports_singleton_iso(iso_) || !zero_rake
+        || iso_.num_canonical >= kCpuRankBlockerIsoMinCanonical;
+    s.level_sweeps = cpu_uses_level_flats();
+    s.materialized = cpu_materializes_strategy();
+    s.reference = backend_label_lc.find("levelized") == std::string::npos;
+    s.scalar = backend_label_lc.find("avx2") == std::string::npos;
+    uint64_t live_oop = 0, live_ip = 0;
+    for (uint32_t c = 0; c < iso_.num_canonical; ++c) {
+        if (c < oop_reach_.size() && oop_reach_[c] > 0.0f) ++live_oop;
+        if (c < ip_reach_.size()  && ip_reach_[c]  > 0.0f) ++live_ip;
+        if (c < iso_.canonical_to_originals.size()) {
+            s.originals += iso_.canonical_to_originals[c].size();
+        }
+    }
+    // evaluate_terminal()'s dot-product rows: OOP skips its dead lanes (or
+    // walks its active list); IP runs every lane unless its active list
+    // engages; the equity route skips only without an active list.
+    const bool oop_active = terminal_active_list_engaged(iso_.num_canonical, oop_reach_);
+    const bool ip_active  = terminal_active_list_engaged(iso_.num_canonical, ip_reach_);
+    s.board_dot_rows  = live_oop + (ip_active ? live_ip : s.lanes);
+    s.equity_dot_rows = (oop_active ? s.lanes : live_oop) + s.lanes;
+    const uint32_t N = tree_.total_nodes;
+    if (N == 0) return s;
+    // Pre-order from the root carrying the cards dealt so far: a showdown
+    // short of the river settles on an equity table (the rule
+    // precompute_matchups() and gpu_iteration_shape() use).
+    struct Visit { uint32_t node; uint32_t dealt; };
+    std::vector<Visit> stack;
+    std::vector<uint32_t> order;
+    order.reserve(N);
+    stack.push_back({0u, 0u});
+    while (!stack.empty()) {
+        const Visit v = stack.back();
+        stack.pop_back();
+        order.push_back(v.node);
+        const auto nt = static_cast<NodeType>(tree_.node_types[v.node]);
+        if (nt == NodeType::TERMINAL) {
+            if (static_cast<TerminalType>(tree_.terminal_types[v.node]) !=
+                TerminalType::SHOWDOWN) {
+                ++s.folds;
+            } else if (config_.board_size + v.dealt >= 5) {
+                ++s.board_showdowns;
+            } else {
+                ++s.equity_showdowns;
+            }
+            continue;
+        }
+        const uint32_t nch = tree_.num_children[v.node];
+        if (nt != NodeType::CHANCE) s.action_slots += nch;
+        const uint32_t off = tree_.children_offset[v.node];
+        for (uint32_t k = 0; k < nch; ++k) {
+            const uint32_t c = tree_.children[off + k];
+            const bool dealt_here =
+                c < tree_.dealt_card.size() && tree_.dealt_card[c] != 0xFFu;
+            stack.push_back({c, v.dealt + (dealt_here ? 1u : 0u)});
+        }
+    }
+    if (s.threads > 1) {
+        // LevelizedCpuBackend::dfs_configure()'s cut: descend from the root
+        // while a subtree holds more than N / (32 x threads) nodes; those
+        // trunk nodes run on one thread, everything below them in parallel.
+        std::vector<uint32_t> sub(N, 1u);
+        for (auto it = order.rbegin(); it != order.rend(); ++it) {
+            const uint32_t n = *it;
+            if (static_cast<NodeType>(tree_.node_types[n]) == NodeType::TERMINAL) continue;
+            const uint32_t off = tree_.children_offset[n];
+            for (uint32_t k = 0; k < tree_.num_children[n]; ++k) {
+                sub[n] += sub[tree_.children[off + k]];
+            }
+        }
+        const uint32_t target = std::max<uint32_t>(1u, N / (32u * s.threads));
+        stack.push_back({0u, 0u});
+        while (!stack.empty()) {
+            const Visit v = stack.back();
+            stack.pop_back();
+            const auto nt = static_cast<NodeType>(tree_.node_types[v.node]);
+            const uint32_t nch = tree_.num_children[v.node];
+            if (nt == NodeType::TERMINAL || nch == 0 || sub[v.node] <= target) continue;
+            if (nt != NodeType::CHANCE) s.trunk_slots += nch;
+            const uint32_t off = tree_.children_offset[v.node];
+            for (uint32_t k = 0; k < nch; ++k) {
+                stack.push_back({tree_.children[off + k], 0u});
+            }
+        }
+    }
+    // The model's inputs, for recalibrating its constants on another machine
+    // (ROADMAP "ETA recalibration", CPU).
+    if (std::getenv("DEEPSOLVER_ETA_DEBUG")) {
+        std::fprintf(stderr,
+            "[eta-cpu] nodes=%llu slots=%llu folds=%llu board_sd=%llu equity_sd=%llu "
+            "lanes=%llu originals=%llu board_rows=%llu equity_rows=%llu "
+            "threads=%u trunk_slots=%llu rank_blocker=%d level=%d materialized=%d "
+            "reference=%d scalar=%d\n",
+            (unsigned long long)s.nodes, (unsigned long long)s.action_slots,
+            (unsigned long long)s.folds, (unsigned long long)s.board_showdowns,
+            (unsigned long long)s.equity_showdowns, (unsigned long long)s.lanes,
+            (unsigned long long)s.originals, (unsigned long long)s.board_dot_rows,
+            (unsigned long long)s.equity_dot_rows, s.threads,
+            (unsigned long long)s.trunk_slots, s.rank_blocker ? 1 : 0,
+            s.level_sweeps ? 1 : 0, s.materialized ? 1 : 0, s.reference ? 1 : 0,
+            s.scalar ? 1 : 0);
+    }
+    return s;
+}
+
+inline double Solver::estimated_iteration_seconds(
+    const std::string& backend_label_lc,
+    int cuda_compute_capability, uint32_t cpu_threads_effective,
+    const TerminalRepresentationPlan& plan) const
+{
+    if (backend_label_lc.rfind("cuda", 0) == 0) {
+        return estimate_gpu_iteration_seconds(gpu_iteration_shape(plan),
+                                              cuda_compute_capability);
+    }
+    return estimate_cpu_iteration_seconds(
+        cpu_iteration_shape(backend_label_lc, cpu_threads_effective));
 }
 
 // ============================================================================
@@ -2244,10 +2438,9 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
 // the order of magnitude of the byte estimate, which is what the UI cares
 // about for the "X MB host" banner.
 //
-// Time estimate: same `estimate_solve_seconds()` helper as the post-solve
-// path uses — backend-throughput table calibrated against `--benchmark
-// standard`. Picks the GPU rate when AUTO would select GPU (so the user
-// sees the right number BEFORE backend allocation).
+// Time estimate: same estimated_iteration_seconds() the post-solve path
+// uses (memory_budget.h models). Picks the GPU model when AUTO would select
+// GPU (so the user sees the right number BEFORE backend allocation).
 inline SolveResources Solver::estimate_only() {
     iso_ = compute_isomorphism(config_.board.data(), config_.board_size,
                                &iso_constraints());
@@ -2542,8 +2735,11 @@ inline SolveResources Solver::estimate_only() {
     }
 
     r.ops_per_iteration = ops_per_solve_iteration(player_nodes, MAX_ACTIONS, nc);
-    r.estimated_solve_seconds = estimate_solve_seconds(
-        player_nodes, MAX_ACTIONS, nc, config_.max_iterations, lc, cc, cpu_eff);
+    const double iteration_s =
+        estimated_iteration_seconds(lc, cc, cpu_eff, est_plan);
+    r.estimated_iteration_ms  = iteration_s * 1000.0;
+    r.estimated_solve_seconds =
+        estimate_solve_seconds(iteration_s, config_.max_iterations);
 
     // v1.4.0 Phase 2: same CPU mode diagnostics on the estimate-only path.
     if (predicted_backend != BackendType::GPU) {

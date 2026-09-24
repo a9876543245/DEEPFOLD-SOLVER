@@ -29,7 +29,24 @@
     "number it carries is the progress signal, not its pass/fail.",
     "mono_full_menu_gpu is the GATE: the same spot actually routed to CUDA. It",
     "carries known_gap so it reports red without failing the run — being red",
-    "today is the point (ROADMAP §5 rule 2), and it turns green when B3 lands."
+    "today is the point (ROADMAP §5 rule 2), and it turns green when B3 lands.",
+    "2026-09-24: the `eta` family measures the pre-solve ETA against the clock.",
+    "Every throughput row now records est_iter_ms (resources.estimated_iteration_ms)",
+    "next to the measured iter_ms_median, so any run prints how far the ETA is",
+    "off. The eta fixtures span enumerated GPU trees from 33k to 5M nodes on all",
+    "three terminal plans (rank_blocker_only, signed_count, and the raked",
+    "dense_category_valid path), plus the Td9d6h 3bet anchor on the CPU. The",
+    "anchor ranges are the ROADMAP §0-pre ones (scripts/footprint-breakdown.mjs).",
+    "eta_turn_cpu8 / eta_river_cpu8 (with std_cpu8, the collapsed flop) are the",
+    "small trees where the depth-first trunk is most of the tree at 8 threads —",
+    "until 2026-09-24 the serial trunk visit re-evaluated every terminal child",
+    "of a trunk node (the river ran slower at 8 threads than at 1).",
+    "The CPU rows of the eta family (2026-09-24, the CPU model): 1 and 8",
+    "threads; rank-blocker river / turn / enumerated flop, singleton and iso",
+    "(the >= 512-lane crossover or rake); signed-count and equity dot products;",
+    "full vs 3bet ranges; the collapsed Fast-mode flop; a node-locked turn",
+    "(materialized level sweeps). eta_turn_cpu1 / eta_turn_cpu8 are the",
+    "CliCpuEtaWithin2x fixture."
   ],
   "fixtures": [
     {
@@ -164,6 +181,236 @@
                "--flop-sizes", "0.33,0.75", "--turn-sizes", "0.33,0.75",
                "--river-sizes", "0.33,0.75", "--backend", "gpu", "--host-memory-mb",
                "200000", "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_turn_menu_gpu",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKd7c2h",
+               "--flop-sizes", "0.33,0.75", "--turn-sizes", "0.33,0.75",
+               "--river-sizes", "0.33,0.75",
+               "--iterations", "100", "--exploitability", "0",
+               "--backend", "gpu", "--postsolve", "none",
+               "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_paired_gpu",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsAd7c",
+               "--iterations", "20", "--exploitability", "0",
+               "--backend", "gpu", "--gpu-memory-mb", "24000", "--host-memory-mb", "32000",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_mono_menu_gpu",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKsQs",
+               "--flop-sizes", "0.33,0.75", "--turn-sizes", "0.33,0.75",
+               "--river-sizes", "0.33,0.75",
+               "--iterations", "20", "--exploitability", "0",
+               "--backend", "gpu", "--postsolve", "none",
+               "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_anchor_gpu",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "args": ["--pot", "200", "--stack", "900", "--board", "Td9d6h",
+               "--flop-sizes", "0.33,0.75", "--turn-sizes", "0.33,0.75",
+               "--river-sizes", "0.33,0.75",
+               "--oop-range", "AA:1,KK:1,QQ:1,JJ:1,TT:0.5,99:0.3,88:0.2,77:0.2,66:0.2,55:0.2,AKs:1,AQs:1,AJs:1,ATs:0.7,A5s:1,A4s:1,A3s:0.6,A2s:0.4,KQs:1,KJs:0.8,KTs:0.5,QJs:0.6,QTs:0.4,JTs:0.6,T9s:0.3,98s:0.3,AKo:1,AQo:0.8,AJo:0.4,KQo:0.4",
+               "--ip-range", "QQ:0.5,JJ:1,TT:1,99:1,88:1,77:1,66:0.8,55:0.6,44:0.4,33:0.4,22:0.4,AQs:1,AJs:1,ATs:1,A9s:0.5,A5s:0.8,A4s:0.6,KQs:1,KJs:1,KTs:0.8,QJs:1,QTs:0.8,JTs:1,T9s:0.8,98s:0.6,87s:0.5,76s:0.4,65s:0.3,AQo:1,AJo:0.6,KQo:0.8",
+               "--iterations", "20", "--exploitability", "0",
+               "--backend", "gpu", "--postsolve", "none",
+               "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_rainbow_anchor_gpu",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "args": ["--pot", "200", "--stack", "900", "--board", "AsKd7c",
+               "--flop-sizes", "0.33,0.75", "--turn-sizes", "0.33,0.75",
+               "--river-sizes", "0.33,0.75",
+               "--oop-range", "AA:1,KK:1,QQ:1,JJ:1,TT:0.5,99:0.3,88:0.2,77:0.2,66:0.2,55:0.2,AKs:1,AQs:1,AJs:1,ATs:0.7,A5s:1,A4s:1,A3s:0.6,A2s:0.4,KQs:1,KJs:0.8,KTs:0.5,QJs:0.6,QTs:0.4,JTs:0.6,T9s:0.3,98s:0.3,AKo:1,AQo:0.8,AJo:0.4,KQo:0.4",
+               "--ip-range", "QQ:0.5,JJ:1,TT:1,99:1,88:1,77:1,66:0.8,55:0.6,44:0.4,33:0.4,22:0.4,AQs:1,AJs:1,ATs:1,A9s:0.5,A5s:0.8,A4s:0.6,KQs:1,KJs:1,KTs:0.8,QJs:1,QTs:0.8,JTs:1,T9s:0.8,98s:0.6,87s:0.5,76s:0.4,65s:0.3,AQo:1,AJo:0.6,KQo:0.8",
+               "--iterations", "20", "--exploitability", "0",
+               "--backend", "gpu", "--gpu-memory-mb", "24000", "--host-memory-mb", "32000",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_mono_rake_gpu",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKsQs", "--rake-nl25",
+               "--iterations", "10", "--exploitability", "0",
+               "--backend", "gpu", "--postsolve", "none",
+               "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_anchor_cpu8",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 8,
+      "args": ["--pot", "200", "--stack", "900", "--board", "Td9d6h",
+               "--flop-sizes", "0.33,0.75", "--turn-sizes", "0.33,0.75",
+               "--river-sizes", "0.33,0.75",
+               "--oop-range", "AA:1,KK:1,QQ:1,JJ:1,TT:0.5,99:0.3,88:0.2,77:0.2,66:0.2,55:0.2,AKs:1,AQs:1,AJs:1,ATs:0.7,A5s:1,A4s:1,A3s:0.6,A2s:0.4,KQs:1,KJs:0.8,KTs:0.5,QJs:0.6,QTs:0.4,JTs:0.6,T9s:0.3,98s:0.3,AKo:1,AQo:0.8,AJo:0.4,KQo:0.4",
+               "--ip-range", "QQ:0.5,JJ:1,TT:1,99:1,88:1,77:1,66:0.8,55:0.6,44:0.4,33:0.4,22:0.4,AQs:1,AJs:1,ATs:1,A9s:0.5,A5s:0.8,A4s:0.6,KQs:1,KJs:1,KTs:0.8,QJs:1,QTs:0.8,JTs:1,T9s:0.8,98s:0.6,87s:0.5,76s:0.4,65s:0.3,AQo:1,AJo:0.6,KQo:0.8",
+               "--iterations", "10", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_turn_cpu8",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 8,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKd7c2h",
+               "--iterations", "200", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_river_cpu8",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 8,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKd7c2h3s",
+               "--iterations", "3000", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_river_cpu1",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 1,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKd7c2h3s",
+               "--iterations", "3000", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "1",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_turn_cpu1",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 1,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKd7c2h",
+               "--iterations", "40", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "1",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_turn_menu_cpu8",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 8,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKd7c2h",
+               "--flop-sizes", "0.33,0.75", "--turn-sizes", "0.33,0.75", "--river-sizes", "0.33,0.75",
+               "--iterations", "40", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_turn_3bet_cpu8",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 8,
+      "args": ["--pot", "200", "--stack", "900", "--board", "AsKd7c2h",
+               "--flop-sizes", "0.33,0.75", "--turn-sizes", "0.33,0.75", "--river-sizes", "0.33,0.75",
+               "--oop-range", "AA:1,KK:1,QQ:1,JJ:1,TT:0.5,99:0.3,88:0.2,77:0.2,66:0.2,55:0.2,AKs:1,AQs:1,AJs:1,ATs:0.7,A5s:1,A4s:1,A3s:0.6,A2s:0.4,KQs:1,KJs:0.8,KTs:0.5,QJs:0.6,QTs:0.4,JTs:0.6,T9s:0.3,98s:0.3,AKo:1,AQo:0.8,AJo:0.4,KQo:0.4",
+               "--ip-range", "QQ:0.5,JJ:1,TT:1,99:1,88:1,77:1,66:0.8,55:0.6,44:0.4,33:0.4,22:0.4,AQs:1,AJs:1,ATs:1,A9s:0.5,A5s:0.8,A4s:0.6,KQs:1,KJs:1,KTs:0.8,QJs:1,QTs:0.8,JTs:1,T9s:0.8,98s:0.6,87s:0.5,76s:0.4,65s:0.3,AQo:1,AJo:0.6,KQo:0.8",
+               "--iterations", "200", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_flop_rb3bet_cpu8",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 8,
+      "args": ["--pot", "200", "--stack", "900", "--board", "AsKd7c",
+               "--oop-range", "AA:1,KK:1,QQ:1,JJ:1,TT:0.5,99:0.3,88:0.2,77:0.2,66:0.2,55:0.2,AKs:1,AQs:1,AJs:1,ATs:0.7,A5s:1,A4s:1,A3s:0.6,A2s:0.4,KQs:1,KJs:0.8,KTs:0.5,QJs:0.6,QTs:0.4,JTs:0.6,T9s:0.3,98s:0.3,AKo:1,AQo:0.8,AJo:0.4,KQo:0.4",
+               "--ip-range", "QQ:0.5,JJ:1,TT:1,99:1,88:1,77:1,66:0.8,55:0.6,44:0.4,33:0.4,22:0.4,AQs:1,AJs:1,ATs:1,A9s:0.5,A5s:0.8,A4s:0.6,KQs:1,KJs:1,KTs:0.8,QJs:1,QTs:0.8,JTs:1,T9s:0.8,98s:0.6,87s:0.5,76s:0.4,65s:0.3,AQo:1,AJo:0.6,KQo:0.8",
+               "--iterations", "10", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_turn_mono_cpu8",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 8,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKsQs2d",
+               "--iterations", "200", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_mono_rake_cpu8",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 8,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKsQs", "--rake-nl25",
+               "--iterations", "8", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_mono_cpu1",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 1,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKsQs",
+               "--iterations", "3", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "1",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_mono_3bet_cpu8",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 8,
+      "args": ["--pot", "200", "--stack", "900", "--board", "AsKsQs",
+               "--oop-range", "AA:1,KK:1,QQ:1,JJ:1,TT:0.5,99:0.3,88:0.2,77:0.2,66:0.2,55:0.2,AKs:1,AQs:1,AJs:1,ATs:0.7,A5s:1,A4s:1,A3s:0.6,A2s:0.4,KQs:1,KJs:0.8,KTs:0.5,QJs:0.6,QTs:0.4,JTs:0.6,T9s:0.3,98s:0.3,AKo:1,AQo:0.8,AJo:0.4,KQo:0.4",
+               "--ip-range", "QQ:0.5,JJ:1,TT:1,99:1,88:1,77:1,66:0.8,55:0.6,44:0.4,33:0.4,22:0.4,AQs:1,AJs:1,ATs:1,A9s:0.5,A5s:0.8,A4s:0.6,KQs:1,KJs:1,KTs:0.8,QJs:1,QTs:0.8,JTs:1,T9s:0.8,98s:0.6,87s:0.5,76s:0.4,65s:0.3,AQo:1,AJo:0.6,KQo:0.8",
+               "--iterations", "30", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_std_cpu1",
+      "family": "eta",
+      "expected_tree_mode": "collapsed",
+      "expected_threads": 1,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKd7c",
+               "--iterations", "30", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "1",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_fast_full_cpu8",
+      "family": "eta",
+      "expected_tree_mode": "collapsed",
+      "expected_threads": 8,
+      "args": ["--pot", "55", "--stack", "975", "--board", "AsKd7c",
+               "--flop-sizes", "0.33,0.66,1.0", "--turn-sizes", "0.5,1.0", "--river-sizes", "0.5,1.0",
+               "--iterations", "20", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
+    },
+    {
+      "name": "eta_turn_lock_cpu8",
+      "family": "eta",
+      "expected_tree_mode": "enumerated",
+      "expected_threads": 8,
+      "args": ["--pot", "100", "--stack", "500", "--board", "AsKd7c2h",
+               "--node-locks", "[{\"history\":\"\",\"combo\":\"AhKh\",\"strategy\":[1,0,0]}]",
+               "--iterations", "100", "--exploitability", "0",
+               "--backend", "cpu", "--cpu-backend", "levelized", "--cpu-threads", "8",
+               "--postsolve", "none", "--no-strategy-tree", "--no-progress"]
     }
   ]
 }

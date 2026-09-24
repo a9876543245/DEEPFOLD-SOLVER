@@ -517,20 +517,27 @@ inline uint64_t bytes_for_json_response(uint64_t emitted_nodes,
 // v1.2.2: solve-time estimate (so UI can show ETA pre-iteration)
 // ============================================================================
 //
-// Cost model: dominant per-iter work is the cfr regret update — for every
-// player node, we touch every action × every canonical combo × every opponent
-// canonical combo (the matchup matrix multiply). So:
-//   ops_per_iter ≈ player_nodes × MAX_ACTIONS × nc × nc
+// ETA = seconds per iteration × max_iterations + 0.5 s. The per-iteration
+// cost has one model per backend family:
 //
-// Throughput is a hardcoded backend table calibrated against the
-// `--benchmark standard` scenario on a few reference machines. Goal is NOT
-// 10% accuracy — goal is to distinguish "30 seconds" from "30 minutes" so
-// the user knows whether to commit. Real measurements often within 2× of the
-// estimate, sometimes 3-4× off on edge cases (very deep stacks with lots of
-// bet sizes have higher constant overhead).
+//   CPU (2026-09-24): a measured per-kernel model, see
+//   estimate_cpu_iteration_seconds(). It replaced the v1.7.1 ops model
+//     ops_per_iter ≈ player_nodes × MAX_ACTIONS × nc × nc
+//   over a backend/thread throughput table, which still exists because the
+//   Exact estimator (solver_decomposed.h) prices its subgames with it. On
+//   the CPU almost nothing is nc²-shaped per player node — folds and
+//   rank-blocker showdowns are linear, only the dot-product showdowns are
+//   nc² — so that model read 0.2–13× across the bench fixtures.
 //
-// CC-aware GPU rate: Pascal (6.x) is ~10× slower than Ada (8.9) at the kind
-// of fp32 + atomicAdd workload our kernels do. Don't lump them together.
+//   GPU (2026-09-24): a measured per-kernel model, see
+//   estimate_gpu_iteration_seconds(). The ops model above was 4.5–39×
+//   pessimistic on enumerated GPU trees (nc² per player node, where the
+//   GPU's streaming kernels are linear in nc) and 1.5× OPTIMISTIC on the
+//   raked dense-terminal path.
+//
+// Goal is NOT 10% accuracy — goal is to distinguish "30 seconds" from
+// "30 minutes" so the user knows whether to commit. The cap is what is
+// priced: a solve that meets its exploitability target stops earlier.
 
 inline uint64_t ops_per_solve_iteration(uint64_t player_nodes,
                                          uint64_t max_actions,
@@ -557,6 +564,13 @@ inline uint64_t ops_per_solve_iteration(uint64_t player_nodes,
 /// CC-12 entry of 10 Gops/s would have estimated 11 minutes for a spot
 /// that actually ran in ~12 seconds. CPU rates also bumped (unmeasured
 /// but parallel logic — atomicAdd is faster than I assumed).
+///
+/// 2026-09-24: the CUDA rows no longer price anything by themselves — the
+/// GPU ETA is estimate_gpu_iteration_seconds(), calibrated on CC 12.0, and
+/// these rows only supply its per-generation RATIO (rate(12.x) / rate(cc)).
+/// Every generation but 12.x is still unmeasured. The CPU rows no longer
+/// price the solve ETA either (estimate_cpu_iteration_seconds()); only the
+/// Exact estimator's subgames (solver_decomposed.h) still use them.
 ///
 /// v1.7.1: CPU model split by backend variant (reference vs levelized) and
 /// threads. The pre-v1.7.1 model returned 1.5e8 × min(8, cores) regardless
@@ -627,22 +641,212 @@ inline double estimated_throughput_ops_per_sec(const std::string& backend_label_
     return per_core * (threads >= 2u ? 1.1 : 1.0);
 }
 
-inline double estimate_solve_seconds(uint64_t player_nodes,
-                                     uint64_t max_actions,
-                                     uint64_t canonical_combos,
-                                     int max_iterations,
-                                     const std::string& backend_label_lc,
-                                     int cuda_compute_capability,
-                                     uint32_t cpu_threads_effective = 0u)
+/// 2026-09-24: the inputs of the GPU iteration model — what the kernels of
+/// one GpuBackend::iterate() stream, taken from the tree the solve runs.
+/// Solver::gpu_iteration_shape() builds it for solve() and estimate_only()
+/// alike, so the preview and the solve cannot price different work.
+struct GpuIterationShape {
+    uint64_t nodes = 0;   ///< every node of the tree
+    uint64_t lanes = 0;   ///< live canonical combos (the index space the buffers use)
+    uint32_t depth = 0;   ///< deepest node's distance from the root
+    /// DenseCategoryValid solves only (raked iso-engaged boards): the rows
+    /// the per-terminal dense kernel evaluates — folds + complete-board
+    /// showdowns (partial boards settle in the equity GEMM) — and the
+    /// opponent lanes each row walks, summed over both traversers
+    /// (live OOP + live IP). Zero on every other plan.
+    uint64_t dense_terminal_rows  = 0;
+    uint64_t dense_opponent_lanes = 0;
+};
+
+/// 2026-09-24: the inputs of the CPU iteration model — what one CPU iteration
+/// touches, taken from the tree the solve runs and the routes the backend
+/// takes. Solver::cpu_iteration_shape() builds it for solve() and
+/// estimate_only() alike.
+struct CpuIterationShape {
+    uint64_t nodes        = 0;
+    uint64_t action_slots = 0;   ///< Σ num_children over player nodes
+    uint64_t folds        = 0;
+    uint64_t board_showdowns  = 0;   ///< complete-board showdowns
+    uint64_t equity_showdowns = 0;   ///< partial-board (all-in / collapsed) showdowns
+    uint64_t lanes     = 0;          ///< live canonical combos (the backend's nc)
+    uint64_t originals = 0;          ///< original combos behind those lanes
+    /// Rows one terminal's dot-product showdown evaluates, summed over both
+    /// traversers (LevelizedCpuBackend::evaluate_terminal()).
+    uint64_t board_dot_rows  = 0;
+    uint64_t equity_dot_rows = 0;
+    uint32_t threads = 1;
+    uint64_t trunk_slots = 0;        ///< action slots the depth-first trunk visits serially
+    /// Complete-board showdowns take the rank-blocker (singleton boards,
+    /// raked boards, iso boards at or above kCpuRankBlockerIsoMinCanonical);
+    /// otherwise the signed-count dot product.
+    bool rank_blocker = true;
+    /// The level sweeps instead of the depth-first visit
+    /// (Solver::cpu_uses_level_flats()) ...
+    bool level_sweeps = false;
+    /// ... with a materialized strategy (node locks, non-POSTFLOP schedules).
+    bool materialized = false;
+    bool reference = false;   ///< CpuBackend: one serial recursion per traverser
+    bool scalar    = false;   ///< no AVX2
+};
+
+namespace eta_detail {
+// Measured 2026-09-24 on the RTX 5090 (CC 12.0), alternating updates: nsys
+// per-kernel sums plus bench-matrix 5-run medians (ROADMAP "ETA
+// recalibration").
+//
+// Every CFR kernel of an iteration streams one nc-float row per node — two
+// forward passes (reach), two backward passes (values + the fused regret
+// update), two strategy_sum updates: 0.08–0.11 ns per node·lane on the
+// enumerated fixtures. The terminal kernels of the two production plans
+// add 37–83% on top and scale with the same count closely enough to fold
+// in (rank-blocker showdowns and folds are O(lanes) per terminal; the
+// signed-count GEMM's share rises with nc). The whole iteration measured
+// 0.110–0.129 ns per node·lane on 325k–5M-node trees, nc 125–744, both
+// plans.
+constexpr double kGpuSecondsPerNodeLane = 0.125e-9;
+// Launches per iteration: forward (depth levels) and backward (depth + 1)
+// twice under alternating updates, plus strategy_sum and up to four terminal
+// launches per traverser and the root-reach copies — 4·depth + ~15. When the
+// kernels are too small to cover the host's issue latency this IS the
+// iteration: ~7–8 µs per launch on river trees (0.26 ms/iter default
+// sizes, 0.34 with a two-size menu), ~6 on the collapsed flop.
+constexpr double kGpuSecondsPerLaunch = 8.0e-6;
+// DenseCategoryValid: terminal_level_kernel walks the opponent's live list
+// for every (terminal row, lane) — 358.8 ms of a 368 ms iteration on raked
+// AsKsQs under nsys, 8.1 ps per (row × lane × opponent lane); the 5-run
+// bench medians put the whole iteration at 277–286 ms, so this sits at the
+// pessimistic end. Only raked iso-engaged boards take it (the app never
+// sends rake); nothing above covers it, and pricing it by node count alone
+// is 16× optimistic there.
+constexpr double kGpuSecondsPerDenseTerm = 8.1e-12;
+}  // namespace eta_detail
+
+/// GPU seconds per CFR iteration. Calibrated on CC 12.0 only; every other
+/// generation scales by the throughput table's per-CC ratio (unmeasured).
+inline double estimate_gpu_iteration_seconds(const GpuIterationShape& s,
+                                             int cuda_compute_capability)
 {
-    if (max_iterations <= 0 || player_nodes == 0 || canonical_combos == 0) return 0.0;
-    const uint64_t ops = ops_per_solve_iteration(player_nodes, max_actions, canonical_combos);
-    const double rate = estimated_throughput_ops_per_sec(
-        backend_label_lc, cuda_compute_capability, cpu_threads_effective);
-    if (rate <= 0.0) return 0.0;
+    if (s.nodes == 0 || s.lanes == 0) return 0.0;
+    const double launches = 4.0 * static_cast<double>(s.depth) + 15.0;
+    const double seconds =
+        launches * eta_detail::kGpuSecondsPerLaunch
+      + static_cast<double>(s.nodes) * static_cast<double>(s.lanes)
+            * eta_detail::kGpuSecondsPerNodeLane
+      + static_cast<double>(s.dense_terminal_rows) * static_cast<double>(s.lanes)
+            * static_cast<double>(s.dense_opponent_lanes)
+            * eta_detail::kGpuSecondsPerDenseTerm;
+    const double generation =
+        estimated_throughput_ops_per_sec("cuda", 120)
+      / estimated_throughput_ops_per_sec("cuda", cuda_compute_capability);
+    return seconds * generation;
+}
+
+namespace eta_detail {
+// Measured 2026-09-24 on a Ryzen 9 9950X3D (8 cores, AVX2, 96 MB L3),
+// levelized backend, alternating updates (ROADMAP "ETA recalibration",
+// CPU): the kernels from the backend's own clocks
+// (timing.phase_backward_{showdown,fold}_cpu_ms) at 1 thread, the rest from
+// bench-matrix 5-run medians of timing.iterations_ms.
+//
+// Terminals, per evaluation for ONE traverser (each terminal is evaluated
+// once per traverser per iteration):
+//   folds — 52 per-card opponent sums and one lookup per own original;
+//   linear in ORIGINALS, so a mono flop's 344 lanes cost like 1176.
+constexpr double kCpuFoldSecondsPerOriginal           = 2.05e-9;
+//   rank-blocker showdowns — the 52 × B bucket sweep (B = distinct hand
+//   ranks, independent of nc) plus a prefix query per original; the iso
+//   variant fans every canonical out to its originals.
+constexpr double kCpuRankBlockerSeconds               = 0.427e-6;
+constexpr double kCpuRankBlockerSecondsPerOriginal    = 3.71e-9;
+constexpr double kCpuRankBlockerIsoSecondsPerOriginal = 4.39e-9;
+//   dot products — the only nc²-shaped kernels: signed-count int8 rows on
+//   iso boards below kCpuRankBlockerIsoMinCanonical, float equity rows on
+//   partial boards; a per-row cost (tail, output) plus a per-cell cost.
+constexpr double kCpuDotSecondsPerRow                 = 1.36e-9;
+constexpr double kCpuSignedCountSecondsPerCell        = 15.3e-12;
+constexpr double kCpuEquitySecondsPerCell             = 21.6e-12;
+// Nodes, per iteration (both traversers): regret matching, reach, values and
+// the regret / strategy_sum update per action slot × lane, plus a per-node
+// cost (dispatch, arena, chance aggregation).
+constexpr double kCpuSecondsPerSlotLane               = 1.0e-9;
+constexpr double kCpuSecondsPerDecisionNode           = 0.121e-6;
+// Threads, depth-first visit: the trunk above the N / (32 × threads) cut runs
+// on one thread (its forward and backward visits, 2.1× the node cost); below
+// it the terminals divide by the team, the node stream no faster than the
+// regrets / strategy_sum bandwidth floor (node work scales ~3×, not 8×).
+constexpr double kCpuTrunkFactor                      = 2.1;
+constexpr double kCpuDramSecondsPerSlotLane           = 0.30e-9;
+// Level sweeps (--cpu-traversal level): three N × lane flats streamed per
+// pass and a barrier per level — the node term ×8.3; ×17 with a materialized
+// strategy (node locks: compute_strategy and discount sweeps on top).
+constexpr double kCpuLevelSweepNodeFactor             = 8.3;
+constexpr double kCpuMaterializedNodeFactor           = 17.1;
+// The reference backend runs both traversals serially under alternating
+// updates. Without AVX2 the dot products slow down 3.5× (on top of the
+// 1.1× everything else takes).
+constexpr double kCpuReferenceFactor                  = 1.26;
+constexpr double kCpuScalarFactor                     = 1.10;
+constexpr double kCpuScalarDotFactor                  = 3.5;
+}  // namespace eta_detail
+
+/// CPU seconds per CFR iteration. Calibrated on one machine (above); other
+/// CPUs differ in core speed, cache and memory bandwidth — unmeasured.
+inline double estimate_cpu_iteration_seconds(const CpuIterationShape& s)
+{
+    using namespace eta_detail;
+    if (s.nodes == 0 || s.lanes == 0) return 0.0;
+    const double nc     = static_cast<double>(s.lanes);
+    const double orig   = static_cast<double>(s.originals);
+    const double stride = static_cast<double>(cpu_lane_stride(s.lanes));
+    // One terminal, both traversers.
+    const double fold = 2.0 * kCpuFoldSecondsPerOriginal * orig;
+    const double rank_blocker = 2.0 * (kCpuRankBlockerSeconds
+        + orig * (s.originals > s.lanes ? kCpuRankBlockerIsoSecondsPerOriginal
+                                        : kCpuRankBlockerSecondsPerOriginal));
+    const double signed_count = static_cast<double>(s.board_dot_rows)
+        * (kCpuDotSecondsPerRow + kCpuSignedCountSecondsPerCell * nc);
+    const double equity = static_cast<double>(s.equity_dot_rows)
+        * (kCpuDotSecondsPerRow + kCpuEquitySecondsPerCell * nc);
+    const double boards = static_cast<double>(s.board_showdowns);
+    const double dots = static_cast<double>(s.equity_showdowns) * equity
+                      + (s.rank_blocker ? 0.0 : boards * signed_count);
+    const double terminals = static_cast<double>(s.folds) * fold
+                           + (s.rank_blocker ? boards * rank_blocker : 0.0)
+                           + dots * (s.scalar ? kCpuScalarDotFactor : 1.0);
+    const uint64_t decision_nodes =
+        s.nodes - s.folds - s.board_showdowns - s.equity_showdowns;
+    const double node =
+        kCpuSecondsPerSlotLane * static_cast<double>(s.action_slots) * stride
+      + kCpuSecondsPerDecisionNode * static_cast<double>(decision_nodes);
+
+    double seconds;
+    const double t = static_cast<double>(s.threads);
+    if (s.reference) {
+        seconds = kCpuReferenceFactor * (node + terminals);
+    } else if (s.level_sweeps) {
+        const double f = s.materialized ? kCpuMaterializedNodeFactor
+                                        : kCpuLevelSweepNodeFactor;
+        seconds = (f * node + terminals) / t;
+    } else if (s.threads <= 1) {
+        seconds = node + terminals;
+    } else {
+        const double trunk = kCpuSecondsPerSlotLane
+                           * static_cast<double>(s.trunk_slots) * stride;
+        const double below = std::max(
+            (node - trunk) / t,
+            kCpuDramSecondsPerSlotLane
+                * static_cast<double>(s.action_slots - s.trunk_slots) * stride);
+        seconds = kCpuTrunkFactor * trunk + below + terminals / t;
+    }
+    return s.scalar ? seconds * kCpuScalarFactor : seconds;
+}
+
+inline double estimate_solve_seconds(double iteration_seconds, int max_iterations)
+{
+    if (max_iterations <= 0 || iteration_seconds <= 0.0) return 0.0;
     // Add a fixed 0.5s for backend prepare + final postsolve so very small
     // spots don't show "0.01s" — too good to be true.
-    return (static_cast<double>(ops) * static_cast<double>(max_iterations)) / rate + 0.5;
+    return iteration_seconds * static_cast<double>(max_iterations) + 0.5;
 }
 
 // ============================================================================

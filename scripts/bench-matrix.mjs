@@ -84,7 +84,7 @@ for (const fx of manifest.fixtures) {
   // targetHits[target] = array of {iteration, elapsed_ms} across runs
   const targetHits = new Map((fx.targets ?? []).map((t) => [t, []]));
   const probeOverheads = [];
-  const rates = [], walls = [], procWalls = [], rss = [], vram = [];
+  const rates = [], iterMs = [], walls = [], procWalls = [], rss = [], vram = [];
   let last = null;
   let failed = null;
   let completed = 0;
@@ -156,8 +156,9 @@ for (const fx of manifest.fixtures) {
       probeOverheads.push(j.convergence.probe_overhead_ms ?? 0);
     }
     if (!isEstimate) {
-      const iterMs = j.timing?.iterations_ms ?? 0;
-      rates.push(iterMs > 0 ? (j.iterations_run * 1000) / iterMs : 0);
+      const loopMs = j.timing?.iterations_ms ?? 0;
+      rates.push(loopMs > 0 ? (j.iterations_run * 1000) / loopMs : 0);
+      if (j.iterations_run > 0) iterMs.push(loopMs / j.iterations_run);
       walls.push(j.timing?.total_ms ?? 0);
       procWalls.push(procWall);
       rss.push(j.resources?.measured_peak_rss_bytes ?? 0);
@@ -172,7 +173,7 @@ for (const fx of manifest.fixtures) {
     // A known_gap fixture is EXPECTED to be red until its blocker lands, so
     // it is reported but does not condemn the run.
     if (!fx.known_gap) anyFailed = true;
-    rates.length = walls.length = procWalls.length = 0;
+    rates.length = iterMs.length = walls.length = procWalls.length = 0;
     rss.length = vram.length = 0;
     probeOverheads.length = 0;
     for (const hits of targetHits.values()) hits.length = 0;
@@ -222,6 +223,14 @@ for (const fx of manifest.fixtures) {
     iter_per_sec_median: rates.length ? r3(median(rates)) : null,
     iter_per_sec_min: rates.length ? r3(Math.min(...rates)) : null,
     iter_per_sec_max: rates.length ? r3(Math.max(...rates)) : null,
+    iter_ms_median: iterMs.length ? r3(median(iterMs)) : null,
+    // The pre-solve ETA against the clock (2026-09-24). est_iter_ms is the
+    // model's per-iteration cost (engines before that date do not emit it);
+    // eta_ratio > 1 means the ETA is pessimistic.
+    est_solve_s: last?.resources?.estimated_solve_seconds ?? null,
+    est_iter_ms: last?.resources?.estimated_iteration_ms ?? null,
+    eta_ratio: (iterMs.length && last?.resources?.estimated_iteration_ms)
+      ? r3(last.resources.estimated_iteration_ms / median(iterMs)) : null,
     total_ms_median: walls.length ? Math.round(median(walls)) : null,
     proc_wall_ms_median: procWalls.length ? Math.round(median(procWalls)) : null,
     peak_rss_mb_max: rss.length ? mb(Math.max(...rss)) : null,
@@ -256,7 +265,10 @@ for (const fx of manifest.fixtures) {
       `${rec.fixture.padEnd(20)} ${String(rec.iter_per_sec_median ?? 'FAIL').padStart(10)} it/s med  ` +
       `rss ${String(rec.peak_rss_mb_max ?? '-').padStart(8)} MB (est peak ${rec.est_peak_host_mb ?? '-'})  ` +
       `vram ${String(rec.peak_vram_mb_max ?? '-').padStart(8)} MB  ` +
-      `state est/alloc ${stateEst}/${rec.allocated_state_mb} MB` + status);
+      `state est/alloc ${stateEst}/${rec.allocated_state_mb} MB` +
+      (rec.eta_ratio !== null
+        ? `  eta ${rec.est_iter_ms.toFixed(2)}/${rec.iter_ms_median} ms/it (${rec.eta_ratio}x)` : '') +
+      status);
   }
 }
 

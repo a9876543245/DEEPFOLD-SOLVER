@@ -805,11 +805,16 @@ struct SolveResources {
     // before they commit to a long solve. Useful for the "5-minute CPU
     // turn solve still no result" wait-cliff problem.
     //
-    // Calculation: ops_per_iteration ≈ player_nodes × MAX_ACTIONS × nc²
-    // (per-combo cfr regret update, dominant cost on every iter).
-    // Throughput is a hardcoded backend table — not accurate to 10%, but
-    // accurate enough to distinguish "30 seconds" from "30 minutes" which
-    // is what the user actually needs.
+    // Calculation (memory_budget.h): seconds per iteration × max_iterations,
+    // from measured per-backend models (2026-09-24). GPU: the tree's nodes ×
+    // live lanes, launches per depth level and the raked dense-terminal work.
+    // CPU: action slots × lanes, each terminal priced by the kernel it takes
+    // (fold, rank-blocker, signed-count or equity dot product), the serial
+    // depth-first trunk and the thread count. ops_per_iteration
+    // (player_nodes × MAX_ACTIONS × nc², the v1.7.1 model the Exact estimator
+    // still prices) feeds neither. Not accurate to 10%, but accurate enough
+    // to distinguish "30 seconds" from "30 minutes" which is what the user
+    // actually needs.
     uint64_t ops_per_iteration         = 0;
     /// Selected backend for THIS solve, used in UI to label the estimate.
     /// E.g., "CPU-DCFR", "CUDA (NVIDIA GeForce GTX 1070, ...)".
@@ -817,6 +822,11 @@ struct SolveResources {
     /// Estimated wall-clock seconds to complete the configured iterations.
     /// 0 if estimation isn't possible (e.g. no iterations requested).
     double   estimated_solve_seconds   = 0.0;
+    /// 2026-09-24: the per-iteration cost behind estimated_solve_seconds, so
+    /// the estimate can be checked against timing.iterations_ms /
+    /// iterations_run of the same solve (bench-matrix, CliGpuEtaWithin2x,
+    /// CliCpuEtaWithin2x).
+    double   estimated_iteration_ms    = 0.0;
 
     // ---- v1.4.0 Phase 2: CPU mode diagnostics (empty/0 on GPU solves) ----
     /// "avx2" or "scalar". Mirrors `cpu_simd::mode_label()`.

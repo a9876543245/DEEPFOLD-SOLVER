@@ -1278,10 +1278,10 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     const bool zero_rake = ctx.config != nullptr
         && ctx.config->rake_rate == 0.0f && ctx.config->rake_cap == 0.0f;
     // Crossover sits in (344, 686]; the only iso nc values that exist between
-    // are >= 686, so any threshold in that gap behaves identically.
-    constexpr uint16_t kRbIsoMinCanonical = 512;
+    // are >= 686, so any threshold in that gap behaves identically. Shared
+    // with the CPU ETA (terminal_plan.h).
     const bool rb_beneficial = singleton_iso || !zero_rake
-        || ctx.iso->num_canonical >= kRbIsoMinCanonical;
+        || ctx.iso->num_canonical >= kCpuRankBlockerIsoMinCanonical;
     showdown_rank_blocker_supported_ =
         kShowdownRankBlockerShortcutEnabled
         && !kForceDense
@@ -3407,6 +3407,19 @@ inline void LevelizedCpuBackend::dfs_visit(
 {
     const auto& tree = *ctx_.tree;
     const std::size_t S = row_stride_;
+    // Cut nodes return the value rows the parallel phase stored. Checked
+    // before the terminal test: dfs_configure() cuts every terminal child of
+    // a trunk node, and testing TERMINAL first evaluated those terminals a
+    // second time, serially, on the trunk's thread.
+    if (trunk) {
+        const uint32_t slot = dfs_cut_slot_[n];
+        if (slot != kNoCutSlot) {
+            const float* rows = dfs_cut_row(slot);
+            std::memcpy(out_oop, rows + 2 * S, sizeof(float) * S);
+            std::memcpy(out_ip,  rows + 3 * S, sizeof(float) * S);
+            return;
+        }
+    }
     const auto nt = static_cast<NodeType>(tree.node_types[n]);
 
     if (nt == NodeType::TERMINAL) {
@@ -3441,15 +3454,6 @@ inline void LevelizedCpuBackend::dfs_visit(
         }
         evaluate_terminal(n, 1, r_oop, out_ip);
         return;
-    }
-    if (trunk) {
-        const uint32_t slot = dfs_cut_slot_[n];
-        if (slot != kNoCutSlot) {
-            const float* rows = dfs_cut_row(slot);
-            std::memcpy(out_oop, rows + 2 * S, sizeof(float) * S);
-            std::memcpy(out_ip,  rows + 3 * S, sizeof(float) * S);
-            return;
-        }
     }
     const uint8_t nch = tree.num_children[n];
     if (nch == 0) {
@@ -3631,6 +3635,16 @@ inline void LevelizedCpuBackend::dfs_visit_alt(
 {
     const auto& tree = *ctx_.tree;
     const std::size_t S = row_stride_;
+    // Before the terminal test, as in dfs_visit(): the trunk's terminal
+    // children are cut nodes the parallel phase already evaluated.
+    if (trunk) {
+        const uint32_t slot = dfs_cut_slot_[n];
+        if (slot != kNoCutSlot) {
+            const float* rows = dfs_cut_row(slot);
+            std::memcpy(out, rows + static_cast<std::size_t>(2 + traverser) * S, sizeof(float) * S);
+            return;
+        }
+    }
     const auto nt = static_cast<NodeType>(tree.node_types[n]);
 
     if (nt == NodeType::TERMINAL) {
@@ -3640,14 +3654,6 @@ inline void LevelizedCpuBackend::dfs_visit_alt(
         }
         evaluate_terminal(n, traverser, (traverser == 0) ? r_ip : r_oop, out);
         return;
-    }
-    if (trunk) {
-        const uint32_t slot = dfs_cut_slot_[n];
-        if (slot != kNoCutSlot) {
-            const float* rows = dfs_cut_row(slot);
-            std::memcpy(out, rows + static_cast<std::size_t>(2 + traverser) * S, sizeof(float) * S);
-            return;
-        }
     }
     const uint8_t nch = tree.num_children[n];
     if (nch == 0) {

@@ -278,9 +278,11 @@ pub struct SolveResources {
     /// ('auto') would engage decomposition.
     #[serde(default)]
     pub runout_approximated: bool,
-    // v1.2.2: pre-iteration solve cost prediction. ops_per_iteration ≈
-    // player_nodes × MAX_ACTIONS × nc² (dominant cost per CFR iteration).
-    // estimated_solve_seconds is ops × max_iterations / backend_throughput.
+    // v1.2.2: pre-iteration solve cost prediction. estimated_solve_seconds is
+    // seconds-per-iteration × max_iterations, from measured per-kernel models
+    // on both CPU and GPU (engine memory_budget.h, 2026-09-24).
+    // ops_per_iteration (player_nodes × MAX_ACTIONS × nc², the old CPU
+    // model) no longer feeds it.
     // backend_for_estimate names the backend the estimate was computed for.
     #[serde(default)]
     pub ops_per_iteration: u64,

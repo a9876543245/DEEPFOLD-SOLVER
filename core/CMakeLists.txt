@@ -704,6 +704,17 @@ if(BUILD_TESTS)
     set_tests_properties(CliConvergenceLog PROPERTIES
         LABELS "smoke" TIMEOUT 180)
 
+    # 2026-09-24: the CPU pre-solve ETA must land within 2x of the measured
+    # per-iteration cost at 1 and 8 threads on a rank-blocker turn (the old
+    # nc^2 ops model read 11-13x there). Red on v3.2.0. Calibrated on a
+    # Ryzen 9 9950X3D - see tests/cli_eta_cpu.cmake.
+    add_test(NAME CliCpuEtaWithin2x
+        COMMAND ${CMAKE_COMMAND}
+            -DEXE=$<TARGET_FILE:deepsolver_core>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_eta_cpu.cmake)
+    set_tests_properties(CliCpuEtaWithin2x PROPERTIES
+        LABELS "smoke" TIMEOUT 120)
+
     # GPU postsolve parity test — only when CUDA is available, since the test
     # exercises the GPU backend path directly. Skip-marker inside the test
     # handles "CUDA compiled in but no device present" at runtime.
@@ -846,6 +857,17 @@ if(BUILD_TESTS)
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
         set_tests_properties(CliGpuIsoTerminalSelfcheck PROPERTIES
             LABELS "smoke;gpu" TIMEOUT 180)
+
+        # 2026-09-24: the pre-solve ETA must land within 2x of the measured
+        # per-iteration cost on a large enumerated GPU tree (the old
+        # nc^2 ops model read 14x on this 1.45M-node fixture). Red on
+        # v3.2.0. Calibrated on CC 12.0 - see tests/cli_eta.cmake.
+        add_test(NAME CliGpuEtaWithin2x
+            COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:deepsolver_core>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_eta.cmake)
+        set_tests_properties(CliGpuEtaWithin2x PROPERTIES
+            LABELS "smoke;gpu" TIMEOUT 120)
 
         # ----------------------------------------------------------------
         # Stage 3: GPU subgame streaming validation. SAME source as the CPU

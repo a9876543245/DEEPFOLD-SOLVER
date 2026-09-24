@@ -967,6 +967,7 @@ std::string result_to_json(
         json << "    \"ops_per_iteration\": " << r.ops_per_iteration << ",\n";
         json << "    \"backend_for_estimate\": \"" << escape_json(r.backend_for_estimate) << "\",\n";
         json << "    \"estimated_solve_seconds\": " << r.estimated_solve_seconds << ",\n";
+        json << "    \"estimated_iteration_ms\": " << r.estimated_iteration_ms << ",\n";
         // v1.4.0 Phase 2: CPU mode diagnostics (empty/0 on GPU solves).
         json << "    \"cpu_simd\": \"" << escape_json(r.cpu_simd) << "\",\n";
         json << "    \"cpu_threads_effective\": " << r.cpu_threads_effective << ",\n";
@@ -1928,6 +1929,7 @@ int main(int argc, char* argv[]) {
                       << "    \"ops_per_iteration\": " << r.ops_per_iteration << ",\n"
                       << "    \"backend_for_estimate\": \"" << escape_json(r.backend_for_estimate) << "\",\n"
                       << "    \"estimated_solve_seconds\": " << r.estimated_solve_seconds << ",\n"
+                      << "    \"estimated_iteration_ms\": " << r.estimated_iteration_ms << ",\n"
                       << "    \"cpu_simd\": \"" << escape_json(r.cpu_simd) << "\",\n"
                       << "    \"cpu_threads_effective\": " << r.cpu_threads_effective << ",\n"
                       << "    \"cpu_backend_kind\": \"" << escape_json(r.cpu_backend_kind) << "\"\n"

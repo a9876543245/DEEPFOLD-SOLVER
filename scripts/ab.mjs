@@ -92,8 +92,12 @@ const FIXTURES = [
   { name: 'gpu_flop_mono',      args: [...POT, ...STACK, '--board', 'AsKsQs',     '--iterations', '20', '--exploitability', '0', '--backend', 'gpu', '--postsolve', 'full', ...QUIET] },
   { name: 'gpu_turn_singleton', args: [...POT, ...STACK, '--board', 'AsKd7c2h',   '--iterations', '40', '--exploitability', '0', '--backend', 'gpu', '--postsolve', 'full', ...QUIET] },
   { name: 'gpu_river',          args: [...POT, ...STACK, '--board', 'AsKd7c2h3s', '--iterations', '80', '--exploitability', '0', '--backend', 'gpu', '--postsolve', 'full', ...QUIET] },
-  // Exercises the exploitability probe loop and the early-stop path.
-  { name: 'cpu_early_stop',     args: [...POT, ...STACK, '--board', 'AsKd7c',     '--iterations', '400', '--exploitability', '1.5', '--backend', 'cpu', '--postsolve', 'full', ...QUIET] },
+  // Exercises the exploitability probe loop and the early-stop path. The
+  // cadence is pinned: the default one self-calibrates from wall-clock probe
+  // and iteration times, so the stop iteration moves with machine speed and
+  // load (100 -> 103/104 once the 2026-09-24 DFS trunk fix made this
+  // 8-thread flop 2.3x faster, with identical math).
+  { name: 'cpu_early_stop',     args: [...POT, ...STACK, '--board', 'AsKd7c',     '--iterations', '400', '--exploitability', '1.5', '--exploitability-interval', '50', '--backend', 'cpu', '--postsolve', 'full', ...QUIET] },
 ];
 
 function run(exe, args, label) {

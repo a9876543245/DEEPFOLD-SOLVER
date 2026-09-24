@@ -136,6 +136,13 @@ inline bool terminal_dense_forced() {
 /// decides whether to build the dense tables at all.
 constexpr uint32_t kTerminalActiveListDensityDen = 4;
 
+/// LevelizedCpuBackend's rank-blocker crossover on zero-rake iso boards: at
+/// or above this many canonical combos the rank-blocker beats the signed-count
+/// dot product (measured crossover in (344, 686]). Shared so the CPU ETA
+/// (memory_budget.h::estimate_cpu_iteration_seconds) predicts the same
+/// showdown route the backend takes.
+constexpr uint16_t kCpuRankBlockerIsoMinCanonical = 512;
+
 /// Does this player's root reach engage the active-list terminal kernels?
 /// Missing/short reach ⇒ the backends treat every combo as live, so no.
 inline bool terminal_active_list_engaged(
