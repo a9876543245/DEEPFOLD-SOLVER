@@ -69,7 +69,7 @@ static void vec_pos_normalize2(
         const float r0p = (regret0[i] > 0.0f) ? regret0[i] : 0.0f;
         const float r1p = (regret1[i] > 0.0f) ? regret1[i] : 0.0f;
         const float pos_sum = r0p + r1p;
-        if (pos_sum > 0.0f) {
+        if (pos_sum >= kMinRegretSum) {
             const float inv = 1.0f / pos_sum;
             strat0[i] = r0p * inv;
             strat1[i] = r1p * inv;

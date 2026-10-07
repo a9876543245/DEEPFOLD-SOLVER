@@ -34,6 +34,24 @@
 namespace deepsolver {
 namespace gpu {
 
+/// Twin of cpu_simd.h's kMinRegretSum (FLT_MIN): the smallest regret sum /
+/// strategy-sum total whose reciprocal is finite; below it a row is uniform.
+/// With --use_fast_math the device flushes denormals to zero anyway, so this
+/// only matters for the host-side finalize and precision-mode builds.
+constexpr float kGpuMinNormalSum = 1.17549435e-38f;
+
+/// 2026-10-06 (exact isomorphism): device view of RunoutClassMaps. A chance
+/// node adds, for a merged runout child, value[child][c] plus one
+/// value[child][maps[j][c]] per other orbit member. All null = no remapping
+/// (Fast isomorphism, or a board with no merged runouts): the plain
+/// weight × value sum, unchanged.
+struct DeviceRunoutMaps {
+    const uint16_t* node_set  = nullptr;   ///< [N], 0xFFFF = plain weight
+    const uint32_t* set_first = nullptr;   ///< per set: first map index
+    const uint8_t*  set_count = nullptr;   ///< per set: number of maps
+    const uint16_t* maps      = nullptr;   ///< [maps × nc]
+};
+
 class CudaError : public std::runtime_error {
 public:
     CudaError(const char* file, int line, cudaError_t err)

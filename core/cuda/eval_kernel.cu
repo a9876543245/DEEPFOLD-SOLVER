@@ -563,55 +563,75 @@ __global__ void rank_blocker_terminal_kernel(
     float* __restrict__ out_values =
         node_values + static_cast<size_t>(value_row[n]) * nc;
 
-    // Shared memory layout (ull array first for 8-byte alignment):
-    // [s_acc : max_B ull][s_total : max_B][s_prefix : max_B+1][s_chunk : blockDim]
+    // Shared memory layout (8-byte arrays first for alignment):
+    // [s_acc : max_B ull][s_warp : kRbBlock/32 ull]
+    // [s_total : max_B][s_prefix : max_B+1][s_reach : nc][s_bucket : nc u16]
     extern __shared__ unsigned long long s_acc[];
-    float* smem_f   = reinterpret_cast<float*>(s_acc + max_bucket_count);
+    unsigned long long* s_warp = s_acc + max_bucket_count;
+    float* smem_f   = reinterpret_cast<float*>(s_warp + kRbBlock / 32);
     float* s_total  = smem_f;
     float* s_prefix = smem_f + max_bucket_count;
-    float* s_chunk  = smem_f + (2 * static_cast<int>(max_bucket_count) + 1);
+    float* s_reach  = smem_f + (2 * static_cast<int>(max_bucket_count) + 1);
+    uint16_t* s_bucket = reinterpret_cast<uint16_t*>(s_reach + nc);
 
     // 1) zero bucket totals, then scatter opponent reach into rank buckets.
     //    Accumulate in 64-bit fixed point (see kRbFixedScale) so the result
-    //    does not depend on the atomic resolution order.
+    //    does not depend on the atomic resolution order. The opponent row and
+    //    the bucket ids are staged in shared memory on the way: step 4's
+    //    card-removal loops gather them at random (2026-10-07).
     for (int i = tid; i < B; i += blockDim.x) s_acc[i] = 0ull;
     __syncthreads();
     for (int o = tid; o < nc; o += blockDim.x) {
         const uint16_t bo = mbucket[o];
-        if (bo != kRbNoBucket) {
-            const float r = reach_opp[o];
-            if (r != 0.0f) {
-                const unsigned long long q = __float2ull_rn(r * kRbFixedScale);
-                if (q != 0ull) atomicAdd(&s_acc[bo], q);
-            }
+        const float r = reach_opp[o];
+        s_bucket[o] = bo;
+        s_reach[o]  = r;
+        if (bo != kRbNoBucket && r != 0.0f) {
+            const unsigned long long q = __float2ull_rn(r * kRbFixedScale);
+            if (q != 0ull) atomicAdd(&s_acc[bo], q);
         }
     }
     __syncthreads();
-    for (int i = tid; i < B; i += blockDim.x) {
-        s_total[i] = static_cast<float>(
-            __ull2double_rn(s_acc[i]) * kRbFixedInvScale);
-    }
-    __syncthreads();
 
-    // 2) exclusive prefix-sum of s_total[0..B) → s_prefix[0..B]. Chunk scan:
-    //    each thread serial-scans a contiguous chunk, thread 0 scans the
-    //    per-chunk totals, then each thread adds its chunk offset.
-    const int chunk = (B + blockDim.x - 1) / blockDim.x;
-    const int start = tid * chunk;
-    const int stop  = min(start + chunk, B);
-    float local = 0.0f;
-    for (int i = start; i < stop; ++i) local += s_total[i];
-    s_chunk[tid] = local;
-    __syncthreads();
-    if (tid == 0) {
-        float acc = 0.0f;
-        for (int t = 0; t < blockDim.x; ++t) { float v = s_chunk[t]; s_chunk[t] = acc; acc += v; }
-        s_prefix[B] = acc;   // grand total
-    }
-    __syncthreads();
+    // 2) exclusive prefix-sum over the buckets — in the 64-bit fixed point,
+    //    so it is exact and order-free, then converted once (2026-10-07). It
+    //    used to convert each bucket to float and scan in float with thread 0
+    //    walking all 256 chunk totals serially while the block waited.
+    //    Each thread owns a contiguous run of buckets; warps scan the run
+    //    totals with shuffles; one warp scans the warp totals.
     {
-        float run = s_chunk[tid];
-        for (int i = start; i < stop; ++i) { s_prefix[i] = run; run += s_total[i]; }
+        const int per   = (B + kRbBlock - 1) / kRbBlock;
+        const int start = tid * per;
+        const int stop  = min(start + per, B);
+        unsigned long long mine = 0ull;
+        for (int i = start; i < stop; ++i) mine += s_acc[i];
+        const int lane = tid & 31, warp = tid >> 5;
+        unsigned long long incl = mine;
+        for (int d = 1; d < 32; d <<= 1) {
+            const unsigned long long v = __shfl_up_sync(0xffffffffu, incl, d);
+            if (lane >= d) incl += v;
+        }
+        if (lane == 31) s_warp[warp] = incl;
+        __syncthreads();
+        if (warp == 0) {
+            unsigned long long w = (lane < kRbBlock / 32) ? s_warp[lane] : 0ull;
+            for (int d = 1; d < 32; d <<= 1) {
+                const unsigned long long v = __shfl_up_sync(0xffffffffu, w, d);
+                if (lane >= d) w += v;
+            }
+            if (lane < kRbBlock / 32) s_warp[lane] = w;   // inclusive warp totals
+        }
+        __syncthreads();
+        unsigned long long run = (incl - mine) + (warp > 0 ? s_warp[warp - 1] : 0ull);
+        for (int i = start; i < stop; ++i) {
+            s_prefix[i] = static_cast<float>(__ull2double_rn(run) * kRbFixedInvScale);
+            s_total[i]  = static_cast<float>(__ull2double_rn(s_acc[i]) * kRbFixedInvScale);
+            run += s_acc[i];
+        }
+        if (tid == kRbBlock - 1) {
+            s_prefix[B] = static_cast<float>(
+                __ull2double_rn(s_warp[kRbBlock / 32 - 1]) * kRbFixedInvScale);
+        }
     }
     __syncthreads();
     const float total = s_prefix[B];
@@ -646,7 +666,7 @@ __global__ void rank_blocker_terminal_kernel(
 
     // 4) per self-combo value.
     for (int c = tid; c < nc; c += blockDim.x) {
-        const uint16_t b16 = mbucket[c];
+        const uint16_t b16 = s_bucket[c];
         if (b16 == kRbNoBucket) { out_values[c] = 0.0f; continue; }
         const int b = b16;
         const uint8_t k0 = combo_card0[c];
@@ -675,13 +695,13 @@ __global__ void rank_blocker_terminal_kernel(
                 float opp_total = total;
                 for (uint32_t k = lo0; k < hi0; ++k) {
                     const uint16_t o = card_list[k];
-                    if (mbucket[o] != kRbNoBucket) opp_total -= reach_opp[o];
+                    if (s_bucket[o] != kRbNoBucket) opp_total -= s_reach[o];
                 }
                 for (uint32_t k = lo1; k < hi1; ++k) {
                     const uint16_t o = card_list[k];
-                    if (mbucket[o] != kRbNoBucket) opp_total -= reach_opp[o];
+                    if (s_bucket[o] != kRbNoBucket) opp_total -= s_reach[o];
                 }
-                opp_total += reach_opp[c];
+                opp_total += s_reach[c];
                 val += B * opp_total;
             }
             out_values[c] = val;
@@ -693,35 +713,35 @@ __global__ void rank_blocker_terminal_kernel(
             // appears in BOTH lists → subtracted twice from `same`).
             for (uint32_t k = lo0; k < hi0; ++k) {
                 const uint16_t o = card_list[k];
-                const uint16_t bo = mbucket[o];
+                const uint16_t bo = s_bucket[o];
                 if (bo == kRbNoBucket) continue;
-                const float r = reach_opp[o];
+                const float r = s_reach[o];
                 if      (bo < b) stronger -= r;
                 else if (bo > b) weaker   -= r;
                 else             same     -= r;
             }
             for (uint32_t k = lo1; k < hi1; ++k) {
                 const uint16_t o = card_list[k];
-                const uint16_t bo = mbucket[o];
+                const uint16_t bo = s_bucket[o];
                 if (bo == kRbNoBucket) continue;
-                const float r = reach_opp[o];
+                const float r = s_reach[o];
                 if      (bo < b) stronger -= r;
                 else if (bo > b) weaker   -= r;
                 else             same     -= r;
             }
-            same += reach_opp[c];   // undo the double subtraction of c
+            same += s_reach[c];   // undo the double subtraction of c
             out_values[c] = win_p * weaker + lose_p * stronger + tie_p * same;
         } else {
             float opp_total = total;
             for (uint32_t k = lo0; k < hi0; ++k) {
                 const uint16_t o = card_list[k];
-                if (mbucket[o] != kRbNoBucket) opp_total -= reach_opp[o];
+                if (s_bucket[o] != kRbNoBucket) opp_total -= s_reach[o];
             }
             for (uint32_t k = lo1; k < hi1; ++k) {
                 const uint16_t o = card_list[k];
-                if (mbucket[o] != kRbNoBucket) opp_total -= reach_opp[o];
+                if (s_bucket[o] != kRbNoBucket) opp_total -= s_reach[o];
             }
-            opp_total += reach_opp[c];   // undo the double subtraction of c
+            opp_total += s_reach[c];   // undo the double subtraction of c
             out_values[c] = self_payoff * opp_total;
         }
     }
@@ -830,10 +850,12 @@ void launch_rank_blocker_terminal_level(
     if (num_level_nodes == 0) return;
     const int block = kRbBlock;
     const uint32_t grid = num_level_nodes;   // one block per terminal
-    // shared: s_acc[max_B] (ull) + s_total[max_B] + s_prefix[max_B+1] + s_chunk[block]
+    // shared: s_acc[max_B] + s_warp[block/32] (ull) + s_total[max_B] +
+    // s_prefix[max_B+1] + s_reach[nc] (float) + s_bucket[nc] (u16)
     const size_t shmem =
-        static_cast<size_t>(max_bucket_count) * sizeof(unsigned long long) +
-        (static_cast<size_t>(2) * max_bucket_count + 1 + block) * sizeof(float);
+        (static_cast<size_t>(max_bucket_count) + block / 32) * sizeof(unsigned long long) +
+        (static_cast<size_t>(2) * max_bucket_count + 1 + nc) * sizeof(float) +
+        static_cast<size_t>(nc) * sizeof(uint16_t);
 
     rank_blocker_terminal_kernel<<<grid, block, shmem>>>(
         d_node_types, d_terminal_types, d_pots,
@@ -1096,8 +1118,10 @@ void launch_equity_showdown_gemm(
 // these boards (payoff * valid * weight folds to +-count / |orbit_c|), and
 // what the CPU signed-count kernels compute. S is antisymmetric, so the same
 // product form serves both traversers with that traverser's opponent reach.
-// Zero-rake boards only (the plan picks SignedCount only then); the rake
-// terms are kept in the coefficient so a raked table would still be exact.
+// Zero-rake boards only (the plan picks SignedCount only then, and
+// GpuBackend::prepare refuses otherwise): with rake a loss pays −half_pot,
+// not −(half_pot − rake), and a tie −rake/2, which this one-coefficient form
+// cannot express.
 // ---------------------------------------------------------------------------
 __global__ void signed_count_showdown_gemm_kernel(
     const EquityTile* __restrict__ tiles,         // eq_slot unused; mi = runout

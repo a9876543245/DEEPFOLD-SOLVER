@@ -37,6 +37,41 @@ pub fn cancel_solve() -> Result<bool, String> {
     engine::cancel_current_solve()
 }
 
+/// 2026-10-06: one node of the solve kept in memory (`--serve`): kind,
+/// pot, stacks, to-call, action labels + amounts, strategies, EVs, ranges.
+/// `history` is comma-separated engine action labels, "#<card>" on the
+/// action that ends a street to pick the runout; a history ending a street
+/// without a card returns the chance node (its `runouts` list the cards).
+#[tauri::command]
+pub async fn query_node(session_id: u64, history: String) -> Result<serde_json::Value, String> {
+    let reply = engine::query_session(
+        session_id, serde_json::json!({ "cmd": "node", "history": history })).await?;
+    session_reply(reply)
+}
+
+/// 2026-10-06: per-combo ranges (+ pot, stack, board, initiative) at a node
+/// of the in-memory solve — what a later-street re-solve starts from.
+#[tauri::command]
+pub async fn query_ranges(session_id: u64, history: String) -> Result<serde_json::Value, String> {
+    let reply = engine::query_session(
+        session_id, serde_json::json!({ "cmd": "ranges", "history": history })).await?;
+    session_reply(reply)
+}
+
+/// Drop an in-memory solve (frees its RAM); no id = all of them.
+#[tauri::command]
+pub async fn close_session(session_id: Option<u64>) {
+    engine::close_session(session_id).await;
+}
+
+fn session_reply(reply: serde_json::Value) -> Result<serde_json::Value, String> {
+    if reply.get("status").and_then(|v| v.as_str()) == Some("error") {
+        let msg = reply.get("message").and_then(|v| v.as_str()).unwrap_or("query failed");
+        return Err(msg.to_string());
+    }
+    Ok(reply)
+}
+
 /// Get solver engine status / health check.
 #[tauri::command]
 pub fn engine_status() -> String {

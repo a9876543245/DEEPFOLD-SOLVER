@@ -24,6 +24,8 @@ export interface GtoScenario {
   hero_position: string;       // "BB" | "BTN" | etc.
   effective_bb: number | null;
   description: string;
+  /** Preflop line to the hero's decision, e.g. "BTN 2.5bb BB 11.0bb BTN". */
+  preflop_line?: string | null;
 }
 
 export interface GtoChart {

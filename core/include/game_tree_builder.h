@@ -34,7 +34,16 @@ struct TreeNode {
     float    stack = 0.0f;        ///< Remaining stack of the player TO ACT
     float    bet_into = 0.0f;     ///< Outstanding contribution difference to call
     int      raise_count = 0;     ///< Number of raises so far in this street
-    bool     oop_has_initiative = false; ///< Did OOP make the last aggressive action?
+    /// Chips the player TO ACT has put in on this street (the opponent has
+    /// street_contrib + bet_into). Needed for "x" raises: raise TO x times the
+    /// opponent's street wager.
+    float    street_contrib = 0.0f;
+    /// Last bettor/raiser on this street (0 = OOP, 1 = IP, 2 = none yet).
+    uint8_t  aggressor = 2;
+    /// The previous street's last aggressor — on the root street, IP when OOP
+    /// has no initiative. OOP's opening bet into an IP aggressor is a donk bet
+    /// and takes the donk menu.
+    uint8_t  prev_aggressor = 2;
 
     TerminalType terminal_type = TerminalType::SHOWDOWN;
 
@@ -53,7 +62,59 @@ struct TreeNode {
     /// Cumulative runout cards dealt from root to this node. The full board
     /// at any node = config.board ∪ runout_cards. Built up during recursion.
     std::vector<uint8_t> runout_cards;
+    /// Chance children only: the suit permutations mapping dealt_card onto
+    /// the other members of its runout orbit (CanonicalRunout::member_perms).
+    std::vector<std::array<uint8_t, 4>> runout_member_perms;
 };
+
+// ============================================================================
+// Bet-sizing menus
+// ============================================================================
+
+using SizingMenus = std::array<std::array<StreetSizing, 3>, 2>;   ///< [player][street]
+
+/// Street index of a board size (3 = flop 0, 4 = turn 1, 5 = river 2).
+inline uint8_t street_of_board_size(uint8_t board_size) {
+    return board_size >= 5 ? 2 : (board_size == 4 ? 1 : 0);
+}
+
+/// The per-player, per-street menus the builder plays from (2026-10-06).
+/// A custom config (--bet-sizing) is used as given. A legacy config derives
+/// them so the legacy trees come out unchanged: each street's one list serves
+/// bets and raises of both players; OOP may lead every later street with it;
+/// on the root street OOP without initiative leads only with
+/// allow_donk_bet, adding donk_bet_size to the list.
+inline SizingMenus resolve_sizing_menus(const SolverConfig& cfg) {
+    SizingMenus m;
+    if (cfg.bet_sizing.custom) {
+        for (int p = 0; p < 2; ++p)
+            for (int st = 0; st < 3; ++st) m[p][st] = cfg.bet_sizing.player[p][st];
+        return m;
+    }
+    const std::vector<float>* lists[3] = {
+        &cfg.bet_sizing.flop_sizes, &cfg.bet_sizing.turn_sizes, &cfg.bet_sizing.river_sizes};
+    const bool allin[3] = {
+        cfg.bet_sizing.flop_allin, cfg.bet_sizing.turn_allin, cfg.bet_sizing.river_allin};
+    const uint8_t root_street = street_of_board_size(cfg.board_size);
+    for (int st = 0; st < 3; ++st) {
+        std::vector<BetSize> sizes;
+        for (float f : *lists[st]) sizes.push_back({BetSize::Kind::PotFraction, f});
+        for (int p = 0; p < 2; ++p) {
+            m[p][st].bet   = sizes;
+            m[p][st].raise = sizes;
+            m[p][st].allin = allin[st];
+        }
+        if (st == root_street && !cfg.oop_has_initiative) {
+            if (cfg.allow_donk_bet) {
+                m[0][st].donk = sizes;
+                m[0][st].donk.push_back({BetSize::Kind::PotFraction, cfg.donk_bet_size});
+            }
+        } else {
+            m[0][st].donk = sizes;
+        }
+    }
+    return m;
+}
 
 // ============================================================================
 // Game Tree Builder
@@ -122,13 +183,27 @@ public:
         return range_perms_;
     }
 
+    /// The group the runout orbits are taken under
+    /// (IsomorphismMapping::runout_perms). The constructor derives the same
+    /// group from the config; a solve whose classes come from elsewhere (a
+    /// forced iso — decomposition subgames share the flop trunk's) must pass
+    /// its own.
+    void set_runout_group(const std::vector<std::array<uint8_t, 4>>& perms) {
+        range_perms_ = perms;
+    }
+
 private:
     const SolverConfig& config_;
     std::vector<TreeNode> nodes_;
-    /// 2026-09-09 audit P0: the suit permutations the players' ranges and
-    /// node locks are symmetric under. Every chance node's runout orbits are
-    /// taken under (board-fixing perms) ∩ this set, so two turn cards share
-    /// one child only when the two resulting subgames are truly isomorphic.
+    /// The hand-class group (hand_class_suit_group: fixes the ROOT board,
+    /// preserves ranges and locks, moves only never-flush suits). Every
+    /// chance node's runout orbits are taken under (perms fixing that node's
+    /// board) ∩ this set, so two runout cards share one child only when the
+    /// two subgames are isomorphic AND the hand classes are invariant under
+    /// the map. 2026-10-06 audit: this used to be the range/lock group alone,
+    /// which on a flop root admitted perms fixing flop ∪ turn but not the
+    /// flop (AcKd7h + 7s turn → (h s)) — the river orbits then merged Xh with
+    /// Xs while the hand classes were singletons.
     std::vector<std::array<uint8_t, 4>> range_perms_;
     uint16_t      nc_estimate_ = 0;
     MemoryBudget  budget_      = MemoryBudget::defaults();
@@ -156,18 +231,14 @@ private:
     /// Generate available actions for a player node
     std::vector<Action> generate_actions(const TreeNode& node) const;
 
-    /// Get bet sizes for the current street
-    const std::vector<float>& get_bet_sizes(uint8_t street) const;
+    /// Does putting `additional` chips in (bet, or call + raise) leave the
+    /// actor's remaining stack below allin_threshold × the pot once the
+    /// opponent calls? Then the action is played as all-in instead.
+    bool should_force_allin(float pot, float bet_into, float stack,
+                            float additional) const;
 
-    /// Check if all-in should be the current street's option
-    bool has_allin(uint8_t street) const;
-
-    /// Compute geometric bet sizing:
-    /// Calculate the bet size that, if repeated each street, reaches all-in.
-    float compute_geometric_size(float pot, float stack, int streets_remaining) const;
-
-    /// Check if a raise would trigger the all-in threshold
-    bool should_force_allin(float pot, float stack, float proposed_bet) const;
+    /// resolve_sizing_menus(config_), resolved once per builder.
+    SizingMenus menus_;
 
     /// Flatten the pointer-based tree into SoA format
     FlatGameTree flatten() const;
@@ -184,8 +255,10 @@ inline GameTreeBuilder::GameTreeBuilder(const SolverConfig& config)
     c.oop_weights = &config.oop_range_weights;
     c.ip_weights  = &config.ip_range_weights;
     c.node_locks  = &config.node_locks;
-    range_perms_ = suit_perms_preserving_constraints(
-        c, board_to_mask(config.board.data(), config.board_size));
+    range_perms_ = (config.iso_mode == IsoMode::Fast)
+        ? hand_class_suit_group(config.board.data(), config.board_size, &c)
+        : board_symmetry_group(config.board.data(), config.board_size, &c);
+    menus_ = resolve_sizing_menus(config);
 }
 
 inline uint32_t GameTreeBuilder::add_node(TreeNode node) {
@@ -194,157 +267,92 @@ inline uint32_t GameTreeBuilder::add_node(TreeNode node) {
     return nodes_.back().node_id;
 }
 
-inline const std::vector<float>& GameTreeBuilder::get_bet_sizes(uint8_t street) const {
-    switch (street) {
-        case 0: return config_.bet_sizing.flop_sizes;
-        case 1: return config_.bet_sizing.turn_sizes;
-        case 2: return config_.bet_sizing.river_sizes;
-        default: return config_.bet_sizing.river_sizes;
-    }
-}
-
-inline bool GameTreeBuilder::has_allin(uint8_t street) const {
-    switch (street) {
-        case 0: return config_.bet_sizing.flop_allin;
-        case 1: return config_.bet_sizing.turn_allin;
-        case 2: return config_.bet_sizing.river_allin;
-        default: return true;
-    }
-}
-
-inline float GameTreeBuilder::compute_geometric_size(float pot, float stack,
-                                                      int streets_remaining) const {
-    if (streets_remaining <= 0) return stack;
-    // Solve: pot * ((1+x)^n - 1) / x = stack, approximately:
-    // x = (stack / pot)^(1/n) - 1 ... simplified geometric ratio
-    // We want the pot-fraction bet b such that betting b*pot each street
-    // exhausts the stack. Using the geometric series:
-    // stack = b*pot * (1 + (1+2b) + (1+2b)^2 + ... )
-    // Approximate: b ≈ ((stack/pot + 1)^(1/n) - 1) / 2
-    float ratio = std::pow((stack + pot) / pot, 1.0f / streets_remaining);
-    float geo_fraction = (ratio - 1.0f) / 2.0f;
-    return std::max(0.2f, std::min(geo_fraction, 3.0f));  // Clamp to [20%, 300%]
-}
-
-inline bool GameTreeBuilder::should_force_allin(float pot, float stack,
-                                                 float proposed_bet) const {
-    float remaining = stack - proposed_bet;
-    float new_pot = pot + proposed_bet * 2; // Both players contribute
-    if (remaining <= 0) return true;
-    float spr = remaining / new_pot;
-    return spr < config_.allin_threshold;
+inline bool GameTreeBuilder::should_force_allin(float pot, float bet_into,
+                                                 float stack, float additional) const {
+    const float remaining = stack - additional;
+    if (remaining <= 0.0f) return true;
+    // Pot once the opponent calls: the actor adds `additional`, the opponent
+    // the part of it they have not matched yet. 2026-10-06 audit: a raise was
+    // priced against pot + bet_into + 2·additional — 2·bet_into too much —
+    // which forced all-in earlier than the documented threshold.
+    const float new_pot = pot + 2.0f * additional - bet_into;
+    return remaining / new_pot < config_.allin_threshold;
 }
 
 inline std::vector<Action> GameTreeBuilder::generate_actions(const TreeNode& node) const {
+    // 2026-10-06 (audit + custom sizing): every menu size becomes a candidate
+    // amount; candidates are sorted and de-duplicated, and an all-in — the
+    // menu's own or one a size was forced into — is appended exactly once, so
+    // menu order cannot drop a size (a `break` after the first forced all-in
+    // used to discard every later, smaller one) and no node carries two
+    // all-ins (the donk branch used to append a second one).
+    const StreetSizing& menu = menus_[node.active_player][node.street];
     std::vector<Action> actions;
+    std::vector<float> amounts;
+    bool add_allin = false;
+    auto consider = [&](float additional) {
+        if (!(additional > 0.0f)) return;
+        if (additional >= node.stack ||
+            should_force_allin(node.pot, node.bet_into, node.stack, additional)) {
+            if (menu.allin) add_allin = true;   // without all-in the size is dropped
+            return;
+        }
+        amounts.push_back(additional);
+    };
 
+    ActionType sized_type = ActionType::BET;
     if (node.bet_into > 0) {
         // Facing a bet: Fold, Call, Raise options
         actions.push_back({ActionType::FOLD, 0.0f});
         actions.push_back({ActionType::CALL, node.bet_into});
+        sized_type = ActionType::RAISE;
 
-        // Raise options (if under raise cap)
         if (node.raise_count < config_.raise_cap && node.stack > node.bet_into) {
-            const auto& sizes = get_bet_sizes(node.street);
-            float current_pot = node.pot + node.bet_into; // pot when facing bet
-
-            for (float frac : sizes) {
-                // Amount is the actor's ADDITIONAL investment (call + raise),
-                // not a street-total wager. Heads-up, bet_into is also the
-                // last wager increment, so a full raise invests at least 2x it.
-                // A short all-in is legal even when it cannot meet that minimum.
-                float raise_to = std::max(2.0f * node.bet_into,
-                                         node.bet_into + current_pot * frac);
-                raise_to = std::min(raise_to, node.stack);
-
-                // Check all-in threshold
-                if (should_force_allin(current_pot, node.stack, raise_to)) {
-                    // Force all-in instead
-                    if (has_allin(node.street)) {
-                        actions.push_back({ActionType::ALLIN, node.stack});
-                    }
-                    break;  // No point adding smaller raises
-                }
-
-                actions.push_back({ActionType::RAISE, raise_to});
+            const float mine = node.street_contrib;
+            const float theirs = mine + node.bet_into;
+            for (const BetSize& b : menu.raise) {
+                // Amount is the actor's ADDITIONAL investment (call + raise).
+                // A % raise is Pio's: the raise on top of the call is that
+                // fraction of the pot after calling. An "x" raise is TO x
+                // times the opponent's street wager. Heads-up, bet_into is the
+                // last wager increment, so a full raise invests at least 2x it;
+                // a short all-in is legal even when it cannot meet that.
+                float additional = (b.kind == BetSize::Kind::Multiplier)
+                    ? b.value * theirs - mine
+                    : node.bet_into + b.value * (node.pot + node.bet_into);
+                additional = std::max(additional, 2.0f * node.bet_into);
+                consider(additional);
             }
-
-            // Add explicit all-in if not already forced
-            if (has_allin(node.street) && actions.back().type != ActionType::ALLIN) {
-                actions.push_back({ActionType::ALLIN, node.stack});
-            }
+            if (menu.allin) add_allin = true;
         }
     } else {
         // No bet to face: Check or Bet options
         actions.push_back({ActionType::CHECK, 0.0f});
-
-        // Donk bet pruning: OOP without initiative can't donk by default
-        bool can_bet = true;
-        if (node.active_player == 0 && !node.oop_has_initiative && !config_.allow_donk_bet) {
-            can_bet = false;
-        }
-
-        if (can_bet) {
-            const auto& sizes = get_bet_sizes(node.street);
-            int streets_remaining = 2 - node.street; // flop=2, turn=1, river=0
-
-            for (float frac : sizes) {
-                float bet_amount = node.pot * frac;
-                bet_amount = std::min(bet_amount, node.stack);
-
-                // Geometric sizing for deep stacks
-                if (streets_remaining > 0 && node.stack > node.pot * 2.0f) {
-                    float geo = compute_geometric_size(node.pot, node.stack, streets_remaining + 1);
-                    // If geometric size is significantly different, consider adding it
-                    if (std::abs(geo - frac) > 0.1f && geo > frac) {
-                        // The geometric size fills a gap — we'll add it only if
-                        // it doesn't duplicate existing sizes
-                        float geo_bet = node.pot * geo;
-                        geo_bet = std::min(geo_bet, node.stack);
-                        if (should_force_allin(node.pot, node.stack, geo_bet)) {
-                            actions.push_back({ActionType::ALLIN, node.stack});
-                            break;
-                        } else {
-                            // Add geometric as a virtual size between existing ones
-                            // (handled by the caller if needed)
-                        }
-                    }
-                }
-
-                if (should_force_allin(node.pot, node.stack, bet_amount)) {
-                    if (has_allin(node.street)) {
-                        actions.push_back({ActionType::ALLIN, node.stack});
-                    }
-                    break;
-                }
-
-                actions.push_back({ActionType::BET, bet_amount});
+        // OOP acts first on every street, so OOP without a bet to face is
+        // opening the street; into the previous street's IP aggressor that is
+        // a donk bet. An empty donk menu means check only.
+        const bool donk_spot = (node.active_player == 0 && node.prev_aggressor == 1);
+        const std::vector<BetSize>& opens = donk_spot ? menu.donk : menu.bet;
+        if (!(donk_spot && opens.empty())) {
+            for (const BetSize& b : opens) {
+                if (b.kind == BetSize::Kind::PotFraction) consider(node.pot * b.value);
             }
-
-            // Donk bet (restricted size): if allowed but only one small size
-            if (node.active_player == 0 && !node.oop_has_initiative && config_.allow_donk_bet) {
-                float donk = node.pot * config_.donk_bet_size;
-                donk = std::min(donk, node.stack);
-                actions.push_back({ActionType::BET, donk});
-            }
-
-            // Explicit all-in option
-            if (has_allin(node.street) && !actions.empty() &&
-                actions.back().type != ActionType::ALLIN) {
-                actions.push_back({ActionType::ALLIN, node.stack});
-            }
+            if (menu.allin) add_allin = true;
         }
     }
 
-    // Deduplicate: remove duplicate all-in entries
-    auto last = std::unique(actions.begin(), actions.end());
-    actions.erase(last, actions.end());
-
-    // Cap total actions at MAX_ACTIONS
-    if (actions.size() > MAX_ACTIONS) {
-        actions.resize(MAX_ACTIONS);
+    std::sort(amounts.begin(), amounts.end());
+    float last = -1.0f;
+    for (float a : amounts) {
+        if (last >= 0.0f && a - last <= 1e-4f * std::max(1.0f, a)) continue;
+        actions.push_back({sized_type, a});
+        last = a;
     }
-
+    // Defensive cap (validated menus never reach it): drop the largest sized
+    // options, never the all-in.
+    const std::size_t room = MAX_ACTIONS - (add_allin ? 1u : 0u);
+    if (actions.size() > room) actions.resize(room);
+    if (add_allin) actions.push_back({ActionType::ALLIN, node.stack});
     return actions;
 }
 
@@ -363,7 +371,9 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
     float    n_stack;
     float    n_bet_into;
     int      n_raise_count;
-    bool     n_oop_has_initiative;
+    float    n_street_contrib;
+    uint8_t  n_aggressor;
+    uint8_t  n_prev_aggressor;
     std::vector<uint8_t> n_runout_cards;
     {
         const TreeNode& node = nodes_[node_idx];
@@ -374,7 +384,9 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
         n_stack              = node.stack;
         n_bet_into           = node.bet_into;
         n_raise_count        = node.raise_count;
-        n_oop_has_initiative = node.oop_has_initiative;
+        n_street_contrib     = node.street_contrib;
+        n_aggressor          = node.aggressor;
+        n_prev_aggressor     = node.prev_aggressor;
         n_runout_cards       = node.runout_cards;
     }
 
@@ -429,11 +441,12 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
                 child.stack = n_stack;
                 child.bet_into = 0;
                 child.raise_count = 0;
-                child.oop_has_initiative = true;
+                child.prev_aggressor = n_aggressor;   // street_contrib 0, aggressor none
                 child.dealt_card = rep.card;
                 child.runout_weight = rep.weight;
                 child.runout_cards = n_runout_cards;
                 child.runout_cards.push_back(rep.card);
+                child.runout_member_perms = rep.member_perms;
                 uint32_t child_idx = add_node(std::move(child));
                 nodes_[node_idx].children.push_back(
                     {{ActionType::CHECK, static_cast<float>(rep.card)}, child_idx});
@@ -510,7 +523,7 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
             child.stack = n_stack;
             child.bet_into = 0;
             child.raise_count = 0;
-            child.oop_has_initiative = true;
+            child.prev_aggressor = n_aggressor;   // street_contrib 0, aggressor none
             child.dealt_card = 0xFFu;
             child.runout_weight = 1;
             child.runout_cards = n_runout_cards;
@@ -529,11 +542,12 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
             child.stack = n_stack;
             child.bet_into = 0;
             child.raise_count = 0;
-            child.oop_has_initiative = true;
+            child.prev_aggressor = n_aggressor;   // street_contrib 0, aggressor none
             child.dealt_card = rep.card;
             child.runout_weight = rep.weight;  // Phase 2: orbit size
             child.runout_cards = n_runout_cards;
             child.runout_cards.push_back(rep.card);
+            child.runout_member_perms = rep.member_perms;
 
             uint32_t child_idx = add_node(std::move(child));
             nodes_[node_idx].children.push_back(
@@ -554,14 +568,20 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
     node_view.stack              = n_stack;
     node_view.bet_into           = n_bet_into;
     node_view.raise_count        = n_raise_count;
-    node_view.oop_has_initiative = n_oop_has_initiative;
+    node_view.street_contrib     = n_street_contrib;
+    node_view.aggressor          = n_aggressor;
+    node_view.prev_aggressor     = n_prev_aggressor;
     auto actions = generate_actions(node_view);
 
     for (const auto& action : actions) {
         TreeNode child;
         child.street = n_street;
-        child.oop_has_initiative = n_oop_has_initiative;
         child.raise_count = n_raise_count;
+        // The opponent acts next on every non-terminal child of a decision
+        // (or the street ends): its street wager is the actor's + bet_into.
+        child.street_contrib = n_street_contrib + n_bet_into;
+        child.aggressor = n_aggressor;
+        child.prev_aggressor = n_prev_aggressor;
         // Inherit cumulative runout cards from parent so terminal evaluation
         // along this branch knows the full board.
         child.runout_cards = n_runout_cards;
@@ -643,8 +663,8 @@ inline void GameTreeBuilder::build_subtree(uint32_t node_idx) {
                 child.raise_count = (action.type == ActionType::RAISE)
                     ? n_raise_count + 1 : n_raise_count;
 
-                // Track initiative
-                child.oop_has_initiative = (n_active_player == 0);
+                // This actor is now the street's last aggressor.
+                child.aggressor = n_active_player;
 
                 if (bettor_remaining <= 0.01f) {
                     // All-in: opponent can only call or fold
@@ -688,11 +708,12 @@ inline FlatGameTree GameTreeBuilder::build() {
     root.stack = config_.effective_stack;
     root.bet_into = 0;
     root.raise_count = 0;
-    // OOP has initiative by default so bet options are available at the root.
-    // The UI/CLI can override via SolverConfig.oop_has_initiative (used for
-    // analyzing single-raised pots where OOP would only check to IP). See
-    // --oop-initiative CLI flag.
-    root.oop_has_initiative = config_.oop_has_initiative;
+    // SolverConfig.oop_has_initiative (--oop-initiative) says who was the
+    // last aggressor before the root street: OOP (3-bet pot, OOP raised last
+    // preflop) or IP (single-raised pot, IP opened) — OOP's opening bet into
+    // IP then takes the donk menu.
+    root.aggressor = 2;
+    root.prev_aggressor = config_.oop_has_initiative ? 0 : 1;
 
     add_node(std::move(root));
     build_subtree(0);
@@ -723,6 +744,16 @@ inline FlatGameTree GameTreeBuilder::flatten() const {
         flat.dealt_card.push_back(node.dealt_card);
         flat.runout_weight.push_back(node.runout_weight);
         flat.matchup_idx.push_back(0);  // populated post-build by Solver::precompute_matchups
+        uint16_t perm_set = kNoRunoutPerms;
+        if (!node.runout_member_perms.empty()) {
+            auto it = std::find(flat.runout_perm_sets.begin(), flat.runout_perm_sets.end(),
+                                node.runout_member_perms);
+            perm_set = static_cast<uint16_t>(it - flat.runout_perm_sets.begin());
+            if (it == flat.runout_perm_sets.end()) {
+                flat.runout_perm_sets.push_back(node.runout_member_perms);
+            }
+        }
+        flat.runout_perm_set.push_back(perm_set);
 
         for (const auto& [action, child_idx] : node.children) {
             flat.children.push_back(child_idx);

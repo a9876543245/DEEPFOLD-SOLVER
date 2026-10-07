@@ -66,7 +66,8 @@ void launch_propagate_reach(
     const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
     const float* d_strat_src, int strat_src_mode,
-    float* d_reach_oop, float* d_reach_ip, uint16_t nc);
+    float* d_reach_oop, float* d_reach_ip, uint16_t nc,
+    int players);   // bit 0 OOP, bit 1 IP: whose reach rows to (re)write
 
 void launch_aggregate_node_values(
     const uint8_t* d_node_types, const uint8_t* d_active_player,
@@ -81,7 +82,10 @@ void launch_aggregate_node_values(
     float* d_regrets, float pos_disc, float neg_disc,
     // gridDim.z = num_traversers; blockIdx.z picks the traverser and offsets
     // node_values by blockIdx.z * value_span. 1 / 0 reproduces the old launch.
-    int num_traversers = 1, size_t value_span = 0);
+    int num_traversers = 1, size_t value_span = 0, DeviceRunoutMaps rm = {},
+    // CFR passes only (d_regrets set): the fused strategy_sum update.
+    float* d_strategy_sum = nullptr, const float* d_reach_oop = nullptr,
+    const float* d_reach_ip = nullptr, float strat_weight = 0.0f, int ss_mode = 0);
 
 // Postsolve variant: max-over-actions at traverser-acting nodes.
 // Same signature as launch_aggregate_node_values.
@@ -94,16 +98,7 @@ void launch_aggregate_node_values_br(
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
     const float* d_strat_src, int strat_src_mode,
     float* d_node_values,
-    uint16_t nc, int traverser);
-
-void launch_update_strategy_sum(
-    float* d_strategy_sum, const float* d_strat_src, int strat_src_mode,
-    const float* d_reach_own,
-    const uint8_t* d_node_types, const uint8_t* d_active_player,
-    const uint8_t* d_num_children,
-    const uint32_t* d_node_offset,
-    uint32_t num_nodes, uint16_t nc,
-    int traverser, float strat_weight, int ss_mode);
+    uint16_t nc, int traverser, DeviceRunoutMaps rm = {});
 
 void launch_showdown_terminal(
     const float* d_matchup_ev, const float* d_matchup_valid,
@@ -421,6 +416,10 @@ struct DeviceSolverState {
     uint32_t* value_row      = nullptr;  // [N] node index → value buffer row
     size_t    value_rows     = 0;
     size_t    value_span     = 0;        // value_rows * nc — one region
+    // 2026-10-07: regions allocated — 1 under alternating updates (the two
+    // backward passes run one after the other and share region 0), 2 under
+    // the simultaneous schedule's fused grid (memory_budget::gpu_value_regions).
+    size_t    value_regions  = 0;
 
     uint32_t* node_offset    = nullptr;  // [N] device slot table
     size_t    total_slots    = 0;        // Σ na over player nodes
@@ -507,6 +506,36 @@ static void free_device(T*& ptr) {
 }
 
 // ---- Tree upload ----
+
+// ---- Exact-isomorphism runout maps (2026-10-06) ----
+
+struct DeviceRunoutMapsOwned {
+    uint16_t* node_set  = nullptr;
+    uint32_t* set_first = nullptr;
+    uint8_t*  set_count = nullptr;
+    uint16_t* maps      = nullptr;
+    gpu::DeviceRunoutMaps view() const { return {node_set, set_first, set_count, maps}; }
+};
+
+static void free_runout_maps(DeviceRunoutMapsOwned& m) {
+    free_device(m.node_set);
+    free_device(m.set_first);
+    free_device(m.set_count);
+    free_device(m.maps);
+}
+
+/// Nothing is uploaded when no chance child needs remapping (Fast
+/// isomorphism, or no merged runouts): the kernels then see null pointers
+/// and keep the plain weight × value sum.
+static DeviceRunoutMapsOwned upload_runout_maps(const RunoutClassMaps* m) {
+    DeviceRunoutMapsOwned d;
+    if (m == nullptr || m->set_first.empty()) return d;
+    d.node_set  = upload_vector(m->node_set);
+    d.set_first = upload_vector(m->set_first);
+    d.set_count = upload_vector(m->set_count);
+    d.maps      = upload_vector(m->maps);
+    return d;
+}
 
 static DeviceTree upload_tree(const FlatGameTree& tree) {
     DeviceTree dt;
@@ -942,7 +971,7 @@ __global__ void apply_locks_kernel(
     const uint32_t* __restrict__ node_offset,     // [N] per-node slot index
     uint32_t num_locks,
     uint16_t nc,
-    uint8_t  max_actions)
+    const uint8_t*  __restrict__ num_children)   // [N]
 {
     uint32_t lock_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (lock_id >= num_locks) return;
@@ -954,7 +983,9 @@ __global__ void apply_locks_kernel(
 
     size_t base = static_cast<size_t>(node_offset[node]) * nc + combo;
     size_t stride = nc;
-    for (uint32_t a = 0; a < count && a < max_actions; ++a) {
+    // Clamped by the node's own action count (2026-10-06 audit): in the
+    // compact layout a longer vector would write into the next node's slots.
+    for (uint32_t a = 0; a < count && a < num_children[node]; ++a) {
         current_strategy[base + a * stride] = strategies_flat[off + a];
     }
 }
@@ -1010,9 +1041,12 @@ static void free_levels(DeviceLevels& dl) {
 static void free_equity_batch(DeviceEquityBatch& eb) {
     free_device(eb.terminal_order);
     // Not free_device(): ADL on gpu::EquityTile* also finds util.cuh's
-    // template and the call becomes ambiguous.
+    // template and the call becomes ambiguous. Unchecked like every other
+    // teardown free (2026-10-06 audit): this runs from ~Impl(), and a sticky
+    // CUDA error rethrown from a destructor called std::terminate — the
+    // process died without its JSON error and the app never retried on CPU.
     if (eb.tiles != nullptr) {
-        CUDA_CHECK(cudaFree(eb.tiles));
+        cudaFree(eb.tiles);
         eb.tiles = nullptr;
     }
     eb.num_terminals = 0;
@@ -1086,6 +1120,17 @@ static void run_terminal_pass(const DeviceTree& tree,
                               float* nv)
 {
     using namespace deepsolver::gpu;
+    // [diag] DEEPSOLVER_GPU_PASS_TIMING: split of the terminal pass.
+    static const bool kTiming = (std::getenv("DEEPSOLVER_GPU_PASS_TIMING") != nullptr);
+    static cudaEvent_t tev[4] = {};
+    static double tsum[4] = {};
+    static int tcalls = 0;
+    auto tmark = [&](int k) {
+        if (!kTiming) return;
+        if (!tev[k]) cudaEventCreate(&tev[k]);
+        cudaEventRecord(tev[k]);
+    };
+    tmark(0);
     if (lv.num_terminals > 0) {
         if (mu.rb_valid) {
             launch_rank_blocker_terminal_level(
@@ -1117,6 +1162,7 @@ static void run_terminal_pass(const DeviceTree& tree,
                 mu.equity, mu.equity_slot, nv);
         }
     }
+    tmark(1);
     if (mu.rb_valid && lv.num_folds > 0) {
         launch_fold_blocker_terminals(
             tree.terminal_types, tree.pots, tree.parent_indices,
@@ -1135,6 +1181,7 @@ static void run_terminal_pass(const DeviceTree& tree,
             mu.iso_denom, mu.iso_board_mask, mu.num_runouts,
             reach_opp_base, nc, traverser, cfg.rake_rate, cfg.rake_cap, nv);
     }
+    tmark(2);
     run_equity_batch(tree, mu, eb, d_value_row, reach_opp_base, nc, cfg, nv);
     // 2026-09-11: full-board showdowns on SignedCount boards, one GEMM.
     if (scb.num_tiles > 0 && mu.signed_count_valid) {
@@ -1142,6 +1189,23 @@ static void run_terminal_pass(const DeviceTree& tree,
             scb.tiles, scb.num_tiles, scb.terminal_order, tree.pots,
             d_value_row, mu.signed_count, mu.canonical_weights,
             reach_opp_base, nc, cfg.rake_rate, cfg.rake_cap, nv);
+    }
+    tmark(3);
+    if (kTiming) {
+        cudaEventSynchronize(tev[3]);
+        for (int k = 1; k < 4; ++k) {
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, tev[k - 1], tev[k]);
+            tsum[k] += ms;
+        }
+        if (++tcalls % 20 == 0) {
+            std::fprintf(stderr,
+                "[terminal-timing] %d passes: showdown=%.2fms folds=%.2fms "
+                "equity+sc=%.2fms (terminals=%u folds=%u eq=%u sc_tiles=%u rb=%d)\n",
+                tcalls, tsum[1] / tcalls, tsum[2] / tcalls, tsum[3] / tcalls,
+                lv.num_terminals, lv.num_folds, eb.num_terminals, scb.num_tiles,
+                mu.rb_valid ? 1 : 0);
+        }
     }
 }
 
@@ -1158,7 +1222,8 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
                                               const FlatGameTree& tree,
                                               bool materialize_strategy,
                                               const std::vector<uint32_t>& host_value_row,
-                                              size_t value_rows)
+                                              size_t value_rows,
+                                              size_t value_regions)
 {
     DeviceSolverState ds;
     size_t N  = num_nodes;
@@ -1190,16 +1255,15 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
     //     (compact; inc 2 dropped action_values, inc 3 dropped
     //     current_strategy — keep bytes_for_gpu_state_compact in sync)
     //   reach = 2 buffers of N*nc floats (full tree)
-    //   node_values = 2 × value_rows*nc floats — B3 inc 1 split it into
-    //     compacted terminal rows + a 2-level non-terminal window, so one
-    //     region is smaller than N*nc (83.9% on the 4.65M-node target); the
-    //     factor 2 is the per-traverser region that lets both backward passes
-    //     share one grid (kGpuValueRegions)
+    //   node_values = value_regions × value_rows*nc floats — B3 inc 1 split
+    //     it into compacted terminal rows + a 2-level non-terminal window, so
+    //     one region is smaller than N*nc (83.9% on the 4.65M-node target);
+    //     a second region only under the simultaneous schedule, whose two
+    //     backward passes share one grid (gpu_value_regions)
     const size_t strat_buffers = materialize_strategy ? 3u : 2u;
     size_t bytes_strat = strat_stride * sizeof(float);
     size_t bytes_reach = N * nc * sizeof(float);
-    size_t bytes_values =
-        memory_budget::kGpuValueRegions * value_rows * nc * sizeof(float);
+    size_t bytes_values = value_regions * value_rows * nc * sizeof(float);
     size_t state_bytes_required = bytes_strat * strat_buffers
                                 + bytes_reach * 2 + bytes_values;
     {
@@ -1225,10 +1289,10 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
         ? alloc_device_zero<float>(strat_stride) : nullptr;
     ds.reach_scratch_oop  = alloc_device_zero<float>(N * nc);
     ds.reach_scratch_ip   = alloc_device_zero<float>(N * nc);
-    ds.node_values        = alloc_device_zero<float>(
-        memory_budget::kGpuValueRegions * value_rows * nc);
+    ds.node_values        = alloc_device_zero<float>(value_regions * value_rows * nc);
     ds.value_rows         = value_rows;
     ds.value_span         = value_rows * nc;
+    ds.value_regions      = value_regions;
     ds.value_row          = upload_vector(host_value_row);
     ds.node_offset        = upload_vector(ds.host_node_offset);
 
@@ -1302,6 +1366,7 @@ struct GpuBackend::Impl {
     DeviceEquityBatch eqbatch{};
     DeviceEquityBatch scbatch{};   // 2026-09-11: full-board showdowns, SignedCount boards
     DeviceNodeLocks   locks{};
+    DeviceRunoutMapsOwned runout_maps{};
 
     // Host-side copies of level schedule (for iterating on host to launch per-terminal kernels)
     std::vector<uint32_t> host_node_order;
@@ -1318,6 +1383,12 @@ struct GpuBackend::Impl {
     const FlatGameTree*       host_tree = nullptr;
     bool prepared = false;
     bool finalized = false;  // true once finalize() has populated current_strategy with averaged
+    // 2026-10-07: which players' reach_scratch rows match their CURRENT
+    // strategy (bit 0 OOP, bit 1 IP). A player's reach depends on that
+    // player's strategy alone, so after one traverser's regret update only
+    // that side needs propagating again. Anything else that writes the rows
+    // (prepare, the postsolve passes) clears it.
+    int reach_fresh = 0;
 
     // The postsolve scratch buffers (reach_scratch_*, node_values) are
     // shared across run_postsolve_pass invocations. The
@@ -1373,6 +1444,7 @@ struct GpuBackend::Impl {
         free_reach(reach);
         free_matchup(matchup);
         free_tree(tree);
+        free_runout_maps(runout_maps);
     }
 
     /// Run one postsolve traversal:
@@ -1430,6 +1502,7 @@ void GpuBackend::prepare(const SolverContext& ctx) {
     free_reach(impl_->reach);
     free_matchup(impl_->matchup);
     free_tree(impl_->tree);
+    free_runout_maps(impl_->runout_maps);
     impl_->finalized = false;
     impl_->prepared = false;
 
@@ -1449,6 +1522,7 @@ void GpuBackend::prepare(const SolverContext& ctx) {
     try {
         // Upload tree + matchup + reach + node locks
         impl_->tree    = upload_tree(*ctx.tree);
+        impl_->runout_maps = upload_runout_maps(ctx.runout_maps);
         // Phase 2: prefer per-runout tables. Fall back to a single-table view
         // wrapping the legacy matchup_ev/_valid if the per-runout vectors are
         // empty (Phase 0/1 callers).
@@ -1505,6 +1579,11 @@ void GpuBackend::prepare(const SolverContext& ctx) {
                     ctx.terminal_plan->representation ==
                         TerminalRepresentation::SignedCount) {
                     count_tables = ctx.matchup_showdown_count_per_runout;
+                    // The GEMM's one-coefficient payoff is exact only unraked.
+                    if (ctx.config->rake_rate != 0.0f || ctx.config->rake_cap != 0.0f) {
+                        throw std::runtime_error(
+                            "GpuBackend::prepare: SignedCount plan on a raked solve");
+                    }
                 }
             }
             impl_->matchup = upload_matchup(
@@ -1672,6 +1751,20 @@ void GpuBackend::prepare(const SolverContext& ctx) {
                     if (static_cast<size_t>(mi) < hslot.size()) {
                         slot = hslot[static_cast<size_t>(mi)];
                     }
+                    // 2026-10-06 audit: a showdown with cards still to come
+                    // can only be settled on its equity table; without one
+                    // it used to fall to the current-board kernels.
+                    if (slot < 0 && ctx.matchup_board_masks != nullptr &&
+                        static_cast<size_t>(mi) < ctx.matchup_board_masks->size()) {
+                        const CardMask bm = (*ctx.matchup_board_masks)[static_cast<size_t>(mi)];
+                        int cards = 0;
+                        for (CardMask m = bm; m != 0; m &= (m - 1)) ++cards;
+                        if (cards < 5) {
+                            throw std::runtime_error(
+                                "GpuBackend::prepare: a partial-board showdown has no "
+                                "equity table");
+                        }
+                    }
                 }
                 if (slot >= 0) {
                     eq_terms.push_back({slot, mi, n});
@@ -1837,7 +1930,9 @@ void GpuBackend::prepare(const SolverContext& ctx) {
                                            *ctx.tree,
                                            impl_->materialize_strategy,
                                            impl_->host_value_row,
-                                           impl_->value_rows);
+                                           impl_->value_rows,
+                                           memory_budget::gpu_value_regions(
+                                               ctx.config->alternating_updates));
         {
             const uint64_t nc64 = ctx.iso->num_canonical;
             const uint64_t n64  = ctx.tree->total_nodes;
@@ -1845,9 +1940,9 @@ void GpuBackend::prepare(const SolverContext& ctx) {
             impl_->device_state_bytes_exact =
                 strat_buffers * impl_->state.state_stride * sizeof(float)
               + 2ULL * n64 * nc64 * sizeof(float)                  // reach ×2
-              + memory_budget::kGpuValueRegions                    // B3 inc 1 +
-                    * static_cast<uint64_t>(impl_->value_rows)     // one region
-                    * nc64 * sizeof(float)                         // per traverser
+              + impl_->state.value_regions                         // B3 inc 1 +
+                    * static_cast<uint64_t>(impl_->value_rows)     // regions
+                    * nc64 * sizeof(float)
               + 2ULL * n64 * sizeof(uint32_t);   // node_offset + value_row
         }
 
@@ -1862,6 +1957,7 @@ void GpuBackend::prepare(const SolverContext& ctx) {
         }
 
         impl_->prepared = true;
+        impl_->reach_fresh = 0;
     } catch (...) {
         // Partial allocation rollback. Each free_* is safe on a half-populated
         // struct because they only free non-null members. Reset prepared so a
@@ -1871,12 +1967,16 @@ void GpuBackend::prepare(const SolverContext& ctx) {
         free_locks(impl_->locks);
         free_levels(impl_->levels);
         free_equity_batch(impl_->eqbatch);
-    free_equity_batch(impl_->scbatch);
+        free_equity_batch(impl_->scbatch);
         free_reach(impl_->reach);
         free_matchup(impl_->matchup);
         free_tree(impl_->tree);
+        free_runout_maps(impl_->runout_maps);
         impl_->host_node_order.clear();
         impl_->host_level_offsets.clear();
+        // 2026-10-06 audit: forget the board too, so a retry cannot take the
+        // keep-board path over the device data freed just above.
+        impl_->host_tree = nullptr;
         impl_->prepared = false;
         impl_->finalized = false;
         throw;
@@ -1893,8 +1993,8 @@ void GpuBackend::reprepare_keep_board(const SolverContext& ctx) {
     // the board matches do we keep them. tree node count is a cheap, sufficient
     // signature here: the decomposition pins ONE board per backend, so the tree
     // (hence matchup) never changes across re-solves of a pinned leaf.
-    if (!impl_->host_tree ||
-        ctx.tree->total_nodes != impl_->host_tree->total_nodes) {
+    if (!impl_->host_tree || ctx.tree != impl_->host_tree ||
+        ctx.tree->total_nodes != impl_->tree.num_nodes) {
         prepare(ctx);
         return;
     }
@@ -1921,10 +2021,13 @@ void GpuBackend::reprepare_keep_board(const SolverContext& ctx) {
                                           *impl_->host_tree,
                                           impl_->materialize_strategy,
                                           impl_->host_value_row,
-                                          impl_->value_rows);
+                                          impl_->value_rows,
+                                          memory_budget::gpu_value_regions(
+                                              ctx.config->alternating_updates));
         impl_->sample_vram();  // keep-board path: track min-free vs the
                                // original prepare()'s baseline
         impl_->prepared = true;
+        impl_->reach_fresh = 0;
     } catch (...) {
         free_solver_state(impl_->state);
         free_locks(impl_->locks);
@@ -1969,6 +2072,7 @@ void GpuBackend::reprepare_keep_state(const SolverContext& ctx) {
     try {
         impl_->reach = upload_reach(*ctx.ip_reach, *ctx.oop_reach);
         impl_->locks = upload_locks(*ctx.resolved_locks);
+        impl_->reach_fresh = 0;   // new root reach: every row is stale
     } catch (...) {
         // Reach/locks are gone but state is intact and unusable without them:
         // drop the whole prepare so the next call rebuilds from scratch.
@@ -2000,13 +2104,34 @@ void GpuBackend::iterate(int iteration) {
     auto& I = *impl_;
     uint16_t nc = I.iso->num_canonical;
     uint32_t N  = I.tree.num_nodes;
-    uint8_t  A  = MAX_ACTIONS;
 
     // Compute DCFR discount factors per the configured schedule. Branches on
     // STANDARD vs POSTFLOP_STYLE — see solver_backend.h for formulas.
     float pos_disc, neg_disc, strat_weight;
     compute_dcfr_factors(iteration, *I.config, pos_disc, neg_disc, strat_weight);
     const int ss_mode = dcfr_strategy_sum_mode(*I.config);
+
+    // [diag] DEEPSOLVER_GPU_PASS_TIMING: device time per pass (CUDA events),
+    // summed over the run and printed to stderr every 10 iterations. Nsight
+    // cannot inject into this process on every setup; this needs nothing.
+    static const bool kPassTiming =
+        (std::getenv("DEEPSOLVER_GPU_PASS_TIMING") != nullptr);
+    struct PassTimer {
+        enum { kMarks = 12 };
+        cudaEvent_t ev[kMarks] = {};
+        const char* name[kMarks] = {};
+        double total_ms[kMarks] = {};
+        int used = 0, iters = 0;
+    };
+    static PassTimer ptimer;
+    auto mark = [&](const char* label) {
+        if (!kPassTiming || ptimer.used >= PassTimer::kMarks) return;
+        if (!ptimer.ev[ptimer.used]) cudaEventCreate(&ptimer.ev[ptimer.used]);
+        ptimer.name[ptimer.used] = label;
+        cudaEventRecord(ptimer.ev[ptimer.used++]);
+    };
+    if (kPassTiming) ptimer.used = 0;
+    mark("start");
 
     // [diag] DEEPSOLVER_GPU_ITERHASH: per-phase FNV-1a hashes of device state,
     // printed to stderr, for localizing run-to-run divergence between two runs
@@ -2041,7 +2166,7 @@ void GpuBackend::iterate(int iteration) {
     // Steps 1-2 as a callable: the alternating schedule (2026-09-12) runs
     // them again between the two traversers, on the regrets the first
     // traverser just updated.
-    auto run_forward = [&]() {
+    auto run_forward = [&](int players) {
     if (I.materialize_strategy) {
         launch_compute_strategy(
             I.state.regrets, I.state.current_strategy,
@@ -2060,7 +2185,7 @@ void GpuBackend::iterate(int iteration) {
             I.locks.node_indices, I.locks.combo_indices,
             I.locks.strategies_flat, I.locks.strategy_offsets,
             I.state.node_offset,
-            I.locks.num_locks, nc, A);
+            I.locks.num_locks, nc, I.tree.num_children);
         CUDA_CHECK(cudaGetLastError());
     }
     if (kIterHash) {
@@ -2074,14 +2199,18 @@ void GpuBackend::iterate(int iteration) {
 
     // 2) Forward reach propagation.
     //    Initialize root reach (node 0) from the uploaded range weights.
-    CUDA_CHECK(cudaMemcpy(I.state.reach_scratch_oop,
-                           I.reach.oop_reach,
-                           static_cast<size_t>(nc) * sizeof(float),
-                           cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(I.state.reach_scratch_ip,
-                           I.reach.ip_reach,
-                           static_cast<size_t>(nc) * sizeof(float),
-                           cudaMemcpyDeviceToDevice));
+    if (players & 1) {
+        CUDA_CHECK(cudaMemcpy(I.state.reach_scratch_oop,
+                               I.reach.oop_reach,
+                               static_cast<size_t>(nc) * sizeof(float),
+                               cudaMemcpyDeviceToDevice));
+    }
+    if (players & 2) {
+        CUDA_CHECK(cudaMemcpy(I.state.reach_scratch_ip,
+                               I.reach.ip_reach,
+                               static_cast<size_t>(nc) * sizeof(float),
+                               cudaMemcpyDeviceToDevice));
+    }
 
     // Depth-keyed schedule: level 0 = root, max_depth = deepest leaves.
     // Reach propagates parents→children, so iterate ROOT-DOWN and launch on the
@@ -2100,7 +2229,7 @@ void GpuBackend::iterate(int iteration) {
             I.state.node_offset,
             d_level, count,
             strat_src, strat_src_mode,
-            I.state.reach_scratch_oop, I.state.reach_scratch_ip, nc);
+            I.state.reach_scratch_oop, I.state.reach_scratch_ip, nc, players);
     }
     if (kIterHash) {
         const size_t nvspan = static_cast<size_t>(N) * nc;
@@ -2110,7 +2239,14 @@ void GpuBackend::iterate(int iteration) {
                      hash_dev(I.state.reach_scratch_ip, nvspan));
     }
     };
-    run_forward();
+    // Refresh only the stale side: after an alternating iteration that is the
+    // player updated last (IP); after prepare or a postsolve pass, both.
+    {
+        const int stale = 3 & ~I.reach_fresh;
+        if (stale) run_forward(stale);
+        I.reach_fresh = 3;
+    }
+    mark("forward");
 
     // 3-5) Backward pass + regret/strategy_sum updates for each traverser.
     // Lambda since Impl is private and can't be accessed from a free function.
@@ -2121,8 +2257,10 @@ void GpuBackend::iterate(int iteration) {
         // This traverser's own value region. Both passes write the same ROWS
         // with different values, so separate regions are what makes them
         // independent — and independence is what lets them share a grid.
-        float* nv = I.state.node_values
-                  + static_cast<size_t>(traverser) * I.state.value_span;
+        // Alternating updates run them in turn: one region, region 0.
+        const size_t region = (I.state.value_regions > 1)
+                            ? static_cast<size_t>(traverser) : 0;
+        float* nv = I.state.node_values + region * I.state.value_span;
 
         float* reach_opp_base = (traverser == 0) ? I.state.reach_scratch_ip
                                                   : I.state.reach_scratch_oop;
@@ -2135,26 +2273,11 @@ void GpuBackend::iterate(int iteration) {
         run_terminal_pass(I.tree, I.matchup, I.levels, I.eqbatch, I.scbatch, I.reach,
                           I.state.value_row, reach_opp_base, nc, traverser,
                           *I.config, nv);
+        mark("terminals");
 
-        // Strategy_sum update — branch on schedule (decay-and-add for
-        // POSTFLOP, accumulative reach-weighted for STANDARD).
-        //
-        // ORDER MATTERS since B1a inc 3: this reads the ITERATION-START
-        // strategy. With the materialized buffer that was a snapshot and the
-        // order was free; deriving it from regrets makes "before
-        // update_regrets" the only correct position.
-        //
-        // B3 inc 1 moved it AHEAD of the backward pass, because update_regrets
-        // now runs inside that pass. Its inputs (reach + regrets) are untouched
-        // by the backward pass, so the move is inert — but the constraint it
-        // encodes is now structural rather than a convention.
-        const float* reach_own = (traverser == 0) ? I.state.reach_scratch_oop
-                                                  : I.state.reach_scratch_ip;
-        launch_update_strategy_sum(
-            I.state.strategy_sum, strat_src, strat_src_mode, reach_own,
-            I.tree.node_types, I.tree.active_player, I.tree.num_children,
-            I.state.node_offset,
-            N, nc, traverser, strat_weight, ss_mode);
+        // The strategy_sum update runs inside the backward pass since
+        // 2026-10-07 (aggregate_node_values_kernel, ahead of each node's
+        // regret update — it must read the iteration-start strategy).
     };
 
     // Backward: deepest level → root, BOTH traversers in one grid. Every child
@@ -2188,7 +2311,9 @@ void GpuBackend::iterate(int iteration) {
                 I.state.node_offset, I.state.value_row,
                 d_level, count_nodes,
                 strat_src, strat_src_mode,
-                I.state.node_values + static_cast<size_t>(first) * I.state.value_span,
+                I.state.node_values
+                    + ((I.state.value_regions > 1) ? static_cast<size_t>(first) : 0)
+                      * I.state.value_span,
                 nc, first,
                 // Regret update for THIS level, fused. It used to be one sweep
                 // over all N nodes after the pass, which only worked while
@@ -2197,7 +2322,11 @@ void GpuBackend::iterate(int iteration) {
                 // throughput. Fused it is launch-free and re-reads nothing.
                 I.state.regrets, pos_disc, neg_disc,
                 count,
-                I.state.value_span);
+                I.state.value_span,
+                I.runout_maps.view(),
+                I.state.strategy_sum,
+                I.state.reach_scratch_oop, I.state.reach_scratch_ip,
+                strat_weight, ss_mode);
         }
     };
 
@@ -2295,9 +2424,8 @@ void GpuBackend::iterate(int iteration) {
     }
 
     auto dump_traverser_hashes = [&](const char* tag) {
-        // Both traverser regions — the buffer is 2× value_rows since fusion.
-        const size_t nvspan =
-            memory_budget::kGpuValueRegions * I.state.value_span;
+        // Every allocated region (2 under the fused grid, 1 when alternating).
+        const size_t nvspan = I.state.value_regions * I.state.value_span;
         std::fprintf(stderr,
                      "[ih] it=%d %s nv=%016llx reg=%016llx "
                      "ss=%016llx\n",
@@ -2319,15 +2447,40 @@ void GpuBackend::iterate(int iteration) {
         // reach and values use OOP's new strategy, then IP's half.
         run_traverser(0);
         run_backward(0, 1);
-        run_forward();
+        mark("backward");
+        run_forward(/*players=*/1);   // only OOP's strategy changed
+        mark("forward");
         run_traverser(1);
         run_backward(1, 1);
+        mark("backward");
+        I.reach_fresh = 1;             // IP's regrets just changed
         if (kIterHash) dump_traverser_hashes("alternating");
     } else {
         run_traverser(0);  // OOP prologue
         run_traverser(1);  // IP prologue
-        run_backward(0, static_cast<int>(memory_budget::kGpuValueRegions));
+        run_backward(0, static_cast<int>(I.state.value_regions));
+        I.reach_fresh = 0;  // both players' regrets changed
         if (kIterHash) dump_traverser_hashes("fused");
+    }
+
+    if (kPassTiming && ptimer.used > 1) {
+        cudaEventSynchronize(ptimer.ev[ptimer.used - 1]);
+        for (int k = 1; k < ptimer.used; ++k) {
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, ptimer.ev[k - 1], ptimer.ev[k]);
+            ptimer.total_ms[k] += ms;
+        }
+        if (++ptimer.iters % 10 == 0) {
+            std::fprintf(stderr, "[pass-timing] %d iters:", ptimer.iters);
+            double sum = 0.0;
+            for (int k = 1; k < ptimer.used; ++k) sum += ptimer.total_ms[k];
+            for (int k = 1; k < ptimer.used; ++k) {
+                std::fprintf(stderr, " %d.%s=%.2fms(%.0f%%)", k, ptimer.name[k],
+                             ptimer.total_ms[k] / ptimer.iters,
+                             100.0 * ptimer.total_ms[k] / std::max(sum, 1e-9));
+            }
+            std::fprintf(stderr, " | %.2f ms/iter\n", sum / ptimer.iters);
+        }
     }
 
     // 2026-09-10: no per-iteration device sync. Measured on the collapsed
@@ -2379,36 +2532,51 @@ void GpuBackend::finalize() {
     // here would put the peak straight back (finalize can be called mid-loop
     // for the exploitability probe, so regrets and strategy_sum must both stay
     // live). The arithmetic below is normalize_strategy_kernel line for line —
-    // same summation order over actions, same 1e-7 threshold, same
+    // same summation order over actions, same FLT_MIN threshold, same
     // multiply-by-reciprocal — so the result is bit-identical.
-    std::vector<float> host_strat(I.state.state_stride, 0.0f);
-    if (!host_strat.empty()) {
-        CUDA_CHECK(cudaMemcpy(host_strat.data(),
-                               I.state.strategy_sum,
-                               host_strat.size() * sizeof(float),
-                               cudaMemcpyDeviceToHost));
-    }
+    //
+    // 2026-10-07: streamed. The rows land straight in their per-node vectors
+    // through a bounded staging buffer; the whole strategy_sum used to be
+    // downloaded into one flat buffer first, so finalize briefly held two
+    // full copies on the host. Slots are assigned in node order, so the
+    // staging window only ever moves forward.
+    strategy_.assign(N, {});
     CUDA_CHECK(cudaDeviceSynchronize());
+    constexpr size_t kStagingFloats = size_t(16) << 20;   // 64 MB
+    std::vector<float> staging;
+    size_t win_begin = 0, win_end = 0;   // strategy_sum floats held in staging
     for (uint32_t n = 0; n < N; ++n) {
         auto nt = static_cast<NodeType>(I.host_tree->node_types[n]);
         const uint8_t na = I.host_tree->num_children[n];
         if ((nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) || na == 0) {
-            continue;
+            continue;   // chance / terminal: no strategy, the row stays empty
         }
-        const size_t base = static_cast<size_t>(I.state.host_node_offset[n]) * nc;
+        const size_t src = static_cast<size_t>(I.state.host_node_offset[n]) * nc;
+        const size_t len = static_cast<size_t>(na) * nc;
+        if (src < win_begin || src + len > win_end) {
+            win_begin = src;
+            win_end = std::min(static_cast<size_t>(I.state.state_stride),
+                               src + std::max(kStagingFloats, len));
+            staging.resize(win_end - win_begin);
+            CUDA_CHECK(cudaMemcpy(staging.data(), I.state.strategy_sum + win_begin,
+                                  staging.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+        }
+        std::vector<float>& row = strategy_[n];
+        row.assign(staging.begin() + (src - win_begin),
+                   staging.begin() + (src - win_begin) + len);
         const size_t stride = nc;
         for (uint16_t combo = 0; combo < nc; ++combo) {
-            const size_t b = base + combo;
             float total_sum = 0.0f;
-            for (int a = 0; a < na; ++a) total_sum += host_strat[b + a * stride];
-            if (total_sum > 1e-7f) {
+            for (int a = 0; a < na; ++a) total_sum += row[combo + a * stride];
+            if (total_sum >= gpu::kGpuMinNormalSum) {
                 const float inv = 1.0f / total_sum;
                 for (int a = 0; a < na; ++a) {
-                    host_strat[b + a * stride] = host_strat[b + a * stride] * inv;
+                    row[combo + a * stride] = row[combo + a * stride] * inv;
                 }
             } else {
                 const float u = 1.0f / static_cast<float>(na);
-                for (int a = 0; a < na; ++a) host_strat[b + a * stride] = u;
+                for (int a = 0; a < na; ++a) row[combo + a * stride] = u;
             }
         }
     }
@@ -2417,23 +2585,6 @@ void GpuBackend::finalize() {
     // today, but sample anyway so the high-water mark provably covers the
     // whole finalize path, not just prepare.
     impl_->sample_vram();
-
-    // Build strategy_ in same per-node format as CpuBackend. A player node's
-    // na action rows are contiguous at slot host_node_offset[n], already in
-    // [a*nc+c] order — one straight copy per node.
-    strategy_.assign(N, {});
-    for (uint32_t n = 0; n < N; ++n) {
-        auto nt = static_cast<NodeType>(I.host_tree->node_types[n]);
-        uint8_t na = I.host_tree->num_children[n];
-        if ((nt == NodeType::PLAYER_OOP || nt == NodeType::PLAYER_IP) && na > 0) {
-            size_t src = static_cast<size_t>(I.state.host_node_offset[n]) * nc;
-            strategy_[n].assign(host_strat.begin() + src,
-                                host_strat.begin() + src
-                                    + static_cast<size_t>(na) * nc);
-        } else {
-            strategy_[n].assign(static_cast<size_t>(na) * nc, 0.0f);
-        }
-    }
 
     // current_strategy on device now holds the averaged strategy. Mark
     // postsolve-ready so compute_combo_evs_gpu / compute_best_response_gpu
@@ -2510,8 +2661,10 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
             state.node_offset,
             d_level, count,
             ps_src, ps_src_mode,
-            state.reach_scratch_oop, state.reach_scratch_ip, nc);
+            state.reach_scratch_oop, state.reach_scratch_ip, nc, /*players=*/3);
     }
+    // The CFR loop's reach rows are gone (averaged-strategy reach now).
+    reach_fresh = 0;
 
     // 3) Terminals in ONE launch (their value depends only on reach, which the
     //    forward pass above has already finished), then the backward value
@@ -2539,7 +2692,7 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
                 d_level, count,
                 ps_src, ps_src_mode,
                 state.node_values,
-                nc, traverser);
+                nc, traverser, runout_maps.view());
         } else {
             launch_aggregate_node_values(
                 tree.node_types, tree.active_player, tree.num_children,
@@ -2550,7 +2703,7 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
                 ps_src, ps_src_mode,
                 state.node_values,
                 nc, traverser,
-                /*regrets=*/nullptr, 0.0f, 0.0f);
+                /*regrets=*/nullptr, 0.0f, 0.0f, 1, 0, runout_maps.view());
         }
     }
 

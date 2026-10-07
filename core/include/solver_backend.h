@@ -183,6 +183,10 @@ inline uint32_t resolve_cpu_threads(uint32_t requested, uint32_t hw_concurrency)
 }
 
 struct SolverContext {
+    /// 2026-10-06 (exact isomorphism): how chance nodes fold a merged runout
+    /// child onto its other orbit members (build_runout_class_maps).
+    /// nullptr / kNoRunoutPerms everywhere = plain weight × child.
+    const RunoutClassMaps* runout_maps = nullptr;
     const FlatGameTree*          tree          = nullptr;
     const IsomorphismMapping*    iso           = nullptr;
     const SolverConfig*          config        = nullptr;
@@ -364,6 +368,13 @@ public:
     /// Layout: strategy[node_idx][action * num_canonical + canonical_combo]
     ///         ∈ [0, 1], rows sum to 1 over actions for each combo.
     virtual const std::vector<std::vector<float>>& strategy() const = 0;
+
+    /// 2026-10-07: hand the finalized strategy over instead of copying it.
+    /// Solver::strategy_ used to be a deep copy taken while the backend's own
+    /// copy stayed alive — two copies of the largest host object at peak
+    /// (6.1 GiB of a 6.55 GiB peak on a 1.28M-node flop). The backend keeps
+    /// no strategy afterwards; the next finalize() rebuilds it.
+    virtual std::vector<std::vector<float>> take_strategy() { return strategy(); }
 
     /// Human-readable backend name, e.g. "CPU-DCFR", "CUDA (RTX 4060, 8GB)".
     /// Shown in UI as the active backend indicator.

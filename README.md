@@ -42,7 +42,7 @@ DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). 
 
 - **2,550+ preflop scenarios** browsable in-app. One click applies as IP / OOP range.
 - **120+ pre-solved flop spots** in a one-click library.
-- **Bet sizing presets** — Standard / Polar / Small Ball — flow through to both the solver tree and the UI buttons.
+- **Bet sizing — presets or fully custom** — Lite / Standard / Polar / Small Ball presets, or a Pio-style editor: bet / raise / donk menus per street and per player in % of pot or `2.5x` raises, an all-in toggle, a raise cap and an adjustable all-in threshold. The same menus build the solver tree and the action buttons.
 - **Range editor + node locking** — override any combo frequency and re-solve.
 - **Training mode** — 10-question drills that score your answers against the equilibrium.
 
@@ -50,7 +50,7 @@ DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). 
 
 - **Trilingual UI** — English / 中文 / 日本語, switchable at any time.
 - **Auto-update** — banner-driven one-click installer refresh, signed releases, install-mode `passive`.
-- **Suit isomorphism** delivers 3–7× speedup on monotone / three-of-suit boards automatically; per-runout matchup tables on GPU give 6–10× over CPU on iso-engaged trees.
+- **Suit isomorphism** is exact (Pio-style) by default: mirrored runouts share one subtree and are mapped back per hand, so strategies match a solve without isomorphism; an optional fast mode also merges never-flush suits for a smaller tree. Per-runout matchup tables on GPU give 6–10× over CPU on iso-engaged trees.
 - **Route A navigation cache** — O(1) action switching, no re-solve. **Path B runout selector** for PioSolver-style chance-aware navigation.
 - **Reproducible benchmarks** — `deepsolver_core --benchmark standard` runs an AsKd7c rainbow / 100-iter scenario and emits compact perf-tracking JSON (`iterations_per_sec`, `nodes_per_sec`, `memory_estimate_mb`, full timing breakdown). Greppable for CI regression tracking.
 
@@ -102,7 +102,7 @@ Not a member yet? Upgrade at [deepfold.co](https://deepfold.co).
 | **Memory Profile** | `safe / balanced / performance` presets to bound host-RAM, JSON, and strategy-tree-node budgets. No more silent OOM kills. |
 | **Runout picker** | When iso enumeration is engaged, click any canonical river card to switch subtrees. |
 | **GTO chart library** | 2,550+ bundled preflop scenarios browsable in-app. One click applies as IP / OOP range. |
-| **Bet sizing presets** | Standard / Polar / Small Ball — flows through to the solver tree AND the UI buttons. |
+| **Bet sizing** | Presets (Lite / Standard / Polar / Small Ball) or a Pio-style custom editor (bet / raise / donk per street and player, % or x sizes, all-in threshold, raise cap) — flows through to the solver tree AND the UI buttons. |
 | **Training mode** | 10-question drills that score your answers against the equilibrium. |
 | **Pre-solved spot library** | 120+ common flop spots, one click to load. |
 | **Range editor + node locking** | Override any combo frequency and re-solve. |

@@ -42,7 +42,7 @@ DEEPFOLD-SOLVER は [DEEPFOLD](https://deepfold.co) のデスクトップ GTO �
 
 - **2,550+ プリフロップ シナリオ** をアプリ内ブラウズ。ワンクリックで IP / OOP レンジに適用。
 - **120+ 解析済み flop スポット** をワンクリックで読込。
-- **ベットサイジング プリセット** — Standard / Polar / Small Ball — ソルバーツリーと UI ボタンの両方に反映。
+- **ベットサイジング:プリセットまたは完全カスタム** — Lite / Standard / Polar / Small Ball のプリセット、または Pio 式エディタ:ストリート・プレイヤーごとの bet / raise / donk(ポット % または `2.5x` レイズ)、オールイン切替、レイズ上限、調整可能なオールイン閾値。同じメニューがソルバーツリーと UI ボタンの両方を構成。
 - **レンジエディタ + ノードロック** — 任意のコンボの頻度を上書きして再ソルブ。
 - **トレーニングモード** — 10 問のドリルが均衡解と比較して回答を採点。
 
@@ -50,7 +50,7 @@ DEEPFOLD-SOLVER は [DEEPFOLD](https://deepfold.co) のデスクトップ GTO �
 
 - **三言語 UI** — English / 中文 / 日本語、いつでも切替可能。
 - **自動更新** — バナーからのワンクリックインストール、署名付きリリース、install mode `passive`。
-- **スート同型** がモノトーン / 3-of-suit ボードで自動的に 3〜7 倍高速化、GPU per-runout マッチアップテーブルが iso 有効時に CPU 比 6〜10 倍。
+- **スート同型** はデフォルトで厳密モード(Pio 式):鏡像ランアウトは 1 つのサブツリーを共有し、ハンドごとに写像して戻すため、同型なしの解と同じ戦略になる。オプションの高速モードはフラッシュになり得ないスートも統合してツリーを小さくする。GPU per-runout マッチアップテーブルが iso 有効時に CPU 比 6〜10 倍。
 - **Route A ナビゲーションキャッシュ** — O(1) アクション切替、再ソルブ不要。**Path B runout セレクタ** で PioSolver 風の chance-aware ナビゲーション。
 - **再現可能なベンチマーク** — `deepsolver_core --benchmark standard` が AsKd7c rainbow / 100 iter シナリオを実行、コンパクトな perf JSON(`iterations_per_sec` / `nodes_per_sec` / `memory_estimate_mb` + 完全な timing 内訳)を出力。CI regression 追跡で grep 可能。
 
@@ -102,7 +102,7 @@ GPU と SIMD はどちらも自動検出。右上のステータスピルで **C
 | **Memory Profile** | `safe / balanced / performance` プリセットで host RAM / JSON / strategy-tree-node 予算を境界決定。サイレント OOM なし |
 | **Runout ピッカー** | iso 列挙有効時、任意の正準 river カードをクリックして枝切替 |
 | **GTO チャートライブラリ** | 2,550 件以上のプリフロップシナリオをアプリ内ブラウズ。ワンクリックで IP / OOP レンジに適用 |
-| **ベットサイジング プリセット** | Standard / Polar / Small Ball — ソルバーツリーと UI ボタンの両方に反映 |
+| **ベットサイジング** | プリセット(Lite / Standard / Polar / Small Ball)または Pio 式カスタム(ストリート・プレイヤーごとの bet / raise / donk、% / x サイズ、オールイン閾値、レイズ上限)— ソルバーツリーと UI ボタンの両方に反映 |
 | **トレーニングモード** | 10 問のドリルが均衡解と比較して回答を採点 |
 | **解析済みスポットライブラリ** | 120 件以上の一般的な flop スポット、ワンクリックで読込 |
 | **レンジエディタ + ノードロック** | 任意のコンボの頻度を上書きして再ソルブ |

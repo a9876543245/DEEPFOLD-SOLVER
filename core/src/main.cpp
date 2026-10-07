@@ -19,6 +19,7 @@
 #include "solver_backend.h"
 #include "solver_decomposed.h"   // Stage 5: runout decomposition (opt-in route)
 #include "cpu_simd.h"
+#include "json_lite.h"
 
 #include <algorithm>
 #include <cmath>
@@ -32,6 +33,7 @@
 #include <cstring>
 #include <map>
 #include <stdexcept>
+#include <thread>
 
 #ifdef _WIN32
 // PSAPI_VERSION 2 maps GetProcessMemoryInfo → K32GetProcessMemoryInfo
@@ -80,6 +82,10 @@ struct CLIArgs {
     std::string board_str;
     std::string history;
     std::string target_combo;
+    /// 2026-10-07: "oop" | "ip" - the player whose range --target joins
+    /// (weight 1e-3 on its combos the range leaves out) so the solve plays
+    /// the hand; without it an out-of-range hand only has a zero-reach lane.
+    std::string target_player;
     int iterations = 500;
     float exploitability = 0.5f;    // percentage
     /// T0/0b: base exploitability-probe interval. -1 = unset (solver default
@@ -115,6 +121,17 @@ struct CLIArgs {
     /// depressed short fixtures); harness fixtures pass this explicitly.
     bool no_progress = false;
 
+    /// 2026-10-06: keep the solved spot in memory after the result and answer
+    /// node / range queries on stdin (one JSON request per line; each reply
+    /// and the initial result end with a kServeEnd line).
+    bool serve = false;
+
+    /// 2026-10-06: the app's process id. A watchdog thread ends this engine
+    /// as soon as that process is gone, so a solve or session can never
+    /// outlive the app (closing it or a crash used to leave a solve running
+    /// for up to hours).
+    uint32_t parent_pid = 0;
+
     // Backend selection: "auto" | "cpu" | "gpu"
     std::string backend = "auto";
 
@@ -122,6 +139,12 @@ struct CLIArgs {
     std::vector<float> flop_sizes = {0.33f, 0.75f};
     std::vector<float> turn_sizes = {0.75f};
     std::vector<float> river_sizes = {0.75f};
+    /// 2026-10-06: Pio-style per-player menus (JSON, see apply_bet_sizing_json).
+    std::string bet_sizing_json;
+    /// 2026-10-06: suit isomorphism mode, "exact" (default) or "fast".
+    std::string iso_mode = "exact";
+    int   raise_cap = -1;               ///< --raise-cap (-1 = SolverConfig default)
+    float allin_threshold_pct = -1.0f;  ///< --allin-threshold in % (-1 = default)
 
     // Custom ranges (range-string format)
     std::string ip_range_str;
@@ -160,6 +183,7 @@ struct CLIArgs {
     int decompose_warmstart   = -1;   // --decompose-warmstart 0|1
     float rake_rate = 0.0f;
     float rake_cap  = 0.0f;
+    bool  rake_cap_set = false;   ///< --rake-cap / --rake-nl25 given
 
     // CPU SIMD policy + thread count overrides.
     //   --cpu-simd auto|scalar|avx2  default auto (CPUID picks)
@@ -225,6 +249,8 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.board_str = argv[++i];
         } else if (arg == "--history" && i + 1 < argc) {
             args.history = argv[++i];
+        } else if (arg == "--target-player" && i + 1 < argc) {
+            args.target_player = argv[++i];
         } else if (arg == "--target" && i + 1 < argc) {
             args.target_combo = argv[++i];
         } else if (arg == "--iterations" && i + 1 < argc) {
@@ -259,6 +285,10 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.postsolve = "none";
         } else if (arg == "--no-progress") {
             args.no_progress = true;
+        } else if (arg == "--serve") {
+            args.serve = true;
+        } else if (arg == "--parent-pid" && i + 1 < argc) {
+            args.parent_pid = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--single-thread-postsolve") {
             args.parallel_postsolve = false;
         } else if (arg == "--parallel-postsolve") {
@@ -287,12 +317,14 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.rake_rate = std::stof(argv[++i]);
         } else if (arg == "--rake-cap" && i + 1 < argc) {
             args.rake_cap = std::stof(argv[++i]);
+            args.rake_cap_set = true;
         } else if (arg == "--rake-nl25") {
             // NL25 standard: 5% capped at 2bb. Caller is expected to use
             // pot/stack in the SAME unit (e.g. 1bb=1 → cap=2.0,
             // 1bb=10 → cap=20, 1bb=100 → cap=200).
             args.rake_rate = 0.05f;
             args.rake_cap  = 2.0f;
+            args.rake_cap_set = true;
         } else if (arg == "--host-memory-mb" && i + 1 < argc) {
             args.host_memory_mb = static_cast<uint64_t>(std::max(0, std::stoi(argv[++i])));
         } else if (arg == "--gpu-memory-mb" && i + 1 < argc) {
@@ -314,22 +346,33 @@ CLIArgs parse_args(int argc, char* argv[]) {
             std::string s = argv[++i];
             std::stringstream ss(s); std::string tok;
             while (std::getline(ss, tok, ',')) {
-                try { args.flop_sizes.push_back(std::stof(tok)); } catch (...) {}
+                // 2026-10-06 audit: a bad token used to vanish silently.
+                args.flop_sizes.push_back(std::stof(tok));
             }
         } else if (arg == "--turn-sizes" && i + 1 < argc) {
             args.turn_sizes.clear();
             std::string s = argv[++i];
             std::stringstream ss(s); std::string tok;
             while (std::getline(ss, tok, ',')) {
-                try { args.turn_sizes.push_back(std::stof(tok)); } catch (...) {}
+                // 2026-10-06 audit: a bad token used to vanish silently.
+                args.turn_sizes.push_back(std::stof(tok));
             }
         } else if (arg == "--river-sizes" && i + 1 < argc) {
             args.river_sizes.clear();
             std::string s = argv[++i];
             std::stringstream ss(s); std::string tok;
             while (std::getline(ss, tok, ',')) {
-                try { args.river_sizes.push_back(std::stof(tok)); } catch (...) {}
+                // 2026-10-06 audit: a bad token used to vanish silently.
+                args.river_sizes.push_back(std::stof(tok));
             }
+        } else if (arg == "--iso" && i + 1 < argc) {
+            args.iso_mode = argv[++i];
+        } else if (arg == "--bet-sizing" && i + 1 < argc) {
+            args.bet_sizing_json = argv[++i];
+        } else if (arg == "--raise-cap" && i + 1 < argc) {
+            args.raise_cap = std::stoi(argv[++i]);
+        } else if (arg == "--allin-threshold" && i + 1 < argc) {
+            args.allin_threshold_pct = std::stof(argv[++i]);
         } else if (arg == "--gpu-info") {
             args.gpu_info = true;
         } else if (arg == "--benchmark" && i + 1 < argc) {
@@ -386,7 +429,8 @@ Arguments:
   --stack <float>          Effective stack size (required)
   --board <string>         Board cards, e.g. "AsKd7c" (required)
   --history <string>       Action history, e.g. "Check,Bet33" (optional)
-  --target <string>        Target combo to analyze, e.g. "AhKh" (optional)
+  --target <string>        Combo or grid label to analyze at the --history
+                           node, e.g. "AhKh" or "AKs" (optional)
   --iterations <int>       Max DCFR iterations (default: 500)
   --exploitability <float> Target exploitability % of pot; the solve stops early
                            once the running-average reaches it (default: 0.5,
@@ -474,6 +518,37 @@ Arguments:
                            anchor; simultaneous: both traversers read the
                            iteration-start strategies (pre-3.2 behaviour).
                            DEEPSOLVER_CFR_UPDATES overrides.
+  --bet-sizing <json>      Pio-style menus per player and street, e.g.
+                           {"oop":{"flop":{"bet":["33%","75%"],"raise":["2.5x"],
+                           "donk":[],"allin":true},...},"ip":{...},
+                           "raise_cap":3,"allin_threshold":12}
+                           "N%" = N percent of the pot (a raise: the raise on top
+                           of the call as a share of the pot after calling);
+                           "Nx" (raises only) = raise TO N times the bet faced.
+                           Overrides --flop/turn/river-sizes.
+  --iso <exact|fast>       Suit isomorphism. exact (default): Pio-style - hands
+                           are never merged while cards are to come; runouts
+                           that mirror each other share one solved child and
+                           are mapped back per hand. fast: hands differing only
+                           in never-flush suits share one strategy too - fewer
+                           lanes on monotone/two-tone flops, but with suited !=
+                           offsuit range weights such hands block differently
+                           and get one strategy below the turn/river card.
+  --target-player <oop|ip> With --target: the hand joins this player's range
+                           (weight 0.001 where the range leaves it out) so an
+                           out-of-range hand gets a solved strategy.
+  --raise-cap <n>          Max raises per street (default 3).
+  --allin-threshold <pct>  A bet or raise that leaves less than this share of
+                           the pot behind once called is played as all-in
+                           (default 12).
+  --serve                  After the result, keep the solve in memory and
+                           answer one JSON request per stdin line:
+                           {"cmd":"node","history":"Check,Bet_75"} (node view;
+                           a history ending a street without "#card" names the
+                           chance node), {"cmd":"ranges","history":...}
+                           (per-combo ranges for a later-street re-solve),
+                           {"cmd":"quit"}. Every reply, and the result itself,
+                           is followed by a line @@DEEPSOLVER_END@@.
   --help, -h               Show this help message
 
 Output:
@@ -488,138 +563,259 @@ Example:
 // Range Parsing: range-string format -> 1326-float weight array
 // ============================================================================
 
+/// 2026-10-06 audit: the combos one hand token names — a specific combo
+/// ("AhKh"), a grid label ("AKs", "AKo", "AA") or both shapes of a non-pair
+/// ("AK"). Ranks are case-insensitive. Empty when the token is not a hand.
+std::vector<uint16_t> hand_token_combos(const std::string& raw) {
+    std::string t;
+    for (char ch : raw) if (ch != ' ' && ch != '\t') t += ch;
+    std::vector<uint16_t> out;
+    auto upper = [](char c) { return static_cast<char>((c >= 'a' && c <= 'z') ? c - 32 : c); };
+    auto is_rank = [&](char c) { return std::string("23456789TJQKA").find(upper(c)) != std::string::npos; };
+    auto is_suit = [](char c) { return c == 'c' || c == 'd' || c == 'h' || c == 's'; };
+    if (t.size() == 4 && is_rank(t[0]) && is_suit(t[1]) && is_rank(t[2]) && is_suit(t[3])) {
+        const std::string a{upper(t[0]), t[1]}, b{upper(t[2]), t[3]};
+        const Card c0 = parse_card(a), c1 = parse_card(b);
+        if (c0 == c1) return out;   // "AhAh" is not a hand
+        out.push_back(Combo(c0, c1).index());
+        return out;
+    }
+    if ((t.size() == 2 || t.size() == 3) && is_rank(t[0]) && is_rank(t[1])) {
+        const std::string label{upper(t[0]), upper(t[1])};
+        const char shape = (t.size() == 3) ? static_cast<char>(t[2] | 0x20) : 0;   // s / o
+        if (t.size() == 3 && shape != 's' && shape != 'o') return out;
+        if (label[0] == label[1] && shape != 0) return out;   // "AAs"
+        const auto& combos = get_combo_table();
+        for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+            const std::string g = combo_to_grid_label(combos[i]);
+            const bool same_ranks = g.compare(0, 2, label) == 0 ||
+                (g[0] == label[1] && g[1] == label[0]);
+            if (!same_ranks) continue;
+            if (shape == 0 || (g.size() == 3 && g[2] == shape)) out.push_back(i);
+        }
+    }
+    return out;
+}
+
 /// Parse range string, e.g. "AA:1.0,AKs:0.5,A4o:1.0"
-/// Returns a map of grid_label -> weight
+/// 2026-10-06 audit: unknown tokens used to be skipped silently ("AK",
+/// "AhKh", lowercase, a weight-less "AA") and any weight accepted ("AA:50%"
+/// became 50). Now: tokens are hand_token_combos() shapes, the weight is
+/// optional (1.0), may be a percentage ("50%"), and must lie in [0, 1];
+/// anything else is an error that names the token.
 void apply_range_string(const std::string& range_str, std::array<float, NUM_COMBOS>& weights) {
     if (range_str.empty()) return;
 
     // First, set all weights to 0 (custom range mode)
     weights.fill(0.0f);
 
-    // Build reverse map: grid_label -> list of combo indices
-    const auto& combo_table = get_combo_table();
-    std::map<std::string, std::vector<uint16_t>> label_to_combos;
-    for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
-        std::string label = combo_to_grid_label(combo_table[i]);
-        label_to_combos[label].push_back(i);
-    }
-
-    // Parse "combo:freq,combo:freq,..."
     std::istringstream iss(range_str);
     std::string token;
     while (std::getline(iss, token, ',')) {
-        // Trim whitespace
         size_t start = token.find_first_not_of(" \t");
         size_t end = token.find_last_not_of(" \t");
         if (start == std::string::npos) continue;
         token = token.substr(start, end - start + 1);
 
-        size_t colon = token.find(':');
-        if (colon == std::string::npos) continue;
-
-        std::string label = token.substr(0, colon);
-        float freq = std::stof(token.substr(colon + 1));
-
-        auto it = label_to_combos.find(label);
-        if (it != label_to_combos.end()) {
-            for (uint16_t idx : it->second) {
-                weights[idx] = freq;
+        const size_t colon = token.find(':');
+        const std::string hand = token.substr(0, colon);
+        float freq = 1.0f;
+        if (colon != std::string::npos) {
+            std::string w = token.substr(colon + 1);
+            const bool pct = !w.empty() && w.back() == '%';
+            if (pct) w.pop_back();
+            char* endp = nullptr;
+            const double v = std::strtod(w.c_str(), &endp);
+            if (w.empty() || endp == nullptr || *endp != '\0' || !std::isfinite(v)) {
+                throw std::invalid_argument("range: bad weight in '" + token + "'");
             }
+            freq = static_cast<float>(pct ? v / 100.0 : v);
         }
+        if (!(freq >= 0.0f && freq <= 1.0f)) {
+            throw std::invalid_argument("range: weight outside [0, 1] in '" + token + "'");
+        }
+        const std::vector<uint16_t> combos = hand_token_combos(hand);
+        if (combos.empty()) {
+            throw std::invalid_argument("range: unknown hand '" + hand + "'");
+        }
+        for (uint16_t idx : combos) weights[idx] = freq;
     }
 }
 
-/// Parse a combo string like "Ad4s" into a combo index
-uint16_t parse_combo_to_index(const std::string& combo_str) {
-    if (combo_str.size() != 4) return UINT16_MAX;
-    Card c0 = parse_card(combo_str.substr(0, 2));
-    Card c1 = parse_card(combo_str.substr(2, 2));
-    Combo combo(c0, c1);
-    return combo.index();
-}
-
-/// Parse node locks from JSON string
+/// Parse node locks from JSON.
 /// Format: [{"history":"Check,Bet_33","combo":"Ad4s","strategy":[0,1,0,0]}, ...]
+/// 2026-10-06 audit: a real JSON reader (the old substring scanner read an
+/// empty history — the ROOT — when the JSON had a space after a colon, and
+/// silently dropped locks it could not read). `combo` may be a specific combo
+/// or a grid label (every combo of it). The strategy must be finite,
+/// non-negative with a positive sum; it is normalized here. Its length is
+/// checked against the node when the lock is resolved.
 std::vector<NodeLockEntry> parse_node_locks(const std::string& json_str) {
     std::vector<NodeLockEntry> locks;
     if (json_str.empty()) return locks;
-
-    // Manual JSON parser with brace-depth tracking for robustness
-    size_t pos = 0;
-    while (pos < json_str.size()) {
-        size_t obj_start = json_str.find('{', pos);
-        if (obj_start == std::string::npos) break;
-
-        // Find matching '}' with depth tracking (handles nested objects)
-        int depth = 1;
-        size_t obj_end = obj_start + 1;
-        bool in_string = false;
-        while (obj_end < json_str.size() && depth > 0) {
-            char ch = json_str[obj_end];
-            if (ch == '\\' && in_string) { obj_end += 2; continue; } // skip escaped chars
-            if (ch == '"') in_string = !in_string;
-            else if (!in_string) {
-                if (ch == '{') ++depth;
-                else if (ch == '}') --depth;
-            }
-            if (depth > 0) ++obj_end;
-        }
-        if (depth != 0) break; // malformed JSON
-
-        std::string obj = json_str.substr(obj_start + 1, obj_end - obj_start - 1);
-        pos = obj_end + 1;
-
-        NodeLockEntry entry;
-
-        // Extract "key":"value" with escaped-quote awareness
-        auto extract_str = [&](const std::string& key) -> std::string {
-            std::string search = "\"" + key + "\":\"";
-            size_t k = obj.find(search);
-            if (k == std::string::npos) return "";
-            size_t vstart = k + search.size();
-            // Find closing quote, skipping escaped quotes
-            size_t vend = vstart;
-            while (vend < obj.size()) {
-                if (obj[vend] == '\\') { vend += 2; continue; }
-                if (obj[vend] == '"') break;
-                ++vend;
-            }
-            if (vend >= obj.size()) return "";
-            return obj.substr(vstart, vend - vstart);
+    const json::Value root = json::parse(json_str);
+    if (!root.is_array()) {
+        throw std::invalid_argument("--node-locks must be a JSON array of "
+                                    "{history, combo, strategy} objects");
+    }
+    for (std::size_t k = 0; k < root.array.size(); ++k) {
+        const json::Value& o = root.array[k];
+        auto bad = [&](const std::string& why) {
+            throw std::invalid_argument("--node-locks entry " + std::to_string(k) + ": " + why);
         };
-
-        entry.history = extract_str("history");
-        entry.combo_str = extract_str("combo");
-        entry.combo_idx = parse_combo_to_index(entry.combo_str);
-
-        // Extract "strategy":[...]
-        size_t strat_key = obj.find("\"strategy\":");
-        if (strat_key != std::string::npos) {
-            size_t bracket_start = obj.find('[', strat_key);
-            size_t bracket_end = obj.find(']', bracket_start);
-            if (bracket_start != std::string::npos && bracket_end != std::string::npos) {
-                std::string arr = obj.substr(bracket_start + 1, bracket_end - bracket_start - 1);
-                std::istringstream arr_stream(arr);
-                std::string num;
-                while (std::getline(arr_stream, num, ',')) {
-                    // Trim whitespace
-                    size_t s = num.find_first_not_of(" \t");
-                    if (s == std::string::npos) continue;
-                    num = num.substr(s);
-                    try {
-                        entry.strategy.push_back(std::stof(num));
-                    } catch (...) {
-                        // Skip malformed numbers
-                    }
-                }
+        if (!o.is_object()) bad("not an object");
+        const json::Value* h = o.find("history");
+        const json::Value* c = o.find("combo");
+        const json::Value* st = o.find("strategy");
+        if (h != nullptr && !h->is_string()) bad("history must be a string");
+        if (c == nullptr || !c->is_string()) bad("missing combo");
+        if (st == nullptr || !st->is_array() || st->array.empty()) bad("missing strategy");
+        std::vector<float> strategy;
+        double sum = 0.0;
+        for (const auto& x : st->array) {
+            if (!x.is_number() || !std::isfinite(x.number) || x.number < 0.0) {
+                bad("strategy values must be finite and >= 0");
             }
+            strategy.push_back(static_cast<float>(x.number));
+            sum += x.number;
         }
-
-        if (entry.combo_idx != UINT16_MAX && !entry.strategy.empty()) {
-            locks.push_back(entry);
+        if (!(sum > 0.0)) bad("strategy must have a positive sum");
+        for (float& v : strategy) v = static_cast<float>(v / sum);
+        const std::vector<uint16_t> combos = hand_token_combos(c->string);
+        if (combos.empty()) bad("unknown combo '" + c->string + "'");
+        for (uint16_t idx : combos) {
+            NodeLockEntry entry;
+            entry.history = (h != nullptr) ? h->string : std::string();
+            entry.combo_idx = idx;
+            entry.combo_str = get_combo_table()[idx].to_string();
+            entry.strategy = strategy;
+            locks.push_back(std::move(entry));
         }
     }
     return locks;
+}
+
+// ============================================================================
+// Bet sizing (2026-10-06, Pio-style custom menus)
+// ============================================================================
+
+/// One size token: "33" / "33%" / "33.3%" (percent of the pot) or, in a raise
+/// menu, "2.5x" (raise TO 2.5 times the opponent's street wager). JSON numbers
+/// are percentages too.
+BetSize parse_size_token(const json::Value& v, bool raise_menu, const std::string& where) {
+    std::string t;
+    if (v.is_number()) {
+        std::ostringstream oss;
+        oss << v.number;
+        t = oss.str();
+    } else if (v.is_string()) {
+        for (char ch : v.string) if (ch != ' ' && ch != '\t') t += ch;
+    } else {
+        throw std::invalid_argument(where + ": sizes must be strings like \"75%\" or \"2.5x\"");
+    }
+    const std::string shown = v.is_string() ? v.string : t;
+    BetSize b;
+    const bool mult = !t.empty() && (t.back() == 'x' || t.back() == 'X');
+    if (mult || (!t.empty() && t.back() == '%')) t.pop_back();
+    char* endp = nullptr;
+    const double num = std::strtod(t.c_str(), &endp);
+    if (t.empty() || endp == nullptr || *endp != '\0' || !std::isfinite(num)) {
+        throw std::invalid_argument(where + ": bad size '" + shown + "'");
+    }
+    if (mult) {
+        if (!raise_menu) {
+            throw std::invalid_argument(where + ": an \"x\" size only applies to raises");
+        }
+        if (!(num > 1.0 && num <= 100.0)) {
+            throw std::invalid_argument(where + ": a raise multiple must be in (1, 100]");
+        }
+        b.kind = BetSize::Kind::Multiplier;
+        b.value = static_cast<float>(num);
+    } else {
+        if (!(num > 0.0 && num <= 1000.0)) {
+            throw std::invalid_argument(where + ": a pot percentage must be in (0, 1000]");
+        }
+        b.kind = BetSize::Kind::PotFraction;
+        b.value = static_cast<float>(num / 100.0);
+    }
+    return b;
+}
+
+std::vector<BetSize> parse_size_menu(const json::Value* v, bool raise_menu,
+                                     const std::string& where) {
+    std::vector<BetSize> out;
+    if (v == nullptr || v->kind == json::Value::Kind::Null) return out;
+    if (!v->is_array()) throw std::invalid_argument(where + " must be an array");
+    if (v->array.size() > kMaxSizesPerMenu) {
+        throw std::invalid_argument(where + ": at most " +
+                                    std::to_string(kMaxSizesPerMenu) + " sizes");
+    }
+    for (const auto& item : v->array) out.push_back(parse_size_token(item, raise_menu, where));
+    return out;
+}
+
+/// --bet-sizing JSON:
+///   {"oop": {"flop": {"bet": [...], "raise": [...], "donk": [...], "allin": true},
+///            "turn": {...}, "river": {...}},
+///    "ip":  {"flop": {"bet": [...], "raise": [...], "allin": true}, ...},
+///    "raise_cap": 3, "allin_threshold": 12}
+/// allin_threshold is a percentage: a bet or raise that would leave less
+/// than that share of the pot behind once called is played as all-in.
+void apply_bet_sizing_json(const std::string& text, SolverConfig& cfg) {
+    const json::Value root = json::parse(text);
+    if (!root.is_object()) throw std::invalid_argument("--bet-sizing must be a JSON object");
+    static const char* kPlayers[2] = {"oop", "ip"};
+    static const char* kStreets[3] = {"flop", "turn", "river"};
+    cfg.bet_sizing.custom = true;
+    for (int p = 0; p < 2; ++p) {
+        const json::Value* pv = root.find(kPlayers[p]);
+        for (int st = 0; st < 3; ++st) {
+            StreetSizing menu;
+            const json::Value* sv = (pv != nullptr) ? pv->find(kStreets[st]) : nullptr;
+            const std::string where = std::string("--bet-sizing ") + kPlayers[p] + "." + kStreets[st];
+            if (sv != nullptr) {
+                if (!sv->is_object()) throw std::invalid_argument(where + " must be an object");
+                menu.bet   = parse_size_menu(sv->find("bet"),   false, where + ".bet");
+                menu.raise = parse_size_menu(sv->find("raise"), true,  where + ".raise");
+                menu.donk  = parse_size_menu(sv->find("donk"),  false, where + ".donk");
+                if (p == 1 && !menu.donk.empty()) {
+                    throw std::invalid_argument(where + ".donk: only OOP has donk bets");
+                }
+                if (const json::Value* a = sv->find("allin")) {
+                    if (!a->is_bool()) throw std::invalid_argument(where + ".allin must be true/false");
+                    menu.allin = a->boolean;
+                }
+            }
+            cfg.bet_sizing.player[p][st] = std::move(menu);
+        }
+    }
+    if (const json::Value* rc = root.find("raise_cap")) {
+        if (!rc->is_number() || rc->number < 0 || rc->number > 10 ||
+            rc->number != static_cast<double>(static_cast<int>(rc->number))) {
+            throw std::invalid_argument("--bet-sizing raise_cap must be an integer in [0, 10]");
+        }
+        cfg.raise_cap = static_cast<int>(rc->number);
+    }
+    if (const json::Value* th = root.find("allin_threshold")) {
+        if (!th->is_number() || !(th->number >= 0.0 && th->number <= 100.0)) {
+            throw std::invalid_argument("--bet-sizing allin_threshold must be a percentage in [0, 100]");
+        }
+        cfg.allin_threshold = static_cast<float>(th->number / 100.0);
+    }
+}
+
+/// Legacy per-street size lists (--flop-sizes etc., pot fractions).
+void validate_legacy_sizes(const std::vector<float>& sizes, const char* flag) {
+    if (sizes.size() > kMaxSizesPerMenu) {
+        throw std::invalid_argument(std::string(flag) + ": at most " +
+                                    std::to_string(kMaxSizesPerMenu) + " sizes");
+    }
+    for (float f : sizes) {
+        if (!(std::isfinite(f) && f > 0.0f && f <= 10.0f)) {
+            throw std::invalid_argument(std::string(flag) +
+                                        ": sizes are pot fractions in (0, 10]");
+        }
+    }
 }
 
 // ============================================================================
@@ -636,7 +832,17 @@ std::string escape_json(const std::string& s) {
             case '\n': result += "\\n"; break;
             case '\r': result += "\\r"; break;
             case '\t': result += "\\t"; break;
-            default: result += c; break;
+            default:
+                // 2026-10-06 audit: other control characters are not legal
+                // inside a JSON string either.
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(static_cast<unsigned char>(c)));
+                    result += buf;
+                } else {
+                    result += c;
+                }
+                break;
         }
     }
     return result;
@@ -806,11 +1012,248 @@ void write_cpu_diagnostics_json(
     out.precision(old_precision);
 }
 
+// ============================================================================
+// Node views (2026-10-06, engine-driven navigation)
+// ============================================================================
+
+constexpr const char* kServeEnd = "@@DEEPSOLVER_END@@";
+
+std::string card_name(uint8_t c) {
+    static const char RANK_CH[] = "23456789TJQKA";
+    static const char SUIT_CH[] = "cdhs";
+    std::string s;
+    s += RANK_CH[c / 4];
+    s += SUIT_CH[c % 4];
+    return s;
+}
+
+const char* node_kind_name(NodeType t) {
+    switch (t) {
+        case NodeType::PLAYER_OOP:
+        case NodeType::PLAYER_IP: return "player";
+        case NodeType::CHANCE:    return "chance";
+        default:                  return "terminal";
+    }
+}
+
+const char* action_type_name(ActionType t) {
+    switch (t) {
+        case ActionType::FOLD:  return "fold";
+        case ActionType::CHECK: return "check";
+        case ActionType::CALL:  return "call";
+        case ActionType::BET:   return "bet";
+        case ActionType::RAISE: return "raise";
+        default:                return "allin";
+    }
+}
+
+/// The NodeInfo members as JSON fields (no surrounding braces).
+void write_node_info_fields(std::ostream& json, const deepsolver::Solver::NodeInfo& info) {
+    const auto old_flags = json.flags();
+    const auto old_prec = json.precision();
+    json << std::fixed << std::setprecision(2);
+    json << "\"kind\":\"" << node_kind_name(info.type) << "\""
+         << ",\"street\":" << static_cast<int>(info.street)
+         << ",\"pot\":" << jsafe(info.pot)
+         << ",\"stack_oop\":" << jsafe(info.stack_oop)
+         << ",\"stack_ip\":" << jsafe(info.stack_ip)
+         << ",\"to_call\":" << jsafe(info.to_call);
+    json << ",\"board\":[";
+    for (size_t i = 0; i < info.board.size(); ++i) {
+        json << (i ? "," : "") << "\"" << card_name(info.board[i]) << "\"";
+    }
+    json << "]";
+    if (info.type == NodeType::TERMINAL) {
+        const char* t = info.terminal == TerminalType::FOLD_OOP ? "fold_oop"
+                      : info.terminal == TerminalType::FOLD_IP  ? "fold_ip" : "showdown";
+        json << ",\"terminal\":\"" << t << "\"";
+    }
+    json << ",\"actions\":[";
+    for (size_t i = 0; i < info.actions.size(); ++i) {
+        const auto& a = info.actions[i];
+        json << (i ? "," : "") << "{\"label\":\"" << escape_json(a.label)
+             << "\",\"type\":\"" << action_type_name(a.type)
+             << "\",\"amount\":" << jsafe(a.amount)
+             << ",\"raise_to\":" << jsafe(a.raise_to)
+             << ",\"next\":\"" << node_kind_name(a.next) << "\"}";
+    }
+    json << "],\"runouts\":[";
+    for (size_t i = 0; i < info.runouts.size(); ++i) {
+        json << (i ? "," : "") << "{\"card\":\"" << card_name(info.runouts[i].card)
+             << "\",\"weight\":" << static_cast<int>(info.runouts[i].weight) << "}";
+    }
+    json << "]";
+    json.flags(old_flags);
+    json.precision(old_prec);
+}
+
+using SuitPerm = deepsolver::Solver::SuitPerm;
+
+bool is_identity(const SuitPerm& p) {
+    return p[0] == 0 && p[1] == 1 && p[2] == 2 && p[3] == 3;
+}
+
+/// A specific-combo key ("AhKs": higher rank first, then higher suit) seen
+/// through `p`; grid labels ("AKs") come back unchanged.
+std::string permute_combo_key(const std::string& key, const SuitPerm& p) {
+    if (key.size() != 4) return key;
+    try {
+        Card c0 = permute_card(parse_card(key.substr(0, 2)), p);
+        Card c1 = permute_card(parse_card(key.substr(2, 2)), p);
+        if (card_rank(c1) > card_rank(c0) ||
+            (card_rank(c1) == card_rank(c0) && card_suit(c1) > card_suit(c0))) {
+            std::swap(c0, c1);
+        }
+        return card_name(c0) + card_name(c1);
+    } catch (const std::invalid_argument&) {
+        return key;
+    }
+}
+
+/// The node's cards seen through `p` (navigate_to_node's view).
+void permute_node_info(deepsolver::Solver::NodeInfo& info, const SuitPerm& p) {
+    for (auto& c : info.board) c = permute_card(c, p);
+    std::sort(info.board.begin(), info.board.end());
+    for (auto& r : info.runouts) r.card = permute_card(r.card, p);
+    std::sort(info.runouts.begin(), info.runouts.end(),
+              [](const auto& a, const auto& b) { return a.card < b.card; });
+}
+
+/// --serve: everything the UI shows for one node.
+std::string node_view_json(const deepsolver::Solver& solver, uint32_t node,
+                           const std::string& history, const SuitPerm& view) {
+    const bool relabel = !is_identity(view);
+    std::ostringstream json;
+    json << "{\"status\":\"ok\",\"history\":\"" << escape_json(history) << "\",";
+    auto info = solver.node_info(node);
+    if (relabel) permute_node_info(info, view);
+    write_node_info_fields(json, info);
+    if (info.type == NodeType::PLAYER_OOP || info.type == NodeType::PLAYER_IP) {
+        json << ",\"acting\":\"" << solver.acting_player_at(node) << "\"";
+        json << std::fixed << std::setprecision(1);
+        json << ",\"global_strategy\":{";
+        const auto gs = solver.extract_global_strategy_at(node);
+        for (size_t i = 0; i < gs.size(); ++i) {
+            json << (i ? "," : "") << "\"" << escape_json(gs[i].first) << "\":\""
+                 << jsafe(gs[i].second) << "%\"";
+        }
+        json << "}" << std::setprecision(4);
+        // Grid labels AND specific combos (the per-variant panel).
+        json << ",\"combo_strategies\":{";
+        const auto cs = solver.extract_combo_strategies_at(node);
+        for (size_t i = 0; i < cs.size(); ++i) {
+            const std::string key = relabel ? permute_combo_key(cs[i].first, view) : cs[i].first;
+            json << (i ? "," : "") << "\"" << escape_json(key) << "\":{";
+            for (size_t j = 0; j < cs[i].second.size(); ++j) {
+                json << (j ? "," : "") << "\"" << escape_json(cs[i].second[j].first)
+                     << "\":" << jsafe(cs[i].second[j].second);
+            }
+            json << "}";
+        }
+        json << "}";
+        const auto opp = solver.extract_opponent_range_at(node);
+        json << ",\"opponent_side\":\"" << opp.opponent << "\",\"opponent_range\":{";
+        for (size_t i = 0; i < opp.labels.size(); ++i) {
+            json << (i ? "," : "") << "\"" << escape_json(opp.labels[i].first) << "\":"
+                 << jsafe(opp.labels[i].second);
+        }
+        json << "}" << std::setprecision(2);
+        json << ",\"combo_evs\":{";
+        const auto evs = solver.node_combo_evs(node);
+        for (size_t i = 0; i < evs.size(); ++i) {
+            json << (i ? "," : "") << "\"" << escape_json(evs[i].first) << "\":"
+                 << jsafe(evs[i].second);
+        }
+        json << "}";
+    }
+    json << "}";
+    return json.str();
+}
+
+/// --serve: the per-combo ranges at a node plus what a later-street
+/// re-solve from there needs (board, pot, stack, initiative).
+std::string ranges_json(const deepsolver::Solver& solver, uint32_t node,
+                        const SuitPerm& view) {
+    auto info = solver.node_info(node);
+    auto ranges = solver.combo_ranges_at(node);
+    const auto& combos = get_combo_table();
+    if (!is_identity(view)) {
+        permute_node_info(info, view);
+        for (auto& r : ranges) {
+            std::array<float, NUM_COMBOS> moved{};
+            for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+                const uint16_t j = Combo(permute_card(combos[i].cards[0], view),
+                                         permute_card(combos[i].cards[1], view)).index();
+                moved[j] = r[i];
+            }
+            r = moved;
+        }
+    }
+    std::ostringstream json;
+    json << "{\"status\":\"ok\",\"pot\":" << std::fixed << std::setprecision(4)
+         << jsafe(info.pot) << ",\"stack\":" << jsafe(std::min(info.stack_oop, info.stack_ip))
+         << ",\"board\":\"";
+    for (uint8_t c : info.board) json << card_name(c);
+    // OOP's next-street lead is a donk bet when IP was this street's last
+    // aggressor; that is what --oop-initiative 0 means at a new root.
+    json << "\",\"oop_has_initiative\":"
+         << (solver.street_aggressor_at(node) == 1 ? "false" : "true");
+    json << std::defaultfloat << std::setprecision(6);
+    for (int p = 0; p < 2; ++p) {
+        json << (p == 0 ? ",\"oop\":\"" : ",\"ip\":\"");
+        bool first = true;
+        for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+            if (!(ranges[p][i] > 0.0f)) continue;
+            json << (first ? "" : ",") << combos[i].to_string() << ":" << ranges[p][i];
+            first = false;
+        }
+        json << "\"";
+    }
+    json << "}";
+    return json.str();
+}
+
+/// --serve request loop. One JSON request per line; malformed requests get
+/// an error reply, never end the session.
+void serve_loop(const deepsolver::Solver& solver) {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        std::string reply;
+        try {
+            const json::Value req = json::parse(line);
+            const json::Value* cmd = req.find("cmd");
+            const std::string c = (cmd != nullptr && cmd->is_string()) ? cmd->string : "";
+            if (c == "quit") break;
+            const json::Value* h = req.find("history");
+            const std::string history = (h != nullptr && h->is_string()) ? h->string : "";
+            SuitPerm view;
+            const uint32_t node = solver.navigate_to_node(history, /*stop_at_final_chance=*/true, &view);
+            if (node == deepsolver::Solver::kInvalidNode) {
+                throw std::invalid_argument("history '" + history + "' is not a node of this tree");
+            }
+            if (c == "node") {
+                reply = node_view_json(solver, node, history, view);
+            } else if (c == "ranges") {
+                reply = ranges_json(solver, node, view);
+            } else {
+                throw std::invalid_argument("unknown cmd '" + c + "'");
+            }
+        } catch (const std::exception& e) {
+            reply = std::string("{\"status\":\"error\",\"message\":\"") +
+                    escape_json(e.what()) + "\"}";
+        }
+        std::cout << reply << "\n" << kServeEnd << "\n" << std::flush;
+    }
+}
+
 std::string result_to_json(
     const SolverResult& result, const CLIArgs& args,
     const std::string& backend_name,
     const std::map<std::string, deepsolver::Solver::StrategyTreeEntry>*
-        strategy_tree = nullptr) {
+        strategy_tree = nullptr,
+    const deepsolver::Solver::NodeInfo* node_info = nullptr) {
     (void)args;
     std::ostringstream json;
     json << std::fixed << std::setprecision(2);
@@ -831,6 +1274,7 @@ std::string result_to_json(
          << (args.force_cpu_postsolve ? "true" : "false") << ",\n";
     json << "  \"dcfr_schedule\": \"" << escape_json(args.dcfr_schedule) << "\",\n";
     json << "  \"decompose_runouts\": \"" << escape_json(args.decompose_runouts) << "\",\n";
+    json << "  \"isomorphism\": \"" << escape_json(args.iso_mode) << "\",\n";
     json << "  \"rake_rate\": " << args.rake_rate << ",\n";
     json << "  \"rake_cap\": " << args.rake_cap << ",\n";
     json << "  \"iterations_run\": " << result.iterations_run << ",\n";
@@ -1006,6 +1450,13 @@ std::string result_to_json(
         json << std::setprecision(2);
     }
 
+    // 2026-10-06: the displayed node's pot, stacks and action amounts.
+    if (node_info != nullptr) {
+        json << ",\n  \"node\": {";
+        write_node_info_fields(json, *node_info);
+        json << "}";
+    }
+
     // Acting player (for UI header "當前行動者")
     if (!result.acting_player.empty()) {
         json << ",\n  \"acting_player\": \"" << escape_json(result.acting_player) << "\"";
@@ -1131,7 +1582,9 @@ std::string result_to_json(
                      << "\",\"weight\":" << int(entry.runout_options[i].weight) << "}";
                 if (i + 1 < entry.runout_options.size()) json << ",";
             }
-            json << "]";
+            json << "],";
+            // 2026-10-06: pot, stacks, to-call and per-action amounts.
+            write_node_info_fields(json, entry.info);
 
             json << "}";
             if (entry_i + 1 < strategy_tree->size()) json << ",";
@@ -1596,8 +2049,32 @@ bool run_benchmark_paired(std::ostream& out,
 // Main
 // ============================================================================
 
+/// --parent-pid: end this process when the parent exits (see CLIArgs).
+static void watch_parent(uint32_t pid) {
+#ifdef _WIN32
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    if (h == nullptr) return;   // already gone or not ours to watch
+    std::thread([h]() {
+        WaitForSingleObject(h, INFINITE);
+        TerminateProcess(GetCurrentProcess(), 3);
+    }).detach();
+#else
+    (void)pid;
+#endif
+}
+
 int main(int argc, char* argv[]) {
-    auto args = parse_args(argc, argv);
+    // 2026-10-06 audit: argument parsing used to run outside every try block
+    // ("--iterations abc" aborted with nothing on stdout or stderr).
+    CLIArgs args;
+    try {
+        args = parse_args(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "{\"status\": \"error\", \"message\": \"Invalid arguments: "
+                  << escape_json(e.what()) << "\"}\n";
+        return 1;
+    }
+    if (args.parent_pid != 0) watch_parent(args.parent_pid);
 
     if (args.help) {
         print_help();
@@ -1689,7 +2166,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Validate required arguments
-    if (args.pot <= 0 || args.stack <= 0 || args.board_str.empty()) {
+    if (!(std::isfinite(args.pot) && args.pot > 0) ||
+        !(std::isfinite(args.stack) && args.stack > 0) || args.board_str.empty()) {
         std::cerr << "{\"status\": \"error\", \"message\": \"Missing required arguments: --pot, --stack, --board\"}\n";
         return 1;
     }
@@ -1714,9 +2192,41 @@ int main(int argc, char* argv[]) {
         }
         config.record_convergence = args.convergence_log;
         config.time_budget_seconds = args.time_budget_seconds;
+        validate_legacy_sizes(args.flop_sizes, "--flop-sizes");
+        validate_legacy_sizes(args.turn_sizes, "--turn-sizes");
+        validate_legacy_sizes(args.river_sizes, "--river-sizes");
         config.bet_sizing.flop_sizes = args.flop_sizes;
         config.bet_sizing.turn_sizes = args.turn_sizes;
         config.bet_sizing.river_sizes = args.river_sizes;
+        if (!args.bet_sizing_json.empty()) {
+            apply_bet_sizing_json(args.bet_sizing_json, config);
+        }
+        if (args.iso_mode == "exact") {
+            config.iso_mode = IsoMode::Exact;
+        } else if (args.iso_mode == "fast") {
+            config.iso_mode = IsoMode::Fast;
+        } else {
+            throw std::invalid_argument("Invalid --iso value: " + args.iso_mode);
+        }
+        if (args.raise_cap >= 0) {
+            if (args.raise_cap > 10) throw std::invalid_argument("--raise-cap must be in [0, 10]");
+            config.raise_cap = args.raise_cap;
+        }
+        if (args.allin_threshold_pct >= 0.0f) {
+            if (!(args.allin_threshold_pct <= 100.0f)) {
+                throw std::invalid_argument("--allin-threshold must be a percentage in [0, 100]");
+            }
+            config.allin_threshold = args.allin_threshold_pct / 100.0f;
+        }
+        if (!(std::isfinite(args.rake_rate) && args.rake_rate >= 0.0f && args.rake_rate < 1.0f) ||
+            !(std::isfinite(args.rake_cap) && args.rake_cap >= 0.0f)) {
+            throw std::invalid_argument("--rake-rate must be in [0, 1) and --rake-cap >= 0");
+        }
+        // 2026-10-06 audit: a rate without a cap meant min(rate·pot, 0) = no
+        // rake at all. No cap given now means uncapped.
+        if (args.rake_rate > 0.0f && !args.rake_cap_set) {
+            args.rake_cap = 1e30f;
+        }
         config.oop_has_initiative = (args.oop_has_initiative != 0);
         // Output plan (review round 2): the memory gates only price the
         // navigation cache + full JSON when we will actually emit them.
@@ -1734,8 +2244,10 @@ int main(int argc, char* argv[]) {
                 ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
             if (kind == "levelized") {
                 config.cpu_backend_kind = SolverConfig::CpuBackendKind::LEVELIZED;
-            } else {
+            } else if (kind == "reference") {
                 config.cpu_backend_kind = SolverConfig::CpuBackendKind::REFERENCE;
+            } else {
+                throw std::invalid_argument("Invalid --cpu-backend value: " + args.cpu_backend_kind);
             }
         }
 
@@ -1749,6 +2261,9 @@ int main(int argc, char* argv[]) {
             std::string trav = args.cpu_traversal;
             for (char& ch : trav)
                 ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (trav != "dfs" && trav != "level") {
+                throw std::invalid_argument("Invalid --cpu-traversal value: " + args.cpu_traversal);
+            }
             config.cpu_dfs_traversal = (trav == "dfs");
             // Env override for A/B runs and test sweeps. Applied to the config
             // (not inside the backend) so the memory estimators see the same
@@ -1785,8 +2300,10 @@ int main(int argc, char* argv[]) {
                 cpu_simd::set_policy(cpu_simd::SimdPolicy::ForceScalar);
             } else if (mode == "avx2") {
                 cpu_simd::set_policy(cpu_simd::SimdPolicy::ForceAvx2);
-            } else {
+            } else if (mode == "auto") {
                 cpu_simd::set_policy(cpu_simd::SimdPolicy::Auto);
+            } else {
+                throw std::invalid_argument("Invalid --cpu-simd value: " + args.cpu_simd);
             }
         }
         {
@@ -1867,6 +2384,28 @@ int main(int argc, char* argv[]) {
             config.has_custom_ranges = true;
         }
 
+        // --target-player: the target hand joins that player's range with a
+        // small weight wherever the range leaves it out, so the solve plays it.
+        if (!args.target_player.empty()) {
+            if (args.target_player != "oop" && args.target_player != "ip") {
+                throw std::invalid_argument("Invalid --target-player value: " + args.target_player);
+            }
+            if (args.target_combo.empty()) {
+                throw std::invalid_argument("--target-player needs --target");
+            }
+            if (config.has_custom_ranges) {
+                auto& w = (args.target_player == "ip") ? config.ip_range_weights
+                                                       : config.oop_range_weights;
+                const auto combos = hand_token_combos(args.target_combo);
+                if (combos.empty()) {
+                    throw std::invalid_argument("--target: unknown hand '" + args.target_combo + "'");
+                }
+                for (uint16_t idx : combos) {
+                    if (!(w[idx] > 0.0f)) w[idx] = 1e-3f;
+                }
+            }
+        }
+
         // Parse node locks
         if (!args.node_locks_str.empty()) {
             config.node_locks = parse_node_locks(args.node_locks_str);
@@ -1884,6 +2423,17 @@ int main(int argc, char* argv[]) {
         eval.initialize();
 
         // Parse backend selection
+        {
+            std::string b = args.backend;
+            for (char& ch : b) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (b != "auto" && b != "cpu" && b != "gpu" && b != "cuda") {
+                throw std::invalid_argument("Invalid --backend value: " + args.backend);
+            }
+        }
+        if (args.decompose_runouts != "off" && args.decompose_runouts != "auto" &&
+            args.decompose_runouts != "on") {
+            throw std::invalid_argument("Invalid --decompose-runouts value: " + args.decompose_runouts);
+        }
         BackendType backend_type = parse_backend_type(args.backend);
 
         Solver solver(config, backend_type);
@@ -2051,13 +2601,25 @@ int main(int argc, char* argv[]) {
                                                  : std::string("none");
 
         uint32_t target_node = 0;
+        // 2026-10-07: a runout card that is not its orbit's representative is
+        // shown through the suit permutation, as --serve shows it.
+        SuitPerm history_view = {0, 1, 2, 3};
         if (monolithic_ok) {
             // Process history navigation
             if (!args.history.empty()) {
-                target_node = solver.navigate_to_node(args.history);
+                target_node = solver.navigate_to_node(args.history, false, &history_view);
+                if (target_node == Solver::kInvalidNode) {
+                    throw std::invalid_argument(
+                        "--history '" + args.history + "' is not a node of this tree");
+                }
                 result.action_labels = solver.get_action_labels_at(target_node);
                 result.global_strategy = solver.extract_global_strategy_at(target_node);
                 result.combo_strategies = solver.extract_combo_strategies_at(target_node);
+                if (!is_identity(history_view)) {
+                    for (auto& cs : result.combo_strategies) {
+                        cs.first = permute_combo_key(cs.first, history_view);
+                    }
+                }
             }
 
             // Acting player + opponent range (for UI view switcher)
@@ -2066,9 +2628,17 @@ int main(int argc, char* argv[]) {
             result.opponent_side = opp.opponent;
             result.opponent_range = std::move(opp.labels);
 
-            // Target combo analysis
+            // Target combo analysis (a specific combo names the dealt world:
+            // look it up in the solved one).
             if (!args.target_combo.empty()) {
-                result.target_analysis = solver.analyze_combo(args.target_combo);
+                std::string target = args.target_combo;
+                if (target.size() == 4 && !is_identity(history_view)) {
+                    SuitPerm inv;
+                    for (uint8_t s = 0; s < 4; ++s) inv[history_view[s]] = s;
+                    target = permute_combo_key(target, inv);
+                }
+                result.target_analysis = solver.analyze_combo(target, target_node);
+                result.target_analysis.combo_str = args.target_combo;
                 result.has_target = true;
             }
         }
@@ -2388,8 +2958,26 @@ int main(int argc, char* argv[]) {
                       << "}\n";
         } else {
             // Output JSON to stdout (with the strategy tree appended).
+            deepsolver::Solver::NodeInfo shown_node;
+            if (monolithic_ok) {
+                shown_node = solver.node_info(target_node);
+                if (!is_identity(history_view)) permute_node_info(shown_node, history_view);
+            }
             std::string out_json =
-                result_to_json(result, args, backend_name, strategy_tree_ptr);
+                result_to_json(result, args, backend_name, strategy_tree_ptr,
+                               monolithic_ok ? &shown_node : nullptr);
+            // --serve on a decomposed result: the stitched tree lives in the
+            // response only — node queries would read the collapsed prefix
+            // solve, so no session is offered.
+            const bool session = args.serve && monolithic_ok && !decomposed;
+            if (args.serve) {
+                const std::string head = "\"status\": \"success\",\n";
+                const std::size_t pos = out_json.find(head);
+                if (pos != std::string::npos) {
+                    out_json.insert(pos + head.size(),
+                        std::string("  \"session\": ") + (session ? "true" : "false") + ",\n");
+                }
+            }
             // Review round 2: serializing a large strategy tree into the
             // ostringstream above IS a real host-memory phase — re-sample
             // the peak after building the string and patch the token so
@@ -2411,6 +2999,13 @@ int main(int argc, char* argv[]) {
                 }
             }
             std::cout << out_json;
+            if (args.serve) {
+                std::cout << "\n" << kServeEnd << "\n" << std::flush;
+                if (session) {
+                    solver.release_backend();   // CPU state / VRAM no longer needed
+                    serve_loop(solver);
+                }
+            }
         }
 
     } catch (const std::exception& e) {

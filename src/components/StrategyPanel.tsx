@@ -1,7 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import type { SolverResponse, ComboStrategy } from '../lib/poker';
 import { getActionColor, parseBoardCards, expandComboLabel, SUIT_SYMBOLS, SUIT_COLORS } from '../lib/poker';
-import { parseRange } from '../lib/ranges';
 import type { SolverProgress } from '../hooks/useSolver';
 import { useT } from '../lib/i18n';
 import { aggregateTurns } from '../lib/aggregateRunouts';
@@ -18,7 +17,6 @@ interface Props {
   loading?: boolean;
   progress?: SolverProgress | null;
   board?: string;
-  heroRange?: string;
   onLockNode?: () => void;
   /** Sprint Aggregated-Report-Lite: history string for the current node
    *  (e.g. "Check,Bet_33,Call"). Drives the per-turn runout aggregation.
@@ -91,7 +89,7 @@ function ComboDisplay({ rank1, suit1, rank2, suit2, isDead }: {
   );
 }
 
-export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress, board, heroRange, onLockNode, currentHistory }: Props) {
+export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress, board, onLockNode, currentHistory }: Props) {
   const t = useT();
   const [showRunoutReport, setShowRunoutReport] = useState(false);
   const [showComboDrill, setShowComboDrill] = useState(false);
@@ -606,9 +604,12 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
       {/* Target Combo Analysis */}
       {result.target_combo_analysis && (() => {
         const tca = result.target_combo_analysis;
-        // Check if this combo is in the hero's original preflop range
-        const heroRangeMap = heroRange ? parseRange(heroRange) : null;
-        const isOutOfRange = heroRangeMap ? (heroRangeMap[tca.combo] ?? 0) <= 0.001 : false;
+        // Off-range = the ACTING player does not hold the hand at this node
+        // (node strategies list only hands that reach it). The hero's
+        // preflop range used to decide it — the wrong player at the
+        // opponent's nodes (BTN's AA read "not in your range" for BB).
+        const nodeStrat = result.combo_strategies?.[tca.combo];
+        const isOutOfRange = !nodeStrat || !!nodeStrat['Not in range'];
         const hasStrategy = Object.keys(tca.strategy_mix).some(k => k !== 'Not in range');
 
         return (

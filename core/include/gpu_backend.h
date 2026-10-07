@@ -57,6 +57,11 @@ public:
     bool finalize_for_probe() override;
     void synchronize() override;
     const std::vector<std::vector<float>>& strategy() const override { return strategy_; }
+    std::vector<std::vector<float>> take_strategy() override {
+        std::vector<std::vector<float>> out = std::move(strategy_);
+        strategy_.clear();
+        return out;
+    }
     const char* name() const override { return name_.c_str(); }
 
     // GPU postsolve fast paths. Both reuse the device buffers already

@@ -10,16 +10,21 @@
  *   node scripts/bulk-presolve.mjs --sizings standard # subset
  *   node scripts/bulk-presolve.mjs --limit 5          # solve first 5 spots only (smoke)
  *   node scripts/bulk-presolve.mjs --resume           # skip files that already exist
- *   node scripts/bulk-presolve.mjs --shard 0/2        # every 2nd spot starting at 0 (run
+ *   node scripts/bulk-presolve.mjs --shard 0/2        # every 2nd board starting at 0, all
+ *                                                     # sizings of a board in one shard (run
  *                                                     # the shards as separate processes;
  *                                                     # each keeps its own failures log)
+ *   node scripts/bulk-presolve.mjs --exe <path>       # solve with this engine binary
+ *   node scripts/bulk-presolve.mjs --gpu-memory-mb N  # fixed VRAM budget: the enumerate /
+ *                                                     # collapse decision no longer depends
+ *                                                     # on what else is using the card
  *
  * Output:
  *   gto_output/presolved/raw/m<i>_b<j>_<sizing>_<stack>bb.json
  *
  * Phase 2 (compact-presolved.mjs) compresses + strips fluff from these.
  *
- * Reads the actual TS source files for MATCHUPS / BOARD_TEMPLATES / BET_SIZINGS
+ * Reads the actual TS source files for MATCHUPS / BOARD_TEMPLATES / SIZING_PRESETS
  * via regex extraction so we don't need a TypeScript loader. The arrays are
  * valid JS object literals — only the type annotations are TS-specific, and
  * those live OUTSIDE the array body (as `: PositionMatchup[]` after the `=`).
@@ -40,7 +45,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..');
 const RANGES_TS    = join(REPO_ROOT, 'src/lib/ranges.ts');
 const SPOTS_TS     = join(REPO_ROOT, 'src/lib/presolvedSpots.ts');
-const SIZINGS_TS   = join(REPO_ROOT, 'src/lib/gameTree.ts');
+const SIZINGS_TS   = join(REPO_ROOT, 'src/lib/betSizing.ts');
 
 // CUDA build with 5090 support — see PRESOLVE_BUNDLE_PLAN §2.
 // Falls back to the CPU-only build if CUDA isn't built.
@@ -61,6 +66,8 @@ function parseArgs(argv) {
     resume: false,
     shard: null,             // {k, n}: solve plan indices with i % n == k
     hostMemoryMb: 0,         // >0: pass --host-memory-mb (bundle machine budget)
+    gpuMemoryMb: 0,          // >0: pass --gpu-memory-mb (else the engine probes free VRAM)
+    exe: '',                 // engine binary override
     sizings: ['standard', 'lite'],
     stacksBb: ['default'],   // 'default' = use the matchup's defaultStack
     limit: 0,
@@ -84,6 +91,8 @@ function parseArgs(argv) {
     if (a === '--dry-run')        out.dryRun = true;
     else if (a === '--resume')    out.resume = true;
     else if (a === '--host-memory-mb') out.hostMemoryMb = parseInt(argv[++i], 10);
+    else if (a === '--gpu-memory-mb') out.gpuMemoryMb = parseInt(argv[++i], 10);
+    else if (a === '--exe')       out.exe = resolve(argv[++i]);
     else if (a === '--shard') {
       const m = String(argv[++i]).match(/^(\d+)\/(\d+)$/);
       if (!m || Number(m[1]) >= Number(m[2])) throw new Error('--shard expects k/n with k < n');
@@ -134,7 +143,7 @@ function extractArray(srcPath, name) {
   return new Function(`return ${m[1]}`)();
 }
 
-/** Same but for a Record<string, ...> object literal (BET_SIZINGS). */
+/** Same but for a Record<string, ...> object literal (SIZING_PRESETS). */
 function extractRecord(srcPath, name) {
   const src = readFileSync(srcPath, 'utf-8');
   const re = new RegExp(
@@ -146,9 +155,10 @@ function extractRecord(srcPath, name) {
 
 const MATCHUPS        = extractArray(RANGES_TS, 'MATCHUPS');
 const BOARD_TEMPLATES = extractArray(SPOTS_TS,  'BOARD_TEMPLATES');
-const BET_SIZINGS     = extractRecord(SIZINGS_TS, 'BET_SIZINGS');
+// Pot percentages per street — the same presets the app sends as specs.
+const SIZING_PRESETS  = extractRecord(SIZINGS_TS, 'SIZING_PRESETS');
 
-console.log(`Loaded ${MATCHUPS.length} matchups, ${BOARD_TEMPLATES.length} boards, ${Object.keys(BET_SIZINGS).length} sizings`);
+console.log(`Loaded ${MATCHUPS.length} matchups, ${BOARD_TEMPLATES.length} boards, ${Object.keys(SIZING_PRESETS).length} sizings`);
 
 // ============================================================================
 // Plan generation
@@ -165,7 +175,7 @@ function buildPlan() {
     for (let bi = 0; bi < BOARD_TEMPLATES.length; ++bi) {
       const board = BOARD_TEMPLATES[bi];
       for (const sizingKey of args.sizings) {
-        if (!BET_SIZINGS[sizingKey]) {
+        if (!SIZING_PRESETS[sizingKey]) {
           throw new Error(`unknown sizing key: ${sizingKey}`);
         }
         // For now: 'default' = use the matchup's own defaultStack.
@@ -186,7 +196,7 @@ function buildPlan() {
             stack:    Math.round(effStackBb * 10),
             ipRange:  m.ipRange,
             oopRange: m.oopRange,
-            sizes:    BET_SIZINGS[sizingKey],
+            sizes:    SIZING_PRESETS[sizingKey],
             // Metadata for the output filename + bundled JSON
             meta: {
               matchup_label: m.label,
@@ -218,6 +228,7 @@ function spotFilename(spot) {
 // ============================================================================
 
 function pickExe() {
+  if (args.exe)                return args.exe;
   if (args.backend === 'cpu')  return CPU_EXE;
   if (args.backend === 'cuda') return CUDA_EXE;
   // auto: prefer cuda build if it exists
@@ -226,7 +237,9 @@ function pickExe() {
 
 function solveOne(exe, spot) {
   return new Promise((resolveFn, reject) => {
-    const sizes = spot.sizes;
+    // Legacy per-street lists (pot fractions) build the same tree as the
+    // preset's spec (one list for bets and raises of both players).
+    const fractions = (st) => spot.sizes[st].map((pct) => pct / 100).join(',');
     const cmdArgs = [
       '--pot',           String(spot.pot),
       '--stack',         String(spot.stack),
@@ -235,17 +248,18 @@ function solveOne(exe, spot) {
       '--exploitability', String(args.exploitability),
       '--ip-range',      spot.ipRange,
       '--oop-range',     spot.oopRange,
-      '--flop-sizes',    sizes.flopBetSizes.join(','),
-      '--turn-sizes',    sizes.turnBetSizes.join(','),
-      '--river-sizes',   sizes.riverBetSizes.join(','),
+      '--flop-sizes',    fractions('flop'),
+      '--turn-sizes',    fractions('turn'),
+      '--river-sizes',   fractions('river'),
       '--dcfr-schedule', args.dcfrSchedule,
       '--cpu-persistent-omp', '1',
       '--postsolve',     'full',
       '--strategy-tree-evs', 'visible',
       '--strategy-tree-max-nodes', String(args.maxTreeNodes),
-      '--backend',       (exe === CUDA_EXE) ? 'cuda' : 'cpu',
+      '--backend',       (exe === CPU_EXE || args.backend === 'cpu') ? 'cpu' : 'cuda',
     ];
     if (args.hostMemoryMb > 0) cmdArgs.push('--host-memory-mb', String(args.hostMemoryMb));
+    if (args.gpuMemoryMb > 0) cmdArgs.push('--gpu-memory-mb', String(args.gpuMemoryMb));
     const child = spawn(exe, cmdArgs, { windowsHide: true });
     let stdout = '';
     let stderr = '';
@@ -304,7 +318,10 @@ async function main() {
   mkdirSync(OUT_RAW_DIR, { recursive: true });
   let plan = buildPlan();
   if (args.shard) {
-    plan = plan.filter((_, i) => i % args.shard.n === args.shard.k);
+    // By board, not by spot: the plan alternates sizings, so `i % n` put
+    // every standard spot in shard 0 and every lite spot in shard 1 (v3.0.0).
+    const perBoard = args.sizings.length * args.stacksBb.length;
+    plan = plan.filter((_, i) => Math.floor(i / perBoard) % args.shard.n === args.shard.k);
     console.log(`Shard ${args.shard.k}/${args.shard.n}: ${plan.length} spots`);
   }
   console.log(`\n=== ${plan.length} spots to solve ===\n`);

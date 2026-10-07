@@ -69,8 +69,16 @@ inline std::vector<Card> parse_board(const std::string& s) {
     }
     std::vector<Card> board;
     board.reserve(s.size() / 2);
+    CardMask seen = 0;
     for (size_t i = 0; i < s.size(); i += 2) {
-        board.push_back(parse_card(s.substr(i, 2)));
+        const Card c = parse_card(s.substr(i, 2));
+        // 2026-10-06 audit: "AsKd7c2h2h" used to "solve" on 7-card
+        // evaluations holding the same card twice.
+        if (seen & card_to_mask(c)) {
+            throw std::invalid_argument("Board has a duplicate card: " + s.substr(i, 2));
+        }
+        seen |= card_to_mask(c);
+        board.push_back(c);
     }
     return board;
 }
@@ -119,18 +127,19 @@ struct Combo {
 /// Lookup table: combo_index -> Combo (pre-computed at init)
 /// combo_index_table[i] gives the Combo with index i.
 inline const std::array<Combo, NUM_COMBOS>& get_combo_table() {
-    static bool initialized = false;
-    static std::array<Combo, NUM_COMBOS> table{};
-    if (!initialized) {
+    // A function-local static initializer runs exactly once even when the
+    // first calls race (the old `static bool initialized` flag did not).
+    static const std::array<Combo, NUM_COMBOS> table = [] {
+        std::array<Combo, NUM_COMBOS> t{};
         uint16_t idx = 0;
         for (Card c2 = 1; c2 < NUM_CARDS; ++c2) {
             for (Card c1 = 0; c1 < c2; ++c1) {
-                table[idx] = Combo(c1, c2);
+                t[idx] = Combo(c1, c2);
                 ++idx;
             }
         }
-        initialized = true;
-    }
+        return t;
+    }();
     return table;
 }
 

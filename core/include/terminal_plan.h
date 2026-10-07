@@ -193,7 +193,8 @@ inline bool host_dense_matchup_required(
 ///
 ///   singleton-iso                → RankBlockerOnly   (no dense upload)
 ///     ... + RB_SELFCHECK env     → DebugDenseSelfCheck (dense upload forced)
-///   rake == 0 (iso-engaged)      → SignedCount       (host +1 B/cell)
+///   rake == 0 (iso-engaged),
+///     every class pair ≤ 127     → SignedCount       (host +1 B/cell)
 ///   otherwise                    → DenseCategoryValid
 ///
 /// host_bytes_per_cell reproduces matchup_bytes_per_cell():
@@ -205,6 +206,12 @@ inline TerminalRepresentationPlan plan_terminal_representation(
     TerminalRepresentationPlan p;
     const bool singleton = showdown_rank_blocker::supports_singleton_iso(iso);
     const bool zero_rake = (config.rake_rate == 0.0f && config.rake_cap == 0.0f);
+    // 2026-10-06 audit: the signed pair count is int8, and a class pair can
+    // hold up to |Ci|·|Cj| original pairs — 12 × 12 = 144 under S4 on a
+    // quads turn, which wrapped to −112. Such boards take the dense tables.
+    uint32_t max_class = 0;
+    for (uint16_t w : iso.canonical_weights) max_class = std::max<uint32_t>(max_class, w);
+    const bool count_fits_int8 = max_class * max_class <= 127u;
 
     if (singleton) {
         p.representation = terminal_selfcheck_forced()
@@ -213,7 +220,7 @@ inline TerminalRepresentationPlan plan_terminal_representation(
         p.device_dense_upload =
             (p.representation == TerminalRepresentation::DebugDenseSelfCheck);
         p.host_bytes_per_cell = memory_budget::kBaseMatchupBytesPerCell;
-    } else if (zero_rake) {
+    } else if (zero_rake && count_fits_int8) {
         p.representation      = TerminalRepresentation::SignedCount;
         p.device_dense_upload = true;
         p.host_bytes_per_cell = memory_budget::kSignedCountMatchupBytesPerCell;

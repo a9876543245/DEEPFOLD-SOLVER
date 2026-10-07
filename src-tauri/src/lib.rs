@@ -7,6 +7,7 @@ mod api_server;
 
 use commands::{
     solve, estimate_solve, cancel_solve, engine_status, save_solution, load_solution, get_gpu_info, start_google_oauth,
+    query_node, query_ranges, close_session,
 };
 use gto_charts::{list_gto_scenarios, load_gto_chart, read_bundled_presolve};
 
@@ -27,7 +28,10 @@ pub fn run() {
             start_google_oauth,
             list_gto_scenarios,
             load_gto_chart,
-            read_bundled_presolve
+            read_bundled_presolve,
+            query_node,
+            query_ranges,
+            close_session
         ])
         .setup(|_app| {
             // Optionally start headless API server
@@ -47,6 +51,13 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // 2026-10-06 audit: a running solve or the in-memory session used
+            // to outlive the window. (The engine also watches --parent-pid.)
+            if let tauri::RunEvent::Exit = event {
+                engine::shutdown();
+            }
+        });
 }

@@ -19,12 +19,14 @@
 #include <vector>
 #include <algorithm>
 #include <map>
+#include <stdexcept>
 
 namespace deepsolver {
 
 // ============================================================================
 // Suit Isomorphism Result
 // ============================================================================
+
 
 /// Maps original combo indices to canonical indices
 struct IsomorphismMapping {
@@ -45,6 +47,19 @@ struct IsomorphismMapping {
     /// telemetry can report the board's index space and the solve's side by
     /// side — every buffer is sized by num_canonical, not by this.
     uint16_t board_canonical = 0;
+
+    /// The suit permutations the classes were built under. A class row is
+    /// one strategy-equivalent object only under these.
+    std::vector<std::array<uint8_t, 4>> perms;
+
+    /// The group every chance node's runout orbits are taken under (restricted
+    /// at each node to the perms that also fix the cards dealt so far). Fast:
+    /// equal to `perms`, so a merged runout child's class rows ARE the other
+    /// members' rows. Exact: the board's whole symmetry group (it fixes the
+    /// root board and preserves ranges/locks) — the chance node then maps the
+    /// representative child's values onto each member through the permutation
+    /// (build_runout_class_maps).
+    std::vector<std::array<uint8_t, 4>> runout_perms;
 };
 
 // ============================================================================
@@ -100,6 +115,21 @@ inline bool perm_preserves_constraints(
         }
     }
     if (c.node_locks != nullptr && !c.node_locks->empty()) {
+        // 2026-10-07: a lock below a runout card ("Check,Check#2c") holds in
+        // that card's world only, so the permutation must fix the card — one
+        // that moves it merges the locked world with an unlocked one.
+        for (const auto& lock : *c.node_locks) {
+            const std::string& h = lock.history;
+            for (size_t at = h.find('#'); at != std::string::npos; at = h.find('#', at + 1)) {
+                Card card;
+                try {
+                    card = parse_card(h.substr(at + 1, 2));
+                } catch (const std::invalid_argument&) {
+                    continue;   // not a card: resolve_node_locks rejects the history
+                }
+                if (permute_card(card, perm) != card) return false;
+            }
+        }
         // Every lock (history, combo, strategy) must have its image
         // (history, perm(combo), same strategy) among the locks.
         for (const auto& lock : *c.node_locks) {
@@ -117,17 +147,48 @@ inline bool perm_preserves_constraints(
     return true;
 }
 
-/// The suit permutations that preserve the ranges/locks in `c` — the
-/// board-independent half of every symmetry group in the tree. The tree
-/// builder intersects this with the group fixing each chance node's board.
-inline std::vector<std::array<uint8_t, 4>> suit_perms_preserving_constraints(
-    const IsoConstraints& c, CardMask dead = 0)
+inline std::vector<std::array<uint8_t, 4>>
+suit_perms_fixing_board(const Card* board, uint8_t board_size);
+
+/**
+ * @brief The suit-permutation group of the canonical hand space (2026-10-06
+ *        audit). Every chance node's runout orbits must be a subgroup of it.
+ *
+ * A permutation is admitted when it
+ *   (a) fixes the root board,
+ *   (b) preserves both ranges and the node locks (IsoConstraints), and
+ *   (c) moves only suits that can never make a flush on any runout — board
+ *       count + cards still to come ≤ 2.
+ *
+ * (c) is what keeps merged hands interchangeable BELOW the chance nodes:
+ * members of a class then hold one hand rank on every completed board (the
+ * rank-blocker, category and signed-count representations assume it) and
+ * the same flush chances. Without it a paired flop like 7c7dKh admitted the
+ * (c d) swap, so QcJc and QdJd shared one strategy — after a 2c turn one is
+ * a flush draw and the other is not. What can still differ between members
+ * of a class below a chance node is card removal only.
+ */
+inline std::vector<std::array<uint8_t, 4>> hand_class_suit_group(
+    const Card* board, uint8_t board_size, const IsoConstraints* constraints)
 {
+    uint8_t suit_count[4] = {};
+    for (uint8_t i = 0; i < board_size; ++i) suit_count[card_suit(board[i])]++;
+    const int to_come = std::max(0, 5 - static_cast<int>(board_size));
+    const CardMask board_mask = board_to_mask(board, board_size);
+
     std::vector<std::array<uint8_t, 4>> out;
-    std::array<uint8_t, 4> perm = {0, 1, 2, 3};
-    do {
-        if (perm_preserves_constraints(perm, c, dead)) out.push_back(perm);
-    } while (std::next_permutation(perm.begin(), perm.end()));
+    for (const auto& perm : suit_perms_fixing_board(board, board_size)) {
+        bool moves_live_suit = false;
+        for (int s = 0; s < 4; ++s) {
+            if (perm[s] != s && suit_count[s] + to_come > 2) moves_live_suit = true;
+        }
+        if (moves_live_suit) continue;
+        if (constraints != nullptr &&
+            !perm_preserves_constraints(perm, *constraints, board_mask)) {
+            continue;
+        }
+        out.push_back(perm);
+    }
     return out;
 }
 
@@ -147,69 +208,48 @@ inline std::vector<std::array<uint8_t, 4>> suit_perms_preserving_constraints(
  *        never passes nullptr).
  * @return IsomorphismMapping
  */
+/// The board's whole symmetry group: suit permutations that fix the board
+/// and preserve both ranges and the node locks.
+inline std::vector<std::array<uint8_t, 4>> board_symmetry_group(
+    const Card* board, uint8_t board_size, const IsoConstraints* constraints)
+{
+    const CardMask board_mask = board_to_mask(board, board_size);
+    std::vector<std::array<uint8_t, 4>> out;
+    for (const auto& perm : suit_perms_fixing_board(board, board_size)) {
+        if (constraints != nullptr &&
+            !perm_preserves_constraints(perm, *constraints, board_mask)) {
+            continue;
+        }
+        out.push_back(perm);
+    }
+    return out;
+}
+
 inline IsomorphismMapping compute_isomorphism(const Card* board, uint8_t board_size,
-                                              const IsoConstraints* constraints = nullptr) {
+                                              const IsoConstraints* constraints = nullptr,
+                                              IsoMode mode = IsoMode::Fast) {
     IsomorphismMapping result;
 
-    // Step 1: Determine which suits appear on the board
-    uint8_t suit_count[4] = {};
-    for (uint8_t i = 0; i < board_size; ++i) {
-        suit_count[card_suit(board[i])]++;
-    }
-
-    // Step 2: Build suit equivalence classes
-    // Suits with the same count on the board can be permuted freely
-    // Example: Board = As Kd 7c → suit_count = {1, 1, 0, 1}
-    //   Hearts(0 on board) is different from Clubs/Diamonds/Spades(1 each)
-    //   But C, D, S can be permuted among themselves
-
-    // Group suits by their board count (and rank pattern for more precision)
-    struct SuitSignature {
-        uint8_t count;                 ///< How many board cards of this suit
-        std::vector<Rank> board_ranks; ///< Which ranks appear (sorted)
-    };
-
-    std::array<SuitSignature, 4> suit_sigs;
-    for (int s = 0; s < 4; ++s) {
-        suit_sigs[s].count = suit_count[s];
-        for (uint8_t i = 0; i < board_size; ++i) {
-            if (card_suit(board[i]) == s) {
-                suit_sigs[s].board_ranks.push_back(card_rank(board[i]));
-            }
-        }
-        std::sort(suit_sigs[s].board_ranks.begin(), suit_sigs[s].board_ranks.end());
-    }
-
-    // Generate all valid suit permutations (those that preserve the board)
-    // A permutation p[0..3] maps suit i → suit p[i]
+    // Steps 1-2: the permutations that may merge hands. A permutation
+    // p[0..3] maps suit i → suit p[i]. Fast: board-fixing, range/lock-
+    // preserving and moving only suits that can never flush
+    // (hand_class_suit_group). Exact: none while cards are still to come — a
+    // merged pair blocks different cards, which a dealt card makes matter —
+    // and the whole board symmetry group on a river root (nothing to come).
     std::vector<std::array<uint8_t, 4>> valid_perms;
-    std::array<uint8_t, 4> perm = {0, 1, 2, 3};
-
-    do {
-        bool valid = true;
-        // Check: board under this permutation must equal the original board
-        // (up to card reordering)
-        CardMask original_board = 0;
-        CardMask permuted_board = 0;
-
-        for (uint8_t i = 0; i < board_size; ++i) {
-            original_board |= card_to_mask(board[i]);
-            Card permuted_card = make_card(card_rank(board[i]),
-                                            static_cast<Suit>(perm[card_suit(board[i])]));
-            permuted_board |= card_to_mask(permuted_card);
+    if (mode == IsoMode::Fast) {
+        valid_perms = hand_class_suit_group(board, board_size, constraints);
+        result.runout_perms = valid_perms;
+    } else {
+        const auto group = board_symmetry_group(board, board_size, constraints);
+        result.runout_perms = group;
+        if (board_size >= 5) {
+            valid_perms = group;
+        } else {
+            valid_perms.push_back({0, 1, 2, 3});
         }
-
-        if (original_board == permuted_board) {
-            // 2026-09-09 audit: the ranges and locks must be symmetric under
-            // the permutation too, or the bucket would merge hands the game
-            // distinguishes.
-            if (constraints == nullptr ||
-                perm_preserves_constraints(
-                    perm, *constraints, board_to_mask(board, board_size))) {
-                valid_perms.push_back(perm);
-            }
-        }
-    } while (std::next_permutation(perm.begin(), perm.end()));
+    }
+    result.perms = valid_perms;
 
     // Step 3: For each combo, find its canonical form
     // Canonical = lexicographically smallest combo after applying all valid permutations
@@ -332,6 +372,8 @@ inline IsomorphismMapping compact_isomorphism(
     IsomorphismMapping out;
     out.num_canonical   = live;
     out.board_canonical = full.board_canonical ? full.board_canonical : nc;
+    out.perms           = full.perms;
+    out.runout_perms    = full.runout_perms;
     out.canonical_to_originals.resize(live);
     out.canonical_weights.assign(live, 0);
 
@@ -361,6 +403,9 @@ inline IsomorphismMapping compact_isomorphism(
 struct CanonicalRunout {
     Card card;       ///< Lex-min representative of this orbit
     uint8_t weight;  ///< Orbit size (= number of undealt cards this rep covers)
+    /// One suit permutation per OTHER orbit member, mapping `card` onto it
+    /// (the representative itself is the identity and is not stored).
+    std::vector<std::array<uint8_t, 4>> member_perms;
 };
 
 /// Result of canonical runout enumeration.
@@ -452,6 +497,7 @@ inline CanonicalRunouts enumerate_canonical_runouts(
         // Compute orbit by applying every perm; dedupe.
         // |perms| <= 24, so the orbit fits in a tiny stack array.
         Card orbit[24];
+        std::array<uint8_t, 4> orbit_perm[24];
         uint8_t orbit_size = 0;
         Card lex_min = card;
         for (const auto& p : perms) {
@@ -463,18 +509,106 @@ inline CanonicalRunouts enumerate_canonical_runouts(
                 if (orbit[k] == img) { seen = true; break; }
             }
             if (!seen) {
+                orbit_perm[orbit_size] = p;
                 orbit[orbit_size++] = img;
                 if (img < lex_min) lex_min = img;
             }
         }
 
         if (card == lex_min) {
-            out.reps.push_back({card, orbit_size});
+            CanonicalRunout r{card, orbit_size, {}};
+            for (uint8_t k = 0; k < orbit_size; ++k) {
+                if (orbit[k] != card) r.member_perms.push_back(orbit_perm[k]);
+            }
+            out.reps.push_back(std::move(r));
             out.total_weight = static_cast<uint8_t>(out.total_weight + orbit_size);
         }
     }
 
     return out;
+}
+
+/**
+ * @brief 2026-10-06 (exact isomorphism): the per-hand index maps a chance node
+ *        uses to fold a merged runout child onto the other orbit members.
+ *
+ * Member u = g(rep): the world where u is dealt is the representative's world
+ * relabelled by g, so a hand h there plays like g⁻¹(h) in the
+ * representative's subtree. The chance node therefore adds, per member,
+ * child[map_g[c]] with map_g[c] = class of g⁻¹(c). Under Fast isomorphism
+ * every g maps each class onto itself (the runout group is the class group),
+ * so every map is the identity and the chance node keeps its plain
+ * weight × child sum — node_set stays kNoRunoutPerms there.
+ */
+struct RunoutClassMaps {
+    std::vector<uint16_t> node_set;   ///< per node: set index, or kNoRunoutPerms
+    std::vector<uint16_t> maps;       ///< map j occupies [j·nc, (j+1)·nc)
+    std::vector<uint32_t> set_first;  ///< per set: index of its first map
+    std::vector<uint8_t>  set_count;  ///< per set: maps in it (orbit size − 1)
+};
+
+inline RunoutClassMaps build_runout_class_maps(const FlatGameTree& tree,
+                                               const IsomorphismMapping& iso) {
+    RunoutClassMaps out;
+    out.node_set.assign(tree.total_nodes, kNoRunoutPerms);
+    const uint16_t nc = iso.num_canonical;
+    if (nc == 0 || tree.runout_perm_set.size() != tree.total_nodes ||
+        tree.runout_perm_sets.empty()) {
+        return out;
+    }
+    const auto& combos = get_combo_table();
+    std::vector<uint16_t> set_id(tree.runout_perm_sets.size(), kNoRunoutPerms);
+    for (std::size_t s = 0; s < tree.runout_perm_sets.size(); ++s) {
+        const auto& perms = tree.runout_perm_sets[s];
+        std::vector<uint16_t> maps(perms.size() * nc);
+        bool trivial = true;
+        for (std::size_t j = 0; j < perms.size(); ++j) {
+            std::array<uint8_t, 4> inv{};
+            for (uint8_t k = 0; k < 4; ++k) inv[perms[j][k]] = k;
+            for (uint16_t c = 0; c < nc; ++c) {
+                const Combo& cb = combos[iso.canonical_to_originals[c][0]];
+                const uint16_t img = Combo(permute_card(cb.cards[0], inv),
+                                           permute_card(cb.cards[1], inv)).index();
+                const uint16_t ci = iso.original_to_canonical[img];
+                // The runout group preserves the ranges, so a live hand's
+                // image is live; anything else is a bookkeeping bug.
+                if (ci == UINT16_MAX) {
+                    throw std::runtime_error(
+                        "build_runout_class_maps: a merged runout maps a hand outside the index space");
+                }
+                maps[j * nc + c] = ci;
+                trivial = trivial && (ci == c);
+            }
+        }
+        if (trivial) continue;
+        set_id[s] = static_cast<uint16_t>(out.set_first.size());
+        out.set_first.push_back(static_cast<uint32_t>(out.maps.size() / nc));
+        out.set_count.push_back(static_cast<uint8_t>(perms.size()));
+        out.maps.insert(out.maps.end(), maps.begin(), maps.end());
+    }
+    for (uint32_t n = 0; n < tree.total_nodes; ++n) {
+        const uint16_t s = tree.runout_perm_set[n];
+        if (s != kNoRunoutPerms && s < set_id.size()) out.node_set[n] = set_id[s];
+    }
+    return out;
+}
+
+/// out[0..nc) += Σ over chance child `child`'s runout orbit of its values:
+/// weight × src when its members need no remapping, else src plus one
+/// gathered copy per other member. (The rows' padding past nc is untouched
+/// by the gathers and gets src's zeros from the add.)
+template <typename AddScaled, typename AddGathered>
+inline void for_runout_orbit(const RunoutClassMaps* m, uint32_t child, uint32_t weight,
+                             AddScaled add_scaled, AddGathered add_gathered) {
+    const uint16_t set = (m != nullptr && child < m->node_set.size())
+        ? m->node_set[child] : kNoRunoutPerms;
+    if (set == kNoRunoutPerms) {
+        add_scaled(static_cast<float>(weight));
+        return;
+    }
+    add_scaled(1.0f);
+    const uint32_t first = m->set_first[set];
+    for (uint8_t j = 0; j < m->set_count[set]; ++j) add_gathered(first + j);
 }
 
 } // namespace deepsolver

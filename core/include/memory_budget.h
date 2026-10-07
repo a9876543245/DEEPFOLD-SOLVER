@@ -111,7 +111,7 @@ constexpr uint64_t kCpuActionLaneFloats = 8;
 /// `bytes_for_flat_tree` below.
 constexpr uint64_t kHostProcessOverheadBytes = 96ULL * 1024ULL * 1024ULL;
 
-/// The host-resident FlatGameTree. Thirteen per-node arrays (31 B/node) and
+/// The host-resident FlatGameTree. Fourteen per-node arrays (33 B/node) and
 /// three per-edge arrays (9 B/edge), from the struct in types.h.
 ///
 /// This was folded into the flat 96 MB process baseline until 2026-08-03,
@@ -123,7 +123,7 @@ constexpr uint64_t kHostProcessOverheadBytes = 96ULL * 1024ULL * 1024ULL;
 /// (393 measured vs 372 modeled). On a 627k-node rainbow the same term
 /// accounts for the CPU spot's residual −0.6% (20.6 MB measured vs 50 modeled,
 /// i.e. conservative, which is the direction the gate needs).
-constexpr uint64_t kFlatTreeBytesPerNode = 31;
+constexpr uint64_t kFlatTreeBytesPerNode = 33;
 constexpr uint64_t kFlatTreeBytesPerEdge = 9;
 constexpr double   kFlatTreeGrowthFactor = 2.0;
 inline uint64_t bytes_for_flat_tree(uint64_t nodes, uint64_t edges) {
@@ -179,8 +179,19 @@ inline uint64_t bytes_for_gpu_host_index_tables(uint64_t nodes) {
 /// copy: 1.3 GB on the enumerated rainbow, which is the difference between
 /// "enumerate" and "collapse" at a 8 GB budget. 1.5 stays above every GPU
 /// measurement without charging a copy that never exists.
-constexpr double kFinalStrategyCopiesCpu = 2.0;
-constexpr double kFinalStrategyCopiesGpu = 1.5;
+///
+/// 2026-10-07: ONE copy on both. The Solver takes the backend's strategy over
+/// (ISolverBackend::take_strategy) instead of deep-copying it, releases a
+/// probe's copy before the final finalize, and the GPU streams its download
+/// through a bounded staging buffer instead of a full flat copy. Measured on
+/// the 1.28M-node BTN-vs-BB flop (GPU): peak 6.55 -> 3.41 GiB, finalize RSS
+/// delta 1.0 copies. The CPU keeps the margin its old calibration measured
+/// above whole copies (2.05-2.13 then, 1.08 on the same flop now: per-row
+/// slack plus the postsolve traversals' scratch).
+constexpr double kFinalStrategyCopiesCpu = 1.15;
+constexpr double kFinalStrategyCopiesGpu = 1.0;
+/// The GPU finalize's staging window (GpuBackend::finalize, 16M floats).
+constexpr uint64_t kGpuFinalizeStagingBytes = 64ULL << 20;
 
 /// ...and that calibration measured the wrong moment. It divided the FINALIZE
 /// RSS delta by one copy, which is blind to the mid-loop exploitability probe:
@@ -202,14 +213,18 @@ constexpr double kFinalStrategyCopiesGpu = 1.5;
 /// state, so this copy exists only when the probe is routed through the
 /// CPU traversals (force_cpu_postsolve). Solver::host_probe_copies() is the
 /// one predicate every host-peak site charges it through.
-constexpr double kFinalStrategyProbeCopiesGpu = 1.0;
+///
+/// 2026-10-07: 0. Such a probe's copy is the ONE copy: the Solver releases it
+/// before the next finalize builds the next (see kFinalStrategyCopies*).
+constexpr double kFinalStrategyProbeCopiesGpu = 0.0;
 inline uint64_t bytes_for_live_final_strategy(uint64_t one_copy_bytes,
                                               bool gpu_backend,
                                               bool exploit_probe_runs = false) {
     double copies = gpu_backend ? kFinalStrategyCopiesGpu
                                 : kFinalStrategyCopiesCpu;
     if (gpu_backend && exploit_probe_runs) copies += kFinalStrategyProbeCopiesGpu;
-    return static_cast<uint64_t>(static_cast<double>(one_copy_bytes) * copies);
+    return static_cast<uint64_t>(static_cast<double>(one_copy_bytes) * copies)
+         + (gpu_backend ? kGpuFinalizeStagingBytes : 0);
 }
 /// Result JSON floor when the navigation strategy tree is NOT emitted
 /// (--no-strategy-tree): root strategies + diagnostics + resources, no
@@ -225,6 +240,13 @@ constexpr uint64_t kNoTreeJsonFloorBytes = 4ULL * 1024ULL * 1024ULL;
 /// issue. The cost is one extra value buffer — 348 MB on the 627k-node
 /// enumerated rainbow, 1.47 GB on the 4.65M-node target.
 constexpr uint64_t kGpuValueRegions = 2;
+/// 2026-10-07: ...but only the simultaneous schedule runs both backward passes
+/// in one grid. Alternating updates (the default since 2026-09-12) run them
+/// one after the other, so they share region 0 and the second region was
+/// never needed: 1.9 GiB of a 16.3 GiB state on a 1.28M-node flop.
+inline uint64_t gpu_value_regions(bool alternating_updates) {
+    return alternating_updates ? 1 : kGpuValueRegions;
+}
 
 /// GPU backend keeps regrets, strategy_sum, current_strategy (3 compact
 /// strat-shaped buffers of Σ-player-actions × nc; B1a inc 2 dropped
@@ -269,9 +291,9 @@ struct SolveFootprintEstimate {
     /// measurably exceeded the user's --gpu-memory-mb while the state-only
     /// check said "ok"). 0 on CPU-final footprints.
     uint64_t device_total_bytes        = 0;
-    /// Peak-host lifetime terms (P1-1): 2× the materialized final strategy
-    /// (backend nested copy + Solver deep copy, both alive after finalize)
-    /// plus process/CUDA-context overhead. Without these the host gate
+    /// Peak-host lifetime terms (P1-1): the materialized final strategy
+    /// (one copy since 2026-10-07, see kFinalStrategyCopies*) plus
+    /// process/CUDA-context overhead. Without these the host gate
     /// passed solves whose finalize then blew the budget (measured: mono
     /// CPU est 2.00 GB vs 2.43 GB actual peak).
     uint64_t final_strategy_bytes      = 0;   ///< ONE copy; see gpu_backend.
@@ -374,8 +396,8 @@ inline uint64_t bytes_for_cpu_state_compact(uint64_t player_action_slots,
 /// na × nc row as an UN-padded nested vector (LevelizedCpuBackend::finalize
 /// writes na × nc, not na × stride; GPU finalize repacks to the same shape).
 /// Plus per-row vector headers, which stop being noise at 100k+ nodes.
-/// The peak-host model charges TWO of these (backend copy + Solver copy —
-/// both alive after `strategy_ = backend_->strategy()`).
+/// The peak-host model charges ONE of these since 2026-10-07 (the Solver
+/// takes the backend's copy over; see kFinalStrategyCopies*).
 inline uint64_t bytes_for_final_strategy(uint64_t player_action_slots,
                                          uint64_t nc,
                                          uint64_t player_nodes) {
@@ -437,11 +459,12 @@ inline uint64_t bytes_for_gpu_state_compact(uint64_t total_nodes,
                                             uint64_t player_action_slots,
                                             uint64_t nc,
                                             bool materialize_strategy,
-                                            uint64_t value_rows) {
+                                            uint64_t value_rows,
+                                            uint64_t value_regions) {
     const uint64_t strat_buffers = materialize_strategy ? 3ULL : 2ULL;
     const uint64_t values = value_rows ? value_rows : total_nodes;
     return (strat_buffers * player_action_slots + 2ULL * total_nodes
-              + memory_budget::kGpuValueRegions * values)
+              + value_regions * values)
              * nc * sizeof(float)
          + 2ULL * total_nodes * sizeof(uint32_t);  // node_offset + value_row
 }
@@ -472,10 +495,12 @@ inline uint64_t bytes_for_gpu_device_total(uint64_t total_nodes,
                                            bool device_dense_upload,
                                            bool materialize_strategy,
                                            uint64_t value_rows,
+                                           uint64_t value_regions,
                                            uint64_t equity_tables = 0,
                                            uint64_t signed_count_tables = 0) {
     const uint64_t state   = bytes_for_gpu_state_compact(
-        total_nodes, player_action_slots, nc, materialize_strategy, value_rows);
+        total_nodes, player_action_slots, nc, materialize_strategy, value_rows,
+        value_regions);
     // The equity tables ride along whatever the dense-upload decision is;
     // 2026-09-11: so do the int8 signed pair-count tables on SignedCount
     // boards (signed_count_showdown_gemm_kernel), nc*nc bytes each.

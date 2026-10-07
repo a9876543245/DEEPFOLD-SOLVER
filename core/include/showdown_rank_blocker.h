@@ -54,13 +54,20 @@ namespace deepsolver::showdown_rank_blocker {
 
 struct Scratch {
     static constexpr uint16_t kNoBucket = std::numeric_limits<uint16_t>::max();
+    /// 2026-10-07: the per-card arrays are BUCKET-major, one row of
+    /// kCardStride floats (52 cards, padded) per bucket. The card-major layout
+    /// made the per-card prefix sums 52 dependent add chains of B steps each
+    /// (the bulk of every showdown terminal); bucket-major, each bucket step
+    /// is one independent add across all cards, which vectorizes. Every
+    /// card's sums keep their order, so the values are unchanged.
+    static constexpr std::size_t kCardStride = 56;
 
     std::vector<uint16_t> rank_to_bucket;
     std::vector<uint16_t> touched_ranks;
     std::vector<float> bucket_total;
     std::vector<float> bucket_prefix;
-    std::vector<float> card_bucket_blocked;
-    std::vector<float> card_bucket_prefix;
+    std::vector<float> card_bucket_blocked;   ///< [b * kCardStride + card]
+    std::vector<float> card_bucket_prefix;    ///< [b * kCardStride + card], b in 0..B
     std::size_t bucket_capacity = 0;
 
     void ensure(std::size_t max_buckets) {
@@ -71,12 +78,35 @@ struct Scratch {
             bucket_capacity = max_buckets;
             bucket_total.resize(bucket_capacity);
             bucket_prefix.resize(bucket_capacity + 1);
-            card_bucket_blocked.resize(
-                static_cast<std::size_t>(NUM_CARDS) * bucket_capacity);
-            card_bucket_prefix.resize(
-                static_cast<std::size_t>(NUM_CARDS) * (bucket_capacity + 1));
+            card_bucket_blocked.resize(kCardStride * bucket_capacity);
+            card_bucket_prefix.resize(kCardStride * (bucket_capacity + 1));
         }
         touched_ranks.clear();
+    }
+
+    float& blocked(Card card, std::size_t b) {
+        return card_bucket_blocked[b * kCardStride + card];
+    }
+    /// Card-blocked reach in buckets [lo, hi).
+    float card_range(Card card, std::size_t lo, std::size_t hi) const {
+        return card_bucket_prefix[hi * kCardStride + card]
+             - card_bucket_prefix[lo * kCardStride + card];
+    }
+    /// bucket_prefix / card_bucket_prefix from bucket_total / card_bucket_blocked.
+    void build_prefixes(std::size_t B) {
+        bucket_prefix[0] = 0.0f;
+        for (std::size_t b = 0; b < B; ++b) {
+            bucket_prefix[b + 1] = bucket_prefix[b] + bucket_total[b];
+        }
+        float* prefix = card_bucket_prefix.data();
+        const float* blk = card_bucket_blocked.data();
+        std::fill(prefix, prefix + kCardStride, 0.0f);
+        for (std::size_t b = 0; b < B; ++b) {
+            const float* prev = prefix + b * kCardStride;
+            const float* add  = blk + b * kCardStride;
+            float* next = prefix + (b + 1) * kCardStride;
+            for (std::size_t k = 0; k < kCardStride; ++k) next[k] = prev[k] + add[k];
+        }
     }
 };
 
@@ -213,40 +243,16 @@ inline void reset_buckets(const Metadata& meta, Scratch& scratch) {
     std::fill(scratch.bucket_total.begin(),
               scratch.bucket_total.begin() + static_cast<std::ptrdiff_t>(B),
               0.0f);
-
-    const std::size_t bucket_stride = scratch.bucket_capacity;
-    for (Card card = 0; card < NUM_CARDS; ++card) {
-        float* blocked = scratch.card_bucket_blocked.data()
-            + static_cast<std::size_t>(card) * bucket_stride;
-        std::fill(blocked, blocked + static_cast<std::ptrdiff_t>(B), 0.0f);
-    }
+    std::fill(scratch.card_bucket_blocked.begin(),
+              scratch.card_bucket_blocked.begin()
+                  + static_cast<std::ptrdiff_t>(B * Scratch::kCardStride),
+              0.0f);
 }
 
 /// Turn the accumulated per-bucket reach into the global and per-card rank
 /// prefixes the combo_value queries read. Shared tail of both sweeps.
 inline void finalize_prefixes(const Metadata& meta, Scratch& scratch) {
-    const std::size_t B = meta.bucket_count;
-    const std::size_t bucket_stride = scratch.bucket_capacity;
-    const std::size_t prefix_stride = scratch.bucket_capacity + 1;
-
-    scratch.bucket_prefix[0] = 0.0f;
-    for (std::size_t b = 0; b < B; ++b) {
-        scratch.bucket_prefix[b + 1] =
-            scratch.bucket_prefix[b] + scratch.bucket_total[b];
-    }
-
-    for (Card card = 0; card < NUM_CARDS; ++card) {
-        float acc = 0.0f;
-        float* prefix = scratch.card_bucket_prefix.data()
-            + static_cast<std::size_t>(card) * prefix_stride;
-        const float* blocked = scratch.card_bucket_blocked.data()
-            + static_cast<std::size_t>(card) * bucket_stride;
-        prefix[0] = 0.0f;
-        for (std::size_t b = 0; b < B; ++b) {
-            acc += blocked[b];
-            prefix[b + 1] = acc;
-        }
-    }
+    scratch.build_prefixes(meta.bucket_count);
 }
 
 inline void build_prefixes(
@@ -257,7 +263,6 @@ inline void build_prefixes(
     Scratch& scratch)
 {
     reset_buckets(meta, scratch);
-    const std::size_t bucket_stride = scratch.bucket_capacity;
 
     for (std::size_t k = 0; k < opp_count; ++k) {
         const uint16_t c = opp_active
@@ -269,10 +274,8 @@ inline void build_prefixes(
         if (r == 0.0f) continue;
 
         scratch.bucket_total[b] += r;
-        scratch.card_bucket_blocked[
-            static_cast<std::size_t>(meta.combo_card0[c]) * bucket_stride + b] += r;
-        scratch.card_bucket_blocked[
-            static_cast<std::size_t>(meta.combo_card1[c]) * bucket_stride + b] += r;
+        scratch.blocked(meta.combo_card0[c], b) += r;
+        scratch.blocked(meta.combo_card1[c], b) += r;
     }
 
     finalize_prefixes(meta, scratch);
@@ -298,7 +301,6 @@ inline void build_prefixes_iso(
     Scratch& scratch)
 {
     reset_buckets(meta, scratch);
-    const std::size_t bucket_stride = scratch.bucket_capacity;
 
     for (std::size_t k = 0; k < opp_count; ++k) {
         const uint16_t c = opp_active
@@ -315,10 +317,8 @@ inline void build_prefixes_iso(
             meta.bucket_offsets[static_cast<std::size_t>(c) + 1u];
         for (uint32_t p = begin; p < end; ++p) {
             scratch.bucket_total[b] += r;
-            scratch.card_bucket_blocked[
-                static_cast<std::size_t>(meta.orig_card0[p]) * bucket_stride + b] += r;
-            scratch.card_bucket_blocked[
-                static_cast<std::size_t>(meta.orig_card1[p]) * bucket_stride + b] += r;
+            scratch.blocked(meta.orig_card0[p], b) += r;
+            scratch.blocked(meta.orig_card1[p], b) += r;
         }
     }
 
@@ -331,10 +331,7 @@ inline float card_prefix_sum(
     std::size_t lo,
     std::size_t hi)
 {
-    const std::size_t prefix_stride = scratch.bucket_capacity + 1;
-    const float* prefix = scratch.card_bucket_prefix.data()
-        + static_cast<std::size_t>(card) * prefix_stride;
-    return prefix[hi] - prefix[lo];
+    return scratch.card_range(card, lo, hi);
 }
 
 inline float combo_value(
@@ -722,12 +719,8 @@ inline void showdown_dense_singleton(
               0.0f);
     std::fill(scratch.card_bucket_blocked.begin(),
               scratch.card_bucket_blocked.begin()
-                  + static_cast<std::ptrdiff_t>(
-                      static_cast<std::size_t>(NUM_CARDS) * scratch.bucket_capacity),
+                  + static_cast<std::ptrdiff_t>(B * Scratch::kCardStride),
               0.0f);
-
-    const std::size_t bucket_stride = scratch.bucket_capacity;
-    const std::size_t prefix_stride = scratch.bucket_capacity + 1;
 
     for (uint16_t c = 0; c < nc; ++c) {
         const float r = opp_reach_w[c];
@@ -744,35 +737,14 @@ inline void showdown_dense_singleton(
         scratch.bucket_total[b] += r;
 
         const Combo& combo = combo_table[oi];
-        scratch.card_bucket_blocked[
-            static_cast<std::size_t>(combo.cards[0]) * bucket_stride + b] += r;
-        scratch.card_bucket_blocked[
-            static_cast<std::size_t>(combo.cards[1]) * bucket_stride + b] += r;
+        scratch.blocked(combo.cards[0], b) += r;
+        scratch.blocked(combo.cards[1], b) += r;
     }
 
-    scratch.bucket_prefix[0] = 0.0f;
-    for (std::size_t b = 0; b < B; ++b) {
-        scratch.bucket_prefix[b + 1] =
-            scratch.bucket_prefix[b] + scratch.bucket_total[b];
-    }
-
-    for (Card card = 0; card < NUM_CARDS; ++card) {
-        float acc = 0.0f;
-        float* prefix = scratch.card_bucket_prefix.data()
-            + static_cast<std::size_t>(card) * prefix_stride;
-        const float* blocked = scratch.card_bucket_blocked.data()
-            + static_cast<std::size_t>(card) * bucket_stride;
-        prefix[0] = 0.0f;
-        for (std::size_t b = 0; b < B; ++b) {
-            acc += blocked[b];
-            prefix[b + 1] = acc;
-        }
-    }
+    scratch.build_prefixes(B);
 
     auto card_prefix_sum = [&](Card card, std::size_t lo, std::size_t hi) {
-        const float* prefix = scratch.card_bucket_prefix.data()
-            + static_cast<std::size_t>(card) * prefix_stride;
-        return prefix[hi] - prefix[lo];
+        return scratch.card_range(card, lo, hi);
     };
 
     const float total_reach = scratch.bucket_prefix[B];
@@ -891,12 +863,8 @@ inline void showdown_active_singleton(
               0.0f);
     std::fill(scratch.card_bucket_blocked.begin(),
               scratch.card_bucket_blocked.begin()
-                  + static_cast<std::ptrdiff_t>(
-                      static_cast<std::size_t>(NUM_CARDS) * scratch.bucket_capacity),
+                  + static_cast<std::ptrdiff_t>(B * Scratch::kCardStride),
               0.0f);
-
-    const std::size_t bucket_stride = scratch.bucket_capacity;
-    const std::size_t prefix_stride = scratch.bucket_capacity + 1;
 
     for (std::size_t k = 0; k < opp_count; ++k) {
         const uint16_t c = opp_active[k];
@@ -914,35 +882,14 @@ inline void showdown_active_singleton(
         scratch.bucket_total[b] += r;
 
         const Combo& combo = combo_table[oi];
-        scratch.card_bucket_blocked[
-            static_cast<std::size_t>(combo.cards[0]) * bucket_stride + b] += r;
-        scratch.card_bucket_blocked[
-            static_cast<std::size_t>(combo.cards[1]) * bucket_stride + b] += r;
+        scratch.blocked(combo.cards[0], b) += r;
+        scratch.blocked(combo.cards[1], b) += r;
     }
 
-    scratch.bucket_prefix[0] = 0.0f;
-    for (std::size_t b = 0; b < B; ++b) {
-        scratch.bucket_prefix[b + 1] =
-            scratch.bucket_prefix[b] + scratch.bucket_total[b];
-    }
-
-    for (Card card = 0; card < NUM_CARDS; ++card) {
-        float acc = 0.0f;
-        float* prefix = scratch.card_bucket_prefix.data()
-            + static_cast<std::size_t>(card) * prefix_stride;
-        const float* blocked = scratch.card_bucket_blocked.data()
-            + static_cast<std::size_t>(card) * bucket_stride;
-        prefix[0] = 0.0f;
-        for (std::size_t b = 0; b < B; ++b) {
-            acc += blocked[b];
-            prefix[b + 1] = acc;
-        }
-    }
+    scratch.build_prefixes(B);
 
     auto card_prefix_sum = [&](Card card, std::size_t lo, std::size_t hi) {
-        const float* prefix = scratch.card_bucket_prefix.data()
-            + static_cast<std::size_t>(card) * prefix_stride;
-        return prefix[hi] - prefix[lo];
+        return scratch.card_range(card, lo, hi);
     };
 
     const float total_reach = scratch.bucket_prefix[B];

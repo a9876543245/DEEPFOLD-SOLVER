@@ -410,7 +410,7 @@ if(BUILD_TESTS)
     # diagnostic, and it still fires identically on the v2.4.0 binary.
     add_test(NAME CliMemoryBudgetReject
         COMMAND deepsolver_core
-            --pot 100 --stack 500 --board AsKsQs
+            --pot 100 --stack 500 --board AsKsQs --iso fast
             --iterations 5 --backend cpu --host-memory-mb 2)
     set_tests_properties(CliMemoryBudgetReject PROPERTIES
         LABELS "smoke;memory" TIMEOUT 60
@@ -466,7 +466,7 @@ if(BUILD_TESTS)
     # board still ENUMERATES; CliMonoStateGateCollapse keeps the other side.
     add_test(NAME CliMonoStateGateFits
         COMMAND deepsolver_core
-            --pot 100 --stack 500 --board Ah9h4h
+            --pot 100 --stack 500 --board Ah9h4h --iso fast
             --iterations 5 --backend cpu --postsolve none
             --host-memory-mb 4000 --no-strategy-tree)
     set_tests_properties(CliMonoStateGateFits PROPERTIES
@@ -714,6 +714,18 @@ if(BUILD_TESTS)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_eta_cpu.cmake)
     set_tests_properties(CliCpuEtaWithin2x PROPERTIES
         LABELS "smoke" TIMEOUT 120)
+
+    # 2026-10-06 audit: CLI inputs fail loudly instead of being ignored or
+    # misread (bad ranges/boards/locks/histories), the documented shorthands
+    # and spaced JSON are accepted, and --bet-sizing builds Pio-style menus.
+    foreach(_case bad_inputs lenient_inputs bet_sizing serve serve_view target)
+        add_test(NAME CliInputs_${_case}
+            COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=${_case}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_inputs.cmake)
+        set_tests_properties(CliInputs_${_case} PROPERTIES
+            LABELS "smoke" TIMEOUT 120)
+    endforeach()
 
     # GPU postsolve parity test — only when CUDA is available, since the test
     # exercises the GPU backend path directly. Skip-marker inside the test

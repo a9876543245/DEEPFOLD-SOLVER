@@ -40,6 +40,8 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
+#include <deque>
 #include <functional>
 #include <future>
 #include <iomanip>
@@ -272,13 +274,35 @@ public:
     SolveResources estimate_only();
 
     /// Analyze a specific target combo after solve()
-    ComboAnalysis analyze_combo(const std::string& combo_str) const;
+    /// One combo's strategy and conditional EV at `node_idx` (the root by
+    /// default). 2026-10-06 audit: --target used to report the ROOT for any
+    /// --history.
+    ComboAnalysis analyze_combo(const std::string& combo_str,
+                                uint32_t node_idx = 0) const;
 
     uint32_t tree_node_count() const { return tree_.total_nodes; }
     /// Read-only view of the built game tree. Exposed for diagnostic tools
     /// that need terminal-by-matchup_idx histograms (Phase 2 batching ROI).
     const FlatGameTree& tree() const { return tree_; }
-    uint32_t navigate_to_node(const std::string& history) const;
+    /// The node a history string names, or kInvalidNode when any step does
+    /// not match (2026-10-06 audit: an unmatched step used to return the
+    /// deepest node reached so far — a lock for "Check,Raise_100" landed on
+    /// the "Check" node, and an unknown label silently meant Check).
+    /// `stop_at_final_chance`: a history whose last action ends a street,
+    /// with no "#card" on it, names the CHANCE node itself (the UI then
+    /// offers the runout cards) instead of the lex-min runout's first node.
+    ///
+    /// `view` (2026-10-07): when given, a runout card that is not its orbit's
+    /// representative ("#2s" where the 2c child stands for 2c and 2s) is
+    /// accepted: the history lands on the representative's node and `*view`
+    /// receives the suit permutation that maps that node's world onto the
+    /// dealt cards' (identity when every card named was a representative).
+    /// Without it such a card is invalid - locks and --history stay strict.
+    using SuitPerm = std::array<uint8_t, 4>;
+    uint32_t navigate_to_node(const std::string& history,
+                              bool stop_at_final_chance = false,
+                              SuitPerm* view = nullptr) const;
+    static constexpr uint32_t kInvalidNode = UINT32_MAX;
     std::vector<std::pair<std::string, float>> extract_global_strategy_at(uint32_t node_idx) const;
     std::vector<std::string> get_action_labels_at(uint32_t node_idx) const;
 
@@ -314,6 +338,50 @@ public:
         uint8_t weight;   // orbit size (sum across reps = undealt card count)
     };
 
+    /// 2026-10-06 (engine-driven navigation): everything the UI needs to
+    /// render a node, so it never re-derives the betting tree itself (it used
+    /// to — one shared stack for both players, its own raise formula, a Deal
+    /// step that counted as a check — and showed other nodes than the ones
+    /// solved).
+    struct NodeAction {
+        std::string label;
+        ActionType  type = ActionType::CHECK;
+        float amount   = 0.0f;   ///< chips this action puts in
+        float raise_to = 0.0f;   ///< the actor's street total afterwards
+        NodeType next  = NodeType::TERMINAL;   ///< what the action leads to
+    };
+    struct NodeInfo {
+        NodeType type = NodeType::TERMINAL;
+        uint8_t  street = 0;                     ///< 0 flop, 1 turn, 2 river
+        float    pot = 0.0f;
+        float    stack_oop = 0.0f;               ///< chips behind
+        float    stack_ip  = 0.0f;
+        float    to_call = 0.0f;
+        TerminalType terminal = TerminalType::SHOWDOWN;
+        std::vector<NodeAction> actions;         ///< player nodes
+        std::vector<RunoutOption> runouts;       ///< chance nodes; empty when collapsed
+        std::vector<uint8_t> board;              ///< board cards at this node
+    };
+    NodeInfo node_info(uint32_t node_idx) const;
+    /// The same for any flat tree (the decomposition trunk too): `labels`
+    /// are the node's action labels, `board` the cards on the board there.
+    static NodeInfo node_info_of(const FlatGameTree& t, uint32_t node_idx,
+                                 const std::vector<std::string>& labels, CardMask board);
+    /// Per-grid-label conditional EVs of the acting player at a player node,
+    /// from a traversal of that node's subtree alone.
+    std::vector<std::pair<std::string, float>> node_combo_evs(uint32_t node_idx) const;
+    /// Per-combo weights both players hold at a node: the root weight times
+    /// that player's own action probabilities along the path, 0 for combos
+    /// the board at the node blocks. The ranges a later-street re-solve
+    /// starts from.
+    std::array<std::array<float, NUM_COMBOS>, 2> combo_ranges_at(uint32_t node_idx) const;
+    /// The last bettor/raiser of the street that `node_idx` sits on (for a
+    /// chance node: the street that just ended): 0 OOP, 1 IP, 2 none.
+    uint8_t street_aggressor_at(uint32_t node_idx) const;
+    /// Frees the CFR backend (CPU state / GPU VRAM) once the host strategy is
+    /// final. A --serve session keeps only what node queries read.
+    void release_backend() { backend_.reset(); }
+
     /// One node entry in the cached strategy tree. Mirrors the per-node
     /// fields of SolverResult so the frontend can render a node from this
     /// alone, no extra solve required.
@@ -346,6 +414,8 @@ public:
         // available (rainbow degraded, terminal, or no chance preceded).
         // The currently-selected runout is the LAST entry of `dealt_cards`.
         std::vector<RunoutOption> runout_options;
+        /// 2026-10-06: pot, stacks, to-call and per-action amounts.
+        NodeInfo info;
     };
 
     /// DFS the solved tree from root, keyed by player-action history (the
@@ -501,13 +571,15 @@ public:
         if (!backend_ || tree_.total_nodes == 0 ||
             !ranges_fit_index_space()) { solve(); return; }
         initialize_reach_probs();
+        ensure_host_dense_for_current_reach();
         if (!config_.node_locks.empty()) resolve_node_locks();
         SolverContext ctx = make_context();
         backend_->prepare(ctx);
         const int iters = std::max(1, config_.max_iterations);
         for (int t = 0; t < iters; ++t) backend_->iterate(t);
+        strategy_ = {};
         backend_->finalize();
-        strategy_ = backend_->strategy();
+        strategy_ = backend_->take_strategy();
         apply_node_locks();
         solved_ = true;
     }
@@ -521,13 +593,15 @@ public:
         if (!backend_ || tree_.total_nodes == 0 ||
             !ranges_fit_index_space()) { solve(); return; }
         initialize_reach_probs();
+        ensure_host_dense_for_current_reach();
         if (!config_.node_locks.empty()) resolve_node_locks();
         SolverContext ctx = make_context();
         backend_->reprepare_keep_board(ctx);
         const int iters = std::max(1, config_.max_iterations);
         for (int t = 0; t < iters; ++t) backend_->iterate(t);
+        strategy_ = {};
         backend_->finalize();
-        strategy_ = backend_->strategy();
+        strategy_ = backend_->take_strategy();
         apply_node_locks();
         solved_ = true;
     }
@@ -547,13 +621,15 @@ public:
         if (!backend_ || tree_.total_nodes == 0 ||
             !ranges_fit_index_space()) { solve(); return; }
         initialize_reach_probs();
+        ensure_host_dense_for_current_reach();
         if (!config_.node_locks.empty()) resolve_node_locks();
         SolverContext ctx = make_context();
         backend_->reprepare_keep_state(ctx);
         const int iters = std::max(1, config_.max_iterations);
         for (int t = 0; t < iters; ++t) backend_->iterate(iter_offset + t);
+        strategy_ = {};
         backend_->finalize();
-        strategy_ = backend_->strategy();
+        strategy_ = backend_->take_strategy();
         apply_node_locks();
         solved_ = true;
     }
@@ -562,11 +638,31 @@ public:
         return backend_ && backend_->supports_warm_start();
     }
 
+    /// 2026-10-06 audit: a re-solve with new ranges can engage the CPU
+    /// backends' narrow-range terminal kernels, which have no blocker route,
+    /// so the dense tables the first solve skipped (its ranges were wide) are
+    /// needed now. Without this the decomposition's second CPU sweep died in
+    /// prepare() ("dense matchup tables were not materialized but traverser
+    /// OOP routes terminals through the dense kernels").
+    void ensure_host_dense_for_current_reach() {
+        if (matchup_dense_materialized_ || !backend_ ||
+            std::strncmp(backend_->name(), "CPU", 3) != 0) return;
+        if (!host_dense_matchup_required(terminal_plan_, iso_,
+                                         oop_reach_, ip_reach_)) return;
+        precompute_matchups(/*force_dense=*/true);
+        build_equity_tables();
+    }
+
 private:
     SolverConfig config_;
     BackendType  backend_type_;
+    /// Set by the constructor when an explicit GPU request found no usable
+    /// CUDA device and the solve was moved to the CPU (fallback_reason).
+    std::string  gpu_downgrade_reason_;
     FlatGameTree tree_;
     IsomorphismMapping iso_;
+    /// Built from tree_ + iso_ whenever either changes (build_runout_maps()).
+    RunoutClassMaps runout_maps_;
     /// Borrowed override for iso_ (see set_forced_iso). nullptr ⇒ compute it.
     const IsomorphismMapping* forced_iso_ = nullptr;
     bool solved_ = false;
@@ -973,6 +1069,12 @@ private:
     /// Board mask of the runout table a node evaluates on (root board when
     /// the table has no mask, e.g. before precompute).
     CardMask board_mask_at(uint32_t node_idx) const;
+    /// `player`'s per-class reach AT `node_idx`: the root reach times that
+    /// player's own action probabilities along the path (chance and opponent
+    /// actions leave it unchanged). 2026-10-06 audit: the per-node strategy,
+    /// frequency and EV outputs weighted every node by the ROOT reach, so a
+    /// node's aggregate counted hands that never get there.
+    std::vector<float> player_reach_at(uint32_t node_idx, int player) const;
     /// 2026-09-09 audit P0: the symmetry the canonical hand space may use is
     /// the one the BOARD, both RANGES and the node LOCKS all share. Returned
     /// by value-into-member so the pointers stay valid for the call.
@@ -1000,11 +1102,13 @@ public:
     /// Public so the decomposition stitch (solver_decomposed.h) formats trunk
     /// action labels with the SAME canonical strings the nav cache keys use.
     /// Stateless pure function — exposing it adds no coupling.
-    static std::string action_to_label(ActionType type, float amount, float pot);
-private:
-    /// Trivial accessor used by build_strategy_tree's lambda — wraps
-    /// tree_.children_offset[node] so the walk reads cleaner.
-    uint32_t off_of(uint32_t node) const;
+    /// "Bet_N": N% of the pot. "Raise_N" (2026-10-07): the raise on top of
+    /// the call as N% of the pot after calling - the menus' "N%" (Pio's) -
+    /// where it used to be the chips put in as a share of the pot (a 50%
+    /// raise read "Raise_100"). `to_call` = what the actor faces.
+    static std::string action_to_label(ActionType type, float amount, float pot,
+                                       float to_call = 0.0f);
+    static float action_size_pct(ActionType type, float amount, float pot, float to_call);
 };
 
 // ============================================================================
@@ -1013,11 +1117,33 @@ private:
 
 inline Solver::Solver(const SolverConfig& config, BackendType backend_type)
     : config_(config), backend_type_(backend_type) {
+    // 2026-10-06 audit: an explicit GPU request without a usable CUDA device
+    // fell through to the REFERENCE CPU backend after every gate had priced
+    // a GPU solve (the CPU state was never checked against the host budget).
+    // Resolve it here so the collapse gate, the budgets, the estimate and the
+    // levelized-backend swap all see the CPU solve that will really run.
+    if (backend_type_ == BackendType::GPU) {
+        // Queried once per process: decomposition builds hundreds of solvers.
+        static const std::string r = cuda_gpu_reject_reason();
+        if (!r.empty()) {
+            backend_type_ = BackendType::CPU;
+            gpu_downgrade_reason_ = "GPU backend unavailable (" + r + "); running on CPU.";
+        }
+    }
     auto& eval = get_evaluator();
     if (!eval.is_initialized()) eval.initialize();
 }
 
-inline std::string Solver::action_to_label(ActionType type, float amount, float pot) {
+inline float Solver::action_size_pct(ActionType type, float amount, float pot, float to_call) {
+    if (type == ActionType::RAISE) {
+        const float after_call = pot + to_call;
+        return (after_call > 0) ? ((amount - to_call) / after_call * 100.0f) : 0.0f;
+    }
+    return (pot > 0) ? (amount / pot * 100.0f) : 0.0f;
+}
+
+inline std::string Solver::action_to_label(ActionType type, float amount, float pot,
+                                           float to_call) {
     switch (type) {
         case ActionType::FOLD:  return "Fold";
         case ActionType::CHECK: return "Check";
@@ -1025,10 +1151,11 @@ inline std::string Solver::action_to_label(ActionType type, float amount, float 
         case ActionType::ALLIN: return "All-in";
         case ActionType::BET:
         case ActionType::RAISE: {
-            float pct = (pot > 0) ? (amount / pot * 100.0f) : 0;
+            // Rounded, not truncated (2026-10-06): 0.75 of a 13.33 pot read
+            // "Bet_74". get_action_labels_at() adds decimals on a collision.
             std::ostringstream oss;
             oss << ((type == ActionType::BET) ? "Bet_" : "Raise_")
-                << static_cast<int>(pct);
+                << std::lround(action_size_pct(type, amount, pot, to_call));
             return oss.str();
         }
         default: return "Unknown";
@@ -1058,6 +1185,10 @@ inline uint16_t Solver::evaluate_combo(const Combo& combo) const {
 
 inline SolverContext Solver::make_context() {
     SolverContext ctx;
+    // Exact isomorphism: how chance nodes fold merged runouts (cheap: a few
+    // nc-length maps); rebuilt here because every caller passes the final tree.
+    runout_maps_ = build_runout_class_maps(tree_, iso_);
+    ctx.runout_maps = &runout_maps_;
     ctx.tree                       = &tree_;
     ctx.iso                        = &iso_;
     ctx.config                     = &config_;
@@ -1244,7 +1375,8 @@ inline Solver::EnumeratedFit Solver::check_enumerated_fit(
         device_needed = bytes_for_gpu_device_total(
             total_n, stats.total_edges, player_slots, tables, nc,
             device_dense_upload, gpu_materializes_strategy(),
-            stats.value_rows, equity_tables, signed_count_tables);
+            stats.value_rows, memory_budget::gpu_value_regions(config_.alternating_updates),
+            equity_tables, signed_count_tables);
         device_budget = config_.memory_budget.gpu_bytes > 0
             ? config_.memory_budget.gpu_bytes
             : static_cast<uint64_t>(
@@ -1294,7 +1426,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     stage_start = Clock::now();
     iso_ = forced_iso_ ? *forced_iso_
                        : compute_isomorphism(config_.board.data(), config_.board_size,
-                                             &iso_constraints());
+                                             &iso_constraints(), config_.iso_mode);
     auto stage_end = Clock::now();
     timing.isomorphism_ms = elapsed_since(stage_start, stage_end);
 
@@ -1330,6 +1462,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     const bool step2_host_dense = host_dense_matchup_required(
         step2_plan, iso_, oop_reach_, ip_reach_);
     GameTreeBuilder builder(config_);
+    builder.set_runout_group(iso_.runout_perms);
     builder.set_memory_policy(
         iso_.num_canonical,
         config_.memory_budget,
@@ -1350,6 +1483,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     bool projected_collapse = false;
     if (config_.board_size == 3) {
         GameTreeBuilder probe(config_);
+        probe.set_runout_group(iso_.runout_perms);
         probe.set_memory_policy(
             iso_.num_canonical,
             config_.memory_budget,
@@ -1566,7 +1700,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         const uint64_t gpu_value_rows_est = gpu_value_rows(tree_);
         comp_gpu_state = bytes_for_gpu_state_compact(
             total_n, gate_player_slots, nc, gpu_materializes_strategy(),
-            gpu_value_rows_est);
+            gpu_value_rows_est, memory_budget::gpu_value_regions(config_.alternating_updates));
         // Review round 2 P1-3: the VRAM ceiling gates on the device TOTAL
         // (state + matchup upload + tree metadata + levels + reserve), not
         // state alone — a dense turn solve measurably exceeded the user's
@@ -1577,10 +1711,11 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             total_n, tree_.total_edges, gate_player_slots,
             matchup_ev_per_runout_.size(), nc,
             terminal_plan_.device_dense_upload, gpu_materializes_strategy(),
-            gpu_value_rows_est, matchup_equity_count(),
+            gpu_value_rows_est, memory_budget::gpu_value_regions(config_.alternating_updates),
+            matchup_equity_count(),
             signed_count_device_tables(terminal_plan_, matchup_ev_per_runout_.size()));
-        // Peak-host lifetime terms (P1-1): finalize holds TWO materialized
-        // strategy copies on every backend.
+        // Peak-host lifetime terms (P1-1): the materialized final strategy
+        // (one copy since 2026-10-07).
         comp_final_strategy = bytes_for_final_strategy(
             gate_player_slots, nc, gate_player_nodes);
 
@@ -1639,7 +1774,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         return e;
     };
 
-    std::string fallback_reason;  // surfaced into result.resources below.
+    std::string fallback_reason = gpu_downgrade_reason_;  // surfaced into result.resources below.
 
     // Polish #4: JSON cap as ACTION (not just diagnostic).
     //   If the estimated JSON response would exceed json_bytes, lower
@@ -1870,25 +2005,43 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     double exploit_probe_overhead_ms = 0.0;  // cumulative probe cost, to back
                                              // it out of the per-iter estimate
     const auto iter_start = Clock::now();
+    // 2026-10-06 audit: the GPU backend enqueues iterations asynchronously, so
+    // host time runs up to a launch queue's worth of iterations behind the
+    // device. The time budget and the progress report are checked on a
+    // ~50 ms host tick (the first iteration always reports); on that tick the
+    // queue is drained first, so the budget compares DEVICE time — a 2 s
+    // budget had run a 4.56 s iteration phase. Checking every iteration is
+    // not needed for the budget's accuracy and the per-iteration stderr line
+    // cost short GPU iterations up to ~45% of their throughput.
+    constexpr float kTickMs = 50.0f;
+    auto last_tick = iter_start;
     for (int t = 0; t < config_.max_iterations; ++t) {
         backend_->iterate(t);
         actual_iterations_run_ = t + 1;
 
-        // Time-budget check (v1.3.0): EVERY iter, not just at the
-        // exploitability interval. On slow-per-iter spots (deep-stack turn
-        // on a CPU laptop), each iter can take 5+ seconds — checking only
-        // every 50 iter would mean a "10s budget" actually runs 5 minutes.
-        // Clock::now() + a comparison is nanoseconds; safe to do per-iter.
-        if (config_.time_budget_seconds > 0) {
-            auto now = Clock::now();
-            const float iter_elapsed_s =
-                elapsed_since(iter_start, now) / 1000.0f;
-            if (iter_elapsed_s >= static_cast<float>(config_.time_budget_seconds)) {
-                early_stop_reason = "time_budget";
-                if (progress_cb) {
-                    progress_cb(t + 1, 0.0f, elapsed_since(start_time, now));
+        auto tick_now = Clock::now();
+        const bool tick = (t == 0) ||
+            elapsed_since(last_tick, tick_now) >= kTickMs ||
+            (t + 1) == config_.max_iterations;
+        if (tick) {
+            if (config_.time_budget_seconds > 0) {
+                backend_->synchronize();
+                tick_now = Clock::now();
+            }
+            last_tick = tick_now;
+            if (config_.time_budget_seconds > 0) {
+                const float iter_elapsed_s =
+                    elapsed_since(iter_start, tick_now) / 1000.0f;
+                if (iter_elapsed_s >= static_cast<float>(config_.time_budget_seconds)) {
+                    early_stop_reason = "time_budget";
+                    if (progress_cb) {
+                        progress_cb(t + 1, 0.0f, elapsed_since(start_time, tick_now));
+                    }
+                    break;
                 }
-                break;
+            }
+            if (progress_cb) {
+                progress_cb(t + 1, 0.0f, elapsed_since(start_time, tick_now));
             }
         }
 
@@ -1900,6 +2053,12 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         if (exploit_early_stop &&
             (t + 1) >= next_exp_check &&
             (t + 1) < config_.max_iterations) {
+            // 2026-10-06 audit: drain the queued GPU iterations BEFORE the
+            // probe clock starts. Draining inside it charged up to ~40 queued
+            // iterations to probe_ms (982 ms measured for an 82 ms best
+            // response), which inflated the adaptive stride to its 16× cap and
+            // ran ~5× the needed iterations past the target.
+            backend_->synchronize();
             const auto probe_start = Clock::now();
             // 2026-09-10: a GPU probe is answered from device state (see
             // ISolverBackend::finalize_for_probe) — no 75 MB strategy
@@ -1909,16 +2068,13 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             // force_cpu_postsolve routes the probe through the CPU traversals,
             // which need the host strategy: the full finalize() + copy then.
             bool device_probe = false;
+            strategy_ = {};   // the previous probe's copy: never two alive
             if (!config_.force_cpu_postsolve) {
                 device_probe = backend_->finalize_for_probe();
             } else {
                 backend_->finalize();
             }
-            if (device_probe) {
-                strategy_.clear();
-            } else {
-                strategy_ = backend_->strategy();
-            }
+            if (!device_probe) strategy_ = backend_->take_strategy();
             solved_ = true;
             const float exploit_pct = compute_exploitability();
             const auto probe_end = Clock::now();
@@ -1974,19 +2130,6 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             next_exp_check = (t + 1) + stride;
         }
 
-        // v1.4.1: progress callback fires EVERY iter so the UI progress bar
-        // tracks real iter count instead of a fake setInterval timer.
-        // Previously cadenced to every `exploitability_check_interval` iters
-        // (default 50) — left the bar stuck at 95% / iter 285 on long solves
-        // because the fake timer ran out of headroom before the next real
-        // event. The cb itself is a single-line stderr write (~µs), trivial
-        // even for slow per-iter spots; exploitability is still 0.0f here
-        // (real computation runs in the postsolve pass).
-        if (progress_cb) {
-            auto now = Clock::now();
-            float elapsed = elapsed_since(start_time, now);
-            progress_cb(t + 1, 0.0f, elapsed);
-        }
     }
     // The GPU backend no longer waits per iteration; drain the queue here
     // so iterations_ms is the device's time, not the host's enqueue time.
@@ -2019,16 +2162,19 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         static_cast<float>(backend_->phase_backward_fold_cpu_ms());
     CpuBackendDiagnostics cpu_diag = backend_->cpu_diagnostics();
 
-    // Step 6: finalize (normalize strategy_sum → strategy)
+    // Step 6: finalize (normalize strategy_sum → strategy). A probe's copy
+    // is released first and the backend's is taken over, not copied: one
+    // finalized strategy is alive here, never two (2026-10-07).
     stage_start = Clock::now();
+    strategy_ = {};
     backend_->finalize();
-    strategy_ = backend_->strategy();  // copy out for post-solve passes
+    strategy_ = backend_->take_strategy();
     apply_node_locks();
     solved_ = true;
     stage_end = Clock::now();
     timing.finalize_ms = elapsed_since(stage_start, stage_end);
-    // Peak-host model checkpoint: both strategy copies (backend + ours) are
-    // alive here — this is the sample the 2× final-strategy term must cover.
+    // Peak-host model checkpoint: the one strategy copy and the backend
+    // state are both alive here.
     if (rss_probe_) rss_after_finalize_bytes_ = rss_probe_();
 
     // When the solve early-stopped on the exploitability target, the final
@@ -2200,7 +2346,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         // actually need warned about. Detail comments live in
         // memory_budget.h beside the formulas.
         r.ops_per_iteration = ops_per_solve_iteration(
-            player_nodes, MAX_ACTIONS, iso_.num_canonical);
+            player_nodes, kOpsModelActions, iso_.num_canonical);
         std::string backend_label;
         if (backend_) {
             backend_label = backend_->name();
@@ -2443,7 +2589,7 @@ inline double Solver::estimated_iteration_seconds(
 // GPU (so the user sees the right number BEFORE backend allocation).
 inline SolveResources Solver::estimate_only() {
     iso_ = compute_isomorphism(config_.board.data(), config_.board_size,
-                               &iso_constraints());
+                               &iso_constraints(), config_.iso_mode);
 
     // A4-host inc 3/4: the reaches decide whether the matchup tables are
     // dense or rank-only, which both the builder's runout gate and the byte
@@ -2465,6 +2611,7 @@ inline SolveResources Solver::estimate_only() {
         host_dense_matchup_required(est_plan, iso_, oop_reach_, ip_reach_);
 
     GameTreeBuilder builder(config_);
+    builder.set_runout_group(iso_.runout_perms);
     builder.set_memory_policy(
         iso_.num_canonical,
         config_.memory_budget,
@@ -2476,6 +2623,7 @@ inline SolveResources Solver::estimate_only() {
     bool projected_collapse = false;
     if (config_.board_size == 3) {
         GameTreeBuilder probe(config_);
+        probe.set_runout_group(iso_.runout_perms);
         probe.set_memory_policy(
             iso_.num_canonical,
             config_.memory_budget,
@@ -2643,7 +2791,7 @@ inline SolveResources Solver::estimate_only() {
     const uint64_t gpu_value_rows_est = gpu_value_rows(tree_);
     r.estimated_gpu_state_bytes      = bytes_for_gpu_state_compact(
         total_n, player_slots, nc, gpu_materializes_strategy(),
-        gpu_value_rows_est);
+        gpu_value_rows_est, memory_budget::gpu_value_regions(config_.alternating_updates));
     r.estimated_gpu_matchup_bytes    = (est_plan.device_dense_upload
         ? bytes_for_matchup_tables(matchup_count_est, nc, 2ULL * sizeof(float))
         : 0) + bytes_for_equity_tables(equity_tables_exact, nc)
@@ -2651,7 +2799,8 @@ inline SolveResources Solver::estimate_only() {
     r.estimated_device_total_bytes   = bytes_for_gpu_device_total(
         total_n, tree_.total_edges, player_slots, matchup_count_est, nc,
         est_plan.device_dense_upload, gpu_materializes_strategy(),
-        gpu_value_rows_est, equity_tables_exact,
+        gpu_value_rows_est, memory_budget::gpu_value_regions(config_.alternating_updates),
+        equity_tables_exact,
         signed_count_device_tables(est_plan, matchup_count_est));
 
     // Output plan (review round 2): only price the navigation cache + full
@@ -2675,6 +2824,7 @@ inline SolveResources Solver::estimate_only() {
 
     // Predict which backend AUTO would pick — same heuristic solve() uses.
     BackendType predicted_backend = backend_type_;
+    if (!gpu_downgrade_reason_.empty()) r.fallback_reason = gpu_downgrade_reason_;
     if (backend_type_ == BackendType::AUTO) {
         const bool want_gpu = should_auto_select_gpu(config_, tree_, matchup_count_est);
         predicted_backend = want_gpu ? BackendType::GPU : BackendType::CPU;
@@ -2734,7 +2884,7 @@ inline SolveResources Solver::estimate_only() {
         }
     }
 
-    r.ops_per_iteration = ops_per_solve_iteration(player_nodes, MAX_ACTIONS, nc);
+    r.ops_per_iteration = ops_per_solve_iteration(player_nodes, kOpsModelActions, nc);
     const double iteration_s =
         estimated_iteration_seconds(lc, cc, cpu_eff, est_plan);
     r.estimated_iteration_ms  = iteration_s * 1000.0;
@@ -3408,21 +3558,53 @@ inline void Solver::build_equity_tables() {
 
 inline void Solver::resolve_node_locks() {
     resolved_locks_.clear();
+    // 2026-10-06 audit: a lock that does not fit the tree is an error. It
+    // used to be dropped (unmatched history), applied to the wrong node (the
+    // deepest node an unmatched history reached) or applied unnormalized (a
+    // [1] lock on a 3-action node).
     for (const auto& lock : config_.node_locks) {
-        uint32_t node_idx = navigate_to_node(lock.history);
-        if (node_idx >= tree_.total_nodes) continue;
+        const uint32_t node_idx = navigate_to_node(lock.history);
+        if (node_idx >= tree_.total_nodes) {
+            throw std::invalid_argument("Node lock: history '" + lock.history +
+                                        "' is not a node of this tree");
+        }
+        const auto nt = static_cast<NodeType>(tree_.node_types[node_idx]);
+        if (nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) {
+            throw std::invalid_argument("Node lock: history '" + lock.history +
+                                        "' is not a decision node");
+        }
         uint16_t ci = UINT16_MAX;
         if (lock.combo_idx < NUM_COMBOS) {
             ci = iso_.original_to_canonical[lock.combo_idx];
         }
-        if (ci == UINT16_MAX) continue;
-        // Clamp to the node's real action count. The compact GPU layout
-        // allocates exactly num_children strategy rows per node, so a longer
-        // lock array would spill into the NEXT node's slots on device
-        // (CPU apply_node_locks already caps at n_act).
+        if (ci == UINT16_MAX) continue;   // blocked by the board / not in a range
+        // One frequency per action. A longer vector is accepted only when its
+        // tail is all zeros (callers that size by an upper bound). The compact
+        // GPU layout allocates exactly num_children rows per node, so a longer
+        // array would also spill into the NEXT node's slots on device.
         std::vector<float> strat = lock.strategy;
         const uint8_t n_act = tree_.num_children[node_idx];
-        if (strat.size() > n_act) strat.resize(n_act);
+        bool tail_zero = true;
+        for (std::size_t a = n_act; a < strat.size(); ++a) tail_zero = tail_zero && strat[a] == 0.0f;
+        if (strat.size() < n_act || !tail_zero) {
+            std::string labels;
+            for (const auto& l : get_action_labels_at(node_idx)) {
+                if (!labels.empty()) labels += ", ";
+                labels += l;
+            }
+            throw std::invalid_argument(
+                "Node lock at '" + lock.history + "' gives " +
+                std::to_string(strat.size()) + " frequencies but the node has " +
+                std::to_string(n_act) + " actions (" + labels + ")");
+        }
+        strat.resize(n_act);
+        float sum = 0.0f;
+        for (float v : strat) sum += v;
+        if (!(sum > 0.0f) || !std::isfinite(sum)) {
+            throw std::invalid_argument("Node lock at '" + lock.history +
+                                        "' has no positive frequency");
+        }
+        for (float& v : strat) v /= sum;
         resolved_locks_[{node_idx, ci}] = std::move(strat);
     }
 }
@@ -3513,9 +3695,12 @@ inline std::vector<float> Solver::cpu_ev_traverse(
             std::vector<float> child_vals = cpu_ev_traverse(
                 child, perspective, reach_oop, reach_ip, out_node_values,
                 visible_filter, out_node_opp_compat);
-            for (uint16_t c = 0; c < nc; ++c) {
-                avg[c] += static_cast<float>(weight) * child_vals[c];
-            }
+            for_runout_orbit(&runout_maps_, child, weight,
+                [&](float w) { for (uint16_t c = 0; c < nc; ++c) avg[c] += w * child_vals[c]; },
+                [&](uint32_t map) {
+                    const uint16_t* m = runout_maps_.maps.data() + static_cast<std::size_t>(map) * nc;
+                    for (uint16_t c = 0; c < nc; ++c) avg[c] += child_vals[m[c]];
+                });
             total_weight += weight;
         }
         if (total_weight > 0) {
@@ -3610,6 +3795,36 @@ inline CardMask Solver::board_mask_at(uint32_t node_idx) const {
         return matchup_board_masks_[static_cast<std::size_t>(mi)];
     }
     return board_to_mask(config_.board.data(), config_.board_size);
+}
+
+inline std::vector<float> Solver::player_reach_at(uint32_t node_idx, int player) const {
+    std::vector<float> reach = (player == 0) ? oop_reach_ : ip_reach_;
+    if (node_idx == 0 || node_idx >= tree_.total_nodes || strategy_.empty()) return reach;
+    // Path root → node as (parent, child slot) pairs.
+    std::vector<std::pair<uint32_t, uint8_t>> path;
+    for (uint32_t cur = node_idx; cur != 0;) {
+        const uint32_t parent = tree_.parent_indices[cur];
+        const uint32_t off = tree_.children_offset[parent];
+        uint8_t slot = 0xFF;
+        for (uint8_t k = 0; k < tree_.num_children[parent]; ++k) {
+            if (tree_.children[off + k] == cur) { slot = k; break; }
+        }
+        if (slot == 0xFF) break;   // inconsistent tree
+        path.push_back({parent, slot});
+        cur = parent;
+    }
+    const uint16_t nc = iso_.num_canonical;
+    const auto own = (player == 0) ? NodeType::PLAYER_OOP : NodeType::PLAYER_IP;
+    for (auto it = path.rbegin(); it != path.rend(); ++it) {
+        const uint32_t n = it->first;
+        if (static_cast<NodeType>(tree_.node_types[n]) != own) continue;
+        if (n >= strategy_.size() || strategy_[n].empty()) continue;
+        const std::size_t base = static_cast<std::size_t>(it->second) * nc;
+        for (uint16_t c = 0; c < nc && c < reach.size(); ++c) {
+            if (base + c < strategy_[n].size()) reach[c] *= strategy_[n][base + c];
+        }
+    }
+    return reach;
 }
 
 inline double Solver::legal_joint_mass() const {
@@ -3885,9 +4100,12 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
             if (weight == 0) weight = 1;
             std::vector<float> child_vals = cpu_best_response_traverse(
                 child, player, reach_oop, reach_ip);
-            for (uint16_t c = 0; c < nc; ++c) {
-                avg[c] += static_cast<float>(weight) * child_vals[c];
-            }
+            for_runout_orbit(&runout_maps_, child, weight,
+                [&](float w) { for (uint16_t c = 0; c < nc; ++c) avg[c] += w * child_vals[c]; },
+                [&](uint32_t map) {
+                    const uint16_t* m = runout_maps_.maps.data() + static_cast<std::size_t>(map) * nc;
+                    for (uint16_t c = 0; c < nc; ++c) avg[c] += child_vals[m[c]];
+                });
             total_weight += weight;
         }
         if (total_weight > 0) {
@@ -3954,7 +4172,7 @@ inline float Solver::compute_exploitability() {
     auto ensure_host_strategy = [&]() {
         if (strategy_.empty() && backend_) {
             backend_->finalize();
-            strategy_ = backend_->strategy();
+            strategy_ = backend_->take_strategy();
         }
     };
     // Never answer 0 for want of a host strategy: a probe reads 0 as
@@ -4050,7 +4268,14 @@ inline float Solver::compute_exploitability() {
     }
     const double exploit_chips = (br_oop_total + br_ip_total - ev_total) / (2.0 * mass);
     const float exploit = static_cast<float>(
-        exploit_chips / std::max(static_cast<double>(config_.pot), 1.0) * 100.0);
+        exploit_chips / std::max(static_cast<double>(config_.pot), 1e-9) * 100.0);
+    // 2026-10-06 audit: std::max(0, NaN) is 0, so a NaN solve used to read
+    // as "converged" and stop at the next probe. Non-finite is an error.
+    if (!std::isfinite(exploit)) {
+        throw std::runtime_error(
+            "The solve produced non-finite values (NaN/Inf) - its strategies "
+            "are not usable. Check the range weights and bet sizes.");
+    }
     return std::max(0.0f, exploit);
 }
 
@@ -4064,10 +4289,37 @@ inline std::vector<std::string> Solver::get_action_labels_at(uint32_t node_idx) 
     uint32_t offset = tree_.children_offset[node_idx];
     uint8_t num_children = tree_.num_children[node_idx];
     float pot = tree_.pots[node_idx];
+    const float to_call = tree_.bet_into[node_idx];
     for (uint8_t i = 0; i < num_children; ++i) {
         auto at = static_cast<ActionType>(tree_.child_action_types[offset + i]);
         float amt = tree_.child_action_amts[offset + i];
-        labels.push_back(action_to_label(at, amt, pot));
+        labels.push_back(action_to_label(at, amt, pot, to_call));
+    }
+    // 2026-10-06 audit: two sizes that round to one percentage (0.5 and
+    // 0.505 → "Bet_50" twice) gave duplicate JSON keys, and the second child
+    // could never be navigated to. Labels are unique per node: colliding
+    // ones are re-printed with 1, 2, 3 decimals until they differ.
+    auto collides = [&](std::size_t i) {
+        for (std::size_t j = 0; j < labels.size(); ++j)
+            if (j != i && labels[j] == labels[i]) return true;
+        return false;
+    };
+    for (int decimals = 1; decimals <= 3; ++decimals) {
+        std::vector<std::size_t> dup;
+        for (std::size_t i = 0; i < labels.size(); ++i)
+            if (collides(i)) dup.push_back(i);
+        if (dup.empty()) break;
+        for (std::size_t i : dup) {
+            auto at = static_cast<ActionType>(tree_.child_action_types[offset + i]);
+            float amt = tree_.child_action_amts[offset + i];
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(decimals)
+                << action_size_pct(at, amt, pot, to_call);
+            std::string num = oss.str();
+            while (!num.empty() && num.back() == '0') num.pop_back();
+            if (!num.empty() && num.back() == '.') num.pop_back();
+            labels[i] = std::string(at == ActionType::BET ? "Bet_" : "Raise_") + num;
+        }
     }
     return labels;
 }
@@ -4086,10 +4338,17 @@ inline std::vector<std::pair<std::string, float>> Solver::extract_global_strateg
 
     auto nt = static_cast<NodeType>(tree_.node_types[node_idx]);
     bool is_ip = (nt == NodeType::PLAYER_IP);
-    const auto& reach = is_ip ? ip_reach_ : oop_reach_;
+    const std::vector<float> reach = player_reach_at(node_idx, is_ip ? 1 : 0);
+    // Members of a class a turn/river card blocks cannot be dealt here.
+    const CardMask dead = board_mask_at(node_idx);
+    const auto& combo_table = get_combo_table();
 
     for (uint16_t c = 0; c < iso_.num_canonical; ++c) {
-        float weight = static_cast<float>(iso_.canonical_weights[c]);
+        uint32_t live_members = 0;
+        for (uint16_t o : iso_.canonical_to_originals[c]) {
+            if (!combo_table[o].conflicts_with(dead)) ++live_members;
+        }
+        float weight = static_cast<float>(live_members);
         float reach_w = (c < reach.size()) ? reach[c] : 1.0f;
         weight *= reach_w;
         for (uint8_t a = 0; a < n_act; ++a) {
@@ -4125,7 +4384,8 @@ inline std::vector<std::pair<std::string,
     auto labels = get_action_labels_at(node_idx);
     auto nt = static_cast<NodeType>(tree_.node_types[node_idx]);
     bool is_ip = (nt == NodeType::PLAYER_IP);
-    const auto& reach = is_ip ? ip_reach_ : oop_reach_;
+    const std::vector<float> reach = player_reach_at(node_idx, is_ip ? 1 : 0);
+    const CardMask dead = board_mask_at(node_idx);
 
     const auto& combo_table = get_combo_table();
 
@@ -4138,9 +4398,10 @@ inline std::vector<std::pair<std::string,
     for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
         uint16_t ci = iso_.original_to_canonical[i];
         if (ci == UINT16_MAX) continue;
+        if (combo_table[i].conflicts_with(dead)) continue;
         std::string label = combo_to_grid_label(combo_table[i]);
         float reach_w = (ci < reach.size()) ? reach[ci] : 0.0f;
-        if (reach_w <= 0.0f) continue;  // outside range → skip
+        if (reach_w <= 0.0f) continue;  // not in the range at this node
 
         auto& arr = totals[label];
         if (arr.empty()) arr.assign(n_act, 0.0f);
@@ -4172,6 +4433,7 @@ inline std::vector<std::pair<std::string,
     for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
         uint16_t ci = iso_.original_to_canonical[i];
         if (ci == UINT16_MAX) continue;
+        if (combo_table[i].conflicts_with(dead)) continue;
         float reach_w = (ci < reach.size()) ? reach[ci] : 0.0f;
         if (reach_w <= 0.0f) continue;
 
@@ -4206,7 +4468,10 @@ inline std::vector<std::pair<std::string,
     return out;
 }
 
-inline uint32_t Solver::navigate_to_node(const std::string& history) const {
+inline uint32_t Solver::navigate_to_node(const std::string& history,
+                                         bool stop_at_final_chance,
+                                         SuitPerm* view) const {
+    if (view != nullptr) *view = {0, 1, 2, 3};
     if (history.empty()) return 0;
     std::vector<std::string> steps;
     size_t start = 0, comma;
@@ -4227,6 +4492,7 @@ inline uint32_t Solver::navigate_to_node(const std::string& history) const {
         ActionType type;
         bool has_amount;
         float target_amount;  // absolute bet/raise-to amount in chips
+        bool valid = true;
     };
     auto parse_step = [&](const std::string& raw, float node_pot,
                           float node_bet_into) -> ParsedStep {
@@ -4253,8 +4519,7 @@ inline uint32_t Solver::navigate_to_node(const std::string& history) const {
         bool is_bet   = starts_with("Bet");
         bool is_raise = starts_with("Raise");
         if (!is_bet && !is_raise) {
-            // Unknown label — fall through as CHECK; exact match fallback will
-            // try regardless of parsed type.
+            ps.valid = false;   // unknown label: no fuzzy match
             return ps;
         }
         ps.type = is_bet ? ActionType::BET : ActionType::RAISE;
@@ -4266,7 +4531,7 @@ inline uint32_t Solver::navigate_to_node(const std::string& history) const {
         // Find first digit
         size_t i = 0;
         while (i < tail.size() && (tail[i] < '0' || tail[i] > '9')) ++i;
-        if (i >= tail.size()) return ps;
+        if (i >= tail.size()) { ps.valid = false; return ps; }
         float num = 0.0f;
         bool has_dot = false;
         float frac = 0.1f;
@@ -4291,12 +4556,13 @@ inline uint32_t Solver::navigate_to_node(const std::string& history) const {
             ps.target_amount = node_pot * (num / 100.0f);
             ps.has_amount = true;
         } else {
-            // Raise X / Raise X% → X percent of node_pot (backend native)
+            // Raise X / Raise X% → the call plus X percent of the pot after
+            // calling (the label's meaning, action_size_pct).
             // Raise Xx → X multiplied by the facing bet (frontend convention)
             if (suffix == 'x' || suffix == 'X') {
                 ps.target_amount = node_bet_into * num;
             } else {
-                ps.target_amount = node_pot * (num / 100.0f);
+                ps.target_amount = node_bet_into + (node_pot + node_bet_into) * (num / 100.0f);
             }
             ps.has_amount = true;
         }
@@ -4319,26 +4585,63 @@ inline uint32_t Solver::navigate_to_node(const std::string& history) const {
 
     // pending_runout_card carries a runout choice from the PREVIOUS step
     // through the next chance-skip. -1 = use lex-min default.
-    auto skip_chance_with_runout = [&](uint32_t& node, int runout_card) {
+    // Returns false when the requested runout card is not a child here — a
+    // non-representative card of an iso orbit (or a card already on the
+    // board) used to fall back to the lex-min runout without a word.
+    auto skip_chance_with_runout = [&](uint32_t& node, int runout_card) -> bool {
         while (static_cast<NodeType>(tree_.node_types[node]) == NodeType::CHANCE) {
             uint8_t nch = tree_.num_children[node];
             if (nch == 0) break;
             uint32_t off = tree_.children_offset[node];
             uint32_t pick = tree_.children[off];  // lex-min default
             if (runout_card >= 0) {
+                // The card names the dealt world; under a view permutation
+                // P that is P(canonical card), so look up P^-1(card).
+                Card want = static_cast<Card>(runout_card);
+                if (view != nullptr) {
+                    uint8_t inv[4];
+                    for (uint8_t s = 0; s < 4; ++s) inv[(*view)[s]] = s;
+                    want = make_card(card_rank(want),
+                                     static_cast<Suit>(inv[card_suit(want)]));
+                }
+                bool found = false;
                 for (uint8_t k = 0; k < nch; ++k) {
                     uint32_t child = tree_.children[off + k];
                     uint8_t dc = (child < tree_.dealt_card.size())
                         ? tree_.dealt_card[child] : 0xFFu;
-                    if (dc == static_cast<uint8_t>(runout_card)) {
+                    if (dc == want) {
                         pick = child;
+                        found = true;
                         break;
                     }
                 }
+                // Another member of a representative's orbit: member =
+                // g(rep), so that world is the representative's seen
+                // through g, and P becomes P o g.
+                for (uint8_t k = 0; !found && view != nullptr && k < nch; ++k) {
+                    const uint32_t child = tree_.children[off + k];
+                    const uint8_t dc = tree_.dealt_card[child];
+                    const uint16_t set = tree_.runout_perm_set.empty()
+                        ? kNoRunoutPerms : tree_.runout_perm_set[child];
+                    if (dc == 0xFFu || set == kNoRunoutPerms) continue;
+                    for (const auto& g : tree_.runout_perm_sets[set]) {
+                        if (permute_card(dc, g) != want) continue;
+                        SuitPerm composed;
+                        for (uint8_t s = 0; s < 4; ++s) composed[s] = (*view)[g[s]];
+                        *view = composed;
+                        pick = child;
+                        found = true;
+                        break;
+                    }
+                }
+                // A collapsed chance node deals no card: any choice is moot.
+                const uint8_t first_dc = tree_.dealt_card[tree_.children[off]];
+                if (!found && first_dc != 0xFFu) return false;
                 runout_card = -1;  // consume the choice on the first chance level only
             }
             node = pick;
         }
+        return runout_card < 0;
     };
 
     uint32_t current_node = 0;
@@ -4353,13 +4656,17 @@ inline uint32_t Solver::navigate_to_node(const std::string& history) const {
         if (hash != std::string::npos) {
             step = step_raw.substr(0, hash);
             step_runout_card = parse_card_token(step_raw.substr(hash + 1));
+            if (step_runout_card < 0) return kInvalidNode;
         }
 
-        if (static_cast<NodeType>(tree_.node_types[current_node]) == NodeType::TERMINAL) break;
+        // A step after a terminal names nothing.
+        if (static_cast<NodeType>(tree_.node_types[current_node]) == NodeType::TERMINAL) {
+            return kInvalidNode;
+        }
         // Skip any CHANCE nodes here, applying the pending runout choice from
         // the PRIOR step (if it carried "#<card>"). On the first chance level
         // we use the choice; subsequent chance levels still go lex-min.
-        skip_chance_with_runout(current_node, pending_runout_card);
+        if (!skip_chance_with_runout(current_node, pending_runout_card)) return kInvalidNode;
         pending_runout_card = step_runout_card;
         auto labels = get_action_labels_at(current_node);
 
@@ -4381,6 +4688,7 @@ inline uint32_t Solver::navigate_to_node(const std::string& history) const {
         float node_pot      = tree_.pots[current_node];
         float node_bet_into = tree_.bet_into[current_node];
         ParsedStep ps = parse_step(step, node_pot, node_bet_into);
+        if (!ps.valid) return kInvalidNode;
 
         uint8_t nc = tree_.num_children[current_node];
         uint32_t offset = tree_.children_offset[current_node];
@@ -4401,17 +4709,168 @@ inline uint32_t Solver::navigate_to_node(const std::string& history) const {
                 best_diff = diff;
             }
         }
+        // A fuzzy size must be close: within 1% of the pot ("Bet_50" used to
+        // land on the 75% child when that was the nearest one).
+        if (best_i >= 0 && ps.has_amount &&
+            best_diff > std::max(0.01f * node_pot, 0.05f)) {
+            best_i = -1;
+        }
         if (best_i >= 0) {
             current_node = tree_.children[offset + best_i];
             continue;
         }
 
-        // No match at all — bail out rather than silently navigate wrong.
-        break;
+        return kInvalidNode;
     }
     // Final chance-skip — consume any trailing pending_runout_card.
-    skip_chance_with_runout(current_node, pending_runout_card);
+    if (stop_at_final_chance && pending_runout_card < 0 &&
+        static_cast<NodeType>(tree_.node_types[current_node]) == NodeType::CHANCE) {
+        return current_node;
+    }
+    if (!skip_chance_with_runout(current_node, pending_runout_card)) return kInvalidNode;
     return current_node;
+}
+
+inline uint8_t Solver::street_aggressor_at(uint32_t node_idx) const {
+    for (uint32_t cur = node_idx; cur != 0;) {
+        const uint32_t parent = tree_.parent_indices[cur];
+        if (static_cast<NodeType>(tree_.node_types[parent]) == NodeType::CHANCE) break;
+        const uint32_t off = tree_.children_offset[parent];
+        for (uint8_t k = 0; k < tree_.num_children[parent]; ++k) {
+            if (tree_.children[off + k] != cur) continue;
+            const auto at = static_cast<ActionType>(tree_.child_action_types[off + k]);
+            if (at == ActionType::BET || at == ActionType::RAISE || at == ActionType::ALLIN) {
+                return tree_.active_player[parent];
+            }
+            break;
+        }
+        cur = parent;
+    }
+    return 2;
+}
+
+inline Solver::NodeInfo Solver::node_info(uint32_t node_idx) const {
+    if (node_idx >= tree_.total_nodes) return NodeInfo{};
+    const auto nt = static_cast<NodeType>(tree_.node_types[node_idx]);
+    const bool player = nt == NodeType::PLAYER_OOP || nt == NodeType::PLAYER_IP;
+    return node_info_of(tree_, node_idx,
+                        player ? get_action_labels_at(node_idx) : std::vector<std::string>{},
+                        board_mask_at(node_idx));
+}
+
+inline Solver::NodeInfo Solver::node_info_of(const FlatGameTree& t, uint32_t node_idx,
+                                             const std::vector<std::string>& labels,
+                                             CardMask board) {
+    NodeInfo info;
+    if (node_idx >= t.total_nodes) return info;
+    info.type   = static_cast<NodeType>(t.node_types[node_idx]);
+    info.street = t.street[node_idx];
+    info.pot    = t.pots[node_idx];
+    for (Card c = 0; c < NUM_CARDS; ++c) {
+        if (board & card_to_mask(c)) info.board.push_back(c);
+    }
+    if (info.type == NodeType::TERMINAL) {
+        info.terminal  = static_cast<TerminalType>(t.terminal_types[node_idx]);
+        info.stack_oop = info.stack_ip = t.stacks[node_idx];
+        return info;
+    }
+    if (info.type == NodeType::CHANCE) {
+        // Both players have matched: one stack.
+        info.stack_oop = info.stack_ip = t.stacks[node_idx];
+        const uint32_t off = t.children_offset[node_idx];
+        for (uint8_t k = 0; k < t.num_children[node_idx]; ++k) {
+            const uint32_t child = t.children[off + k];
+            const uint8_t dc = t.dealt_card[child];
+            if (dc != 0xFFu) info.runouts.push_back({dc, t.runout_weight[child]});
+        }
+        return info;
+    }
+    const int actor = t.active_player[node_idx];
+    info.to_call = t.bet_into[node_idx];
+    const float mine = t.stacks[node_idx];
+    const float theirs = mine - info.to_call;
+    info.stack_oop = (actor == 0) ? mine : theirs;
+    info.stack_ip  = (actor == 0) ? theirs : mine;
+    // Chips each player has put in on this street: the path back to the
+    // street's first node.
+    float contrib[2] = {0.0f, 0.0f};
+    for (uint32_t cur = node_idx; cur != 0;) {
+        const uint32_t parent = t.parent_indices[cur];
+        if (static_cast<NodeType>(t.node_types[parent]) == NodeType::CHANCE) break;
+        const uint32_t off = t.children_offset[parent];
+        for (uint8_t k = 0; k < t.num_children[parent]; ++k) {
+            if (t.children[off + k] == cur) {
+                contrib[t.active_player[parent]] += t.child_action_amts[off + k];
+                break;
+            }
+        }
+        cur = parent;
+    }
+    const uint32_t off = t.children_offset[node_idx];
+    for (uint8_t k = 0; k < t.num_children[node_idx]; ++k) {
+        NodeAction a;
+        a.label  = (k < labels.size()) ? labels[k] : std::to_string(k);
+        a.type   = static_cast<ActionType>(t.child_action_types[off + k]);
+        a.amount = (a.type == ActionType::CHECK || a.type == ActionType::FOLD)
+                       ? 0.0f : t.child_action_amts[off + k];
+        a.raise_to = contrib[actor] + a.amount;
+        a.next = static_cast<NodeType>(t.node_types[t.children[off + k]]);
+        info.actions.push_back(std::move(a));
+    }
+    return info;
+}
+
+inline std::array<std::array<float, NUM_COMBOS>, 2>
+Solver::combo_ranges_at(uint32_t node_idx) const {
+    std::array<std::array<float, NUM_COMBOS>, 2> out{};
+    const CardMask dead = board_mask_at(node_idx);
+    const auto& combos = get_combo_table();
+    for (int p = 0; p < 2; ++p) {
+        const std::vector<float> reach = player_reach_at(node_idx, p);
+        for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+            const uint16_t c = iso_.original_to_canonical[i];
+            if (c == UINT16_MAX || c >= reach.size() || combos[i].conflicts_with(dead)) continue;
+            out[p][i] = reach[c];
+        }
+    }
+    return out;
+}
+
+inline std::vector<std::pair<std::string, float>>
+Solver::node_combo_evs(uint32_t node_idx) const {
+    std::vector<std::pair<std::string, float>> out;
+    if (!solved_ || strategy_.empty() || node_idx >= tree_.total_nodes) return out;
+    const auto nt = static_cast<NodeType>(tree_.node_types[node_idx]);
+    if (nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) return out;
+    const int persp = (nt == NodeType::PLAYER_IP) ? 1 : 0;
+    std::vector<float> roop = player_reach_at(node_idx, 0);
+    std::vector<float> rip  = player_reach_at(node_idx, 1);
+    const std::vector<float> acting_reach = (persp == 0) ? roop : rip;
+    std::map<uint32_t, std::vector<float>> vals, opp;
+    const std::set<uint32_t> only{node_idx};
+    cpu_ev_traverse(node_idx, persp, roop, rip, &vals, &only, &opp);
+    const auto v = vals.find(node_idx);
+    const auto m = opp.find(node_idx);
+    if (v == vals.end() || m == opp.end()) return out;
+    const CardMask dead = board_mask_at(node_idx);
+    const auto& combo_table = get_combo_table();
+    std::map<std::string, double> sum_wv, sum_w;
+    for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+        const uint16_t ci = iso_.original_to_canonical[i];
+        if (ci == UINT16_MAX || combo_table[i].conflicts_with(dead)) continue;
+        const float r = (ci < acting_reach.size()) ? acting_reach[ci] : 0.0f;
+        const float mass = (ci < m->second.size()) ? m->second[ci] : 0.0f;
+        if (r <= 0.0f || mass <= 0.0f) continue;
+        const std::string label = combo_to_grid_label(combo_table[i]);
+        sum_wv[label] += static_cast<double>(r) * (v->second[ci] / mass);
+        sum_w[label]  += r;
+    }
+    for (const auto& [label, w] : sum_w) {
+        if (w <= 0.0) continue;
+        const double ev = sum_wv[label] / w;
+        if (std::isfinite(ev)) out.push_back({label, static_cast<float>(ev)});
+    }
+    return out;
 }
 
 inline std::string Solver::acting_player_at(uint32_t node_idx) const {
@@ -4481,10 +4940,12 @@ Solver::extract_opponent_range_at(uint32_t node_idx) const
     // Using max (not mean) keeps the display intuitive — a label shows full
     // color if ANY of its suited/offsuit variants still reaches.
     const auto& combo_table = get_combo_table();
+    const CardMask dead = board_mask_at(node_idx);
     std::map<std::string, float> label_w;
     for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
         uint16_t ci = iso_.original_to_canonical[i];
         if (ci == UINT16_MAX) continue;
+        if (combo_table[i].conflicts_with(dead)) continue;
         float w = (ci < reach.size()) ? reach[ci] : 0.0f;
         if (w <= 0.0f) continue;
         std::string label = combo_to_grid_label(combo_table[i]);
@@ -4507,39 +4968,88 @@ Solver::extract_opponent_range_at(uint32_t node_idx) const
     return out;
 }
 
-inline ComboAnalysis Solver::analyze_combo(const std::string& combo_str) const {
+inline ComboAnalysis Solver::analyze_combo(const std::string& combo_str,
+                                           uint32_t node_idx) const {
     ComboAnalysis analysis;
     analysis.combo_str = combo_str;
-    if (!solved_ || combo_str.size() != 4) return analysis;
+    if (!solved_ || node_idx >= tree_.total_nodes) return analysis;
+    const auto nt = static_cast<NodeType>(tree_.node_types[node_idx]);
+    if (nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) return analysis;
 
-    try {
-        Card c0 = parse_card(combo_str.substr(0, 2));
-        Card c1 = parse_card(combo_str.substr(2, 2));
-        Combo combo(c0, c1);
-        uint16_t combo_idx = combo.index();
-        uint16_t canonical = iso_.original_to_canonical[combo_idx];
-        if (canonical == UINT16_MAX) return analysis;
+    // 2026-10-07: a grid label ("AKs") as well as a specific combo - the UI
+    // sends labels, which used to return an empty analysis. The members are
+    // averaged by the acting player's reach at the node; a hand that never
+    // reaches it (reach 0 on every member) gets no strategy rather than the
+    // meaningless average of a zero-reach lane.
+    const auto& combo_table = get_combo_table();
+    std::vector<uint16_t> members;
+    if (combo_str.size() == 4) {
+        try {
+            const Card c0 = parse_card(combo_str.substr(0, 2));
+            const Card c1 = parse_card(combo_str.substr(2, 2));
+            if (c0 == c1) return analysis;
+            members.push_back(Combo(c0, c1).index());
+            analysis.combo = {c0, c1};
+        } catch (const std::invalid_argument&) {
+            return analysis;
+        }
+    } else {
+        for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+            if (combo_to_grid_label(combo_table[i]) == combo_str) members.push_back(i);
+        }
+    }
+    if (members.empty()) return analysis;
 
-        analysis.combo = {c0, c1};
-        uint8_t n_act = tree_.num_children[0];
-        auto labels = get_action_labels_at(0);
-        float best_freq = -1;
+    const int persp = (nt == NodeType::PLAYER_IP) ? 1 : 0;
+    const std::vector<float> reach = player_reach_at(node_idx, persp);
+    const CardMask dead = board_mask_at(node_idx);
+    // Conditional EVs: at the root the postsolve's (OOP, the root's actor);
+    // elsewhere the acting player's counterfactual value at this node divided
+    // by the opponent mass dealt alongside the hand - as in the strategy tree.
+    std::map<uint32_t, std::vector<float>> vals, opp;
+    if (node_idx != 0) {
+        const std::set<uint32_t> only{node_idx};
+        auto r_oop = oop_reach_;
+        auto r_ip  = ip_reach_;
+        cpu_ev_traverse(0, persp, r_oop, r_ip, &vals, &only, &opp);
+    }
+    const auto v = vals.find(node_idx);
+    const auto m = opp.find(node_idx);
 
+    const uint8_t n_act = tree_.num_children[node_idx];
+    std::vector<double> mix(n_act, 0.0);
+    double w_sum = 0.0, ev_sum = 0.0, ev_w = 0.0;
+    for (uint16_t idx : members) {
+        if (combo_table[idx].conflicts_with(dead)) continue;
+        const uint16_t ci = iso_.original_to_canonical[idx];
+        if (ci == UINT16_MAX || ci >= reach.size() || !(reach[ci] > 0.0f)) continue;
+        const double w = reach[ci];
         for (uint8_t a = 0; a < n_act; ++a) {
-            size_t idx = a * iso_.num_canonical + canonical;
-            float freq = (idx < strategy_[0].size()) ? strategy_[0][idx] : 0;
-            analysis.strategy_mix.push_back({labels[a], freq * 100.0f});
-            if (freq > best_freq) {
-                best_freq = freq;
-                analysis.best_action = labels[a];
-            }
+            const size_t k = static_cast<size_t>(a) * iso_.num_canonical + ci;
+            if (k < strategy_[node_idx].size()) mix[a] += w * strategy_[node_idx][k];
         }
-
-        if (canonical < ev_.size()) {
-            analysis.ev = ev_[canonical];
+        w_sum += w;
+        if (node_idx == 0) {
+            if (ci < ev_.size()) { ev_sum += w * ev_[ci]; ev_w += w; }
+        } else if (v != vals.end() && m != opp.end() && ci < v->second.size() &&
+                   ci < m->second.size() && m->second[ci] > 0.0f) {
+            ev_sum += w * (v->second[ci] / m->second[ci]);
+            ev_w += w;
         }
-    } catch (...) {}
+    }
+    if (!(w_sum > 0.0)) return analysis;
 
+    const auto labels = get_action_labels_at(node_idx);
+    double best = -1.0;
+    for (uint8_t a = 0; a < n_act; ++a) {
+        const double freq = mix[a] / w_sum;
+        analysis.strategy_mix.push_back({labels[a], static_cast<float>(freq * 100.0)});
+        if (freq > best) {
+            best = freq;
+            analysis.best_action = labels[a];
+        }
+    }
+    if (ev_w > 0.0) analysis.ev = static_cast<float>(ev_sum / ev_w);
     return analysis;
 }
 
@@ -4566,97 +5076,119 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
     }
     bool truncated = false;
 
-    // Phase 3 (10-point plan): cap the EV cache size by computing the set of
-    // nodes the strategy tree will actually emit BEFORE running the EV pass,
-    // then telling cpu_ev_traverse to drop everything else. The pre-walk
-    // mirrors the recursion structure of the main `walk` below but only
-    // collects node ids — no allocation per node — so it's effectively free.
-    //
-    // P1-1 (v1.2.1): cap the pre-walk at `effective_max_nodes` too. Without
-    // this, on big trees with tight max_nodes the visible_nodes set (and the
-    // two per-node EV vectors keyed off it, each of length nc) dwarf the
-    // eventual JSON payload by orders of magnitude — the JSON walk would
-    // truncate but the EV cache RAM was already spent.
-    //
-    // Note on counter mismatch: visible_nodes is a `std::set` (deduped),
-    // while the JSON walk may emit the same node under several paths
-    // (runout fan-out at first chance level produces "Check#2s",
-    // "Check#3s", … all pointing at the same acting node). So
-    // visible_nodes.size() ≤ JSON emitted count in general. Capping the
-    // pre-walk at effective_max_nodes is a *conservative* upper bound on EV
-    // cache RAM; the walk may emit a few nodes past the cap with missing
-    // EV data (evs_at returns empty for missing entries — degrades
-    // gracefully, no crash). For v1.2.1 simplicity that's the trade.
-    //
-    // FULL mode skips this and records every visited node, matching the
-    // pre-Phase-3 behavior (kept as an escape hatch for tests / debugging).
-    std::set<uint32_t> visible_nodes;
-    if (need_evs && ev_mode == StrategyTreeEvMode::VISIBLE) {
-        std::function<void(uint32_t, int, int)> precount;
-        precount = [&](uint32_t node, int player_depth, int chance_levels_seen) {
-            // P1-1 cap: stop recursing once we've collected enough nodes to
-            // match the JSON cap. Any further recursion would only inflate
-            // EV cache RAM without affecting emitted JSON (the walk caps
-            // independently at the same threshold).
-            if (effective_max_nodes > 0 &&
-                visible_nodes.size() >= effective_max_nodes) return;
+    // Path token formatter: cards encode as "<rank><suit>" lowercase
+    // (e.g. card 0 = "2c"). Used in the cache key for runout selection.
+    static const char RANK_CH[] = "23456789TJQKA";
+    static const char SUIT_CH[] = "cdhs";
+    auto card_token = [](uint8_t c) -> std::string {
+        std::string s; s += RANK_CH[c / 4]; s += SUIT_CH[c % 4]; return s;
+    };
 
-            // Mirror the chance-handling in `walk`: at first chance level
-            // enumerate every runout option; afterwards auto-skip to lex-min.
-            int chance_seen = chance_levels_seen;
-            while (node < tree_.total_nodes &&
-                   static_cast<NodeType>(tree_.node_types[node]) == NodeType::CHANCE) {
-                uint8_t nch = tree_.num_children[node];
-                if (nch == 0) return;
-                if (chance_seen == 0) {
-                    uint32_t off = tree_.children_offset[node];
-                    bool any_real = false;
+    // For a CHANCE node, the canonical runout options the UI can present
+    // (dealt_card + runout_weight from the builder's iso enumeration). The
+    // legacy single-child fallback (dealt_card == 0xFF) offers none.
+    auto chance_options = [&](uint32_t chance_node) -> std::vector<RunoutOption> {
+        std::vector<RunoutOption> opts;
+        uint8_t nch = tree_.num_children[chance_node];
+        uint32_t off = tree_.children_offset[chance_node];
+        for (uint8_t k = 0; k < nch; ++k) {
+            uint32_t child = tree_.children[off + k];
+            uint8_t dc = (child < tree_.dealt_card.size()) ? tree_.dealt_card[child] : 0xFFu;
+            if (dc == 0xFFu) continue;
+            uint8_t w  = (child < tree_.runout_weight.size()) ? tree_.runout_weight[child] : 1;
+            opts.push_back({dc, w});
+        }
+        return opts;
+    };
+
+    // 2026-10-06 audit: BREADTH-first, so the emitted-node cap covers every
+    // early branch. The depth-first walk spent the whole cap on the first
+    // action's subtree (1999 of 2000 entries under "Check" on a turn spot;
+    // the root's bets and "Check,Bet_33" were never cached).
+    //
+    // Keys: comma-separated player-action labels; at the FIRST chance level
+    // every canonical runout is enumerated (the lex-min one at the
+    // no-suffix key, the others with "#<card>" on the action that ended the
+    // street); later chance levels auto-skip to the lex-min runout.
+    struct Pending {
+        uint32_t node;
+        std::string path;
+        std::vector<uint8_t> dealt;
+        std::vector<RunoutOption> runouts;
+        int depth;
+        int chance_seen;
+    };
+    struct Emitted {
+        uint32_t node;
+        std::string path;
+        std::vector<uint8_t> dealt;
+        std::vector<RunoutOption> runouts;
+    };
+    std::deque<Pending> queue;
+    std::vector<Emitted> emitted;
+    std::set<std::string> emitted_paths;
+    queue.push_back({0u, std::string(), {}, {}, 0, initial_chance_levels_seen});
+    while (!queue.empty()) {
+        Pending it = std::move(queue.front());
+        queue.pop_front();
+        uint32_t node = it.node;
+        bool fanned_out = false;
+        while (node < tree_.total_nodes &&
+               static_cast<NodeType>(tree_.node_types[node]) == NodeType::CHANCE) {
+            const uint8_t nch = tree_.num_children[node];
+            if (nch == 0) { node = tree_.total_nodes; break; }
+            const uint32_t off = tree_.children_offset[node];
+            if (it.chance_seen == 0) {
+                auto opts = chance_options(node);
+                if (opts.size() > 1) {
+                    bool lex_min = true;   // first child in tree order
                     for (uint8_t k = 0; k < nch; ++k) {
-                        uint32_t child = tree_.children[off + k];
-                        uint8_t dc = (child < tree_.dealt_card.size())
-                            ? tree_.dealt_card[child] : 0xFFu;
+                        const uint32_t child = tree_.children[off + k];
+                        const uint8_t dc = tree_.dealt_card[child];
                         if (dc == 0xFFu) continue;
-                        any_real = true;
-                        precount(child, player_depth, chance_seen + 1);
-                        // Cap check inside the fan-out: if the recursive
-                        // call filled the budget, stop iterating siblings.
-                        if (effective_max_nodes > 0 &&
-                            visible_nodes.size() >= effective_max_nodes) return;
+                        Pending next{child,
+                                     lex_min ? it.path : (it.path + "#" + card_token(dc)),
+                                     it.dealt, opts, it.depth, it.chance_seen + 1};
+                        next.dealt.push_back(dc);
+                        queue.push_back(std::move(next));
+                        lex_min = false;
                     }
-                    if (any_real) return;
-                    // single-option chance: fall through to auto-skip
-                    uint32_t child = tree_.children[off];
-                    node = child;
-                    ++chance_seen;
-                    continue;
+                    fanned_out = true;
+                    break;
                 }
-                uint32_t child = tree_.children[tree_.children_offset[node]];
-                node = child;
-                ++chance_seen;
             }
-            if (node >= tree_.total_nodes) return;
-            auto nt = static_cast<NodeType>(tree_.node_types[node]);
-            if (nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) return;
-            visible_nodes.insert(node);
-            if (player_depth >= max_player_depth) return;
-            // Cap check before recursing into children — same rationale as
-            // top of function but caught one level earlier.
-            if (effective_max_nodes > 0 &&
-                visible_nodes.size() >= effective_max_nodes) return;
-            uint8_t na = tree_.num_children[node];
-            uint32_t off = tree_.children_offset[node];
-            for (uint8_t a = 0; a < na; ++a) {
-                precount(tree_.children[off + a], player_depth + 1, chance_seen);
-                if (effective_max_nodes > 0 &&
-                    visible_nodes.size() >= effective_max_nodes) return;
-            }
-        };
-        precount(0, 0, initial_chance_levels_seen);
+            // Single option, or a later chance level: the first child.
+            const uint32_t child = tree_.children[off];
+            const uint8_t dc = tree_.dealt_card[child];
+            if (dc != 0xFFu) it.dealt.push_back(dc);
+            node = child;
+            ++it.chance_seen;
+        }
+        if (fanned_out || node >= tree_.total_nodes) continue;
+        const auto nt = static_cast<NodeType>(tree_.node_types[node]);
+        if (nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) continue;
+        if (emitted_paths.count(it.path)) continue;
+        if (effective_max_nodes > 0 && emitted.size() >= effective_max_nodes) {
+            truncated = true;
+            break;
+        }
+        emitted_paths.insert(it.path);
+        emitted.push_back({node, it.path, it.dealt, it.runouts});
+        if (it.depth >= max_player_depth) continue;
+        const auto labels = get_action_labels_at(node);
+        const uint32_t off = tree_.children_offset[node];
+        for (uint8_t a = 0; a < tree_.num_children[node] && a < labels.size(); ++a) {
+            queue.push_back({tree_.children[off + a],
+                             it.path.empty() ? labels[a] : (it.path + "," + labels[a]),
+                             it.dealt, it.runouts, it.depth + 1, it.chance_seen});
+        }
     }
 
-    // Pre-compute per-node EVs from each player's perspective by running
-    // cpu_ev_traverse from root with capture maps. One pass per perspective
-    // gets values for the visible-or-all set — depending on ev_mode.
+    // Per-node EVs from each player's perspective: one cpu_ev_traverse from
+    // the root per perspective, recording exactly the emitted nodes
+    // (VISIBLE) or every visited node (FULL, the legacy escape hatch).
+    std::set<uint32_t> visible_nodes;
+    for (const auto& e : emitted) visible_nodes.insert(e.node);
     std::map<uint32_t, std::vector<float>> node_vals_oop;
     std::map<uint32_t, std::vector<float>> node_vals_ip;
     // Per-hand card-compatible opponent reach mass at each recorded node, per
@@ -4666,10 +5198,8 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
     std::map<uint32_t, std::vector<float>> node_opp_oop;  // OOP-acting nodes → IP compat mass there
     std::map<uint32_t, std::vector<float>> node_opp_ip;   // IP-acting nodes  → OOP compat mass there
     if (need_evs) {
-        const std::set<uint32_t>* filter = nullptr;
-        if (ev_mode == StrategyTreeEvMode::VISIBLE) {
-            filter = &visible_nodes;
-        }
+        const std::set<uint32_t>* filter =
+            (ev_mode == StrategyTreeEvMode::VISIBLE) ? &visible_nodes : nullptr;
         auto roop = oop_reach_, rip = ip_reach_;
         cpu_ev_traverse(0, 0, roop, rip, &node_vals_oop, filter, &node_opp_oop);
         roop = oop_reach_; rip = ip_reach_;
@@ -4699,13 +5229,15 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
         const std::vector<float>* compat =
             (oit != opp_map.end()) ? &oit->second : nullptr;
 
-        const auto& reach = acting_is_ip ? ip_reach_ : oop_reach_;
+        const std::vector<float> reach = player_reach_at(node, acting_is_ip ? 1 : 0);
+        const CardMask dead = board_mask_at(node);
         const auto& combo_table = get_combo_table();
         std::map<std::string, float> sum_w_val;
         std::map<std::string, float> sum_w;
         for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
             uint16_t ci = iso_.original_to_canonical[i];
             if (ci == UINT16_MAX) continue;
+            if (combo_table[i].conflicts_with(dead)) continue;
             float r = (ci < reach.size()) ? reach[ci] : 0.0f;
             if (r <= 0.0f) continue;
             // Per-hand conditional normalizer: the opponent mass that can be
@@ -4731,169 +5263,29 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
         return out_pairs;
     };
 
-    // Path token formatter: cards encode as "<rank><suit>" lowercase
-    // (e.g. card 0 = "2c"). Used in the cache key for runout selection.
-    // Format chosen to be human-readable in JSON output and easy to parse
-    // by the frontend.
-    static const char RANK_CH[] = "23456789TJQKA";
-    static const char SUIT_CH[] = "cdhs";
-    auto card_token = [](uint8_t c) -> std::string {
-        std::string s; s += RANK_CH[c / 4]; s += SUIT_CH[c % 4]; return s;
-    };
-
-    // Helper: for a CHANCE node, build the list of canonical runout options
-    // the UI can present. Reads dealt_card + runout_weight from the SoA
-    // tree (populated by GameTreeBuilder during iso enumeration). Skips
-    // children with dealt_card == 0xFF (legacy single-child fallback).
-    auto chance_options = [&](uint32_t chance_node) -> std::vector<RunoutOption> {
-        std::vector<RunoutOption> opts;
-        uint8_t nch = tree_.num_children[chance_node];
-        uint32_t off = tree_.children_offset[chance_node];
-        for (uint8_t k = 0; k < nch; ++k) {
-            uint32_t child = tree_.children[off + k];
-            uint8_t dc = (child < tree_.dealt_card.size()) ? tree_.dealt_card[child] : 0xFFu;
-            if (dc == 0xFFu) continue;  // legacy fallback: not a real runout choice
-            uint8_t w  = (child < tree_.runout_weight.size()) ? tree_.runout_weight[child] : 1;
-            opts.push_back({dc, w});
-        }
-        return opts;
-    };
-
-    // Recursive walker. `path` is the cache key built from player-action
-    // labels (comma-separated) plus optional "#<card>" tokens marking the
-    // user's runout choice at the FIRST chance level. Subsequent chance
-    // levels still auto-skip to lex-min (cache size: enumerating all chance
-    // levels would explode for flop solves with iso engaged).
-    //
-    // `dealt_cards_so_far` accumulates cards picked along this path; copied
-    // into each cached entry for UI disclosure.
-    // `runouts_for_first_chance` is a snapshot of options at THIS sub-tree's
-    // root chance step, also copied into each entry so the runout picker UI
-    // can render from any node within the same runout subtree.
-    // `chance_levels_seen` controls when to enumerate vs auto-skip.
-    std::function<void(uint32_t, const std::string&,
-                       const std::vector<uint8_t>&,
-                       const std::vector<RunoutOption>&,
-                       int, int)> walk;
-    walk = [&](uint32_t node, const std::string& path,
-               const std::vector<uint8_t>& dealt_cards_so_far,
-               const std::vector<RunoutOption>& runouts_for_first_chance,
-               int player_depth, int chance_levels_seen) {
-        // Process CHANCE nodes inline.
-        std::vector<uint8_t> dealt_now = dealt_cards_so_far;
-        std::vector<RunoutOption> runouts_now = runouts_for_first_chance;
-        int chance_seen = chance_levels_seen;
-
-        while (node < tree_.total_nodes &&
-               static_cast<NodeType>(tree_.node_types[node]) == NodeType::CHANCE) {
-            uint8_t nch = tree_.num_children[node];
-            if (nch == 0) return;
-
-            // First chance encountered (per sub-tree from root): enumerate
-            // every canonical runout option. Lex-min canonical (the FIRST
-            // child in tree order) is also emitted at the NO-SUFFIX key so
-            // existing nav code that doesn't know about runout selection
-            // still hits cache. Other reps get "#<card>" suffix keys.
-            if (chance_seen == 0) {
-                auto opts = chance_options(node);
-                if (opts.size() > 1) {
-                    uint32_t off = tree_.children_offset[node];
-                    bool is_lex_min = true;  // first iter = first child = lex-min
-                    for (uint8_t k = 0; k < nch; ++k) {
-                        uint32_t child = tree_.children[off + k];
-                        uint8_t dc = (child < tree_.dealt_card.size())
-                            ? tree_.dealt_card[child] : 0xFFu;
-                        if (dc == 0xFFu) continue;
-                        std::vector<uint8_t> d = dealt_now;
-                        d.push_back(dc);
-                        std::string new_path = is_lex_min
-                            ? path
-                            : (path + "#" + card_token(dc));
-                        walk(child, new_path, d, opts,
-                             player_depth, chance_seen + 1);
-                        is_lex_min = false;
-                    }
-                    return;
-                }
-                // Single-option chance: degrade to auto-skip with the one
-                // child. dealt_card may be 0xFF (legacy) — don't append.
-                uint32_t child = tree_.children[off_of(node)];
-                uint8_t dc = (child < tree_.dealt_card.size())
-                    ? tree_.dealt_card[child] : 0xFFu;
-                if (dc != 0xFFu) dealt_now.push_back(dc);
-                node = child;
-                ++chance_seen;
-                continue;
-            }
-            // Subsequent chance levels: auto-skip to first (lex-min) child.
-            uint32_t child = tree_.children[off_of(node)];
-            uint8_t dc = (child < tree_.dealt_card.size())
-                ? tree_.dealt_card[child] : 0xFFu;
-            if (dc != 0xFFu) dealt_now.push_back(dc);
-            node = child;
-            ++chance_seen;
-        }
-        if (node >= tree_.total_nodes) return;
-
-        auto nt = static_cast<NodeType>(tree_.node_types[node]);
-        if (nt != NodeType::PLAYER_OOP && nt != NodeType::PLAYER_IP) return;
-        if (out.count(path)) return;  // already cached (shared sub-path)
-
-        // Sprint 1: emitted-node cap. Once we've cached `effective_max_nodes`
-        // unique entries, refuse to add more — any further `walk` recursion
-        // returns immediately. We mark `truncated` so the caller can show
-        // "tree truncated at N nodes" in the UI instead of silently dropping
-        // branches.
-        if (effective_max_nodes > 0 && out.size() >= effective_max_nodes) {
-            truncated = true;
-            return;
-        }
-
+    for (const auto& e : emitted) {
         StrategyTreeEntry entry;
-        entry.acting          = acting_player_at(node);
-        entry.action_labels   = get_action_labels_at(node);
-        entry.global_strategy = extract_global_strategy_at(node);
-        auto all_combo = extract_combo_strategies_at(node);
+        entry.acting          = acting_player_at(e.node);
+        entry.action_labels   = get_action_labels_at(e.node);
+        entry.global_strategy = extract_global_strategy_at(e.node);
+        auto all_combo = extract_combo_strategies_at(e.node);
         for (auto& [label, mix] : all_combo) {
             if (label.size() <= 3) {
                 entry.combo_strategies.push_back({label, mix});
             }
         }
-        auto opp = extract_opponent_range_at(node);
+        auto opp = extract_opponent_range_at(e.node);
         entry.opponent_side  = opp.opponent;
         entry.opponent_range = std::move(opp.labels);
-        entry.combo_evs      = evs_at(node);
-        entry.dealt_cards    = dealt_now;
-        entry.runout_options = runouts_now;
+        entry.combo_evs      = evs_at(e.node);
+        entry.dealt_cards    = e.dealt;
+        entry.runout_options = e.runouts;
+        entry.info           = node_info(e.node);
+        out[e.path] = std::move(entry);
+    }
 
-        std::vector<std::string> labels_local = entry.action_labels;
-        out[path] = std::move(entry);
-
-        if (player_depth >= max_player_depth) return;
-
-        uint8_t na = tree_.num_children[node];
-        uint32_t off = tree_.children_offset[node];
-        for (uint8_t a = 0; a < na && a < labels_local.size(); ++a) {
-            uint32_t child = tree_.children[off + a];
-            const std::string& alabel = labels_local[a];
-            std::string new_path = path.empty() ? alabel : (path + "," + alabel);
-            walk(child, new_path, dealt_now, runouts_now,
-                 player_depth + 1, chance_seen);
-        }
-    };
-
-    std::vector<uint8_t> empty_cards;
-    std::vector<RunoutOption> empty_runouts;
-    walk(0, "", empty_cards, empty_runouts, 0, initial_chance_levels_seen);
     if (out_truncated) *out_truncated = truncated;
     return out;
-}
-
-// Tiny helper used only inside the walk lambda. children_offset(node) is
-// what we want — wrapped here because the lambda accesses tree_ a lot and
-// it's clearer with a name.
-inline uint32_t Solver::off_of(uint32_t node) const {
-    return tree_.children_offset[node];
 }
 
 } // namespace deepsolver

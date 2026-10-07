@@ -158,6 +158,7 @@ static void vec_pos_normalize2(
     const __m256 zero = _mm256_setzero_ps();
     const __m256 one = _mm256_set1_ps(1.0f);
     const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 min_sum = _mm256_set1_ps(kMinRegretSum);
     std::size_t i = 0;
     for (; i + 8 <= n; i += 8) {
         const __m256 r0 = _mm256_loadu_ps(regret0 + i);
@@ -165,7 +166,7 @@ static void vec_pos_normalize2(
         const __m256 r0p = _mm256_max_ps(r0, zero);
         const __m256 r1p = _mm256_max_ps(r1, zero);
         const __m256 pos_sum = _mm256_add_ps(r0p, r1p);
-        const __m256 has_pos = _mm256_cmp_ps(pos_sum, zero, _CMP_GT_OS);
+        const __m256 has_pos = _mm256_cmp_ps(pos_sum, min_sum, _CMP_GE_OS);
         const __m256 safe_sum = _mm256_blendv_ps(one, pos_sum, has_pos);
         const __m256 inv = _mm256_div_ps(one, safe_sum);
         const __m256 norm0 = _mm256_mul_ps(r0p, inv);
@@ -177,7 +178,7 @@ static void vec_pos_normalize2(
         const float r0p = (regret0[i] > 0.0f) ? regret0[i] : 0.0f;
         const float r1p = (regret1[i] > 0.0f) ? regret1[i] : 0.0f;
         const float pos_sum = r0p + r1p;
-        if (pos_sum > 0.0f) {
+        if (pos_sum >= kMinRegretSum) {
             const float inv = 1.0f / pos_sum;
             strat0[i] = r0p * inv;
             strat1[i] = r1p * inv;

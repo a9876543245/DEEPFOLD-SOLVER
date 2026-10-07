@@ -2,11 +2,12 @@
 /// Spawns the C++ deepsolver_core executable and communicates via stdin/stdout.
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::{timeout, Duration};
 
 use crate::types::{EstimateResponse, GpuInfo, ResolvedMemoryBudget, SolverRequest, SolverResponse};
@@ -53,19 +54,133 @@ struct DecomposeProgress {
 /// `try_run_solver` path serialises through `run_solver`.
 static CURRENT_SOLVE_PID: AtomicU32 = AtomicU32::new(0);
 
+/// 2026-10-06 audit: set by the Stop button. The kill used to look like an
+/// engine crash, so `run_solver` restarted the whole solve on the CPU.
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// The error a cancelled solve returns; the UI treats it as neutral.
+pub const CANCELLED_MESSAGE: &str = "Solve cancelled";
+
+/// Line the engine writes after the result and after every --serve reply.
+const SERVE_END: &str = "@@DEEPSOLVER_END@@";
+
+/// 2026-10-06: an engine process that keeps a solve in memory (`--serve`)
+/// and answers node / range queries, so navigating the tree never re-solves.
+/// Several can be alive - a later-street re-solve keeps the earlier street's
+/// solve queryable - but at most MAX_SESSIONS (least recently used dropped).
+struct EngineSession {
+    id: u64,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+const MAX_SESSIONS: usize = 3;
+static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(1);
+const SESSION_GONE: &str = "The solved spot is no longer in memory - solve it again.";
+
+/// Sessions, least recently used first.
+fn sessions() -> &'static tokio::sync::Mutex<Vec<EngineSession>> {
+    static SLOT: OnceLock<tokio::sync::Mutex<Vec<EngineSession>>> = OnceLock::new();
+    SLOT.get_or_init(|| tokio::sync::Mutex::new(Vec::new()))
+}
+
+async fn kill_session(mut s: EngineSession) {
+    let _ = s.child.kill().await;
+    let _ = s.child.wait().await;
+}
+
+/// End one in-memory session (frees its RAM); `None` ends all of them.
+pub async fn close_session(id: Option<u64>) {
+    let mut list = sessions().lock().await;
+    let (gone, keep): (Vec<_>, Vec<_>) =
+        list.drain(..).partition(|s| id.map_or(true, |i| i == s.id));
+    *list = keep;
+    for s in gone {
+        kill_session(s).await;
+    }
+}
+
+async fn add_session(session: EngineSession) {
+    let mut list = sessions().lock().await;
+    while list.len() >= MAX_SESSIONS {
+        let oldest = list.remove(0);
+        kill_session(oldest).await;
+    }
+    list.push(session);
+}
+
+/// Send one request to in-memory session `id` and return its JSON reply.
+pub async fn query_session(id: u64, request: serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut list = sessions().lock().await;
+    let pos = list.iter().position(|s| s.id == id).ok_or_else(|| SESSION_GONE.to_string())?;
+    // Most recently used goes last.
+    let session = list.remove(pos);
+    list.push(session);
+    let session = list.last_mut().unwrap();
+    let line = format!("{}\n", request);
+    let reply = timeout(Duration::from_secs(600), async {
+        session.stdin.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
+        session.stdin.flush().await.map_err(|e| e.to_string())?;
+        read_until_end(&mut session.stdout).await
+    })
+    .await;
+    match reply {
+        Ok(Ok(Some(text))) => serde_json::from_str(&text)
+            .map_err(|e| format!("Bad engine reply: {}", e)),
+        _ => {
+            // The process died or hung: drop it.
+            if let Some(s) = list.pop() {
+                kill_session(s).await;
+            }
+            Err(SESSION_GONE.to_string())
+        }
+    }
+}
+
+/// Read stdout up to the next SERVE_END line. None = EOF first (the engine
+/// exited). Lossy UTF-8, so a stray byte can never stop the reader.
+async fn read_until_end(reader: &mut BufReader<ChildStdout>) -> Result<Option<String>, String> {
+    let mut out = String::new();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line == SERVE_END {
+            return Ok(Some(out));
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
 /// Cancel the currently-running solve, if any. Returns true if a process
 /// was killed. Called by the `cancel_solve` Tauri command bound to the
 /// frontend Stop button. Uses `taskkill /F` on Windows; the kill_on_drop
 /// path on the Rust side will also reap the child after the process dies.
 pub fn cancel_current_solve() -> Result<bool, String> {
+    CANCELLED.store(true, Ordering::SeqCst);
     let pid = CURRENT_SOLVE_PID.load(Ordering::SeqCst);
     if pid == 0 { return Ok(false); }
+    kill_pid(pid)?;
+    Ok(true)
+}
+
+fn kill_pid(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let out = std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
-            .output()
-            .map_err(|e| format!("taskkill failed: {}", e))?;
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/F", "/PID", &pid.to_string()]);
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let out = cmd.output().map_err(|e| format!("taskkill failed: {}", e))?;
         if !out.status.success() {
             // Already dead is fine — race between user click and natural exit.
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -81,7 +196,22 @@ pub fn cancel_current_solve() -> Result<bool, String> {
             .args(["-9", &pid.to_string()])
             .output();
     }
-    Ok(true)
+    Ok(())
+}
+
+/// App exit: stop the running solve and the in-memory session. (The engine
+/// also watches --parent-pid, so a crash cannot leave it running either.)
+pub fn shutdown() {
+    let pid = CURRENT_SOLVE_PID.swap(0, Ordering::SeqCst);
+    if pid != 0 {
+        let _ = kill_pid(pid);
+    }
+    if let Ok(mut list) = sessions().try_lock() {
+        for s in list.iter_mut() {
+            let _ = s.child.start_kill();
+        }
+        list.clear();
+    }
 }
 
 /// Diagnostic log file location. Writes CLI args and engine stderr on each
@@ -176,17 +306,22 @@ fn find_engine_binary() -> PathBuf {
 ///   - If `request.backend` is "cpu" (or unset in a CPU-only context), run CPU directly.
 ///   - Otherwise try the requested backend (auto/gpu). On GPU-related failure
 ///     (CUDA/device/GPU errors), automatically retry with backend=cpu and
-///     annotate the response so the UI can show a toast.
+///     note it in `resources.fallback_reason` so the UI can show a toast.
+///   - A cancelled solve returns CANCELLED_MESSAGE and is never retried.
 ///   - Non-GPU failures (timeout, bad input, etc.) bubble up as-is.
 pub async fn run_solver(
     request: &SolverRequest,
     app: Option<AppHandle>,
 ) -> Result<SolverResponse, String> {
+    CANCELLED.store(false, Ordering::SeqCst);
     let first_attempt = request.backend.as_deref().unwrap_or("auto");
 
     match try_run_solver(request, None, app.as_ref()).await {
         Ok(response) => Ok(response),
         Err(err) => {
+            if CANCELLED.load(Ordering::SeqCst) {
+                return Err(CANCELLED_MESSAGE.to_string());
+            }
             let gpu_attempted = first_attempt != "cpu";
 
             // Known GPU-specific error messages (from structured engine JSON).
@@ -219,13 +354,15 @@ pub async fn run_solver(
                     "[DeepSolver] GPU run failed ({}); falling back to CPU",
                     err
                 );
-                let mut cpu_response = try_run_solver(request, Some("cpu"), app.as_ref()).await?;
-                // Annotate backend name so UI knows a fallback happened
-                let original = cpu_response.backend.unwrap_or_else(|| "CPU".to_string());
-                cpu_response.backend = Some(format!(
-                    "{} (auto-fallback from GPU: {})",
-                    original, err
-                ));
+                let mut cpu_response = try_run_solver(request, Some("cpu"), app.as_ref())
+                    .await
+                    .map_err(|e| {
+                        if CANCELLED.load(Ordering::SeqCst) { CANCELLED_MESSAGE.to_string() } else { e }
+                    })?;
+                // 2026-10-06 audit: keep `backend` the engine's own name (the
+                // UI keys its badge on it) and say why in fallback_reason.
+                cpu_response.resources.fallback_reason =
+                    format!("GPU run failed ({}); solved on the CPU instead.", err);
                 Ok(cpu_response)
             } else {
                 Err(err)
@@ -246,6 +383,8 @@ fn build_solver_args(request: &SolverRequest, backend_override: Option<&str>) ->
         "--board".to_string(), request.board.clone(),
         "--iterations".to_string(), request.iterations.to_string(),
         "--exploitability".to_string(), request.exploitability.to_string(),
+        // 2026-10-06: the engine ends itself when this app process is gone.
+        "--parent-pid".to_string(), std::process::id().to_string(),
     ];
 
     if let Some(ref history) = request.history {
@@ -255,6 +394,10 @@ fn build_solver_args(request: &SolverRequest, backend_override: Option<&str>) ->
     if let Some(ref target) = request.target_combo {
         args.push("--target".to_string());
         args.push(target.clone());
+        if let Some(ref player) = request.target_player {
+            args.push("--target-player".to_string());
+            args.push(player.clone());
+        }
     }
     if let Some(ref ip) = request.ip_range {
         args.push("--ip-range".to_string());
@@ -305,6 +448,28 @@ fn build_solver_args(request: &SolverRequest, backend_override: Option<&str>) ->
         if !v.is_empty() {
             args.push("--river-sizes".to_string());
             args.push(join_floats(v));
+        }
+    }
+    // 2026-10-06: Pio-style per-player menus (JSON, see the engine's
+    // --bet-sizing help). Overrides the per-street lists above.
+    if let Some(ref spec) = request.bet_sizing {
+        if !spec.is_empty() {
+            args.push("--bet-sizing".to_string());
+            args.push(spec.clone());
+        }
+    }
+    if let Some(cap) = request.raise_cap {
+        args.push("--raise-cap".to_string());
+        args.push(cap.to_string());
+    }
+    if let Some(th) = request.allin_threshold {
+        args.push("--allin-threshold".to_string());
+        args.push(format!("{}", th));
+    }
+    if let Some(ref iso) = request.iso {
+        if !iso.is_empty() {
+            args.push("--iso".to_string());
+            args.push(iso.clone());
         }
     }
 
@@ -401,7 +566,11 @@ async fn try_run_solver(
     app: Option<&AppHandle>,
 ) -> Result<SolverResponse, String> {
     let binary = find_engine_binary();
-    let args = build_solver_args(request, backend_override);
+    let serve = request.serve.unwrap_or(false);
+    let mut args = build_solver_args(request, backend_override);
+    if serve {
+        args.push("--serve".to_string());
+    }
 
     // Log the command for post-hoc debugging of crashes.
     let quoted_args: Vec<String> = args.iter().map(|a| {
@@ -420,6 +589,7 @@ async fn try_run_solver(
 
     let mut cmd = Command::new(&binary);
     cmd.args(&args)
+        .stdin(if serve { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -439,13 +609,19 @@ async fn try_run_solver(
         .map_err(|e| format!("Failed to spawn engine: {} (path: {:?})", e, binary))?;
 
     // v1.3.0: register PID so the cancel_solve Tauri command can kill us.
-    // Cleared in every exit path below — RAII would be nicer but the rest
-    // of this function reads the child move-by-move so a guard struct
-    // would tangle with the borrow checker.
+    // Cleared in every exit path below.
     if let Some(pid) = child.id() {
         CURRENT_SOLVE_PID.store(pid, Ordering::SeqCst);
     }
+    // A Stop click that landed before the PID was registered.
+    if CANCELLED.load(Ordering::SeqCst) {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        CURRENT_SOLVE_PID.store(0, Ordering::SeqCst);
+        return Err(CANCELLED_MESSAGE.to_string());
+    }
 
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take()
         .ok_or_else(|| "Failed to capture stdout".to_string())?;
     let stderr = child.stderr.take()
@@ -456,64 +632,57 @@ async fn try_run_solver(
     // v1.4.1: as we drain stderr we also parse `[Iter N] Exploitability: X%
     // (Yms)` progress lines and emit `engine-progress` events to the frontend.
     // The full string is still collected for error extraction in the failure
-    // path. Replaces the old fake setInterval progress that capped at 95% /
-    // iter 285 because it was based on a guessed iteration rate, not real
-    // engine output.
+    // path. 2026-10-06: lossy UTF-8 — `lines()` stopped at the first invalid
+    // byte, after which nobody drained the pipe and the engine could block.
     let app_for_progress = app.cloned();
     let stderr_handle = tokio::spawn(async move {
-        let reader = BufReader::new(stderr);
-        let mut lines = reader.lines();
+        let mut reader = BufReader::new(stderr);
         let mut collected = String::new();
+        let mut buf = Vec::new();
         // Outer-sweep count remembered across lines so "final pass" /
         // "outer=" events (which don't repeat it) still carry it.
         let mut last_sweep_total: u32 = 0;
-        while let Ok(Some(line)) = lines.next_line().await {
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let text = String::from_utf8_lossy(&buf);
+            let line = text.trim_end_matches(['\r', '\n']);
             // Parse: "[Iter N] Exploitability: X% (Yms)"
-            if let Some(progress) = parse_iter_line(&line) {
+            if let Some(progress) = parse_iter_line(line) {
                 if let Some(handle) = app_for_progress.as_ref() {
                     let _ = handle.emit("engine-progress", progress);
                 }
-            } else if let Some(dp) = parse_decompose_line(&line, &mut last_sweep_total) {
+            } else if let Some(dp) = parse_decompose_line(line, &mut last_sweep_total) {
                 // Parse: "[decompose] sweep S/T leaf I/L" etc. (Exact mode).
                 if let Some(handle) = app_for_progress.as_ref() {
                     let _ = handle.emit("engine-progress-decompose", dp);
                 }
             }
-            collected.push_str(&line);
-            collected.push('\n');
+            // Bounded: a long solve's progress lines are not needed for errors.
+            if collected.len() < 1 << 20 {
+                collected.push_str(line);
+                collected.push('\n');
+            }
         }
         collected
     });
 
-    // Timeout scales with iteration count
     // Timeout scales with iteration count so bigger solves get more time, but
     // stays bounded so a runaway subprocess can't hang the app indefinitely.
-    // Previous formula (iter/5 + 60) gave only 120s for 300 iter — too tight
-    // for a CPU fallback on a complex spot with wide ranges. Bump it so the
-    // envelope is ~2s per iteration + 2min baseline, capped at 15 min.
     //
     //   100 iter → max(300, 260)       = 300 s
     //   300 iter → max(300, 720)       = 720 s
     //   500 iter → max(300, 1120)      =  900 s (capped)
-    //   1000 iter → 900 s (capped)
     //
     // v1.3.1: when the user set a time_budget, Tauri's outer timeout MUST
     // be generous enough for the engine's internal budget to fire BEFORE
-    // Tauri kills the subprocess. The engine checks budget BETWEEN
-    // iterations, so on slow hardware a single iter can exceed the budget
-    // (Pascal CPU laptop on a 9k-node turn solve hits ~150-300s/iter).
-    // Allow 3× the budget plus 90s for postsolve — that gives the engine
-    // room to finish the in-flight iter and run finalize+postsolve before
-    // Tauri's outer killswitch fires. Capped at 30 min to keep runaway
-    // bounded.
-    // Roadmap ④: Exact mode (runout decomposition) ignores time_budget BY
-    // DESIGN — every turn subgame runs its fixed `inner` iterations, and a
-    // real rainbow spot at the standard preset is ~1 h (the UI's pre-flight
-    // says so up front). The budget-derived killswitch below (e.g. Quick →
-    // 270 s) would kill every legitimate Exact run — found by the first
-    // desktop e2e, 2026-07-15. Keep runaway protection, but at an
-    // Exact-scale ceiling; the Stop button + kill_on_drop still cover
-    // interactive aborts.
+    // Tauri kills the subprocess. Allow 3× the budget plus 90s for postsolve,
+    // capped at 30 min. Roadmap ④: Exact mode (runout decomposition) ignores
+    // time_budget BY DESIGN — keep runaway protection at an Exact-scale
+    // ceiling; the Stop button + kill_on_drop still cover interactive aborts.
     let decompose_on = matches!(
         request.decompose_runouts.as_deref(), Some("auto") | Some("on"));
     let timeout_secs = if decompose_on {
@@ -528,25 +697,23 @@ async fn try_run_solver(
         std::cmp::min(std::cmp::max(300u64, (request.iterations as u64) * 2 + 120), 900)
     };
 
-    let stdout_result = match timeout(Duration::from_secs(timeout_secs), async {
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-        let mut json_output = String::new();
-        while let Ok(Some(line)) = lines.next_line().await {
-            json_output.push_str(&line);
-            json_output.push('\n');
+    let mut stdout_reader = BufReader::new(stdout);
+    let read_result = timeout(Duration::from_secs(timeout_secs), async {
+        if serve {
+            // The result ends at SERVE_END; None = the engine exited first.
+            read_until_end(&mut stdout_reader).await
+        } else {
+            let mut bytes = Vec::new();
+            stdout_reader.read_to_end(&mut bytes).await.map_err(|e| e.to_string())?;
+            Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
         }
-        json_output
-    }).await {
-        Ok(s) => s,
+    }).await;
+
+    let stdout_result = match read_result {
+        Ok(Ok(Some(s))) => s,
+        Ok(Ok(None)) | Ok(Err(_)) => String::new(),   // engine exited: see status below
         Err(_) => {
-            // Phase 5: previously we returned without killing the child, so the
-            // engine kept burning CPU/GPU/RAM in the background after the user
-            // saw a "timeout" toast. Now we explicitly:
-            //   1. SIGKILL/TerminateProcess the child
-            //   2. await child.wait so the OS reaps it (no zombie / locked exe)
-            //   3. drain the stderr collector so its task ends cleanly
-            //   4. log pid + backend + iters + board for post-hoc diagnosis
+            // Phase 5: kill the child, reap it, drain stderr, log, report.
             let pid = child.id();
             log_to_file(&format!(
                 "TIMEOUT killing engine pid={:?} backend={} iterations={} board={:?} timeout_secs={}",
@@ -560,11 +727,6 @@ async fn try_run_solver(
             let _ = child.wait().await;
             let _ = stderr_handle.await;
             CURRENT_SOLVE_PID.store(0, Ordering::SeqCst);
-            // v1.3.1: clearer message when time_budget was active. The
-            // engine should have stopped at the budget but didn't get
-            // there before Tauri's killswitch — almost always means a
-            // single iter exceeded our budget×3 envelope, i.e. spot is
-            // too big for this hardware.
             let msg = if let Some(b) = request.time_budget_seconds {
                 if b > 0 {
                     format!(
@@ -589,20 +751,50 @@ async fn try_run_solver(
         }
     };
 
+    // A --serve result arrived and the engine stays up: keep it as the session.
+    if serve && !stdout_result.is_empty() {
+        CURRENT_SOLVE_PID.store(0, Ordering::SeqCst);
+        let mut response: SolverResponse = serde_json::from_str(&stdout_result)
+            .map_err(|e| format!(
+                "Failed to parse engine output: {}. Raw: {}",
+                e, stdout_result.chars().take(200).collect::<String>()
+            ))?;
+        match (response.session, stdin) {
+            (true, Some(stdin)) => {
+                let id = NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst) as u64;
+                response.session_id = Some(id);
+                add_session(EngineSession { id, child, stdin, stdout: stdout_reader }).await;
+            }
+            _ => {
+                response.session = false;
+                let _ = child.wait().await;
+            }
+        }
+        log_to_file(&format!("OK backend={} session={}", backend_override.unwrap_or("(none)"), response.session));
+        return Ok(response);
+    }
+
     let status = child.wait().await
         .map_err(|e| format!("Engine process error: {}", e))?;
     // v1.3.0: child has been reaped — PID no longer valid for cancel.
-    // Clear here so cancel_solve doesn't try to taskkill an exited PID.
     CURRENT_SOLVE_PID.store(0, Ordering::SeqCst);
     let stderr_str = stderr_handle.await.unwrap_or_default();
 
-    if !status.success() {
+    if CANCELLED.load(Ordering::SeqCst) {
+        return Err(CANCELLED_MESSAGE.to_string());
+    }
+
+    if !status.success() || stdout_result.trim().is_empty() {
         // Log the full stderr so we can see what engine said before crashing.
+        let tail: String = {
+            let chars: Vec<char> = stderr_str.chars().collect();
+            chars[chars.len().saturating_sub(500)..].iter().collect()
+        };
         log_to_file(&format!(
             "CRASH exit_code={:?} stderr_len={} stderr_tail={:?}",
             status.code(),
             stderr_str.len(),
-            &stderr_str[stderr_str.len().saturating_sub(500)..]
+            tail
         ));
 
         // Extract the error message from stderr JSON if present
@@ -620,7 +812,7 @@ async fn try_run_solver(
     let response: SolverResponse = serde_json::from_str(&stdout_result)
         .map_err(|e| format!(
             "Failed to parse engine output: {}. Raw: {}",
-            e, &stdout_result[..stdout_result.len().min(200)]
+            e, stdout_result.chars().take(200).collect::<String>()
         ))?;
 
     Ok(response)
@@ -725,8 +917,7 @@ fn extract_engine_error(stderr: &str) -> Option<String> {
 ///
 /// Reuses the same arg-builder as run_solver so the estimate matches what
 /// the real solve would actually do (same memory profile, same iterations,
-/// same backend selection). Skips the streaming-progress / timeout
-/// machinery — estimate-only is fast enough to await directly.
+/// same backend selection).
 pub async fn run_estimate(request: &SolverRequest) -> Result<EstimateResponse, String> {
     let binary = find_engine_binary();
 
@@ -735,15 +926,16 @@ pub async fn run_estimate(request: &SolverRequest) -> Result<EstimateResponse, S
 
     let mut cmd = Command::new(&binary);
     cmd.args(&args);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // 2026-10-06 audit: on timeout the output future is dropped — kill the
+    // process with it instead of leaving it running.
+    cmd.kill_on_drop(true);
 
     #[cfg(windows)]
     cmd.creation_flags(0x08000000);
 
     // 30 s ceiling — estimate-only should complete in well under 1 s; this
-    // is just a safety net for pathological cases (e.g. a broken binary
-    // hanging at startup). If it ever gets close to this, something else
-    // is wrong.
+    // is just a safety net for pathological cases.
     let output = match timeout(Duration::from_secs(30), cmd.output()).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => return Err(format!("Failed to spawn engine for estimate: {}", e)),
@@ -752,10 +944,12 @@ pub async fn run_estimate(request: &SolverRequest) -> Result<EstimateResponse, S
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let msg = extract_engine_error(&stderr)
+            .unwrap_or_else(|| stderr.lines().next().unwrap_or("").to_string());
         return Err(format!(
             "Engine estimate exited with code {:?}: {}",
             output.status.code(),
-            stderr.lines().next().unwrap_or("")
+            msg
         ));
     }
 
@@ -771,16 +965,20 @@ pub async fn detect_gpu() -> Result<GpuInfo, String> {
 
     let mut cmd = Command::new(&binary);
     cmd.arg("--gpu-info")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    cmd.kill_on_drop(true);
 
     #[cfg(windows)]
     cmd.creation_flags(0x08000000);
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run engine for GPU detection: {} (path: {:?})", e, binary))?;
+    // 2026-10-06 audit: a hung driver query no longer hangs the app.
+    let output = match timeout(Duration::from_secs(30), cmd.output()).await {
+        Ok(r) => r.map_err(|e| format!(
+            "Failed to run engine for GPU detection: {} (path: {:?})", e, binary))?,
+        Err(_) => return Err("GPU detection timed out (>30s)".to_string()),
+    };
 
     if !output.status.success() {
         return Err(format!("Engine exited with code: {:?}", output.status.code()));

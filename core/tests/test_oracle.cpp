@@ -533,6 +533,8 @@ static SolverConfig make_two_tone_checkdown() {
     make_checkdown(cfg);
     fixed_iterations(cfg, 1);
     cfg.has_custom_ranges = true;
+    // These cases are about which hands the FAST mode may merge.
+    cfg.iso_mode = IsoMode::Fast;
     return cfg;
 }
 
@@ -548,6 +550,19 @@ static void test_isomorphism_respects_asymmetric_ranges() {
         assert_true(r.resources.canonical_combos == 721,
                     "a suit-symmetric range must keep the two-tone board's 721-hand compression");
         expect_hand_evs(solver, cfg, {"AhAd", "7c7d", "Tc9c"}, 0.05, "symmetric-range check-down");
+    }
+    // Exact mode (the default) never merges hands while cards are to come;
+    // its runout merging is exact, so the check-down EVs still match.
+    {
+        auto cfg = make_two_tone_checkdown();
+        cfg.iso_mode = IsoMode::Exact;
+        set_range(cfg.ip_range_weights, {"QcJc", "QdJd", "5h5s"});
+        Solver solver(cfg, BackendType::CPU);
+        auto r = solver.solve();
+        std::cout << "  exact mode: canonical_combos=" << r.resources.canonical_combos << "\n";
+        assert_true(r.resources.canonical_combos == 1176,
+                    "exact isomorphism must keep every hand separate on a flop");
+        expect_hand_evs(solver, cfg, {"AhAd", "7c7d", "Tc9c"}, 0.05, "exact-mode check-down");
     }
     // Asymmetric: Q♣J♣ without Q♦J♦ breaks the ♣↔♦ symmetry. The canonical
     // space must fall back to the identity (1176 board-live hands) and every
@@ -581,6 +596,273 @@ static void test_isomorphism_respects_asymmetric_ranges() {
 }
 
 // ----------------------------------------------------------------------------
+// 12. (2026-10-06 audit) Runout orbits below a FLOP root must respect the
+//     hand classes. On A♣K♦7♥ the hand space is the identity, but once a 7♠
+//     turn pairs the board, (♥ ♠) fixes flop ∪ turn — the river orbits used to
+//     merge X♥ with X♠ (one child, weight 2) although no hand class does: a
+//     hand holding X♠ counted the X river twice, a hand holding X♥ never saw
+//     it. A check-down has no strategy, so every EV must match the brute-force
+//     runout enumeration.
+// ----------------------------------------------------------------------------
+
+static void test_flop_root_river_orbits_respect_hand_classes() {
+    SolverConfig cfg;
+    cfg.pot = 100.0f;
+    cfg.effective_stack = 200.0f;
+    set_board(cfg, "AcKd7h");
+    make_checkdown(cfg);
+    fixed_iterations(cfg, 1);
+    cfg.has_custom_ranges = true;
+    set_range(cfg.oop_range_weights, {"QsJs", "QhJh", "QcJc", "QdJd"});
+    set_range(cfg.ip_range_weights,
+              {"2c2d", "2c2h", "2c2s", "2d2h", "2d2s", "2h2s"});
+    Solver solver(cfg, BackendType::CPU);
+    auto r = solver.solve();
+    assert_true(!r.runout_approximated, "the flop check-down must enumerate its runouts");
+    expect_hand_evs(solver, cfg, {"QsJs", "QhJh", "QcJc", "QdJd"}, 0.01,
+                    "flop check-down");
+}
+
+// ----------------------------------------------------------------------------
+// 13. (2026-10-06 audit) A hand class may only merge suits that can never
+//     make a flush. On 7♣7♦K♥ the (♣ ♦) swap fixes the board, but after a 2♣
+//     turn Q♣J♣ draws to a flush and Q♦J♦ does not; merged, they shared one
+//     strategy, and the rank-blocker / category tables valued the whole class
+//     with one member's rank. Invariant: on every completion of the board,
+//     the live members of a class hold one hand rank.
+// ----------------------------------------------------------------------------
+
+static void expect_class_rank_constancy(const char* board_text) {
+    const auto board = parse_board(board_text);
+    const uint8_t bs = static_cast<uint8_t>(board.size());
+    IsoConstraints none;   // full ranges: the board alone decides
+    const IsomorphismMapping iso = compute_isomorphism(board.data(), bs, &none);
+    const auto& combos = get_combo_table();
+    const auto& eval = get_evaluator();
+
+    CardMask board_mask = 0;
+    for (Card c : board) board_mask |= card_to_mask(c);
+    std::vector<std::vector<Card>> completions;
+    const int to_come = 5 - static_cast<int>(bs);
+    for (Card a = 0; a < NUM_CARDS; ++a) {
+        if (board_mask & card_to_mask(a)) continue;
+        if (to_come == 1) { completions.push_back({a}); continue; }
+        for (Card b = static_cast<Card>(a + 1); b < NUM_CARDS; ++b) {
+            if (board_mask & card_to_mask(b)) continue;
+            completions.push_back({a, b});
+        }
+    }
+
+    size_t merged = 0;
+    for (uint16_t c = 0; c < iso.num_canonical; ++c) {
+        const auto& members = iso.canonical_to_originals[c];
+        if (members.size() < 2) continue;
+        ++merged;
+        for (const auto& extra : completions) {
+            CardMask runout = 0;
+            for (Card e : extra) runout |= card_to_mask(e);
+            int first_rank = -1;
+            for (uint16_t m : members) {
+                const Combo& h = combos[m];
+                if (h.conflicts_with(runout)) continue;
+                Card cards[7] = {h.cards[0], h.cards[1], board[0], board[1], board[2],
+                                 bs > 3 ? board[3] : extra[0],
+                                 bs > 3 ? extra[0] : extra[1]};
+                const int rank = eval.evaluate(cards[0], cards[1], cards[2], cards[3],
+                                               cards[4], cards[5], cards[6]);
+                if (first_rank < 0) {
+                    first_rank = rank;
+                } else if (rank != first_rank) {
+                    throw std::runtime_error(
+                        std::string(board_text) + ": class of " + combos[members[0]].to_string() +
+                        " merges " + h.to_string() + ", whose rank differs on a completion");
+                }
+            }
+        }
+    }
+    std::cout << "  " << board_text << ": " << iso.num_canonical << " classes ("
+              << merged << " merged) keep one rank on all " << completions.size()
+              << " completions\n";
+}
+
+static void test_hand_classes_never_merge_flush_suits() {
+    // Paired flop with the pair's suits swappable: no merge may survive.
+    {
+        const auto board = parse_board("7c7dKh");
+        IsoConstraints none;
+        const auto iso = compute_isomorphism(board.data(), 3, &none);
+        assert_true(iso.num_canonical == 1176,
+                    "7c7dKh: the (c d) swap moves flush-capable suits, so no hand may merge");
+    }
+    for (const char* b : {"7c7dKh", "7c7d7h", "AsKsQs", "Td9d6h", "AsKd7c",
+                          "7s7d2s2d", "7c7d7h7s", "AsKsQs2h", "7c7d2h2s"}) {
+        expect_class_rank_constancy(b);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 14. (2026-10-06 audit) The int8 signed pair count must not wrap. Under S4
+//     on a quads turn an offsuit class has 12 members — 144 original pairs per
+//     class pair, stored as −112 — and the solve settled at ~28%
+//     exploitability.
+// ----------------------------------------------------------------------------
+
+static void set_offsuit(std::array<float, NUM_COMBOS>& w, Rank r0, Rank r1) {
+    const auto& combos = get_combo_table();
+    for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+        const Combo& c = combos[i];
+        const int a = card_rank(c.cards[0]), b = card_rank(c.cards[1]);
+        const bool ranks_match = (a == r0 && b == r1) || (a == r1 && b == r0);
+        if (ranks_match && card_suit(c.cards[0]) != card_suit(c.cards[1])) w[i] = 1.0f;
+    }
+}
+
+static void test_signed_count_never_wraps() {
+    SolverConfig cfg;
+    cfg.pot = 100.0f;
+    cfg.effective_stack = 200.0f;
+    set_board(cfg, "7c7d7h7s");
+    cfg.iso_mode = IsoMode::Fast;   // merged S4 classes are what overflowed
+    cfg.max_iterations = 300;
+    cfg.target_exploitability = 0.0f;
+    cfg.exploitability_check_interval = 1000;
+    cfg.has_custom_ranges = true;
+    cfg.oop_range_weights.fill(0.0f);
+    cfg.ip_range_weights.fill(0.0f);
+    for (auto* w : {&cfg.oop_range_weights, &cfg.ip_range_weights}) {
+        set_offsuit(*w, RANK_A, RANK_K);
+        set_offsuit(*w, RANK_Q, RANK_J);
+    }
+    Solver solver(cfg, BackendType::CPU);
+    auto r = solver.solve();
+    std::cout << "  quads turn, AKo+QJo: exploitability=" << r.exploitability_pct
+              << "% plan=" << r.resources.terminal_representation << "\n";
+    assert_true(r.exploitability_pct < 1.0,
+                "a quads-turn solve must converge (int8 signed counts wrapped)");
+}
+
+// ----------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------
+// 15. (2026-10-06) Exact isomorphism: merged runouts mapped back per hand
+//     solve the same game as no isomorphism at all. On T♦9♦6♥2♦ the (♠ ♣)
+//     swap merges the ♠/♣ rivers; with suited ≠ offsuit range weights the
+//     merged worlds hold different hands, so the per-hand remap must be right
+//     or every value below the river deal shifts. No isomorphism is forced by
+//     a lock on a board-blocked combo the swap moves (the lock can never act,
+//     but no permutation preserves the lock set).
+// ----------------------------------------------------------------------------
+
+static void test_exact_isomorphism_matches_no_isomorphism() {
+    const char* oop = "AA:1,KK:1,QQ:1,TT:0.5,AKs:1,AQs:1,A5s:1,KQs:1,QJs:0.6,JTs:0.6,"
+                      "98s:0.3,AKo:1,AQo:0.8,KQo:0.4";
+    const char* ip  = "JJ:1,TT:1,99:1,66:0.8,33:0.4,AQs:1,AJs:1,A5s:0.8,KQs:1,QJs:1,"
+                      "JTs:1,T9s:0.8,87s:0.5,AQo:1,AJo:0.6,KQo:0.8";
+    auto make = [&](int iters) {
+        SolverConfig cfg;
+        cfg.pot = 100.0f;
+        cfg.effective_stack = 200.0f;
+        set_board(cfg, "Td9d6h2d");
+        cfg.max_iterations = iters;
+        cfg.target_exploitability = 0.0f;
+        cfg.exploitability_check_interval = 100000;
+        cfg.has_custom_ranges = true;
+        cfg.oop_range_weights.fill(0.0f);
+        cfg.ip_range_weights.fill(0.0f);
+        // Label weights → combos (the CLI's parser lives in main.cpp).
+        auto apply = [](std::array<float, NUM_COMBOS>& w, const char* text) {
+            const auto& combos = get_combo_table();
+            std::string s(text);
+            std::stringstream ss(s);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                const auto colon = tok.find(':');
+                const std::string label = tok.substr(0, colon);
+                const float f = std::stof(tok.substr(colon + 1));
+                for (uint16_t i = 0; i < NUM_COMBOS; ++i) {
+                    if (combo_to_grid_label(combos[i]) == label) w[i] = f;
+                }
+            }
+        };
+        apply(cfg.oop_range_weights, oop);
+        apply(cfg.ip_range_weights, ip);
+        return cfg;
+    };
+    auto no_iso = [&](SolverConfig cfg) {
+        NodeLockEntry lock;
+        lock.history   = "";
+        lock.combo_idx = combo_index("2d3s");   // 2♦ is on the board
+        lock.combo_str = "2d3s";
+        lock.strategy  = {1.0f, 0.0f, 0.0f};
+        cfg.node_locks.push_back(lock);
+        return cfg;
+    };
+
+    // One iteration: both hold the uniform strategy, so the exploitability is
+    // terminal evaluation + chance folding only — it must agree exactly.
+    {
+        Solver a(make(1), BackendType::CPU);
+        Solver b(no_iso(make(1)), BackendType::CPU);
+        const auto ra = a.solve();
+        const auto rb = b.solve();
+        std::cout << "  1 iteration: exact " << ra.exploitability_pct << "% ("
+                  << ra.resources.tree_nodes << " nodes) vs none " << rb.exploitability_pct
+                  << "% (" << rb.resources.tree_nodes << " nodes)\n";
+        assert_true(ra.resources.tree_nodes < rb.resources.tree_nodes,
+                    "exact isomorphism must still merge the mirrored rivers");
+        assert_near(ra.exploitability_pct, rb.exploitability_pct, 1e-3,
+                    "one-iteration exploitability, exact iso vs none");
+    }
+    // Converged: per-hand root EVs agree within convergence noise.
+    {
+        Solver a(make(400), BackendType::CPU);
+        Solver b(no_iso(make(400)), BackendType::CPU);
+        a.solve();
+        b.solve();
+        for (const char* h : {"AsKs", "AcKc", "Ah5h", "As5s", "QcJc", "QsJs", "KsQc", "AhAc"}) {
+            const double ea = a.analyze_combo(h).ev, eb = b.analyze_combo(h).ev;
+            std::cout << "  " << h << ": exact " << ea << " none " << eb << "\n";
+            assert_near(ea, eb, 0.25, std::string("root EV of ") + h + ", exact iso vs none");
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 16. (2026-10-07) A node lock below a runout card holds in that card's world
+//     only. On T♦9♦6♥ the (♣ ♠) swap fixes the board and the full ranges, so
+//     the 2♣ and 2♠ turns shared one child — and a lock at "Check,Check#2c"
+//     on A♥K♥ (a hand the swap leaves alone) silently locked the 2♠ world too.
+//     A permutation must now fix every runout card a lock names.
+// ----------------------------------------------------------------------------
+
+static void test_lock_below_runout_card_pins_one_world() {
+    SolverConfig cfg;
+    cfg.pot = 100.0f;
+    cfg.effective_stack = 200.0f;
+    set_board(cfg, "Td9d6h");
+    make_checkdown(cfg);
+    fixed_iterations(cfg, 1);
+    NodeLockEntry lock;
+    lock.history   = "Check,Check#2c";
+    lock.combo_idx = combo_index("AhKh");
+    lock.combo_str = "AhKh";
+    lock.strategy  = {1.0f};
+    cfg.node_locks.push_back(lock);
+
+    const auto board = parse_board("Td9d6h");
+    IsoConstraints c;
+    c.node_locks = &cfg.node_locks;
+    for (IsoMode mode : {IsoMode::Exact, IsoMode::Fast}) {
+        const auto iso = compute_isomorphism(board.data(), 3, &c, mode);
+        for (const auto& p : iso.runout_perms) {
+            assert_true(p[0] == 0, "a runout permutation moves the locked 2c turn");
+        }
+    }
+    Solver solver(cfg, BackendType::CPU);
+    solver.solve();
+    assert_true(solver.navigate_to_node("Check,Check#2s") != Solver::kInvalidNode,
+                "the 2s turn must be a child of its own");
+}
 
 int main() {
     auto& eval = get_evaluator();
@@ -599,6 +881,11 @@ int main() {
     RUN_TEST(test_turn_allin_runout_equity);
     RUN_TEST(test_turn_cfr_and_postsolve_share_one_game);
     RUN_TEST(test_isomorphism_respects_asymmetric_ranges);
+    RUN_TEST(test_flop_root_river_orbits_respect_hand_classes);
+    RUN_TEST(test_hand_classes_never_merge_flush_suits);
+    RUN_TEST(test_signed_count_never_wraps);
+    RUN_TEST(test_exact_isomorphism_matches_no_isomorphism);
+    RUN_TEST(test_lock_below_runout_card_pins_one_world);
 
     std::cout << "=== " << g_tests_passed << " / " << g_tests_run
               << " tests passed ===\n";

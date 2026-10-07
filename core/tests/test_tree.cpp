@@ -361,6 +361,169 @@ static void test_raise_and_allin_examples() {
     std::cout << "Raise and all-in ledger examples PASSED\n";
 }
 
+// ----------------------------------------------------------------------------
+// 2026-10-06 audit + custom bet sizing
+// ----------------------------------------------------------------------------
+
+static SolverConfig river_config(float pot, float stack) {
+    SolverConfig config;
+    config.pot = pot;
+    config.effective_stack = stack;
+    const auto board = parse_board("AsKd7c2h3s");
+    config.board_size = 5;
+    std::copy(board.begin(), board.end(), config.board.begin());
+    return config;
+}
+
+static std::vector<std::pair<uint8_t, float>> actions_at(const FlatGameTree& tree, uint32_t node) {
+    std::vector<std::pair<uint8_t, float>> out;
+    const auto off = tree.children_offset[node];
+    for (uint8_t a = 0; a < tree.num_children[node]; ++a) {
+        out.push_back({tree.child_action_types[off + a], tree.child_action_amts[off + a]});
+    }
+    return out;
+}
+
+static int count_type(const FlatGameTree& tree, uint32_t node, ActionType t) {
+    int n = 0;
+    for (const auto& [type, amt] : actions_at(tree, node)) n += (type == static_cast<uint8_t>(t));
+    return n;
+}
+
+static void test_menu_order_and_duplicates() {
+    // Menu order must not matter: a `break` after the first forced all-in
+    // used to drop every later (smaller) size — [Check, All-in] for 1.5,0.33.
+    auto a = river_config(100.0f, 150.0f);
+    a.bet_sizing.river_sizes = {1.5f, 0.33f};
+    auto b = river_config(100.0f, 150.0f);
+    b.bet_sizing.river_sizes = {0.33f, 1.5f};
+    GameTreeBuilder ba(a), bb(b);
+    const auto ta = ba.build(), tb = bb.build();
+    require_rule(actions_at(ta, 0) == actions_at(tb, 0), "menu order must not change the root actions");
+    require_rule(count_type(ta, 0, ActionType::BET) == 1 && count_type(ta, 0, ActionType::ALLIN) == 1,
+                 "1.5,0.33 with stack 150 must keep the 33% bet and one all-in");
+
+    // Donk + forced all-in used to append a SECOND all-in after the donk bet.
+    auto d = river_config(100.0f, 100.0f);
+    d.bet_sizing.river_sizes = {0.75f};
+    d.oop_has_initiative = false;
+    d.allow_donk_bet = true;
+    GameTreeBuilder bd(d);
+    const auto td = bd.build();
+    require_rule(count_type(td, 0, ActionType::ALLIN) == 1, "a node carries at most one all-in");
+
+    // Six sizes + check + all-in: the old MAX_ACTIONS = 6 cut the all-in off.
+    auto six = river_config(100.0f, 2000.0f);
+    six.bet_sizing.river_sizes = {0.25f, 0.33f, 0.5f, 0.75f, 1.0f, 1.5f};
+    GameTreeBuilder bs(six);
+    const auto ts = bs.build();
+    require_rule(count_type(ts, 0, ActionType::BET) == 6 && count_type(ts, 0, ActionType::ALLIN) == 1,
+                 "six bet sizes must all be kept, plus the all-in");
+
+    // A non-positive size is ignored instead of recursing forever.
+    auto z = river_config(100.0f, 200.0f);
+    z.bet_sizing.river_sizes = {0.0f, 0.5f};
+    GameTreeBuilder bz(z);
+    const auto tz = bz.build();
+    require_rule(count_type(tz, 0, ActionType::BET) == 1, "a 0% size must not become a bet");
+    std::cout << "Menu order / duplicate / cap rules PASSED\n";
+}
+
+static void test_custom_menus() {
+    // Per-player river menus: OOP bets 50%, IP raises "2.5x" (TO 2.5 times
+    // OOP's 50-chip bet = 125) or 100% (50 call + 100% of the 200-chip pot
+    // after calling = 250).
+    auto c = river_config(100.0f, 1000.0f);
+    c.allin_threshold = 0.0f;
+    c.bet_sizing.custom = true;
+    c.bet_sizing.player[0][2].bet = {{BetSize::Kind::PotFraction, 0.5f}};
+    c.bet_sizing.player[1][2].raise = {{BetSize::Kind::Multiplier, 2.5f},
+                                       {BetSize::Kind::PotFraction, 1.0f}};
+    c.bet_sizing.player[0][2].allin = false;
+    c.bet_sizing.player[1][2].allin = false;
+    GameTreeBuilder builder(c);
+    const auto tree = builder.build();
+    const auto bet = action_child(tree, 0, ActionType::BET, 50.0f);
+    action_child(tree, bet, ActionType::RAISE, 125.0f);
+    const auto big = action_child(tree, bet, ActionType::RAISE, 250.0f);
+    // OOP has no raise menu: fold or call only.
+    require_rule(tree.num_children[big] == 2, "an empty raise menu leaves fold and call");
+    require_rule(count_type(tree, 0, ActionType::ALLIN) == 0, "all-in off means no all-in");
+
+    // Re-raise "x" sizing counts the raiser's own street wager: OOP bet 50,
+    // IP raised to 125, so a 3x re-raise is TO 375 = 325 more.
+    auto r = c;
+    r.bet_sizing.player[0][2].raise = {{BetSize::Kind::Multiplier, 3.0f}};
+    GameTreeBuilder rb(r);
+    const auto rt = rb.build();
+    const auto rbet = action_child(rt, 0, ActionType::BET, 50.0f);
+    const auto rraise = action_child(rt, rbet, ActionType::RAISE, 125.0f);
+    action_child(rt, rraise, ActionType::RAISE, 325.0f);
+    std::cout << "Custom per-player menus PASSED\n";
+}
+
+static void test_donk_menu() {
+    // Turn root, OOP without initiative: OOP's turn lead takes the donk menu
+    // (25% here); after IP bets the turn and OOP calls, OOP's river lead is a
+    // donk again; after a checked-through turn it is a normal bet.
+    SolverConfig c;
+    c.pot = 100.0f;
+    c.effective_stack = 1000.0f;
+    const auto board = parse_board("AsKd7c2h");
+    c.board_size = 4;
+    std::copy(board.begin(), board.end(), c.board.begin());
+    c.oop_has_initiative = false;
+    c.allin_threshold = 0.0f;
+    c.bet_sizing.custom = true;
+    for (int st = 1; st < 3; ++st) {
+        c.bet_sizing.player[0][st].bet  = {{BetSize::Kind::PotFraction, 0.75f}};
+        c.bet_sizing.player[0][st].donk = {{BetSize::Kind::PotFraction, 0.25f}};
+        c.bet_sizing.player[1][st].bet  = {{BetSize::Kind::PotFraction, 0.5f}};
+        c.bet_sizing.player[0][st].allin = c.bet_sizing.player[1][st].allin = false;
+    }
+    GameTreeBuilder builder(c);
+    builder.set_force_runout_collapse(true);
+    const auto tree = builder.build();
+    action_child(tree, 0, ActionType::BET, 25.0f);           // turn donk
+    const auto chk = action_child(tree, 0, ActionType::CHECK, 0.0f);
+    const auto ip_bet = action_child(tree, chk, ActionType::BET, 50.0f);
+    const auto call = action_child(tree, ip_bet, ActionType::CALL, 50.0f);
+    const uint32_t river_after_bet = tree.children[tree.children_offset[call]];
+    action_child(tree, river_after_bet, ActionType::BET, 50.0f);   // 25% of 200: donk
+    const auto ip_chk = action_child(tree, chk, ActionType::CHECK, 0.0f);
+    const uint32_t river_after_check = tree.children[tree.children_offset[ip_chk]];
+    action_child(tree, river_after_check, ActionType::BET, 75.0f); // 75% of 100: bet
+    std::cout << "Donk menu PASSED\n";
+}
+
+static void test_legacy_lists_equal_custom_menus() {
+    // The legacy lists and the menus they resolve to build the same tree.
+    SolverConfig legacy;
+    legacy.pot = 55.0f;
+    legacy.effective_stack = 975.0f;
+    const auto board = parse_board("Td9d6h2c");
+    legacy.board_size = 4;
+    std::copy(board.begin(), board.end(), legacy.board.begin());
+    legacy.bet_sizing.turn_sizes = {0.33f, 0.66f, 1.0f};
+    legacy.bet_sizing.river_sizes = {0.5f, 1.25f};
+    legacy.oop_has_initiative = false;
+    legacy.allow_donk_bet = true;
+    SolverConfig custom = legacy;
+    const SizingMenus menus = resolve_sizing_menus(legacy);
+    custom.bet_sizing.custom = true;
+    for (int p = 0; p < 2; ++p)
+        for (int st = 0; st < 3; ++st) custom.bet_sizing.player[p][st] = menus[p][st];
+    GameTreeBuilder bl(legacy), bc(custom);
+    bl.set_force_runout_collapse(true);
+    bc.set_force_runout_collapse(true);
+    const auto tl = bl.build(), tc = bc.build();
+    require_rule(tl.total_nodes == tc.total_nodes &&
+                 tl.child_action_amts == tc.child_action_amts &&
+                 tl.child_action_types == tc.child_action_types,
+                 "legacy lists and their resolved menus must build one tree");
+    std::cout << "Legacy lists == resolved menus PASSED (" << tl.total_nodes << " nodes)\n";
+}
+
 int main() {
     try {
         std::cout << "=== DeepSolver Game Tree Builder Tests ===\n";
@@ -373,6 +536,10 @@ int main() {
         test_runout_iso_turn_textures();
         test_betting_chip_conservation();
         test_raise_and_allin_examples();
+        test_menu_order_and_duplicates();
+        test_custom_menus();
+        test_donk_menu();
+        test_legacy_lists_equal_custom_menus();
 
         std::cout << "\nAll tests passed!\n";
         return 0;

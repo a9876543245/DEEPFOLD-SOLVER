@@ -48,8 +48,36 @@ constexpr uint16_t NUM_COMBOS = 1326;
 /// Maximum board cards (flop=3, turn=4, river=5)
 constexpr uint8_t MAX_BOARD_CARDS = 5;
 
-/// Maximum actions per node (configurable, but bounded)
-constexpr uint8_t MAX_ACTIONS = 6;
+/// 2026-10-06: how hands and runouts are merged.
+///   Exact (the solver's default) — Pio-style. Hands are never merged while
+///     cards are still to come; runouts that are images of each other under a
+///     symmetry of the WHOLE game (board, ranges, locks) share one solved
+///     child, and the chance node maps that child's per-hand values to the
+///     other members through the suit permutation. Exact on every board.
+///   Fast — hands that differ only in suits which can never flush share one
+///     strategy row too (hand_class_suit_group). Exact with suit-uniform
+///     ranges; with realistic ranges (suited ≠ offsuit weights) hands that
+///     block different cards are forced onto one strategy below the chance
+///     card (measured up to ~0.1% of pot per hand, aggregate ~0).
+enum class IsoMode : uint8_t { Exact = 0, Fast = 1 };
+
+/// FlatGameTree::runout_perm_set value of a node that is not a merged
+/// runout child (or whose members need no remapping).
+constexpr uint16_t kNoRunoutPerms = 0xFFFF;
+
+/// Maximum actions per node. 2026-10-06: 6 → 9 so a custom menu of up to
+/// kMaxSizesPerMenu sizes plus fold/call/all-in always fits (the old cap
+/// silently cut the trailing all-in off a 5-size menu). The CPU and CUDA
+/// kernels size everything from the tree's real child counts.
+constexpr uint8_t MAX_ACTIONS = 9;
+
+/// Most sizes one bet / raise / donk menu may hold (validated at parse).
+constexpr uint8_t kMaxSizesPerMenu = 6;
+
+/// The action count the v1.7.1 ops model (ops_per_solve_iteration) and the
+/// Exact estimator were calibrated with. A calibration constant, not a tree
+/// limit — kept at 6 when MAX_ACTIONS grew.
+constexpr uint8_t kOpsModelActions = 6;
 
 /// Inline card construction
 constexpr Card make_card(Rank r, Suit s) { return static_cast<Card>(r * 4 + s); }
@@ -183,6 +211,12 @@ struct FlatGameTree {
     /// Index into matchup_ev_per_runout for terminal evaluation. -1 / 0 means
     /// "use the root matchup" (legacy behavior). Populated during precompute.
     std::vector<int32_t>   matchup_idx;
+    /// 2026-10-06 (exact isomorphism): for a chance child whose runout orbit
+    /// has more than one card, the index into runout_perm_sets of the suit
+    /// permutations mapping its card onto the OTHER orbit members;
+    /// kNoRunoutPerms on every other node.
+    std::vector<uint16_t>  runout_perm_set;
+    std::vector<std::vector<std::array<uint8_t, 4>>> runout_perm_sets;
 
     // Flattened child indices (indexed by children_offset + child_idx)
     std::vector<uint32_t>  children;          ///< Child node indices
@@ -212,6 +246,7 @@ struct FlatGameTree {
         dealt_card.reserve(est_nodes);
         runout_weight.reserve(est_nodes);
         matchup_idx.reserve(est_nodes);
+        runout_perm_set.reserve(est_nodes);
         children.reserve(est_edges);
         child_action_types.reserve(est_edges);
         child_action_amts.reserve(est_edges);
@@ -222,6 +257,28 @@ struct FlatGameTree {
 // Solver Configuration
 // ============================================================================
 
+/// One bet / raise size option (2026-10-06, custom bet sizing).
+struct BetSize {
+    enum class Kind : uint8_t {
+        PotFraction = 0,   ///< bet: fraction of the pot; raise: the raise on top of the call
+                           ///< as a fraction of the pot after calling (Pio's "% pot raise")
+        Multiplier  = 1,   ///< raise only: raise TO `value` times the opponent's street wager
+    };
+    Kind  kind  = Kind::PotFraction;
+    float value = 0.0f;
+};
+
+/// One player's menu on one street (Pio-style).
+struct StreetSizing {
+    std::vector<BetSize> bet;    ///< the first bet of the street
+    std::vector<BetSize> raise;  ///< facing a bet or raise
+    /// OOP only: leading into the player who was the last aggressor of the
+    /// previous street (on the root street: OOP without initiative). An
+    /// empty menu means OOP can only check there.
+    std::vector<BetSize> donk;
+    bool allin = true;           ///< all-in is offered on this street
+};
+
 /// Bet sizing preset
 struct BetSizingConfig {
     std::vector<float> flop_sizes  = {0.33f, 0.75f};    ///< Fraction of pot
@@ -230,6 +287,13 @@ struct BetSizingConfig {
     bool flop_allin  = true;
     bool turn_allin  = true;
     bool river_allin = true;
+
+    /// 2026-10-06: per-player, per-street menus (--bet-sizing). When `custom`
+    /// is false the tree builder derives them from the legacy lists above
+    /// (one list per street for bets AND raises of both players), which
+    /// reproduces the legacy trees.
+    bool custom = false;
+    StreetSizing player[2][3];   ///< [0 = OOP, 1 = IP][0 = flop, 1 = turn, 2 = river]
 };
 
 /// Node lock entry: force strategy at a specific node for a specific combo
@@ -249,6 +313,10 @@ struct SolverConfig {
     uint8_t board_size = 0;    ///< 3=flop, 4=turn, 5=river
 
     BetSizingConfig bet_sizing;
+
+    /// 2026-10-06: suit isomorphism mode (isomorphism.h IsoMode). Exact by
+    /// default; Fast keeps the older merged hand classes (--iso fast).
+    IsoMode iso_mode = IsoMode::Exact;
 
     int max_iterations = 500;
     float target_exploitability = 0.005f;   ///< 0.5%

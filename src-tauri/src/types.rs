@@ -12,6 +12,11 @@ pub struct SolverRequest {
     pub history: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_combo: Option<String>,
+    /// 2026-10-07: "oop" | "ip" - the target hand joins this player's range
+    /// with a small weight where the range leaves it out (engine
+    /// --target-player), so an out-of-range hand gets a solved strategy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_player: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip_range: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,6 +45,25 @@ pub struct SolverRequest {
     pub turn_sizes: Option<Vec<f64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub river_sizes: Option<Vec<f64>>,
+    /// 2026-10-06: Pio-style per-player menus as the engine's --bet-sizing
+    /// JSON (bet / raise / donk per street, "N%" or "Nx" sizes, all-in
+    /// toggles, raise_cap, allin_threshold). Overrides the per-street lists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bet_sizing: Option<String>,
+    /// Max raises per street (engine --raise-cap).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raise_cap: Option<u32>,
+    /// All-in threshold in % of the pot (engine --allin-threshold).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allin_threshold: Option<f64>,
+    /// Suit isomorphism: "exact" (engine default) | "fast".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iso: Option<String>,
+    /// 2026-10-06: keep the solve in memory after the result (`--serve`) so
+    /// the UI can query any node without re-solving. The GUI sets it; the
+    /// headless API leaves it off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serve: Option<bool>,
 
     // ---- Sprint 3 (resource policy guide): memory budget controls ----
     //
@@ -181,6 +205,21 @@ pub struct ComboAnalysis {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolverResponse {
     pub status: String,
+    /// 2026-10-06: true when the engine kept this solve in memory (--serve)
+    /// and answers `query_node` / `query_ranges`.
+    #[serde(default)]
+    pub session: bool,
+    /// Which in-memory session answers this solve's queries (set by Rust,
+    /// not the engine). Up to three solves stay queryable at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<u64>,
+    /// The shown node's pot, stacks, to-call and per-action amounts
+    /// (engine NodeInfo). Opaque to Rust: passed through to the UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<serde_json::Value>,
+    /// "exact" | "fast" suit isomorphism (empty on older engines).
+    #[serde(default)]
+    pub isomorphism: String,
     pub iterations_run: i32,
     pub exploitability_pct: f64,
     /// v1.3.0: which stop condition ended the iteration loop.
@@ -215,10 +254,11 @@ pub struct SolverResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opponent_range: Option<std::collections::HashMap<String, f64>>,
     /// Route A: client-side navigation cache. Map of player-action history
-    /// path → strategies at that node. Frontend can navigate by lookup
-    /// instead of re-invoking the engine. Populated on every solve.
+    /// path → node entry. 2026-10-06: entries are passed through as JSON —
+    /// the typed struct used to drop every field it did not list (it would
+    /// have silently dropped the new pot/stacks/actions node data).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strategy_tree: Option<std::collections::HashMap<String, StrategyTreeEntry>>,
+    pub strategy_tree: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Sprint 2 (resource policy guide): per-solve resource estimate +
     /// budget decision. Populated by the C++ engine on every solve. Lets
     /// the UI show "tree truncated", "fell back to CPU because …",
@@ -364,44 +404,6 @@ pub struct DecomposeEstimate {
     pub expected_exploit_hi_pct: f64,
     #[serde(default)]
     pub backend: String,
-}
-
-/// Per-node strategy bundle, keyed by player-action history in `strategy_tree`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StrategyTreeEntry {
-    pub acting: String,                 // "OOP" | "IP"
-    pub action_labels: Vec<String>,
-    /// global_strategy values are "<float>%" strings (matches existing schema)
-    pub global_strategy: std::collections::HashMap<String, String>,
-    /// Per-grid-label per-action frequency in [0, 1].
-    pub combo_strategies: std::collections::HashMap<String,
-        std::collections::HashMap<String, f64>>,
-    pub opponent_side: String,
-    pub opponent_range: std::collections::HashMap<String, f64>,
-    /// Per-grid-label EV at this node (chips, from acting player's view).
-    /// Empty for nodes the acting player doesn't reach.
-    #[serde(default)]
-    pub combo_evs: std::collections::HashMap<String, f64>,
-    /// Path B: cumulative runout cards from root to this node (empty for
-    /// nodes before any chance). Format: ["2c", "Jd"]. Lets the UI disclose
-    /// "this strategy is for runout: 2♣ + J♦" instead of silently showing
-    /// lex-min canonical strategies.
-    #[serde(default)]
-    pub dealt_cards: Vec<String>,
-    /// Path B: canonical runout reps available at the IMMEDIATE PRIOR
-    /// chance level. UI uses this to render a runout picker. Empty when no
-    /// chance preceded this node (root, or both root + first action are
-    /// pre-chance). The currently-shown runout is the LAST entry of
-    /// `dealt_cards` matched against this list's `card`.
-    #[serde(default)]
-    pub runout_options: Vec<RunoutOption>,
-}
-
-/// One canonical runout class for the Path B runout picker.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunoutOption {
-    pub card: String,    // "2c", "As", etc.
-    pub weight: u8,      // orbit size
 }
 
 /// GPU detection info — returned by the `get_gpu_info` command.

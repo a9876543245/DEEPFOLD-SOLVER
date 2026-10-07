@@ -42,7 +42,7 @@ DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GP
 
 - **2,550+ preflop 場景** app 內可瀏覽,一鍵套用為 IP / OOP range。
 - **120+ 預解 flop spot** 一鍵載入。
-- **下注尺度預設** — Standard / Polar / Small Ball — 同時影響 solver tree 跟 UI 按鈕。
+- **下注尺度:預設或完全自訂** — Lite / Standard / Polar / Small Ball 預設,或 Pio 式編輯器:每條街、每位玩家各自的 bet / raise / donk(底池 % 或 `2.5x` 加注)、全下開關、加注上限與可調全下門檻;同一套選單同時建構 solver tree 跟 UI 按鈕。
 - **Range 編輯器 + 節點鎖** — 強制任一手牌的 frequency 然後重 solve。
 - **訓練模式** — 10 題 drill 對你的答案打分(vs 均衡解)。
 
@@ -50,7 +50,7 @@ DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GP
 
 - **三語介面** — English / 中文 / 日本語,隨時切換。
 - **自動更新** — banner 一鍵安裝、release 有簽章、install mode `passive`。
-- **花色同構** 在 monotone / 三花色板自動 3–7× 加速;GPU per-runout matchup table 在 iso 啟用時比 CPU 快 6–10×。
+- **花色同構** 預設為精確模式(Pio 式):鏡像的發牌共用同一棵子樹、再逐手牌映射回去,策略與不用同構的解一致;可選的快速模式另外合併永遠成不了同花的花色,樹更小。GPU per-runout matchup table 在 iso 啟用時比 CPU 快 6–10×。
 - **Route A 導航 cache** — O(1) 動作切換、不用重 solve。**Path B runout selector** 提供 PioSolver 風格的 chance-aware 導航。
 - **可重現 benchmark** — `deepsolver_core --benchmark standard` 跑 AsKd7c rainbow / 100 iter 場景,輸出緊湊的 perf JSON(`iterations_per_sec` / `nodes_per_sec` / `memory_estimate_mb` + 完整 timing 內訳)。CI regression 追蹤可直接 grep。
 
@@ -101,7 +101,7 @@ GPU 跟 SIMD 都自動偵測:右上角狀態指示燈一眼看出 **CUDA** / **C
 | **Memory Profile** | `safe / balanced / performance` 預設管 host RAM / JSON / strategy-tree-node 預算。不再沉默 OOM |
 | **Runout 選擇器** | iso 列舉啟用時,點任一 canonical river card 切換子樹 |
 | **GTO 圖庫** | 內建 2,550+ preflop 場景,app 內瀏覽。一鍵套用為 IP / OOP range |
-| **下注尺度預設** | Standard / Polar / Small Ball — 同時影響 solver tree 跟 UI 按鈕 |
+| **下注尺度** | 預設(Lite / Standard / Polar / Small Ball)或 Pio 式自訂(每條街 × 每位玩家的 bet / raise / donk、% 或 x、全下門檻、加注上限)— 同時影響 solver tree 跟 UI 按鈕 |
 | **訓練模式** | 10 題 drill 對你的答案打分(vs 均衡) |
 | **預解 spot 圖庫** | 120+ 常見 flop spot,一鍵載入 |
 | **Range 編輯器 + 節點鎖** | 強制任一手牌的 frequency 然後重 solve |

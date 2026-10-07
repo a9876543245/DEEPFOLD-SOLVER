@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// One scenario's metadata. Returned by `list_gto_scenarios` (no range
 /// strings — keeps the listing payload small).
@@ -27,6 +28,11 @@ pub struct GtoScenario {
     /// Effective stack in BB (None for charts that don't pin a stack).
     pub effective_bb: Option<i32>,
     pub description: String,
+    /// The preflop action line to the hero's decision, e.g.
+    /// "BTN 2.5bb BB 11.0bb BTN" (2026-10-07: the UI matches the villain and
+    /// the heads-up line with it, not just the hero's seat).
+    #[serde(default)]
+    pub preflop_line: Option<String>,
 }
 
 /// One chart's full data. Returned by `load_gto_chart`.
@@ -56,6 +62,15 @@ struct RawContext {
     effective_bb: Option<i32>,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    preflop_line: Option<String>,
+}
+
+/// The listing pass needs the context alone; the strategy's range strings
+/// are skipped without being allocated.
+#[derive(Debug, Deserialize)]
+struct RawChartMeta {
+    context: RawContext,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,7 +132,7 @@ fn find_gto_root() -> Option<PathBuf> {
 /// per-action ranges. Used for the listing pass.
 fn read_metadata(path: &Path, root: &Path) -> Option<GtoScenario> {
     let bytes = std::fs::read(path).ok()?;
-    let raw: RawChart = serde_json::from_slice(&bytes).ok()?;
+    let raw: RawChartMeta = serde_json::from_slice(&bytes).ok()?;
     let rel = path.strip_prefix(root).ok()?;
     let mut id = rel.with_extension("").to_string_lossy().replace('\\', "/");
     // ID always uses forward slashes regardless of platform.
@@ -130,6 +145,7 @@ fn read_metadata(path: &Path, root: &Path) -> Option<GtoScenario> {
         hero_position: raw.context.hero_position.unwrap_or_else(|| "?".into()),
         effective_bb: raw.context.effective_bb,
         description: raw.context.description,
+        preflop_line: raw.context.preflop_line,
     })
 }
 
@@ -144,7 +160,16 @@ fn collect_json_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_json_files(&path, out);
+            // 2026-10-07: charts never live under presolved*/ (bundled solves,
+            // read by key) — and a dev tree's raw backups there are GBs of
+            // solver JSON that every listing used to read and parse in full.
+            let skip = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.starts_with("presolved"));
+            if !skip {
+                collect_json_files(&path, out);
+            }
         } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
             // Skip the top-level progress file — it's not a chart.
             if path.file_name().and_then(|n| n.to_str())
@@ -160,6 +185,23 @@ fn collect_json_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// `load_gto_chart(id)` for the full ranges.
 #[tauri::command]
 pub async fn list_gto_scenarios() -> Result<Vec<GtoScenario>, String> {
+    // 2026-10-07: the bundled charts do not change while the app runs, so the
+    // listing is built once (on the blocking pool — it reads ~2000 files)
+    // and shared. Each call used to rescan synchronously on an async worker;
+    // three components call it on mount, so reloads piled up scans until no
+    // worker was left for any other command.
+    static LIST: OnceLock<tokio::sync::OnceCell<Result<Vec<GtoScenario>, String>>> = OnceLock::new();
+    LIST.get_or_init(tokio::sync::OnceCell::new)
+        .get_or_init(|| async {
+            tokio::task::spawn_blocking(scan_gto_scenarios)
+                .await
+                .unwrap_or_else(|e| Err(format!("chart listing failed: {}", e)))
+        })
+        .await
+        .clone()
+}
+
+fn scan_gto_scenarios() -> Result<Vec<GtoScenario>, String> {
     let root = find_gto_root()
         .ok_or_else(|| "gto_output/ directory not found".to_string())?;
 
@@ -201,6 +243,7 @@ pub async fn load_gto_chart(id: String) -> Result<GtoChart, String> {
         hero_position: raw.context.hero_position.unwrap_or_else(|| "?".into()),
         effective_bb: raw.context.effective_bb,
         description: raw.context.description,
+        preflop_line: raw.context.preflop_line,
     };
 
     Ok(GtoChart {

@@ -78,10 +78,11 @@ struct ScratchArena {
         // on overflow because that would invalidate every outstanding pointer
         // held by parent recursion frames.
         if (top + n > data.size()) {
-            // Grow generously — we're between traversal frames so this only
-            // ever happens during the first call when our initial estimate
-            // was too low. Subsequent iterations stay in the resized buffer.
-            data.resize((top + n) * 2 + 4096);
+            // 2026-10-06 audit: this used to resize, which moves the buffer
+            // out from under the pointers the parent frames still hold.
+            // prepare() reserves from the tree's real depth, so reaching
+            // here is a sizing bug — fail loudly instead of corrupting.
+            throw std::runtime_error("CpuBackend scratch arena overflow");
         }
         float* p = data.data() + top;
         top += n;
@@ -120,6 +121,11 @@ public:
     void iterate(int iteration) override;
     void finalize() override;
     const std::vector<std::vector<float>>& strategy() const override { return strategy_; }
+    std::vector<std::vector<float>> take_strategy() override {
+        std::vector<std::vector<float>> out = std::move(strategy_);
+        strategy_.clear();
+        return out;
+    }
     const char* name() const override {
         // Runtime label — the dispatch table chose AVX2 vs scalar at startup
         // based on CPUID. See cpu_kernels_dispatch.cpp.
@@ -478,9 +484,18 @@ inline void CpuBackend::prepare(const SolverContext& ctx) {
 
     // Reserve scratch arena capacity. Worst case per recursion frame at a
     // player decision node is (max_actions * nc) for action_vals + (nc) for
-    // saved reach. Tree depth is bounded by ~30 in practice; double for
-    // safety, plus padding for terminal/chance scratch.
-    const std::size_t depth_max = 32;
+    // saved reach, times the tree's real depth (custom menus with a high
+    // raise cap go past the old fixed 32), plus padding for terminal/chance
+    // scratch. Children always have larger ids than their parent.
+    std::size_t depth_max = 1;
+    {
+        std::vector<uint16_t> depth(ctx.tree->total_nodes, 0);
+        for (uint32_t n = 1; n < ctx.tree->total_nodes; ++n) {
+            depth[n] = static_cast<uint16_t>(depth[ctx.tree->parent_indices[n]] + 1);
+            depth_max = std::max<std::size_t>(depth_max, depth[n] + 1u);
+        }
+    }
+    depth_max += 2;
     const std::size_t per_frame =
         static_cast<std::size_t>(max_actions + 2) * nc + 4 * nc;
     const std::size_t reserve_floats = depth_max * per_frame + 16 * nc;
@@ -524,7 +539,7 @@ inline void CpuBackend::compute_strategy() {
 
         // Build inv_pos_sum_ and uniform_or_zero_ scratch (per-c branch lifted).
         for (uint16_t c = 0; c < nc; ++c) {
-            if (pos_sum_[c] > 0.0f) {
+            if (pos_sum_[c] >= kMinRegretSum) {
                 inv_pos_sum_[c] = 1.0f / pos_sum_[c];
                 uniform_or_zero_[c] = 0.0f;
             } else {
@@ -998,7 +1013,13 @@ inline void CpuBackend::cfr_traverse(
             cfr_traverse(child, traverser, iteration,
                          reach_oop, reach_ip, child_vals, arena);
             arena.rewind(inner_mark);
-            cpu_simd::vec_axpy(out_vals, static_cast<float>(weight), child_vals, nc);
+            for_runout_orbit(ctx_.runout_maps, child, weight,
+                [&](float w) { cpu_simd::vec_axpy(out_vals, w, child_vals, nc); },
+                [&](uint32_t map) {
+                    const uint16_t* m = ctx_.runout_maps->maps.data() +
+                                        static_cast<std::size_t>(map) * nc;
+                    for (uint16_t c = 0; c < nc; ++c) out_vals[c] += child_vals[m[c]];
+                });
             total_weight += weight;
         }
         if (total_weight > 0) {
@@ -1222,7 +1243,7 @@ inline void CpuBackend::finalize() {
                 for (uint8_t a = 0; a < na; ++a) {
                     total += strategy_sum_[i][static_cast<std::size_t>(a) * nc + c];
                 }
-                if (total > 1e-7f) {
+                if (total >= kMinRegretSum) {
                     float inv = 1.0f / total;
                     for (uint8_t a = 0; a < na; ++a) {
                         strategy_[i][static_cast<std::size_t>(a) * nc + c] =
@@ -1235,9 +1256,10 @@ inline void CpuBackend::finalize() {
                     }
                 }
             }
-        } else {
-            strategy_[i].assign(static_cast<std::size_t>(na) * nc, 0.0f);
         }
+        // Chance / terminal nodes have no strategy: their row stays empty
+        // (it used to be na × nc zeros — every chance node's runout count
+        // times nc, ~0.4 GB of zeros on a 1.28M-node enumerated flop).
     }
 }
 

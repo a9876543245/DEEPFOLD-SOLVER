@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from 'react';
-import type { SolverRequest, SolverResponse, ComboStrategy, EstimateResponse } from '../lib/poker';
+import type { SolverRequest, SolverResponse, ComboStrategy, EstimateResponse, EngineAction } from '../lib/poker';
 import {
   GRID_LABELS,
   SUITS,
@@ -9,7 +9,6 @@ import {
   RANK_VALUES,
 } from '../lib/poker';
 import { parseRange } from '../lib/ranges';
-import type { ActionStep } from '../lib/gameTree';
 import { isTauri } from '../lib/tauriEnv';
 
 // ============================================================================
@@ -89,10 +88,18 @@ function contextualStrategy(
 // Per-combo strategy generation (grid labels + specific combos)
 // ============================================================================
 
+/** What the last action of an engine history string faces. */
+function facingOf(history?: string): 'none' | 'bet' | 'raise' {
+  const last = history ? history.split(',').pop() ?? '' : '';
+  if (last.startsWith('Bet')) return 'bet';
+  if (last.startsWith('Raise') || last.startsWith('All-in')) return 'raise';
+  return 'none';
+}
+
 function generateComboStrategies(
   board: string,
   heroRangeStr?: string,
-  actionPath?: ActionStep[],
+  history?: string,
 ): Record<string, ComboStrategy> {
   const boardCards = parseBoardCards(board);
   const boardRanks = boardCards.map(c => c[0]).sort((a, b) =>
@@ -101,20 +108,13 @@ function generateComboStrategies(
 
   const street = board.length >= 10 ? 'river' : board.length >= 8 ? 'turn' : 'flop';
 
-  let facingAction: 'none' | 'bet' | 'raise' = 'none';
-  if (actionPath && actionPath.length > 0) {
-    const last = actionPath[actionPath.length - 1];
-    if (last.player !== 'Deal') {
-      if (last.action.type === 'bet') facingAction = 'bet';
-      else if (last.action.type === 'raise' || last.action.type === 'allin') facingAction = 'raise';
-    }
-  }
+  const facingAction = facingOf(history);
 
   const heroRange = heroRangeStr ? parseRange(heroRangeStr) : null;
   const strategies: Record<string, ComboStrategy> = {};
   const flat = GRID_LABELS.flat();
 
-  const depth = actionPath ? actionPath.filter(s => s.player !== 'Deal').length : 0;
+  const depth = history ? history.split(',').length : 0;
   const streetMod = street === 'river' ? 0.12 : street === 'turn' ? 0.06 : 0;
 
   // Build set of board suits for board-interaction heuristic
@@ -199,8 +199,7 @@ async function mockSolve(
   onProgress?: (p: SolverProgress) => void,
 ): Promise<SolverResponse> {
   const total = request.iterations ?? 300;
-  const hasActions = request.action_path && request.action_path.length > 0;
-  const totalTime = hasActions ? 400 : 1000;
+  const totalTime = request.history ? 400 : 1000;
   const startMs = Date.now();
 
   // Simulate progress ticks (use setTimeout for compatibility with background tabs)
@@ -229,16 +228,31 @@ async function mockSolve(
   const comboStrategies = generateComboStrategies(
     request.board,
     request.hero_range,
-    request.action_path,
+    request.history,
   );
   const globalStrategy = computeGlobalStrategy(comboStrategies);
 
+  // Browser preview: a root node whose buttons mirror the heuristic labels.
+  // Navigating further needs the engine (desktop app).
+  const actions: EngineAction[] = Object.keys(globalStrategy).map(label => ({
+    label,
+    type: label.startsWith('Check') ? 'check' : label.startsWith('All-in') ? 'allin'
+      : label.startsWith('Fold') ? 'fold' : label.startsWith('Call') ? 'call'
+      : label.startsWith('Raise') ? 'raise' : 'bet',
+    amount: 0, raise_to: 0, next: 'player',
+  }));
   const baseResponse: SolverResponse = {
     status: 'success',
     iterations_run: total,
     exploitability_pct: 0.32,
     global_strategy: globalStrategy,
     combo_strategies: comboStrategies,
+    acting_player: 'OOP',
+    node: {
+      kind: 'player', street: request.board.length >= 10 ? 2 : request.board.length >= 8 ? 1 : 0,
+      pot: request.pot_size, stack_oop: request.effective_stack, stack_ip: request.effective_stack,
+      to_call: 0, board: [], actions, runouts: [],
+    },
   };
 
   if (request.target_combo) {
@@ -255,16 +269,7 @@ async function mockSolve(
       );
       const strength = getHandStrength(combo, boardRanks);
 
-      let facingAction: 'none' | 'bet' | 'raise' = 'none';
-      if (request.action_path && request.action_path.length > 0) {
-        const last = request.action_path[request.action_path.length - 1];
-        if (last.player !== 'Deal') {
-          if (last.action.type === 'bet') facingAction = 'bet';
-          else if (last.action.type === 'raise' || last.action.type === 'allin') facingAction = 'raise';
-        }
-      }
-
-      strategy = contextualStrategy(strength, combo.charCodeAt(0) * 17, facingAction);
+      strategy = contextualStrategy(strength, combo.charCodeAt(0) * 17, facingOf(request.history));
       // Store it back so combo variants can find it too
       comboStrategies[combo] = strategy;
     }
@@ -314,51 +319,34 @@ function isGpuOom(msg: string): boolean {
       || /needs.*MB.*free.*MB.*out of memory/i.test(msg);
 }
 
+/** The error a Stop click ends a solve with (Rust engine::CANCELLED_MESSAGE). */
+const CANCELLED_MESSAGE = 'Solve cancelled';
+
+/**
+ * Runs solves: progress, the pre-solve estimate, errors. `solve()` resolves
+ * to the engine's response, or null when the solve failed (`error` says why)
+ * or was stopped. What is shown is the caller's business (useTreeNav).
+ */
 export function useSolver() {
-  const [result, setResultRaw] = useState<SolverResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [progress, setProgress] = useState<SolverProgress | null>(null);
-  // v1.8.3: surfaces "we retried with reduced sizing" to the UI so the user
-  // knows the strategy uses a simplified tree (monotone × wide range OOM
-  // fallback). Cleared on next solve() call.
-  const [oomFallback, setOomFallback] = useState<{ from: number[]; to: number[] } | null>(null);
   // v1.2.2: pre-solve ETA + memory preview from `--estimate-only`. Set by
   // `solve()` before the actual subprocess fires (sub-second cost) so the
   // UI can show "Estimated 12 minutes on CPU" before the user commits.
   const [estimate, setEstimate] = useState<EstimateResponse | null>(null);
   const timerRef = useRef<number | null>(null);
-  // Always-fresh mirror of `result` so `navigate()` can decide hit/miss
-  // synchronously without a stale closure (state updates may be batched and
-  // the updater function may run after navigate returns).
-  const resultRef = useRef<SolverResponse | null>(null);
+  // One solve at a time: a second call while one runs is refused instead of
+  // racing it (both used to write the shared result).
+  const runningRef = useRef(false);
 
-  // Wrap setResult so external callers (App.tsx) keep the ref in sync.
-  // Supports both direct value and functional updater forms.
-  const setResult = useCallback(
-    (next: SolverResponse | null
-       | ((prev: SolverResponse | null) => SolverResponse | null)) => {
-      if (typeof next === 'function') {
-        setResultRaw(prev => {
-          const computed = (next as (p: SolverResponse | null) => SolverResponse | null)(prev);
-          resultRef.current = computed;
-          return computed;
-        });
-      } else {
-        resultRef.current = next;
-        setResultRaw(next);
-      }
-    },
-    [],
-  );
-
-  const solve = useCallback(async (request: SolverRequest) => {
+  const solve = useCallback(async (request: SolverRequest): Promise<SolverResponse | null> => {
+    if (runningRef.current) return null;
+    runningRef.current = true;
     setLoading(true);
     setError(null);
-    setResult(null);  // ref kept in sync by wrapped setter
     setEstimate(null);  // clear stale estimate from previous solve
-    setOomFallback(null);  // clear stale OOM notice from previous solve
     setProgress({ iteration: 0, total: request.iterations ?? 300, elapsed: 0, phase: 'Starting...', pct: 0 });
     const start = Date.now();
 
@@ -498,112 +486,46 @@ export function useSolver() {
 
       if (isTauri()) {
         const { invoke } = await import('@tauri-apps/api/core');
-
-        if (request.action_path && request.action_path.length > 0) {
-          request.history = request.action_path
-            .filter(step => step.player !== 'Deal')
-            .map(step => step.action.label)
-            .join(',');
-        }
-
-        if (request.node_locks && typeof request.node_locks !== 'string') {
-          request.node_locks = JSON.stringify(request.node_locks);
-        }
-
-        try {
-          response = await invoke<SolverResponse>('solve', { request });
-        } catch (firstErr) {
-          // v1.8.3: GPU OOM auto-retry with reduced flop sizing. The wide-range
-          // × monotone Standard spots overflow 32 GB VRAM during tree build.
-          // Retrying with a single (largest) flop size drops tree nodes ~50%
-          // and reliably fits common consumer GPUs. The strategy is still
-          // valid GTO under the smaller action menu — just less granular.
-          const firstMsg = firstErr instanceof Error ? firstErr.message : String(firstErr);
-          const originalSizes = request.flop_sizes;
-          const canRetry = isGpuOom(firstMsg)
-            && Array.isArray(originalSizes)
-            && originalSizes.length > 1;
-          if (canRetry) {
-            const reduced = [originalSizes![originalSizes!.length - 1]];
-            console.warn(`[useSolver] GPU OOM on flop_sizes=${JSON.stringify(originalSizes)}, retrying with ${JSON.stringify(reduced)}`);
-            setOomFallback({ from: originalSizes!, to: reduced });
-            const retryReq = { ...request, flop_sizes: reduced };
-            response = await invoke<SolverResponse>('solve', { request: retryReq });
-          } else {
-            throw firstErr;
-          }
-        }
+        // A GPU failure (out of memory included) is retried on the CPU by
+        // the Rust side (engine::run_solver), which says so in
+        // resources.fallback_reason.
+        response = await invoke<SolverResponse>('solve', { request });
       } else {
         // Clear the generic timer — mock solver handles its own progress
         if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
         response = await mockSolve(request, setProgress);
       }
 
-      setResult(response);  // wrapped setter syncs the ref
       setElapsed(Date.now() - start);
       setProgress({ iteration: response.iterations_run, total: request.iterations ?? 300, elapsed: Date.now() - start, phase: 'Done', pct: 100 });
+      return response;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // v1.8.3: prettier error for the unrecoverable OOM case (mono × wide
-      // range × already-single-sizing). User-actionable hint instead of raw
-      // engine error string.
-      if (isGpuOom(msg)) {
-        setError(`GPU memory exceeded on this spot's tree. Try switching to the "Lite" sizing preset (single 50% bet per street) — it's specifically designed for these wide-range monotone scenarios.`);
+      if (msg === CANCELLED_MESSAGE) {
+        // Stop: neutral — the previous view stays.
+      } else if (isGpuOom(msg)) {
+        // User-actionable hint instead of the raw engine error string.
+        setError('GPU memory exceeded on this spot\'s tree. Try a smaller bet-sizing menu (e.g. the "Lite" preset: one 50% size per street).');
       } else {
         setError(msg);
       }
       setProgress(null);
+      return null;
     } finally {
       if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
       if (progressUnlisten) { progressUnlisten(); progressUnlisten = null; }
       if (decomposeUnlisten) { decomposeUnlisten(); decomposeUnlisten = null; }
       setLoading(false);
+      runningRef.current = false;
     }
   }, []);
 
   const reset = useCallback(() => {
-    setResult(null);  // wrapped setter syncs the ref
     setError(null);
     setElapsed(0);
     setProgress(null);
     setEstimate(null);
-    setOomFallback(null);
-  }, [setResult]);
+  }, []);
 
-  /**
-   * Route A navigation: try to satisfy the request from `result.strategy_tree`
-   * cache instead of invoking the engine. Returns true on a cache hit (UI was
-   * updated synchronously). On a miss, returns false — the caller should
-   * fall back to `solve(...)`.
-   *
-   * `history` is the comma-separated PLAYER-action path the engine indexed
-   * the cache by. Same string the engine receives via `--history`.
-   */
-  const navigate = useCallback((history: string): boolean => {
-    // Read latest via ref so two clicks in one React tick both see the
-    // post-first-click state (avoids stale-closure bug). Use functional
-    // setState write so React's batching is respected.
-    const current = resultRef.current;
-    if (!current?.strategy_tree) return false;
-    const entry = current.strategy_tree[history];
-    if (!entry) return false;
-
-    const next: SolverResponse = {
-      ...current,
-      global_strategy: entry.global_strategy,
-      combo_strategies: entry.combo_strategies,
-      acting_player: entry.acting as 'OOP' | 'IP',
-      opponent_side: entry.opponent_side as 'OOP' | 'IP',
-      opponent_range: entry.opponent_range,
-      // Path B: surface the runout context so the picker UI can render.
-      dealt_cards: entry.dealt_cards,
-      runout_options: entry.runout_options,
-      // EV per grid label for the EV/equity disclosure UI.
-      combo_evs: entry.combo_evs,
-    };
-    setResult(next);  // wrapped setter syncs the ref
-    return true;
-  }, [setResult]);
-
-  return { result, setResult, loading, error, elapsed, progress, estimate, solve, reset, navigate, oomFallback };
+  return { loading, error, setError, elapsed, progress, estimate, solve, reset };
 }

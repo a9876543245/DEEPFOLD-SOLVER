@@ -214,9 +214,9 @@ const dict: Dict = {
   'panel.out': { en: 'OUT', zh: '範圍外', ja: '範囲外' },
   'panel.offRange': { en: 'Off-Range', zh: '範圍外', ja: '範囲外' },
   'panel.offRangeWarning': {
-    en: 'Not in your preflop range. Below is a hypothetical GTO response if you happen to hold this hand.',
-    zh: '不在你的翻前範圍內。以下是如果你持有這手牌的假設 GTO 回應。',
-    ja: 'プリフロップレンジに含まれていません。このハンドを持っている場合の仮想GTO対応を以下に示します。',
+    en: "Not in the acting player's range at this node. Below is what the solver plays with it (solved with the hand added at a tiny weight).",
+    zh: '不在行動玩家此節點的範圍內。以下是求解器拿到這手牌時的打法（以極小權重加入此手牌求解）。',
+    ja: 'このノードで行動プレイヤーのレンジに含まれていません。以下はこのハンドを持った場合のソルバーの戦略です（ごく小さい重みで追加して解いています）。',
   },
   'panel.best': { en: 'Best: ', zh: '最佳：', ja: '最善：' },
   'panel.suggested': { en: 'Suggested: ', zh: '建議：', ja: '推奨：' },
@@ -258,6 +258,66 @@ const dict: Dict = {
   'action.showdown': { en: 'Showdown', zh: '攤牌', ja: 'ショーダウン' },
   'action.toAct': { en: 'to act', zh: '行動中', ja: 'アクション' },
   'action.awaitDeal': { en: 'awaiting deal', zh: '等待發牌', ja: 'ディール待ち' },
+  'action.toCall': { en: 'To call', zh: '需跟注', ja: 'コール額' },
+  'action.solveToExplore': {
+    en: 'Pre-solved preview — press Solve to explore the tree from here.',
+    zh: '預先求解的預覽 — 按「求解」即可從這裡展開整棵樹。',
+    ja: '事前ソルブのプレビュー — ソルブを押すとここからツリーを探索できます。',
+  },
+
+  // ---- Bet sizing editor (2026-10-06) ----
+  'sizing.custom': { en: 'Custom', zh: '自訂', ja: 'カスタム' },
+  'sizing.editTitle': { en: 'Bet sizing', zh: '下注尺寸', ja: 'ベットサイズ' },
+  'sizing.desc': {
+    en: 'Sizes per street and player, separated by spaces. "33" or "33%" = 33% of the pot. Raises: "60%" = the raise on top of the call as a share of the pot after calling; "2.5x" = raise to 2.5 times the bet faced. Donk = OOP leading into the player who was the last aggressor of the previous street (empty = check only). At most 6 sizes per menu.',
+    zh: '每條街、每位玩家的尺寸，以空白分隔。「33」或「33%」= 底池的 33%。加注：「60%」= 跟注後再加注的部分佔跟注後底池的比例；「2.5x」= 加注到所面對下注的 2.5 倍。Donk = OOP 主動下注到上一條街最後進攻的玩家（留空 = 只能過牌）。每個選單最多 6 個尺寸。',
+    ja: 'ストリート・プレイヤーごとのサイズをスペース区切りで。「33」または「33%」= ポットの33%。レイズ：「60%」= コール後のポットに対するコール分を超えたレイズ額の割合、「2.5x」= 直面したベットの2.5倍にレイズ。ドンク = 前のストリートの最後のアグレッサーへの OOP のリード（空欄 = チェックのみ）。1メニュー最大6サイズ。',
+  },
+  'sizing.bet': { en: 'Bet', zh: '下注', ja: 'ベット' },
+  'sizing.raise': { en: 'Raise', zh: '加注', ja: 'レイズ' },
+  'sizing.donk': { en: 'Donk (OOP)', zh: 'Donk（OOP）', ja: 'ドンク（OOP）' },
+  'sizing.allin': { en: 'All-in', zh: '全下', ja: 'オールイン' },
+  'sizing.raiseCap': { en: 'Raises per street', zh: '每條街加注上限', ja: 'ストリート毎のレイズ上限' },
+  'sizing.allinThreshold': {
+    en: 'All-in below (% of pot behind)', zh: '全下門檻（跟注後剩餘籌碼 < 底池 %）', ja: 'オールイン閾値（コール後残り < ポット%）',
+  },
+  'sizing.loadPreset': { en: 'Load preset', zh: '載入預設', ja: 'プリセット読込' },
+  'sizing.copyOop': { en: 'Copy OOP → IP', zh: '複製 OOP → IP', ja: 'OOP → IP にコピー' },
+  'sizing.apply': { en: 'Apply', zh: '套用', ja: '適用' },
+
+  // ---- Suit isomorphism (Advanced) ----
+  'config.iso.label': { en: 'Suit isomorphism', zh: '花色同構', ja: 'スート同型' },
+  'config.iso.exact': { en: 'Exact', zh: '精確', ja: '正確' },
+  'config.iso.fast': { en: 'Fast (approx.)', zh: '快速（近似）', ja: '高速（近似）' },
+  'config.iso.hint.exact': {
+    en: 'Pio-style: hands are never merged while cards are to come; mirrored runouts share one solved child.',
+    zh: 'Pio 式：還有牌要發時不合併手牌；互為鏡像的發牌共用一個已解子樹。',
+    ja: 'Pio方式：これから配られるカードがある間はハンドを統合しません。鏡像のランアウトは1つの子を共有します。',
+  },
+  'config.iso.hint.fast': {
+    en: 'Also merges hands that differ only in suits that can never make a flush: less memory on monotone/two-tone flops, a slight approximation below the turn/river card.',
+    zh: '另外合併只差在永遠湊不成同花的花色的手牌：單色/雙色翻牌較省記憶體，但轉牌/河牌之後有些微近似。',
+    ja: 'フラッシュになり得ないスートだけが違うハンドも統合：モノトーン/ツートーンで省メモリ、ターン/リバー以降はわずかに近似。',
+  },
+
+  // ---- Engine-driven navigation (2026-10-06) ----
+  'deal.resolveHint': {
+    en: 'This solve approximated this street (its runouts were collapsed to fit memory). Picking a card re-solves the street from the exact ranges here.',
+    zh: '此次求解為了放進記憶體而近似了這條街（發牌未展開）。選一張牌會以此處的精確範圍重新求解這條街。',
+    ja: 'このソルブはメモリに収めるためこのストリートを近似しました（ランアウト未展開）。カードを選ぶと、ここでの正確なレンジでこのストリートを再ソルブします。',
+  },
+  'deal.cachedOnly': {
+    en: 'Only the cards this solve stored can be picked (it is not kept in memory). Suit-equivalent cards play the same strategy.',
+    zh: '只能選此次求解有儲存的牌（求解未保留在記憶體中）。花色等價的牌策略相同。',
+    ja: 'このソルブが保存したカードのみ選べます（メモリには保持されていません）。スート等価なカードは同じ戦略です。',
+  },
+  'panel.neverReaches': {
+    en: 'This hand never reaches this node — it always takes another line earlier.',
+    zh: '這手牌不會走到這個節點 — 它更早就總是走了其他路線。',
+    ja: 'このハンドはこのノードに到達しません — より前に常に別のラインを取ります。',
+  },
+  'locks.active': { en: '{n} node lock(s) on this solve', zh: '此解有 {n} 個節點鎖定', ja: 'このソルブのノードロック {n} 件' },
+  'locks.clear': { en: 'Clear', zh: '清除', ja: 'クリア' },
 
   // ---- Range Editor Modal ----
   'range.editTitle': { en: 'Edit Preflop Range', zh: '編輯翻前範圍', ja: 'プリフロップレンジを編集' },

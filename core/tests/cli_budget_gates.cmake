@@ -115,8 +115,10 @@ elseif(CASE STREQUAL "gpu_device_total_reject")
   # measured) — the honest ceiling rejects upfront. NOTE: singleton-iso
   # turns (e.g. AsKd7c2h) skip the dense upload and would make this fixture
   # meaningless — do not swap the board without re-checking iso engagement.
+  # --iso fast: iso engagement is the premise, and exact isomorphism keeps a
+  # turn board's hands singleton (the rank-blocker then skips the upload).
   execute_process(
-    COMMAND ${EXE} --board Ah9h4h2c --backend gpu --gpu-memory-mb 90 ${COMMON}
+    COMMAND ${EXE} --board Ah9h4h2c --backend gpu --gpu-memory-mb 90 --iso fast ${COMMON}
     OUTPUT_VARIABLE out RESULT_VARIABLE rc ERROR_VARIABLE err)
   if(rc EQUAL 0)
     message(FATAL_ERROR
@@ -429,7 +431,7 @@ elseif(CASE STREQUAL "peak_host_model")
   #     on top of 503 MB of matchup tables — the whole of that board's -9.6%
   #     under-estimate. v2.4.0 reports ~503 MB here.
   execute_process(
-    COMMAND ${EXE} --pot 100 --stack 500 --board AsKsQs --iterations 3
+    COMMAND ${EXE} --pot 100 --stack 500 --board AsKsQs --iso fast --iterations 3
             --exploitability 0 --backend cpu --no-strategy-tree --no-progress
     OUTPUT_VARIABLE dense_out RESULT_VARIABLE dense_rc ERROR_VARIABLE dense_err)
   if(NOT dense_rc EQUAL 0)
@@ -754,7 +756,7 @@ elseif(CASE STREQUAL "gpu_iso_terminal_selfcheck")
   set(ENV{DEEPSOLVER_RB_SELFCHECK} "1")
   set(ENV{DEEPSOLVER_GPU_TERMINAL_STATS} "1")
   execute_process(
-    COMMAND ${EXE} --pot 100 --stack 500 --board Td9d6d2h
+    COMMAND ${EXE} --pot 100 --stack 500 --board Td9d6d2h --iso fast
             --flop-sizes 0.5 --turn-sizes 0.5 --river-sizes 0.5
             --iterations 1 --exploitability 0 --backend gpu --postsolve none
             --no-strategy-tree --no-progress --host-memory-mb 16384

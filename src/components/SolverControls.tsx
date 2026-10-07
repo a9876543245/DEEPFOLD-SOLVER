@@ -4,8 +4,10 @@ import {
   MEMORY_PROFILE_PRESETS, SOLVE_MODE_PRESETS,
   type MemoryProfile, type SolveMode, type EstimateResponse,
 } from '../lib/poker';
-
-export type BetSizingKey = 'lite' | 'standard' | 'polar' | 'small_ball';
+import {
+  SIZING_PRESETS, presetSpec, matchPreset, describeSpec,
+  type BetSizingSpec, type SizingPresetKey,
+} from '../lib/betSizing';
 
 interface Props {
   pot: number;
@@ -16,8 +18,14 @@ interface Props {
   onIterationsChange: (val: number) => void;
   onSolve: () => void;
   loading: boolean;
-  sizingKey?: BetSizingKey;
-  onSizingChange?: (key: BetSizingKey) => void;
+  /** 2026-10-06: the bet sizing menus of the next solve (a preset or custom). */
+  sizingSpec: BetSizingSpec;
+  onSizingSpecChange: (spec: BetSizingSpec) => void;
+  /** Opens the per-player / per-street sizing editor. */
+  onEditSizing: () => void;
+  /** Suit isomorphism: 'exact' (default) or 'fast' (merged never-flush suits). */
+  isoMode?: 'exact' | 'fast';
+  onIsoModeChange?: (mode: 'exact' | 'fast') => void;
   /** Memory profile preset for the next solve. Defaults to 'balanced' if
    *  unset. Mirrors the C++ engine's `--memory-profile` CLI flag and the
    *  Rust `ResolvedMemoryBudget::from_profile` resolver. */
@@ -54,7 +62,8 @@ export function SolverControls({
   pot, stack, iterations,
   onPotChange, onStackChange, onIterationsChange,
   onSolve, loading,
-  sizingKey = 'standard', onSizingChange,
+  sizingSpec, onSizingSpecChange, onEditSizing,
+  isoMode = 'exact', onIsoModeChange,
   memoryProfile = 'balanced', onMemoryProfileChange,
   solveMode = 'standard', onSolveModeChange, onStop,
   decomposeRunouts = 'off', onDecomposeRunoutsChange,
@@ -64,13 +73,13 @@ export function SolverControls({
   const t = useT();
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  const betPresets: Array<{ key: BetSizingKey; label: string; flop: string; turn: string; river: string }> = [
-    { key: 'lite',       label: t('config.lite'),      flop: '50',     turn: '50',     river: '50' },
-    { key: 'standard',   label: t('config.standard'),  flop: '33/75',  turn: '33/75',  river: '33/75' },
-    { key: 'polar',      label: t('config.polar'),     flop: '75/150', turn: '75/150', river: '75/150' },
-    { key: 'small_ball', label: t('config.smallBall'), flop: '25/33',  turn: '25/33',  river: '33/50' },
-  ];
-  const activePreset = Math.max(0, betPresets.findIndex(p => p.key === sizingKey));
+  const presetLabels: Record<SizingPresetKey, string> = {
+    lite: t('config.lite'),
+    standard: t('config.standard'),
+    polar: t('config.polar'),
+    small_ball: t('config.smallBall'),
+  };
+  const activePreset = matchPreset(sizingSpec);
 
   // Memory profile presets — labels are translated, the numeric budgets come
   // from MEMORY_PROFILE_PRESETS so the UI never drifts from the actual values
@@ -201,18 +210,25 @@ export function SolverControls({
           {t('config.betSizing')}
         </label>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-          {betPresets.map((preset, i) => (
+          {(Object.keys(SIZING_PRESETS) as SizingPresetKey[]).map(key => (
             <button
-              key={preset.key}
-              className={`btn-pill ${activePreset === i ? 'active' : ''}`}
-              onClick={() => onSizingChange?.(preset.key)}
+              key={key}
+              className={`btn-pill ${activePreset === key ? 'active' : ''}`}
+              onClick={() => onSizingSpecChange(presetSpec(key))}
             >
-              {preset.label}
+              {presetLabels[key]}
             </button>
           ))}
+          <button
+            className={`btn-pill ${activePreset === null ? 'active' : ''}`}
+            onClick={onEditSizing}
+            title={t('sizing.editTitle')}
+          >
+            {t('sizing.custom')}…
+          </button>
         </div>
         <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginTop: 6 }}>
-          Flop: {betPresets[activePreset].flop}% / Turn: {betPresets[activePreset].turn}% / River: {betPresets[activePreset].river}%
+          {describeSpec(sizingSpec)} (% pot)
         </div>
       </div>
 
@@ -379,6 +395,32 @@ export function SolverControls({
               onChange={(e) => onIterationsChange(Number(e.target.value))}
               style={{ marginTop: 4 }}
             />
+          </div>
+
+          {/* Suit isomorphism: exact (Pio-style, default) or the faster
+              approximation that merges never-flush suits. */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginBottom: 6, display: 'block' }}>
+              {t('config.iso.label')}
+            </label>
+            <div style={{ display: 'flex', gap: 6 }} role="radiogroup">
+              {(['exact', 'fast'] as const).map(m => (
+                <button
+                  key={m}
+                  role="radio"
+                  aria-checked={isoMode === m}
+                  disabled={loading}
+                  className={`btn-pill ${isoMode === m ? 'active' : ''}`}
+                  onClick={() => onIsoModeChange?.(m)}
+                  style={{ flex: 1 }}
+                >
+                  {t(`config.iso.${m}`)}
+                </button>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginTop: 4 }}>
+              {t(`config.iso.hint.${isoMode}`)}
+            </div>
           </div>
 
           {/* Memory Profile (Polish #1) */}

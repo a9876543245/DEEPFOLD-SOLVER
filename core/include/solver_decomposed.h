@@ -47,7 +47,9 @@
 #include <map>
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -217,6 +219,7 @@ private:
 
     IsomorphismMapping    iso_;          ///< Flop iso, shared by trunk+subgames.
     FlatGameTree          trunk_;
+    RunoutClassMaps       trunk_maps_;   ///< chance folding for trunk_ (exact iso)
     uint16_t              nc_ = 0;
 
     // Flop-board matchup (all trunk terminals are on the flop board).
@@ -392,6 +395,52 @@ private:
 };
 
 // ============================================================================
+// Subgame config — the monolithic subtree below one trunk leaf
+// ============================================================================
+
+/// 2026-10-06 (custom bet sizing): the turn subgame below trunk leaf `leaf`
+/// must build exactly the monolithic subtree there. Its board, pot and stack
+/// come from the leaf; its menus are the PARENT's resolved menus (a legacy
+/// config re-derived around the turn as a new root street would change OOP's
+/// opening options); and its "who had the initiative" is the trunk line's
+/// last aggressor, which decides whether OOP's turn lead is a donk bet.
+inline SolverConfig subgame_config_for_leaf(const SolverConfig& base,
+                                            const FlatGameTree& trunk,
+                                            uint32_t leaf) {
+    SolverConfig sub = base;
+    sub.board[base.board_size] = trunk.dealt_card[leaf];
+    sub.board_size = static_cast<uint8_t>(base.board_size + 1);
+    sub.pot = trunk.pots[leaf];
+    sub.effective_stack = trunk.stacks[leaf];
+
+    const SizingMenus menus = resolve_sizing_menus(base);
+    sub.bet_sizing.custom = true;
+    for (int p = 0; p < 2; ++p)
+        for (int st = 0; st < 3; ++st) sub.bet_sizing.player[p][st] = menus[p][st];
+
+    // Last bet/raise/all-in on the path from the root to this leaf (the
+    // trunk is the root street only): IP → OOP's turn lead is a donk bet.
+    uint8_t last_aggressor = 2;
+    for (uint32_t cur = leaf; cur != 0;) {
+        const uint32_t parent = trunk.parent_indices[cur];
+        const uint32_t off = trunk.children_offset[parent];
+        for (uint8_t k = 0; k < trunk.num_children[parent]; ++k) {
+            if (trunk.children[off + k] != cur) continue;
+            const auto at = static_cast<ActionType>(trunk.child_action_types[off + k]);
+            if (static_cast<NodeType>(trunk.node_types[parent]) != NodeType::CHANCE &&
+                (at == ActionType::BET || at == ActionType::RAISE || at == ActionType::ALLIN)) {
+                last_aggressor = trunk.active_player[parent];
+            }
+            break;
+        }
+        if (last_aggressor != 2) break;
+        cur = parent;
+    }
+    sub.oop_has_initiative = (last_aggressor != 1);
+    return sub;
+}
+
+// ============================================================================
 // Setup
 // ============================================================================
 
@@ -401,13 +450,16 @@ inline void TrunkDecomposition::build_trunk() {
         c.oop_weights = &base_cfg_.oop_range_weights;
         c.ip_weights  = &base_cfg_.ip_range_weights;
         c.node_locks  = &base_cfg_.node_locks;
-        iso_ = compute_isomorphism(base_cfg_.board.data(), base_cfg_.board_size, &c);
+        iso_ = compute_isomorphism(base_cfg_.board.data(), base_cfg_.board_size, &c,
+                                   base_cfg_.iso_mode);
     }
     nc_  = iso_.num_canonical;
 
     GameTreeBuilder builder(base_cfg_);
+    builder.set_runout_group(iso_.runout_perms);
     builder.set_truncate_at_chance(true);
     trunk_ = builder.build();
+    trunk_maps_ = build_runout_class_maps(trunk_, iso_);
 
     cw_.assign(nc_, 0.0f);
     for (uint16_t c = 0; c < nc_; ++c)
@@ -655,12 +707,7 @@ inline SolverConfig TrunkDecomposition::make_sub_cfg(
     const std::array<float, NUM_COMBOS>& ip_w) const
 {
     uint32_t leaf = leaves_[static_cast<size_t>(li)];
-    SolverConfig sub = base_cfg_;
-    sub.board[base_cfg_.board_size] = trunk_.dealt_card[leaf];
-    sub.board_size = static_cast<uint8_t>(base_cfg_.board_size + 1);
-    sub.pot = trunk_.pots[leaf];
-    sub.effective_stack = trunk_.stacks[leaf];
-    sub.oop_has_initiative = true;            // post-chance: OOP acts, has init.
+    SolverConfig sub = subgame_config_for_leaf(base_cfg_, trunk_, leaf);
     sub.has_custom_ranges = true;
     sub.oop_range_weights = oop_w;
     sub.ip_range_weights  = ip_w;
@@ -938,13 +985,24 @@ inline void TrunkDecomposition::solve_all_subgames(bool want_br, bool force_cpu,
         // single-threaded (sub.cpu_threads=1) so this doesn't oversubscribe;
         // the engine's own inner parallel regions run serially (nested OMP off).
         // leaf_nav_ slots are disjoint per li, so nav extraction is lock-free.
+        // 2026-10-06 audit: an exception may not leave an OpenMP region (it
+        // calls std::terminate — the process died with no JSON). Keep the
+        // first one and rethrow it after the loop.
+        std::exception_ptr leaf_error;
+        std::mutex leaf_error_mu;
 #if defined(_OPENMP)
         #pragma omp parallel for schedule(dynamic, 1)
 #endif
         for (int li = 0; li < L; ++li) {
-            solve_one_subgame(li, want_br, want_nav);
-            report_leaf();
+            try {
+                solve_one_subgame(li, want_br, want_nav);
+                report_leaf();
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(leaf_error_mu);
+                if (!leaf_error) leaf_error = std::current_exception();
+            }
         }
+        if (leaf_error) std::rethrow_exception(leaf_error);
     }
     subgame_solves_ += L;
 }
@@ -973,7 +1031,12 @@ inline void TrunkDecomposition::cfr(
             if (w == 0) w = 1;
             const auto& cv = (traverser == 0) ? inj_oop_[leaf_idx_[child]]
                                               : inj_ip_[leaf_idx_[child]];
-            for (uint16_t c = 0; c < nc_; ++c) out[c] += static_cast<float>(w) * cv[c];
+            for_runout_orbit(&trunk_maps_, child, w,
+                [&](float wt) { for (uint16_t c = 0; c < nc_; ++c) out[c] += wt * cv[c]; },
+                [&](uint32_t map) {
+                    const uint16_t* m = trunk_maps_.maps.data() + static_cast<std::size_t>(map) * nc_;
+                    for (uint16_t c = 0; c < nc_; ++c) out[c] += cv[m[c]];
+                });
             total_w += w;
         }
         if (total_w > 0) {
@@ -1043,7 +1106,7 @@ inline void TrunkDecomposition::regret_match() {
         for (uint16_t c = 0; c < nc_; ++c) {
             float psum = 0.0f;
             for (uint8_t a = 0; a < na; ++a) psum += std::max(regrets_[n][a * nc_ + c], 0.0f);
-            if (psum > 0.0f) {
+            if (psum >= kMinRegretSum) {
                 float inv = 1.0f / psum;
                 for (uint8_t a = 0; a < na; ++a)
                     cur_strat_[n][a * nc_ + c] = std::max(regrets_[n][a * nc_ + c], 0.0f) * inv;
@@ -1070,7 +1133,7 @@ inline void TrunkDecomposition::finalize_strategy() {
         for (uint16_t c = 0; c < nc_; ++c) {
             float tot = 0.0f;
             for (uint8_t a = 0; a < na; ++a) tot += strat_sum_[n][a * nc_ + c];
-            if (tot > 1e-7f) {
+            if (tot >= kMinRegretSum) {
                 float inv = 1.0f / tot;
                 for (uint8_t a = 0; a < na; ++a)
                     avg_strat_[n][a * nc_ + c] = strat_sum_[n][a * nc_ + c] * inv;
@@ -1101,7 +1164,12 @@ inline void TrunkDecomposition::ev(
             if (w == 0) w = 1;
             const auto& cv = (perspective == 0) ? inj_oop_[leaf_idx_[child]]
                                                 : inj_ip_[leaf_idx_[child]];
-            for (uint16_t c = 0; c < nc_; ++c) out[c] += static_cast<float>(w) * cv[c];
+            for_runout_orbit(&trunk_maps_, child, w,
+                [&](float wt) { for (uint16_t c = 0; c < nc_; ++c) out[c] += wt * cv[c]; },
+                [&](uint32_t map) {
+                    const uint16_t* m = trunk_maps_.maps.data() + static_cast<std::size_t>(map) * nc_;
+                    for (uint16_t c = 0; c < nc_; ++c) out[c] += cv[m[c]];
+                });
             total_w += w;
         }
         if (total_w > 0) {
@@ -1166,7 +1234,12 @@ inline void TrunkDecomposition::br(
             if (w == 0) w = 1;
             const auto& cv = (player == 0) ? br_oop_[leaf_idx_[child]]
                                            : br_ip_[leaf_idx_[child]];
-            for (uint16_t c = 0; c < nc_; ++c) out[c] += static_cast<float>(w) * cv[c];
+            for_runout_orbit(&trunk_maps_, child, w,
+                [&](float wt) { for (uint16_t c = 0; c < nc_; ++c) out[c] += wt * cv[c]; },
+                [&](uint32_t map) {
+                    const uint16_t* m = trunk_maps_.maps.data() + static_cast<std::size_t>(map) * nc_;
+                    for (uint16_t c = 0; c < nc_; ++c) out[c] += cv[m[c]];
+                });
             total_w += w;
         }
         if (total_w > 0) {
@@ -1217,10 +1290,11 @@ TrunkDecomposition::trunk_action_labels(uint32_t n) const {
     uint32_t off = trunk_.children_offset[n];
     uint8_t nch = trunk_.num_children[n];
     float pot = trunk_.pots[n];
+    const float to_call = trunk_.bet_into[n];
     for (uint8_t i = 0; i < nch; ++i) {
         auto at = static_cast<ActionType>(trunk_.child_action_types[off + i]);
         float amt = trunk_.child_action_amts[off + i];
-        labels.push_back(Solver::action_to_label(at, amt, pot));
+        labels.push_back(Solver::action_to_label(at, amt, pot, to_call));
     }
     return labels;
 }
@@ -1472,6 +1546,10 @@ inline void TrunkDecomposition::build_nav_tree(DecomposedResult& r) {
             e.opponent_range = std::move(opp.labels);
             e.combo_evs      = trunk_evs(node);
             // dealt_cards / runout_options stay empty (no chance precedes flop).
+            // 2026-10-07: pot / stacks / action amounts, as on monolithic
+            // entries (without them the UI read these nodes as terminals).
+            e.info = Solver::node_info_of(trunk_, node, e.action_labels,
+                                          board_to_mask(base_cfg_.board.data(), base_cfg_.board_size));
             out[path] = std::move(e);
         }
         if (pdepth >= opts_.nav_max_player_depth) return;
@@ -1606,7 +1684,7 @@ inline DecomposedResult TrunkDecomposition::run() {
     const double exploit_chips = (mass > 0.0)
         ? (br_oop_total + br_ip_total - ev_total) / (2.0 * mass) : 0.0;
     r.exploitability_pct = std::max(0.0f, static_cast<float>(
-        exploit_chips / std::max(static_cast<double>(base_cfg_.pot), 1.0) * 100.0));
+        exploit_chips / std::max(static_cast<double>(base_cfg_.pot), 1e-9) * 100.0));
 
     // Stage 5: stitch the UI navigation strategy tree (trunk flop betting +
     // every turn subgame spliced under the turn chance). Off by default.
@@ -1794,10 +1872,12 @@ inline DecompositionEstimate estimate_decomposition(const SolverConfig& cfg,
     iso_c.oop_weights = &cfg.oop_range_weights;
     iso_c.ip_weights  = &cfg.ip_range_weights;
     iso_c.node_locks  = &cfg.node_locks;
-    IsomorphismMapping iso = compute_isomorphism(cfg.board.data(), cfg.board_size, &iso_c);
+    IsomorphismMapping iso = compute_isomorphism(cfg.board.data(), cfg.board_size, &iso_c,
+                                                 cfg.iso_mode);
     const uint64_t nc = iso.num_canonical;
 
     GameTreeBuilder builder(cfg);
+    builder.set_runout_group(iso.runout_perms);
     builder.set_truncate_at_chance(true);
     FlatGameTree trunk = builder.build();
     e.trunk_nodes = trunk.total_nodes;
@@ -1882,12 +1962,8 @@ inline DecompositionEstimate estimate_decomposition(const SolverConfig& cfg,
             }
             uint64_t per_bytes = 0;
             if (deepest) {
-                SolverConfig sub = cfg;
-                sub.board[cfg.board_size] = trunk.dealt_card[deepest->rep_leaf];
-                sub.board_size = static_cast<uint8_t>(cfg.board_size + 1);
-                sub.pot = deepest->pot;
-                sub.effective_stack = deepest->stack;
-                sub.oop_has_initiative = true;
+                SolverConfig sub =
+                    subgame_config_for_leaf(cfg, trunk, deepest->rep_leaf);
 
                 GameTreeBuilder sb(sub);
                 sb.set_memory_policy(nc, sub.memory_budget,
@@ -1916,7 +1992,8 @@ inline DecompositionEstimate estimate_decomposition(const SolverConfig& cfg,
                 per_bytes = bytes_for_gpu_state_compact(
                                 st.total_nodes, sub_slots, nc,
                                 /*materialize_strategy=*/!cfg.node_locks.empty(),
-                                /*value_rows=*/0)
+                                /*value_rows=*/0,
+                                memory_budget::gpu_value_regions(cfg.alternating_updates))
                           + decomp_estimate_detail::kPinPredictSlackBytesPerLeaf;
                 if (!showdown_rank_blocker::supports_singleton_iso(iso)) {
                     per_bytes += tables * nc * nc * 2ULL * sizeof(float);
@@ -1976,12 +2053,8 @@ inline DecompositionEstimate estimate_decomposition(const SolverConfig& cfg,
         constexpr size_t kMaxSampledLines = 6;
         for (size_t gi = 0; gi < groups.size() && gi < kMaxSampledLines; ++gi) {
             Group& g = groups[gi];
-            SolverConfig sub = cfg;  // inherit menus / budgets / CPU knobs
-            sub.board[cfg.board_size] = trunk.dealt_card[g.rep_leaf];
-            sub.board_size = static_cast<uint8_t>(cfg.board_size + 1);
-            sub.pot = g.pot;
-            sub.effective_stack = g.stack;
-            sub.oop_has_initiative = true;
+            // inherit menus / budgets / CPU knobs
+            SolverConfig sub = subgame_config_for_leaf(cfg, trunk, g.rep_leaf);
             sub.max_iterations = inner;
 
             GameTreeBuilder sb(sub);
@@ -2008,7 +2081,7 @@ inline DecompositionEstimate estimate_decomposition(const SolverConfig& cfg,
             }
 
             const double ops =
-                static_cast<double>(ops_per_solve_iteration(player_n, MAX_ACTIONS, nc))
+                static_cast<double>(ops_per_solve_iteration(player_n, kOpsModelActions, nc))
                 * decomp_estimate_detail::kSubgameTreeOpsCorrection;
             const double cfr_s = (rate > 0.0) ? ops * inner / rate : 0.0;
             const double cells = static_cast<double>(tables)

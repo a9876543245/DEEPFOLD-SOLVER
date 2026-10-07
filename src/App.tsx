@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import { useState, useCallback, useMemo, useEffect } from 'react';
 import { BoardSelector } from './components/BoardSelector';
 import { PositionSelector } from './components/PositionSelector';
 import { SolverControls } from './components/SolverControls';
@@ -7,15 +7,19 @@ import { RangeGrid } from './components/RangeGrid';
 import type { GridDisplayMode } from './components/RangeGrid';
 import { StrategyPanel } from './components/StrategyPanel';
 import { ActionNavigator } from './components/ActionNavigator';
-import { ActionBar } from './components/ActionBar';
+import { ActionBar, prettyAction } from './components/ActionBar';
 import { TurnRiverCardSelector } from './components/TurnRiverCardSelector';
+import { BetSizingEditor } from './components/BetSizingEditor';
 import { useSolver } from './hooks/useSolver';
-import type { SolverRequest, NodeLock, ComboAnalysis, GameContext, MemoryProfile, SolveMode, EstimateResponse } from './lib/poker';
-import { getHandStrength, RANK_VALUES, SOLVE_MODE_PRESETS, DECOMPOSE_PRESETS } from './lib/poker';
+import { useTreeNav } from './hooks/useTreeNav';
+import type {
+  SolverRequest, SolverResponse, NodeLock, ComboAnalysis, GameContext, MemoryProfile,
+  SolveMode, EstimateResponse, EngineAction,
+} from './lib/poker';
+import { SOLVE_MODE_PRESETS, DECOMPOSE_PRESETS } from './lib/poker';
 import type { Position, PositionMatchup } from './lib/ranges';
 import { derivePotStack } from './lib/ranges';
-import { createRootNode, takeAction, dealCard, BET_SIZINGS } from './lib/gameTree';
-import type { GameTreeNode, GameAction, ActionStep } from './lib/gameTree';
+import { presetSpec, specToEngineJson, type BetSizingSpec } from './lib/betSizing';
 import { RangeEditorModal } from './components/RangeEditorModal';
 import { NodeLockEditor } from './components/NodeLockEditor';
 import { GuideModal } from './components/GuideModal';
@@ -44,21 +48,26 @@ import { GameContextSelector } from './components/GameContextSelector';
  */
 // Re-enabled: gto_output is now generated from imported text ranges.
 const GTO_CHART_LIBRARY_ENABLED = true;
-import { RunoutPicker } from './components/RunoutPicker';
 import { useGtoAutoRange } from './hooks/useGtoAutoRange';
 import { HelpCircle, BookOpen, Crosshair } from 'lucide-react';
 import { useT, useLanguage, LANGUAGES } from './lib/i18n';
 import type { AuthUser } from './lib/auth';
-import { clearSession } from './lib/auth';
+
+const SUIT_MAP: Record<string, { symbol: string; color: string }> = {
+  s: { symbol: '♠', color: '#E8E8E8' },
+  h: { symbol: '♥', color: '#FF453A' },
+  d: { symbol: '♦', color: '#0A84FF' },
+  c: { symbol: '♣', color: '#30D158' },
+};
 
 function App() {
   const t = useT();
   const { lang, setLang } = useLanguage();
-  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [, setAuthUser] = useState<AuthUser | null>(null);
   // Core state
-  const [flopBoard, setFlopBoard] = useState('');  // Flop only (6 chars, e.g. "AsKd7c")
-  const [turnCard, setTurnCard] = useState('');     // Turn card (2 chars, e.g. "2h")
-  const [riverCard, setRiverCard] = useState('');   // River card (2 chars, e.g. "Js")
+  // The board the solve starts on (3-5 cards, e.g. "AsKd7c"). Later cards are
+  // dealt along the line (useTreeNav), never edited into this string.
+  const [rootBoard, setRootBoard] = useState('');
   const [pot, setPot] = useState(100);
   const [stack, setStack] = useState(500);
   const [iterations, setIterations] = useState(300);
@@ -66,19 +75,13 @@ function App() {
   const [selectedMatchup, setSelectedMatchup] = useState<PositionMatchup | null>(null);
   const [heroPosition, setHeroPosition] = useState<Position | null>(null);
 
-  // Game tree state
-  const [currentNode, setCurrentNode] = useState<GameTreeNode | null>(null);
-  const [hasSolved, setHasSolved] = useState(false);
-
   // Advanced solver state
   const [customIpRange, setCustomIpRange] = useState<string | null>(null);
   const [customOopRange, setCustomOopRange] = useState<string | null>(null);
+  // Locks of the next root solve. Locks set on a later-street re-solve live
+  // in that solve's request (useTreeNav segment).
   const [nodeLocks, setNodeLocks] = useState<NodeLock[]>([]);
   const [gtoBrowserOpen, setGtoBrowserOpen] = useState(false);
-  // Path B runout choice. null = lex-min default. When user clicks a card
-  // in the RunoutPicker, this is set to that card and the next nav uses
-  // the "#XX" suffix in the cache lookup.
-  const [selectedRunout, setSelectedRunout] = useState<string | null>(null);
 
   // Game context — drives which preflop chart bucket auto-loads as default
   // ranges. Default = Cash 6max 100bb (matches the legacy MATCHUPS dataset).
@@ -112,20 +115,24 @@ function App() {
     setStack(stackChips);
   }, [gameContext.effectiveBB, selectedMatchup]);
 
-  // Off-range combo cache state — actual sync useEffect lives below the
-  // useSolver() call so it can read `result` without TDZ issues.
+  // Off-range analyses already solved, keyed by solve + node + hand: a
+  // re-click is instant.
   const [offRangeCache, setOffRangeCache] = useState<Record<string, ComboAnalysis>>({});
+  // The clicked hand's analysis at the node shown (cleared on navigation).
+  const [targetAnalysis, setTargetAnalysis] = useState<ComboAnalysis | null>(null);
 
   // Grid display mode
   const [gridMode, setGridMode] = useState<GridDisplayMode>('mix');
   const [heatmapAction, setHeatmapAction] = useState<string>('');
   const [gridViewSide, setGridViewSide] = useState<'acting' | 'opponent'>('acting');
 
-  // Bet sizing preset — drives both UI action list (gameTree.ts) AND the
-  // solver tree (passed via SolverRequest.flop_sizes/turn_sizes/river_sizes).
-  // These MUST stay consistent or history navigation silently falls through
-  // to the nearest backend node and shows misleading strategy.
-  const [sizingKey, setSizingKey] = useState<'lite' | 'standard' | 'polar' | 'small_ball'>('standard');
+  // 2026-10-06: bet sizing menus (a preset or a custom Pio-style spec). The
+  // engine builds the tree from it and the UI shows the engine's own nodes,
+  // so the two can no longer disagree.
+  const [sizingSpec, setSizingSpec] = useState<BetSizingSpec>(() => presetSpec('standard'));
+  const [sizingEditorOpen, setSizingEditorOpen] = useState(false);
+  // Suit isomorphism: 'exact' (Pio-style, default) or 'fast'.
+  const [isoMode, setIsoMode] = useState<'exact' | 'fast'>('exact');
 
   // Memory profile preset for the next solve (Polish #1). Default 'balanced'
   // matches the engine's `--memory-profile` default and the Rust resolver in
@@ -156,57 +163,13 @@ function App() {
   const [editingRange, setEditingRange] = useState<'IP' | 'OOP' | null>(null);
   const [editingNodeLock, setEditingNodeLock] = useState<{ combo: string; actions: string[]; initialStrategy?: Record<string, number> } | null>(null);
 
-  // Compute full board from flop + turn + river
-  const fullBoard = useMemo(() => {
-    let b = flopBoard;
-    if (turnCard) b += turnCard;
-    if (riverCard) b += riverCard;
-    return b;
-  }, [flopBoard, turnCard, riverCard]);
+  const { loading, error, setError, elapsed, progress, estimate, solve, reset } = useSolver();
+  const nav = useTreeNav(solve);
+  const { view, segment, line, awaiting, busy: navBusy } = nav;
+  const { act, deal, back, redeal, start, clear, releaseSessions, resolveSegment } = nav;
 
-  const { result, setResult, loading, error, elapsed, progress, estimate, solve, reset, navigate, oomFallback } = useSolver();
-
-  // Off-range combo cache (#2 from roadmap). After a target_combo solve
-  // completes (~10s), keep its analysis so a re-click on the same hand is
-  // instant. Cleared whenever a *fresh* spot solve runs (new strategy_tree
-  // reference + no target_combo_analysis = fresh spot).
-  const prevTreeRef = useRef<unknown>(null);
-  useEffect(() => {
-    if (!result) return;
-    const treeChanged = result.strategy_tree !== prevTreeRef.current;
-    const hasTarget   = !!result.target_combo_analysis;
-    if (treeChanged && !hasTarget) {
-      setOffRangeCache({});
-    } else if (hasTarget) {
-      const a = result.target_combo_analysis!;
-      setOffRangeCache(prev => prev[a.combo] === a ? prev : { ...prev, [a.combo]: a });
-    }
-    prevTreeRef.current = result.strategy_tree;
-  }, [result]);
-
-  // Helper: convert an ActionStep[] path into the engine's history string.
-  // Skips Deal steps. If `selectedRunout` is set, attaches "#<card>" to the
-  // action immediately before the FIRST Deal — Path B uses this to switch
-  // to a non-lex-min canonical runout in the cached strategy tree.
-  const pathToHistory = useCallback((steps: ActionStep[]): string => {
-    const out: string[] = [];
-    let firstDealAttached = false;
-    for (let i = 0; i < steps.length; i++) {
-      const s = steps[i];
-      if (s.player === 'Deal') continue;
-      let label = s.action.label;
-      if (!firstDealAttached && selectedRunout) {
-        // Attach to the action immediately before the first Deal step.
-        const next = steps[i + 1];
-        if (next?.player === 'Deal') {
-          label += '#' + selectedRunout;
-          firstDealAttached = true;
-        }
-      }
-      out.push(label);
-    }
-    return out.join(',');
-  }, [selectedRunout]);
+  // A new node: the clicked hand's analysis belonged to the old one.
+  useEffect(() => { setTargetAnalysis(null); }, [view, awaiting]);
 
   // Determine hero's range
   const getHeroRange = useCallback(() => {
@@ -226,36 +189,33 @@ function App() {
     setPot(potChips);
     setStack(stackChips);
     // Reset tree on matchup change
-    setCurrentNode(null);
-    setHasSolved(false);
-    setTurnCard('');
-    setRiverCard('');
     setCustomIpRange(null);
     setCustomOopRange(null);
     setNodeLocks([]);
+    clear();
     reset();
-  }, [reset, gameContext.effectiveBB]);
+  }, [reset, clear, gameContext.effectiveBB]);
 
-  // Build solver request for given node context
-  const buildRequest = useCallback((boardStr: string, actionPath?: ActionStep[], nodePot?: number, nodeStack?: number): SolverRequest => {
-    // Resolve bet-size arrays from the active preset. These MUST be passed
-    // to the backend — without them it silently uses its own {0.33, 0.75}
-    // default and the tree diverges from what the UI shows.
-    const sz = BET_SIZINGS[sizingKey] ?? BET_SIZINGS.standard;
+  /** The request of a root solve with the current settings. */
+  const buildRequest = useCallback((over?: {
+    board?: string; pot?: number; stack?: number; ipRange?: string; oopRange?: string;
+    locks?: NodeLock[];
+  }): SolverRequest => {
+    const locks = over?.locks ?? nodeLocks;
     return {
-      board: boardStr,
-      pot_size: nodePot ?? pot,
-      effective_stack: nodeStack ?? stack,
+      board: over?.board ?? rootBoard,
+      pot_size: over?.pot ?? pot,
+      effective_stack: over?.stack ?? stack,
       iterations,
-      exploitability: 0.5,
-      ip_range: customIpRange ?? selectedMatchup?.ipRange,
-      oop_range: customOopRange ?? selectedMatchup?.oopRange,
-      node_locks: nodeLocks.length > 0 ? JSON.stringify(nodeLocks) : undefined,
+      // 2026-10-06 audit: the solve mode's target (was a constant 0.5).
+      exploitability: SOLVE_MODE_PRESETS[solveMode].exploitability,
+      ip_range: over?.ipRange ?? customIpRange ?? selectedMatchup?.ipRange,
+      oop_range: over?.oopRange ?? customOopRange ?? selectedMatchup?.oopRange,
+      node_locks: locks.length > 0 ? JSON.stringify(locks) : undefined,
       hero_range: getHeroRange(),
-      action_path: actionPath,
-      flop_sizes: sz.flopBetSizes,
-      turn_sizes: sz.turnBetSizes,
-      river_sizes: sz.riverBetSizes,
+      bet_sizing: specToEngineJson(sizingSpec),
+      iso: isoMode,
+      serve: true,
       memory_profile: memoryProfile,
       // v1.3.0: solve mode picks iter cap + time budget. The user-set
       // `iterations` field above acts as a manual override that wins when
@@ -267,8 +227,7 @@ function App() {
       decompose_runouts: decomposeRunouts,
       // Roadmap ④: Exact iteration presets keyed on solveMode (subgame
       // DEPTH dominates quality per the 2026-07-15 study — presets scale
-      // `inner`, keep sweeps minimal). Only attached when Exact is on so
-      // Fast requests stay byte-identical to v1.9.0.
+      // `inner`, keep sweeps minimal).
       ...(decomposeRunouts === 'auto' ? {
         decompose_outer: DECOMPOSE_PRESETS[solveMode].outer,
         decompose_inner: DECOMPOSE_PRESETS[solveMode].inner,
@@ -278,26 +237,25 @@ function App() {
       // v1.7.0: GUI defaults to the levelized CPU backend (4-5x faster than
       // reference on a typical 8-thread laptop CPU). cpu_simd='auto' lets
       // CPUID pick AVX2 vs scalar at startup, cpu_threads=0 means "use
-      // every available core". Reference is still selectable via the CLI
-      // for parity-test / debugging; the GUI doesn't expose a toggle yet.
+      // every available core".
       cpu_backend: 'levelized',
       cpu_simd: 'auto',
       cpu_threads: 0,
     };
-  }, [pot, stack, iterations, selectedMatchup, getHeroRange, customIpRange, customOopRange, nodeLocks, sizingKey, memoryProfile, solveMode, decomposeRunouts]);
+  }, [rootBoard, pot, stack, iterations, selectedMatchup, getHeroRange, customIpRange, customOopRange, nodeLocks, sizingSpec, isoMode, memoryProfile, solveMode, decomposeRunouts]);
 
   // Roadmap ④: debounced pre-commit estimate for Exact mode. Fires when the
   // Exact pill is on and any solve-shaping config changes; skipped outside
   // Tauri (browser preview can't invoke the sidecar) and while a solve runs.
   useEffect(() => {
     if (decomposeRunouts !== 'auto' || loading) return;
-    if (flopBoard.length < 6) { setExactPreflight(null); return; }
+    if (rootBoard.length < 6) { setExactPreflight(null); return; }
     if (!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) return;
     let cancelled = false;
     const timer = window.setTimeout(async () => {
       try {
         const { invoke } = await import('@tauri-apps/api/core');
-        const request = buildRequest(fullBoard);
+        const request = buildRequest();
         const est = await invoke<EstimateResponse>('estimate_solve', { request });
         if (!cancelled) setExactPreflight(est);
       } catch (e) {
@@ -310,173 +268,72 @@ function App() {
       }
     }, 600);
     return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [decomposeRunouts, loading, flopBoard, fullBoard, buildRequest]);
+  }, [decomposeRunouts, loading, rootBoard, buildRequest]);
+
+  /** Solve `request` and make it the line shown. */
+  const solveRoot = useCallback(async (request: SolverRequest) => {
+    releaseSessions();
+    const resp = await solve(request);
+    if (resp) {
+      setOffRangeCache({});
+      start(resp, request);
+    }
+  }, [solve, start, releaseSessions]);
 
   // Initial solve (root node)
   const handleSolve = useCallback(() => {
-    if (flopBoard.length < 6) return;
+    if (rootBoard.length < 6 || loading) return;
+    solveRoot(buildRequest());
+  }, [rootBoard, loading, solveRoot, buildRequest]);
 
-    // Determine starting street from board card count
-    const numCards = flopBoard.length / 2;
-    let startStreet: 'flop' | 'turn' | 'river';
-    let solveBoard: string;
+  const handleAction = useCallback((action: EngineAction) => {
+    if (loading || navBusy) return;
+    act(action);
+  }, [loading, navBusy, act]);
 
-    if (numCards >= 5) {
-      startStreet = 'river';
-      solveBoard = flopBoard;
-      // Split: first 6 chars = flop, next 2 = turn, next 2 = river
-      // Update turnCard/riverCard, then trim flopBoard to flop-only
-      const tc = flopBoard.substring(6, 8);
-      const rc = flopBoard.substring(8, 10);
-      setFlopBoard(flopBoard.substring(0, 6));
-      setTurnCard(tc);
-      setRiverCard(rc);
-    } else if (numCards >= 4) {
-      startStreet = 'turn';
-      solveBoard = flopBoard;
-      const tc = flopBoard.substring(6, 8);
-      setFlopBoard(flopBoard.substring(0, 6));
-      setTurnCard(tc);
-      setRiverCard('');
-    } else {
-      startStreet = 'flop';
-      solveBoard = flopBoard;
-      setTurnCard('');
-      setRiverCard('');
-    }
-
-    const rootNode = createRootNode(pot, stack, startStreet, sizingKey);
-    setCurrentNode(rootNode);
-    setHasSolved(true);
-    solve(buildRequest(solveBoard, [], pot, stack));
-  }, [flopBoard, pot, stack, solve, buildRequest, sizingKey]);
-
-  // Navigate game tree by taking an action
-  const handleAction = useCallback((action: GameAction) => {
-    if (!currentNode || loading) return;
-    const nextNode = takeAction(currentNode, action, sizingKey);
-    setCurrentNode(nextNode);
-
-    if (nextNode.awaitingDeal) {
-      // Street advanced — need a card dealt.
-      // Clear the card for the new street so the selector appears.
-      if (nextNode.awaitingDeal === 'turn') {
-        setTurnCard('');
-        setRiverCard('');
-      } else {
-        setRiverCard('');
-      }
-      // Don't re-solve yet; wait for card selection
-      return;
-    }
-
-    if (!nextNode.isTerminal) {
-      // Route A: try cache first (instant). Falls back to re-solve only if
-      // the new node isn't in the strategy_tree (e.g. depth beyond cache
-      // horizon, or a re-solve was needed earlier and discarded the cache).
-      const history = pathToHistory(nextNode.path);
-      if (navigate(history)) return;
-
-      // Cache miss → real solve.
-      solve(buildRequest(fullBoard, nextNode.path, nextNode.pot, nextNode.effectiveStack));
-    }
-  }, [currentNode, loading, solve, navigate, pathToHistory, buildRequest, fullBoard, sizingKey]);
-
-  // Handle Turn/River card dealing
   const handleDealCard = useCallback((card: string) => {
-    if (!currentNode?.awaitingDeal) return;
+    if (loading || navBusy) return;
+    deal(card);
+  }, [loading, navBusy, deal]);
 
-    let newBoard: string;
-    if (currentNode.awaitingDeal === 'turn') {
-      setTurnCard(card);
-      newBoard = flopBoard + card;
-    } else {
-      setRiverCard(card);
-      newBoard = flopBoard + turnCard + card;
-    }
+  /** Breadcrumbs: every action, plus every dealt card as its own crumb. */
+  const crumbs = useMemo(() => {
+    const out: { label: string; player: 'OOP' | 'IP' | 'Deal'; step: number; card: boolean }[] = [];
+    line.forEach((s, i) => {
+      out.push({ label: prettyAction(s.label), player: s.actor, step: i, card: false });
+      if (s.card) out.push({ label: s.card, player: 'Deal', step: i, card: true });
+    });
+    return out;
+  }, [line]);
 
-    // Transition node from awaiting → active
-    const activeNode = dealCard(currentNode);
-    setCurrentNode(activeNode);
-
-    // Re-solve with updated board
-    solve(buildRequest(newBoard, activeNode.path, activeNode.pot, activeNode.effectiveStack));
-  }, [currentNode, flopBoard, turnCard, solve, buildRequest]);
-
-  // Navigate breadcrumbs (time travel)
   const handleNavigate = useCallback((index: number) => {
-    // Guard against breadcrumb clicks while a solve is in flight. Without
-    // this, the click can race the in-flight invoke — the new solve clears
-    // result to null, then the old invoke resolves and overwrites it with
-    // strategies from the previous spot, leaving the UI in a stale state.
-    if (loading) return;
-
-    if (index === -1) {
-      // Back to root — reset to flop
-      const rootNode = createRootNode(pot, stack, 'flop', sizingKey);
-      setCurrentNode(rootNode);
-      setTurnCard('');
-      setRiverCard('');
-      solve(buildRequest(flopBoard, [], pot, stack));
-    } else if (currentNode) {
-      // Rebuild tree to this point
-      let node = createRootNode(pot, stack, 'flop', sizingKey);
-      const targetPath = currentNode.path.slice(0, index + 1);
-      for (const step of targetPath) {
-        if (step.player !== 'Deal') {
-          node = takeAction(node, step.action, sizingKey);
-        }
-      }
-
-      // Determine which board to use based on the street
-      let navBoard = flopBoard;
-      if (node.street === 'turn' && turnCard) navBoard = flopBoard + turnCard;
-      else if (node.street === 'river' && turnCard && riverCard) navBoard = flopBoard + turnCard + riverCard;
-
-      // Clear cards for streets we're before
-      if (node.street === 'flop') {
-        setTurnCard('');
-        setRiverCard('');
-      } else if (node.street === 'turn') {
-        setRiverCard('');
-      }
-
-      setCurrentNode(node);
-
-      if (node.awaitingDeal) {
-        // Navigated to a deal point — show card selector
-        return;
-      }
-
-      // Route A: try cache first. Same-street time travel (most common
-      // breadcrumb click) hits the cache; cross-street nav (rare here, but
-      // possible after a deal) falls through to a real solve.
-      const history = pathToHistory(node.path);
-      if (navigate(history)) return;
-
-      solve(buildRequest(navBoard, node.path, node.pot, node.effectiveStack));
-    }
-  }, [pot, stack, flopBoard, turnCard, riverCard, currentNode, loading, solve, navigate, pathToHistory, buildRequest, sizingKey]);
+    if (loading || navBusy) return;
+    if (index < 0) { back(-1); return; }
+    const c = crumbs[index];
+    if (!c) return;
+    // An action that ended a street: back to its deal (pick another card).
+    if (!c.card && line[c.step]?.card) redeal(c.step);
+    else back(c.step);
+  }, [loading, navBusy, back, redeal, crumbs, line]);
 
   // Minimal keyboard study layer: ←/Backspace steps back one node along the
   // line, 1-9 takes the Nth action at the current node (walk the line without
   // the mouse), S = strategy-mix grid, E = EV grid. Ignored while typing in a
   // field, while any modal owns the screen, or while a solve is in flight.
-  // (Forward redo is a follow-up — it needs a redo stack.)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       const tgt = e.target as HTMLElement | null;
       if (tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'TEXTAREA' || tgt.isContentEditable)) return;
-      if (showGuide || showSpotLibrary || showDrill || gtoBrowserOpen || editingRange || editingNodeLock) return;
-      if (loading) return;
+      if (showGuide || showSpotLibrary || showDrill || gtoBrowserOpen || editingRange || editingNodeLock || sizingEditorOpen) return;
+      if (loading || navBusy) return;
 
       // 1-9 → take the Nth available action at the current node.
       if (e.key >= '1' && e.key <= '9') {
         const idx = e.key.charCodeAt(0) - '1'.charCodeAt(0);
-        if (currentNode && !currentNode.isTerminal && idx < currentNode.actions.length) {
+        if (!awaiting && view?.kind === 'player' && idx < view.actions.length) {
           e.preventDefault();
-          handleAction(currentNode.actions[idx]);
+          act(view.actions[idx]);
         }
         return;
       }
@@ -484,9 +341,11 @@ function App() {
       switch (e.key) {
         case 'ArrowLeft':
         case 'Backspace':
-          if (currentNode && currentNode.path.length > 0) {
+          if (line.length > 0) {
             e.preventDefault();
-            handleNavigate(currentNode.path.length - 2);
+            const last = line.length - 1;
+            if (line[last].card) redeal(last);   // back to that deal
+            else back(last - 1);
           }
           break;
         case 's': case 'S':
@@ -499,57 +358,77 @@ function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [currentNode, handleNavigate, handleAction, loading, showGuide, showSpotLibrary, showDrill, gtoBrowserOpen, editingRange, editingNodeLock]);
+  }, [view, awaiting, line, act, back, redeal, loading, navBusy, showGuide, showSpotLibrary, showDrill, gtoBrowserOpen, editingRange, editingNodeLock, sizingEditorOpen]);
 
-  // Click on a combo cell
-  // In-range: instant local lookup from existing solve result
-  // Off-range: re-solve with that combo forced into the range (real GTO calculation)
-  const handleCellClick = useCallback((label: string) => {
-    if (!result?.combo_strategies || flopBoard.length < 6) return;
-
-    const strategy = result.combo_strategies[label];
-    const isNotInRange = !strategy || !!strategy['Not in range'];
-
-    if (!isNotInRange && strategy) {
-      // In-range — instant local lookup, no re-solve needed
-      const analysis: ComboAnalysis = { combo: label, best_action: '', ev: 0, strategy_mix: {} };
+  // Click on a combo cell. In range at this node: its strategy, instantly.
+  // Out of range: a solve with the hand added to the acting player's range
+  // (tiny weight) answers what it would do here.
+  const handleCellClick = useCallback(async (label: string) => {
+    if (!view || view.kind !== 'player' || awaiting || !segment || loading) return;
+    const strategy = view.combo_strategies?.[label];
+    if (strategy && !strategy['Not in range']) {
+      const analysis: ComboAnalysis = {
+        combo: label, best_action: '', ev: view.combo_evs?.[label] ?? 0, strategy_mix: {},
+      };
       let bestFreq = 0;
       for (const [action, freq] of Object.entries(strategy)) {
         if (action === 'Not in range') continue;
         if (freq > 0.01) analysis.strategy_mix[action] = `${(freq * 100).toFixed(1)}%`;
         if (freq > bestFreq) { bestFreq = freq; analysis.best_action = action; }
       }
-      setResult(prev => prev ? { ...prev, target_combo_analysis: analysis } : prev);
-    } else {
-      // Off-range. First check the off-range cache — re-clicks of a hand
-      // we already solved-with-target_combo are instant.
-      const cached = offRangeCache[label];
-      if (cached) {
-        setResult(prev => prev ? { ...prev, target_combo_analysis: cached } : prev);
-        return;
-      }
-      // Cache miss → real re-solve with target_combo, forcing it into the
-      // range. Result auto-saves to offRangeCache via the useEffect above.
-      const request = buildRequest(fullBoard, currentNode?.path, currentNode?.pot, currentNode?.effectiveStack);
-      request.target_combo = label;
-      solve(request);
+      setTargetAnalysis(analysis);
+      return;
     }
-  }, [result, flopBoard, fullBoard, currentNode, solve, buildRequest, offRangeCache, setResult]);
+    const key = `${segment.response.session_id ?? segment.request.board}|${nav.segmentHistory}|${label}`;
+    const cached = offRangeCache[key];
+    if (cached) { setTargetAnalysis(cached); return; }
+    const request: SolverRequest = {
+      ...segment.request,
+      history: nav.segmentHistory || undefined,
+      target_combo: label,
+      target_player: view.acting === 'IP' ? 'ip' : 'oop',
+      serve: false,
+      strategy_tree_max_nodes: 1,
+    };
+    const resp = await solve(request);
+    const a = resp?.target_combo_analysis;
+    if (a) {
+      setOffRangeCache(prev => ({ ...prev, [key]: a }));
+      setTargetAnalysis(a);
+    }
+  }, [view, awaiting, segment, loading, nav.segmentHistory, offRangeCache, solve]);
 
-  // Breadcrumb history for ActionNavigator
-  const breadcrumbHistory = useMemo(() => {
-    if (!currentNode) return [];
-    return currentNode.path.map(step => ({
-      label: step.action.label,
-      player: step.player as 'OOP' | 'IP' | 'Deal',
-    }));
-  }, [currentNode]);
+  // What the grid and the strategy panel show: the solve's response with the
+  // current node's fields.
+  const displayResult = useMemo<SolverResponse | null>(() => {
+    if (!segment || !view) return null;
+    return {
+      ...segment.response,
+      global_strategy: view.global_strategy ?? {},
+      combo_strategies: view.combo_strategies,
+      acting_player: view.acting,
+      opponent_side: view.opponent_side,
+      opponent_range: view.opponent_range,
+      combo_evs: view.combo_evs,
+      target_combo_analysis: targetAnalysis ?? undefined,
+    };
+  }, [segment, view, targetAnalysis]);
+
+  // Locks of the solve shown (root: the nodeLocks state; later streets:
+  // their own request).
+  const segmentLocks = useMemo<NodeLock[]>(() => {
+    if (!segment?.request.node_locks) return [];
+    try { return JSON.parse(segment.request.node_locks) as NodeLock[]; } catch { return []; }
+  }, [segment]);
 
   // Position labels
   const heroIsIP = selectedMatchup && heroPosition ? selectedMatchup.ip === heroPosition : null;
   const villainPosition = selectedMatchup && heroPosition
     ? (selectedMatchup.ip === heroPosition ? selectedMatchup.oop : selectedMatchup.ip)
     : null;
+
+  const boardString = nav.boardCards.join('');
+  const hasSolved = !!segment;
 
   return (
     <AuthGate onAuth={setAuthUser}>
@@ -572,50 +451,7 @@ function App() {
         </div>
 
         {/* Breadcrumb Navigator */}
-        <ActionNavigator history={breadcrumbHistory} onNavigate={handleNavigate} />
-
-        {/* Path B runout picker — shows when current cache entry has runout
-         *  options (i.e. iso enumeration was engaged at the prior chance).
-         *  Picking a different card swaps the cache lookup and re-renders
-         *  strategies for that runout. */}
-        {result?.runout_options && result.runout_options.length > 1 && (
-          <RunoutPicker
-            options={result.runout_options}
-            active={result.dealt_cards?.[result.dealt_cards.length - 1] ?? null}
-            onPick={(card) => {
-              setSelectedRunout(card);
-              // Trigger re-navigation with new runout choice. handleNavigate
-              // would expect a breadcrumb index, so call navigate() directly
-              // via the same path-rebuild used elsewhere.
-              if (currentNode) {
-                // Rebuild the engine history with the new runout token, then
-                // do a cache lookup. Cache miss falls through to re-solve.
-                // We mimic the post-action nav flow.
-                const tempHistory = (() => {
-                  const out: string[] = [];
-                  let attached = false;
-                  for (let i = 0; i < currentNode.path.length; i++) {
-                    const s = currentNode.path[i];
-                    if (s.player === 'Deal') continue;
-                    let label = s.action.label;
-                    if (!attached) {
-                      const next = currentNode.path[i + 1];
-                      if (next?.player === 'Deal') {
-                        label += '#' + card;
-                        attached = true;
-                      }
-                    }
-                    out.push(label);
-                  }
-                  return out.join(',');
-                })();
-                if (!navigate(tempHistory)) {
-                  solve(buildRequest(fullBoard, currentNode.path, currentNode.pot, currentNode.effectiveStack));
-                }
-              }
-            }}
-          />
-        )}
+        <ActionNavigator history={crumbs} onNavigate={handleNavigate} />
 
         {/* Status */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -789,23 +625,23 @@ function App() {
         <PositionSelector
           selectedMatchup={selectedMatchup}
           onMatchupChange={handleMatchupChange}
-          onReset={() => { 
-            setSelectedMatchup(null); 
-            setHeroPosition(null); 
-            setTurnCard(''); 
-            setRiverCard(''); 
+          onReset={() => {
+            setSelectedMatchup(null);
+            setHeroPosition(null);
             setCustomIpRange(null);
             setCustomOopRange(null);
-          }} 
+          }}
           onEditRange={(isIP) => setEditingRange(isIP ? 'IP' : 'OOP')}
         />
-        <BoardSelector board={flopBoard} onBoardChange={(b) => { setFlopBoard(b); setTurnCard(''); setRiverCard(''); }} />
+        <BoardSelector board={rootBoard} onBoardChange={setRootBoard} />
 
         <SolverControls
           pot={pot} stack={stack} iterations={iterations}
           onPotChange={setPot} onStackChange={setStack} onIterationsChange={setIterations}
           onSolve={handleSolve} loading={loading}
-          sizingKey={sizingKey} onSizingChange={setSizingKey}
+          sizingSpec={sizingSpec} onSizingSpecChange={setSizingSpec}
+          onEditSizing={() => setSizingEditorOpen(true)}
+          isoMode={isoMode} onIsoModeChange={setIsoMode}
           memoryProfile={memoryProfile} onMemoryProfileChange={setMemoryProfile}
           expectedEffectiveBB={gameContext.effectiveBB}
           solveMode={solveMode}
@@ -819,10 +655,9 @@ function App() {
           onDecomposeRunoutsChange={setDecomposeRunouts}
           exactPreflight={exactPreflight}
           onStop={async () => {
-            // Pure abort — kills the engine subprocess. No partial result;
-            // useSolver will see the killed process as an error and reset
-            // its loading state. Time-budget is the path for "stop with
-            // what we have" (auto-fires when budget hits).
+            // Pure abort — kills the engine subprocess. The previous view
+            // stays; time-budget is the path for "stop with what we have"
+            // (auto-fires when the budget hits).
             try {
               if ((window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) {
                 const { invoke } = await import('@tauri-apps/api/core');
@@ -841,28 +676,21 @@ function App() {
           loading={loading}
           timeBudgetSeconds={SOLVE_MODE_PRESETS[solveMode].time_budget_seconds}
         />
-        {error && (
+        {(error || nav.navError) && (
           <div className="glass-panel animate-fade-in" style={{
             padding: 12, borderColor: 'var(--color-red)', background: 'var(--color-red-dim)',
           }}>
             <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-red)', marginBottom: 4 }}>{t('error')}</div>
-            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{error}</div>
+            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{error ?? nav.navError}</div>
           </div>
         )}
-        {/* v1.8.3: GPU OOM auto-retry notice. Surfaces when the wide-range
-            monotone Standard tree exceeded VRAM and the solver was rerun
-            with single-sizing flop. Strategy is still GTO but the action
-            menu drops "Bet 33%" — user should know. */}
-        {oomFallback && (
-          <div className="glass-panel animate-fade-in" style={{
-            padding: 12, borderColor: 'var(--color-amber)', background: 'var(--color-amber-dim, rgba(245, 158, 11, 0.08))',
-          }}>
-            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-amber)', marginBottom: 4 }}>Simplified tree</div>
-            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>
-              Wide range + monotone flop exceeded GPU memory at {oomFallback.from.length}-bet sizing
-              ({oomFallback.from.map(s => `${(s*100)|0}%`).join(' / ')}). Solved with single sizing
-              ({oomFallback.to.map(s => `${(s*100)|0}%`).join(' / ')}) instead. Strategy is GTO under the smaller action menu.
-            </div>
+        {nodeLocks.length > 0 && (
+          <div className="glass-panel" style={{ padding: 10, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+            <span style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>
+              {t('locks.active', { n: nodeLocks.length })}
+            </span>
+            <button className="btn-secondary" style={{ fontSize: 11, padding: '3px 10px' }}
+              onClick={() => setNodeLocks([])}>{t('locks.clear')}</button>
           </div>
         )}
       </aside>
@@ -870,8 +698,8 @@ function App() {
       {/* Main Content */}
       <main className="main-content">
 
-        {/* Street Status Bar — shows board progression */}
-        {hasSolved && currentNode && (
+        {/* Street Status Bar — the board as dealt along the line */}
+        {hasSolved && (
           <div style={{
             display: 'flex', alignItems: 'center', gap: 0,
             padding: '10px 16px',
@@ -881,43 +709,19 @@ function App() {
             border: '1px solid var(--color-glass-border)',
             marginBottom: 14, maxWidth: 720, width: '100%',
           }}>
-            {/* Flop */}
             {(() => {
-              const SUIT_MAP: Record<string, { symbol: string; color: string }> = {
-                s: { symbol: '♠', color: '#E8E8E8' },
-                h: { symbol: '♥', color: '#FF453A' },
-                d: { symbol: '♦', color: '#0A84FF' },
-                c: { symbol: '♣', color: '#30D158' },
-              };
-              const isCurrentFlop = currentNode.street === 'flop';
-              const isCurrentTurn = currentNode.street === 'turn';
-              const isCurrentRiver = currentNode.street === 'river';
-
-              // Parse flop cards
-              const flopCards: string[] = [];
-              for (let i = 0; i < flopBoard.length; i += 2) {
-                flopCards.push(flopBoard.substring(i, i + 2));
+              const cards = nav.boardCards;
+              // Street of the node shown (a pending deal belongs to the next).
+              const currentStreet = awaiting
+                ? (awaiting.street === 'turn' ? 1 : 2)
+                : Math.max(0, cards.length - 3);
+              // Actions per street along the line.
+              const perStreet: string[][] = [[], [], []];
+              let st = Math.max(0, (segment ? nav.segments[0].request.board.length / 2 : 3) - 3);
+              for (const s of line) {
+                perStreet[Math.min(2, st)].push(`${s.actor} ${prettyAction(s.label)}`);
+                if (s.card) st += 1;
               }
-
-
-              // Get actions per street from path
-
-              const getStreetActions = (street: 'flop' | 'turn' | 'river') => {
-                const actions: string[] = [];
-                let inStreet = street === 'flop';
-                for (const step of currentNode.path) {
-                  if (step.player === 'Deal') {
-                    if (step.action.label === 'Turn' && street === 'turn') inStreet = true;
-                    else if (step.action.label === 'River' && street === 'river') inStreet = true;
-                    else if (inStreet) break;
-                    continue;
-                  }
-                  if (inStreet) {
-                    actions.push(`${step.player} ${step.action.label}`);
-                  }
-                }
-                return actions;
-              };
 
               const renderCard = (card: string, idx: number) => {
                 const rank = card[0];
@@ -962,80 +766,47 @@ function App() {
                 );
               };
 
+              const section = (idx: 0 | 1 | 2, name: string, color: string, tint: string) => {
+                const isCurrent = currentStreet === idx;
+                const streetCards = idx === 0 ? cards.slice(0, 3) : cards.slice(idx + 2, idx + 3);
+                const reached = streetCards.length > 0 || isCurrent;
+                return (
+                  <div style={{
+                    flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
+                    padding: '4px 8px', borderRadius: 8,
+                    background: isCurrent ? `${tint}14` : 'transparent',
+                    border: isCurrent ? `1px solid ${tint}33` : '1px solid transparent',
+                    opacity: reached ? 1 : 0.3,
+                    transition: 'all 200ms ease',
+                  }}>
+                    <div style={{
+                      fontSize: 9, fontWeight: 700, textTransform: 'uppercase',
+                      letterSpacing: '0.8px', marginBottom: 4,
+                      color: isCurrent ? color : 'var(--color-text-tertiary)',
+                    }}>{name}</div>
+                    <div style={{ display: 'flex', gap: 3 }}>
+                      {streetCards.length > 0 ? streetCards.map((c, i) => renderCard(c, i)) : renderPlaceholder()}
+                    </div>
+                    {streetActionSummary(perStreet[idx])}
+                  </div>
+                );
+              };
+
+              const arrow = (on: boolean) => (
+                <div style={{
+                  width: 24, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  color: on ? 'var(--color-text-tertiary)' : 'rgba(255,255,255,0.1)',
+                  fontSize: 14,
+                }}>→</div>
+              );
+
               return (
                 <>
-                  {/* Flop section */}
-                  <div style={{
-                    flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
-                    padding: '4px 8px', borderRadius: 8,
-                    background: isCurrentFlop ? 'rgba(48,209,88,0.08)' : 'transparent',
-                    border: isCurrentFlop ? '1px solid rgba(48,209,88,0.2)' : '1px solid transparent',
-                    transition: 'all 200ms ease',
-                  }}>
-                    <div style={{
-                      fontSize: 9, fontWeight: 700, textTransform: 'uppercase',
-                      letterSpacing: '0.8px', marginBottom: 4,
-                      color: isCurrentFlop ? '#30D158' : 'var(--color-text-tertiary)',
-                    }}>Flop</div>
-                    <div style={{ display: 'flex', gap: 3 }}>
-                      {flopCards.map((c, i) => renderCard(c, i))}
-                    </div>
-                    {streetActionSummary(getStreetActions('flop'))}
-                  </div>
-
-                  {/* Separator */}
-                  <div style={{
-                    width: 24, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    color: turnCard ? 'var(--color-text-tertiary)' : 'rgba(255,255,255,0.1)',
-                    fontSize: 14,
-                  }}>→</div>
-
-                  {/* Turn section */}
-                  <div style={{
-                    flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
-                    padding: '4px 8px', borderRadius: 8,
-                    background: isCurrentTurn ? 'rgba(255,159,10,0.08)' : 'transparent',
-                    border: isCurrentTurn ? '1px solid rgba(255,159,10,0.2)' : '1px solid transparent',
-                    opacity: turnCard || isCurrentTurn || currentNode.awaitingDeal === 'turn' ? 1 : 0.3,
-                    transition: 'all 200ms ease',
-                  }}>
-                    <div style={{
-                      fontSize: 9, fontWeight: 700, textTransform: 'uppercase',
-                      letterSpacing: '0.8px', marginBottom: 4,
-                      color: isCurrentTurn ? '#FF9F0A' : 'var(--color-text-tertiary)',
-                    }}>Turn</div>
-                    <div style={{ display: 'flex', gap: 3 }}>
-                      {turnCard ? renderCard(turnCard, 0) : renderPlaceholder()}
-                    </div>
-                    {turnCard && streetActionSummary(getStreetActions('turn'))}
-                  </div>
-
-                  {/* Separator */}
-                  <div style={{
-                    width: 24, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    color: riverCard ? 'var(--color-text-tertiary)' : 'rgba(255,255,255,0.1)',
-                    fontSize: 14,
-                  }}>→</div>
-
-                  {/* River section */}
-                  <div style={{
-                    flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
-                    padding: '4px 8px', borderRadius: 8,
-                    background: isCurrentRiver ? 'rgba(255,69,58,0.08)' : 'transparent',
-                    border: isCurrentRiver ? '1px solid rgba(255,69,58,0.2)' : '1px solid transparent',
-                    opacity: riverCard || isCurrentRiver || currentNode.awaitingDeal === 'river' ? 1 : 0.3,
-                    transition: 'all 200ms ease',
-                  }}>
-                    <div style={{
-                      fontSize: 9, fontWeight: 700, textTransform: 'uppercase',
-                      letterSpacing: '0.8px', marginBottom: 4,
-                      color: isCurrentRiver ? '#FF453A' : 'var(--color-text-tertiary)',
-                    }}>River</div>
-                    <div style={{ display: 'flex', gap: 3 }}>
-                      {riverCard ? renderCard(riverCard, 0) : renderPlaceholder()}
-                    </div>
-                    {riverCard && streetActionSummary(getStreetActions('river'))}
-                  </div>
+                  {section(0, 'Flop', '#30D158', '#30D158')}
+                  {arrow(cards.length > 3)}
+                  {section(1, 'Turn', '#FF9F0A', '#FF9F0A')}
+                  {arrow(cards.length > 4)}
+                  {section(2, 'River', '#FF453A', '#FF453A')}
                 </>
               );
             })()}
@@ -1043,7 +814,7 @@ function App() {
         )}
 
         <RangeGrid
-          result={result}
+          result={loading ? null : displayResult}
           displayMode={gridMode}
           heatmapAction={heatmapAction}
           onDisplayModeChange={(mode, action) => {
@@ -1056,25 +827,34 @@ function App() {
           onCellClick={handleCellClick}
         />
 
-        {/* Turn/River Card Selector — shown when awaiting deal */}
-        {hasSolved && currentNode?.awaitingDeal && (
+        {/* Card selector — the line reached a deal */}
+        {hasSolved && awaiting && !loading && (
           <div style={{ marginTop: 12, maxWidth: 720, width: '100%' }}>
             <TurnRiverCardSelector
-              street={currentNode.awaitingDeal}
-              currentBoard={currentNode.awaitingDeal === 'turn' ? flopBoard : flopBoard + turnCard}
+              street={awaiting.street}
+              currentBoard={boardString}
               onCardSelect={handleDealCard}
+              hint={awaiting.collapsed ? t('deal.resolveHint')
+                : (segment?.response.session_id == null ? t('deal.cachedOnly') : undefined)}
+              allowed={!awaiting.collapsed && segment?.response.session_id == null
+                ? new Set(awaiting.runouts.map(r => r.card)) : undefined}
             />
           </div>
         )}
 
-        {/* Action Bar — shown after solving (not during deal) */}
-        {hasSolved && currentNode && !currentNode.awaitingDeal && (result || currentNode.isTerminal) && (
+        {/* Action Bar — the node's actions as solved */}
+        {hasSolved && view && !awaiting && !loading && (
           <div style={{ marginTop: 12, maxWidth: 720, width: '100%' }}>
-            <ActionBar node={currentNode} onAction={handleAction} loading={loading} />
+            <ActionBar view={view} onAction={handleAction} loading={loading || navBusy} />
+            {view.kind === 'player' && view.actions.length === 0 && (
+              <button className="btn-primary" style={{ marginTop: 8, width: '100%' }} onClick={handleSolve}>
+                {t('solve')}
+              </button>
+            )}
           </div>
         )}
 
-        {!result && !loading && (
+        {!displayResult && !loading && (
           <div style={{
             textAlign: 'center', color: 'var(--color-text-tertiary)',
             fontSize: 13, maxWidth: 300,
@@ -1087,47 +867,27 @@ function App() {
       {/* Right Sidebar */}
       <aside className="sidebar-right">
         <StrategyPanel
-          result={result}
+          result={displayResult}
           hoveredCombo={hoveredCombo}
           elapsed={elapsed}
           loading={loading}
           progress={progress}
-          board={fullBoard}
-          heroRange={getHeroRange()}
-          currentHistory={currentNode ? pathToHistory(currentNode.path) : ''}
+          board={boardString}
+          currentHistory={nav.segmentCacheKey}
           onLockNode={() => {
-            const targetCombo = result?.target_combo_analysis?.combo;
-            if (!result || !targetCombo || !currentNode) return;
-            const currentHistory = currentNode.path
-                .filter(step => step.player !== 'Deal')
-                .map(step => step.action.label)
-                .join(',');
-            // If already locked, edit the existing lock
-            const existingLock = nodeLocks.find(l => l.combo === targetCombo && l.history === currentHistory);
-            
-            // Build actions list
-            const comboStrategy = result.combo_strategies?.[targetCombo];
-            let availableActions = comboStrategy 
-              ? Object.keys(comboStrategy).filter(k => k !== 'Not in range')
-              : [];
-              
-            // If combo is not in range or has no actions, fallback to the global action tree so user can still force hypothetical locks
-            if (availableActions.length === 0) {
-              availableActions = Object.keys(result.global_strategy);
-            }
-            
-            console.log("[DEBUG] Activating NodeLockEditor for", targetCombo, availableActions);
-            
-            // Reconstruct initial strategy if it existed
-            let initialStrategy: Record<string, number> | undefined = undefined;
-            if (existingLock) {
+            const targetCombo = targetAnalysis?.combo;
+            if (!view || view.kind !== 'player' || !targetCombo) return;
+            const history = nav.segmentHistory;
+            // The node's actions in engine order: a lock gives one
+            // frequency per action, in this order.
+            const actions = view.actions.map(a => a.label);
+            const existing = segmentLocks.find(l => l.combo === targetCombo && l.history === history);
+            let initialStrategy: Record<string, number> | undefined;
+            if (existing) {
               initialStrategy = {};
-              availableActions.forEach((a, i) => {
-                initialStrategy![a] = existingLock.strategy[i] ?? 0;
-              });
+              actions.forEach((a, i) => { initialStrategy![a] = existing.strategy[i] ?? 0; });
             }
-
-            setEditingNodeLock({ combo: targetCombo, actions: availableActions, initialStrategy });
+            setEditingNodeLock({ combo: targetCombo, actions, initialStrategy });
           }}
         />
       </aside>
@@ -1146,35 +906,37 @@ function App() {
         />
       )}
 
-      {editingNodeLock && currentNode && (
+      {editingNodeLock && segment && (
         <NodeLockEditor
           combo={editingNodeLock.combo}
           actions={editingNodeLock.actions}
           initialStrategy={editingNodeLock.initialStrategy}
           onSave={(str: Record<string, number>) => {
-            const currentHistory = currentNode.path
-                .filter(step => step.player !== 'Deal')
-                .map(step => step.action.label)
-                .join(',');
-
-            // ordered by actions
-            const strategyArr = editingNodeLock.actions.map(a => str[a] ?? 0);
-            
-            setNodeLocks(prev => {
-              const cleaned = prev.filter(l => !(l.combo === editingNodeLock.combo && l.history === currentHistory));
-              return [...cleaned, { history: currentHistory, combo: editingNodeLock.combo, strategy: strategyArr }];
-            });
+            const history = nav.segmentHistory;
+            const lock: NodeLock = {
+              history,
+              combo: editingNodeLock.combo,
+              strategy: editingNodeLock.actions.map(a => str[a] ?? 0),
+            };
+            const locks = [
+              ...segmentLocks.filter(l => !(l.combo === lock.combo && l.history === history)),
+              lock,
+            ];
             setEditingNodeLock(null);
-            
-            // Trigger auto-resolve when locking to immediately see effect
-            if (flopBoard.length >= 6) {
-              // Wait for state to settle then re-solve
-              setTimeout(() => {
-                solve(buildRequest(currentNode.street === 'flop' ? flopBoard : currentNode.street === 'turn' ? flopBoard + turnCard : flopBoard + turnCard + riverCard, currentNode.path, currentNode.pot, currentNode.effectiveStack));
-              }, 0);
-            }
+            // The first solve's locks also carry into the next Solve.
+            if (nav.segments.length === 1) setNodeLocks(locks);
+            // Re-solve this street with the lock and come back to the node.
+            resolveSegment({ node_locks: JSON.stringify(locks) });
           }}
           onClose={() => setEditingNodeLock(null)}
+        />
+      )}
+
+      {sizingEditorOpen && (
+        <BetSizingEditor
+          spec={sizingSpec}
+          onSave={(spec) => { setSizingSpec(spec); setSizingEditorOpen(false); }}
+          onClose={() => setSizingEditorOpen(false)}
         />
       )}
 
@@ -1200,59 +962,42 @@ function App() {
             // Configure state from spot
             const spotPot = Math.round(spot.matchup.defaultPot * 10);
             const spotStack = Math.round(spot.matchup.defaultStack * 10);
-            setFlopBoard(spot.board);
-            setTurnCard('');
-            setRiverCard('');
-            setHasSolved(true);
+            setRootBoard(spot.board);
             setSelectedMatchup(spot.matchup);
-            setHeroPosition(spot.matchup.oop as any);
+            setHeroPosition(spot.matchup.oop as Position);
             setPot(spotPot);
             setStack(spotStack);
             setCustomIpRange(null);
             setCustomOopRange(null);
             setNodeLocks([]);
-            const rootNode = createRootNode(spotPot, spotStack, 'flop');
-            setCurrentNode(rootNode);
             setShowSpotLibrary(false);
+            // The spot's own settings (state updates land after this call).
+            const request = buildRequest({
+              board: spot.board, pot: spotPot, stack: spotStack,
+              ipRange: spot.matchup.ipRange, oopRange: spot.matchup.oopRange, locks: [],
+            });
 
-            // v1.8.3+ Phase 3: if the SpotLibrary already upgraded this spot
-            // to a bundled, pre-solved version (source: 'bundled'), skip the
-            // live solve entirely and render the cached strategy directly.
-            // The bundle has both global_strategy + combo_strategies AND the
-            // navigable strategy_tree, so runout drilling stays instant too.
-            if (spot.source === 'bundled') {
-              setResult({
+            // v1.8.3+ Phase 3: a bundled, pre-solved spot shows its root
+            // strategy at once; Solve explores the tree from there.
+            if (spot.source === 'bundled' || !isRealSolverAvailable()) {
+              setError(null);
+              start({
                 status: 'success',
                 iterations_run: spot.iterationsRun ?? 0,
                 exploitability_pct: spot.exploitabilityPct ?? 0,
                 global_strategy: spot.globalStrategy,
                 combo_strategies: spot.comboStrategies,
-              });
+                acting_player: 'OOP',
+                node: {
+                  kind: 'player', street: 0, pot: spotPot, stack_oop: spotStack, stack_ip: spotStack,
+                  to_call: 0, board: [], actions: [], runouts: [],
+                },
+              }, request);
               return;
             }
-
-            if (isRealSolverAvailable()) {
-              // Tauri mode: trigger a REAL solve with this spot's config.
-              // User sees the normal solving progress indicator.
-              solve({
-                board: spot.board,
-                pot_size: spotPot,
-                effective_stack: spotStack,
-                iterations,
-                exploitability: 0.5,
-                ip_range: spot.matchup.ipRange,
-                oop_range: spot.matchup.oopRange,
-              });
-            } else {
-              // Browser mode: fall back to heuristic preview data (marked isDemo).
-              setResult({
-                status: 'success',
-                iterations_run: 200,
-                exploitability_pct: 0.32,
-                global_strategy: spot.globalStrategy,
-                combo_strategies: spot.comboStrategies,
-              });
-            }
+            // Tauri mode: a REAL solve with this spot's config and the
+            // current sizing menus.
+            solveRoot(request);
           }}
           onClose={() => setShowSpotLibrary(false)}
         />

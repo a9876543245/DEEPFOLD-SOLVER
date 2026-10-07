@@ -18,6 +18,11 @@ interface Props {
   onCardSelect: (card: string) => void;
   /** Callback to cancel / go back */
   onCancel?: () => void;
+  /** Only these cards can be dealt (others are not in the solve that is
+   *  still available); undefined = every card off the board. */
+  allowed?: Set<string>;
+  /** Extra line under the prompt (e.g. "picking a card re-solves..."). */
+  hint?: string;
 }
 
 /** Parse board string into individual card strings */
@@ -35,7 +40,7 @@ function parseBoardCards(board: string): string[] {
  * Shows all 52 cards as a 13×4 grid (ranks × suits), with dealt cards disabled.
  * Designed to match the aesthetic of BoardSelector.
  */
-export function TurnRiverCardSelector({ street, currentBoard, onCardSelect, onCancel }: Props) {
+export function TurnRiverCardSelector({ street, currentBoard, onCardSelect, onCancel, allowed, hint }: Props) {
   const t = useT();
   const usedCards = useMemo(() => {
     const set = new Set<string>();
@@ -92,6 +97,7 @@ export function TurnRiverCardSelector({ street, currentBoard, onCardSelect, onCa
         marginBottom: 12, lineHeight: 1.4,
       }}>
         {t('deal.selectCard', { street: streetLabel })}
+        {hint && <div style={{ marginTop: 4, color: 'var(--color-text-secondary)' }}>{hint}</div>}
       </div>
 
       {/* Current board display */}
@@ -141,7 +147,7 @@ export function TurnRiverCardSelector({ street, currentBoard, onCardSelect, onCa
         {SUITS.map((suit) =>
           RANKS.map((rank) => {
             const card = `${rank}${suit.key}`;
-            const isUsed = usedCards.has(card);
+            const isUsed = usedCards.has(card) || (allowed !== undefined && !allowed.has(card));
 
             return (
               <button

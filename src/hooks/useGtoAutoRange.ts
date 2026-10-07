@@ -38,78 +38,69 @@ function chartFolder(s: GtoScenario): string {
   return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : s.id;
 }
 
-/** For a (potType, role) combination, return scenario_type names ranked
- *  by how well they fit. The first match found in the bundled charts wins.
- *  Multiple candidates are listed because not every (folder × position)
- *  has every scenario type.
- *
- *  Keyed on preflop role, NOT on ip/oop: the opener is OOP in half the
- *  matchups, and asking for the wrong family silently mis-loads a range
- *  (e.g. BTN's *open* in a pot where BTN only called). */
-function scenarioCandidates(
-  potType: 'SRP' | '3BET',
-  role: 'opener' | 'responder',
-): string[] {
-  // SRP context (single raise + call):
-  //   opener   → their range is the open (RFI)
-  //   responder → the caller → "vs_Open" facing the open
-  // 3BET context (raise + 3-bet + call):
-  //   opener   → the original raiser facing a 3-bet → "vs_3B"
-  //   responder → the 3-bettor → "vs_Open" with a 3-bet response
-  if (potType === 'SRP') {
-    return role === 'opener'
-      ? ['RFI', 'SB_vs_BB']                           // the raiser
-      : ['vs_Open', 'vs_RFI'];                        // the caller
-  }
-  // 3BET
-  return role === 'opener'
-    ? ['vs_3B', 'vs_4B', 'vs_4B_allin']               // raiser facing the 3-bet
-    : ['vs_Open', 'vs_RFI'];                          // the 3-bettor
+/** The heads-up preflop line of a chart, e.g. ["BTN", "2.5bb", "BB"]. */
+function lineTokens(s: GtoScenario): string[] {
+  return (s.preflop_line ?? '').trim().split(/\s+/).filter(Boolean);
 }
 
-/** Find the best chart in `scenarios` matching (folder, position, scenario,
- *  effective_bb). Tries the scenario candidates in order; first folder+position
- *  hit with the best stack match wins. */
-function findBestChart(
+/** Find the chart in `scenarios` for (folder, scenario type, hero) whose
+ *  preflop line passes `lineOk`, with the closest stack depth.
+ *
+ *  2026-10-07 audit: the line decides. Matching on the hero's seat alone
+ *  picked the first chart of the folder — BB's defence vs an UTG open for a
+ *  BTN-vs-BB pot, or a multiway line ("CO 2.5bb BTN Call BB"). */
+function findChart(
   scenarios: GtoScenario[],
   folderPath: string,                  // e.g. "cash/6max_100bb"
-  position: string,                    // hero_position to match
-  scenarioRanking: string[],
+  scenarioType: string,
+  hero: string,
+  lineOk: (tokens: string[]) => boolean,
   effectiveBB: number | null,
 ): GtoScenario | null {
-  const inFolder = scenarios.filter(s =>
+  const pool = scenarios.filter(s =>
     chartFolder(s) === folderPath &&
-    s.hero_position === position
+    s.scenario_type === scenarioType &&
+    s.hero_position === hero &&
+    lineOk(lineTokens(s)),
   );
-  if (inFolder.length === 0) return null;
-
-  const stackPick = (pool: GtoScenario[]): GtoScenario | null => {
-    if (pool.length === 0) return null;
-    if (effectiveBB != null) {
-      const exact = pool.filter(s => s.effective_bb === effectiveBB);
-      if (exact.length) return exact[0];
-      const pinned = pool.filter(s => s.effective_bb != null);
-      if (pinned.length) {
-        pinned.sort((a, b) =>
-          Math.abs((a.effective_bb ?? 0) - effectiveBB) -
-          Math.abs((b.effective_bb ?? 0) - effectiveBB),
-        );
-        return pinned[0];
-      }
+  if (pool.length === 0) return null;
+  if (effectiveBB != null) {
+    const exact = pool.filter(s => s.effective_bb === effectiveBB);
+    if (exact.length) return exact[0];
+    const pinned = pool.filter(s => s.effective_bb != null);
+    if (pinned.length) {
+      pinned.sort((a, b) =>
+        Math.abs((a.effective_bb ?? 0) - effectiveBB) -
+        Math.abs((b.effective_bb ?? 0) - effectiveBB),
+      );
+      return pinned[0];
     }
-    const stackless = pool.filter(s => s.effective_bb == null);
-    return (stackless[0] ?? pool[0]);
-  };
-
-  // Try each scenario candidate in order; pick from the first that has
-  // any chart matching folder+position.
-  for (const sc of scenarioRanking) {
-    const filtered = inFolder.filter(s => s.scenario_type === sc);
-    const hit = stackPick(filtered);
-    if (hit) return hit;
   }
-  // Last resort: any chart for folder+position regardless of scenario.
-  return stackPick(inFolder);
+  return pool.find(s => s.effective_bb == null) ?? pool[0];
+}
+
+/** Per-label weights of the chart's actions that pass `pick` (summed). The
+ *  charts hold each hand's frequencies AT this decision (they sum to 1 over
+ *  the actions for every hand that gets there). */
+function actionWeights(chart: GtoChart, pick: (action: string) => boolean): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const action of chart.actions) {
+    if (!pick(action)) continue;
+    for (const [label, f] of Object.entries(parseRange(chart.ranges[action] ?? ''))) {
+      out[label] = (out[label] ?? 0) + f;
+    }
+  }
+  return out;
+}
+
+const isRaise = (a: string) => /^raise/i.test(a);      // opens, 3-bets (not all-ins)
+const isCall = (a: string) => /^call$/i.test(a);
+
+function toRangeString(weights: Record<string, number>): string {
+  return Object.entries(weights)
+    .filter(([, f]) => f > 0.001)
+    .map(([label, f]) => `${label}:${Math.min(1, f).toFixed(3)}`)
+    .join(',');
 }
 
 export function useGtoAutoRange(
@@ -155,57 +146,69 @@ export function useGtoAutoRange(
     const folderPath = `${gameContext.gameType.toLowerCase()}/${gameContext.scenarioType}`;
     const potType = matchup.potType;  // "SRP" | "3BET"
 
-    const { opener } = preflopRoles(matchup);
-    const roleOf = (p: Position): 'opener' | 'responder' =>
-      p === opener ? 'opener' : 'responder';
-
-    const ipChart  = findBestChart(
-      scenarios, folderPath, matchup.ip,
-      scenarioCandidates(potType, roleOf(matchup.ip)), gameContext.effectiveBB,
-    );
-    const oopChart = findBestChart(
-      scenarios, folderPath, matchup.oop,
-      scenarioCandidates(potType, roleOf(matchup.oop)), gameContext.effectiveBB,
-    );
-
-    const newApplied: AppliedGtoRange[] = [];
+    const { opener, responder } = preflopRoles(matchup);
+    const bb = gameContext.effectiveBB;
+    // Heads-up lines: "<opener>" / "<opener> <open> <responder>" /
+    // "<opener> <open> <responder> <3-bet> <opener>".
+    const rfi = findChart(scenarios, folderPath, 'RFI', opener,
+      t => t.length === 1 && t[0] === opener, bb);
+    const vsOpen = findChart(scenarios, folderPath, 'vs_Open', responder,
+      t => t.length === 3 && t[0] === opener && t[2] === responder, bb);
+    const vs3b = potType === '3BET'
+      ? findChart(scenarios, folderPath, 'vs_3B', opener,
+          t => t.length === 5 && t[0] === opener && t[2] === responder && t[4] === opener, bb)
+      : null;
 
     (async () => {
       const { invoke } = await import('@tauri-apps/api/core');
-      // Fetch + apply IP chart.
-      if (ipChart) {
+      const load = async (sc: GtoScenario | null) => {
+        if (!sc) return null;
         try {
-          const chart = await invoke<GtoChart>('load_gto_chart', { id: ipChart.id });
-          const rangeStr = chartToInRange(chart);
-          if (rangeStr) {
-            setCustomIpRange(rangeStr);
-            newApplied.push({
-              side: 'IP', position: matchup.ip,
-              scenarioId: chart.id, description: chart.context.description,
-            });
-          }
-        } catch {/* skip */}
+          return await invoke<GtoChart>('load_gto_chart', { id: sc.id });
+        } catch {
+          return null;
+        }
+      };
+      const [rfiChart, vsOpenChart, vs3bChart] = await Promise.all([load(rfi), load(vsOpen), load(vs3b)]);
+
+      // Each player's flop range: their own action frequencies along the
+      // preflop line, multiplied. SRP: the open; the call of it. 3BP: the
+      // 3-bet; the open times the call of the 3-bet. (All non-fold actions
+      // used to be merged: AA and the other 3-bets sat in BB's flatting
+      // range of a single-raised pot.)
+      let openerRange: string | null = null;
+      let responderRange: string | null = null;
+      let openerChart: GtoChart | null = null;
+      let responderChart: GtoChart | null = null;
+      if (potType === 'SRP') {
+        if (rfiChart) { openerRange = toRangeString(actionWeights(rfiChart, isRaise)); openerChart = rfiChart; }
+        if (vsOpenChart) { responderRange = toRangeString(actionWeights(vsOpenChart, isCall)); responderChart = vsOpenChart; }
       } else {
-        // No GTO match — keep matchup's hardcoded default by setting null.
-        setCustomIpRange(null);
+        if (vsOpenChart) { responderRange = toRangeString(actionWeights(vsOpenChart, isRaise)); responderChart = vsOpenChart; }
+        if (rfiChart && vs3bChart) {
+          const open = actionWeights(rfiChart, isRaise);
+          const call = actionWeights(vs3bChart, isCall);
+          const joint: Record<string, number> = {};
+          for (const [label, f] of Object.entries(call)) joint[label] = f * (open[label] ?? 0);
+          openerRange = toRangeString(joint);
+          openerChart = vs3bChart;
+        }
       }
 
-      if (oopChart) {
-        try {
-          const chart = await invoke<GtoChart>('load_gto_chart', { id: oopChart.id });
-          const rangeStr = chartToInRange(chart);
-          if (rangeStr) {
-            setCustomOopRange(rangeStr);
-            newApplied.push({
-              side: 'OOP', position: matchup.oop,
-              scenarioId: chart.id, description: chart.context.description,
-            });
-          }
-        } catch {/* skip */}
-      } else {
-        setCustomOopRange(null);
-      }
-
+      const newApplied: AppliedGtoRange[] = [];
+      const apply = (pos: Position, range: string | null, chart: GtoChart | null) => {
+        const side: 'IP' | 'OOP' = pos === matchup.ip ? 'IP' : 'OOP';
+        const set = side === 'IP' ? setCustomIpRange : setCustomOopRange;
+        if (range && chart) {
+          set(range);
+          newApplied.push({ side, position: pos, scenarioId: chart.id, description: chart.context.description });
+        } else {
+          // No chart for this line — keep the matchup's hardcoded default.
+          set(null);
+        }
+      };
+      apply(opener, openerRange, openerChart);
+      apply(responder, responderRange, responderChart);
       setApplied(newApplied);
     })();
   }, [matchup, gameContext, scenarios, setCustomIpRange, setCustomOopRange]);
@@ -218,21 +221,4 @@ export function useGtoAutoRange(
   }, []);
 
   return { applied, clearApplied };
-}
-
-/** Combine all non-fold actions in a chart into a single in-range string.
- *  Mirrors the helper in GtoChartBrowser but available standalone here. */
-function chartToInRange(chart: GtoChart): string {
-  const merged: Record<string, number> = {};
-  for (const action of chart.actions) {
-    if (/fold/i.test(action)) continue;
-    const parsed = parseRange(chart.ranges[action] ?? '');
-    for (const [combo, f] of Object.entries(parsed)) {
-      merged[combo] = (merged[combo] ?? 0) + f;
-    }
-  }
-  return Object.entries(merged)
-    .filter(([, f]) => f > 0.001)
-    .map(([combo, f]) => `${combo}:${Math.min(1, f).toFixed(3)}`)
-    .join(',');
 }

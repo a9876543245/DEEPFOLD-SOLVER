@@ -31,7 +31,9 @@ endif()
 
 # Budgets pinned so neither the default 6 GiB host budget (the estimate peaks
 # at 5.5) nor the free-VRAM probe can collapse the tree under the test.
-set(SPOT --pot 100 --stack 500 --board AsKsQs
+# --iso fast: the calibrated fixture is the merged-class monotone tree (exact
+# isomorphism keeps 3x the lanes on a monotone flop and collapses here).
+set(SPOT --pot 100 --stack 500 --board AsKsQs --iso fast
     --flop-sizes 0.33,0.75 --turn-sizes 0.33,0.75 --river-sizes 0.33,0.75
     --backend gpu --gpu-memory-mb 24000 --host-memory-mb 16000
     --exploitability 0 --postsolve none --no-strategy-tree --no-progress)

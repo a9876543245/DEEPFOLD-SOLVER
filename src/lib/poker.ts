@@ -85,8 +85,9 @@ export interface SolverRequest {
   node_locks?: string;
   /** Hero's range — used to filter the range grid display */
   hero_range?: string;
-  /** Action path for game tree navigation */
-  action_path?: import('../lib/gameTree').ActionStep[];
+  /** 2026-10-07: with target_combo, the player whose range the hand joins
+   *  (small weight where the range leaves it out) so it gets a real strategy. */
+  target_player?: 'oop' | 'ip';
   /** Execution backend: 'auto' | 'cpu' | 'gpu'. Defaults to 'auto'. */
   backend?: string;
   /** OOP has initiative at the root flop node (can bet). Defaults to true.
@@ -103,6 +104,14 @@ export interface SolverRequest {
   flop_sizes?: number[];
   turn_sizes?: number[];
   river_sizes?: number[];
+  /** 2026-10-06: Pio-style menus — `specToEngineJson(BetSizingSpec)`.
+   *  Overrides flop/turn/river_sizes. */
+  bet_sizing?: string;
+  /** 'exact' (default, Pio-style) | 'fast' suit isomorphism. */
+  iso?: 'exact' | 'fast';
+  /** Keep the solve in memory (engine --serve) so node / range queries
+   *  (`query_node`, `query_ranges`) never re-solve. */
+  serve?: boolean;
 
   // ---- Sprint 3 (resource policy guide): memory budget controls ----
   /** Preset: "safe" | "balanced" | "performance". Default "balanced".
@@ -226,6 +235,14 @@ export interface ComboAnalysis {
 
 export interface SolverResponse {
   status: string;
+  /** 2026-10-06: the solve stays in memory and answers `query_node` /
+   *  `query_ranges` with this id (Tauri only; up to 3 are kept). */
+  session?: boolean;
+  session_id?: number;
+  /** The shown node: pot, stacks, to-call, actions with amounts. */
+  node?: EngineNodeInfo;
+  /** "exact" | "fast" suit isomorphism the solve used. */
+  isomorphism?: string;
   iterations_run: number;
   exploitability_pct: number;
   /** v1.3.0: which stop condition ended the solve. Empty when the engine
@@ -252,7 +269,7 @@ export interface SolverResponse {
    *  of "what hands does the opponent have here". */
   opponent_range?: Record<string, number>;
   /** Per-grid-label EV at the currently-displayed node (chips, acting view).
-   *  Mirrors the field in cache entry — `useSolver.navigate` copies it up. */
+   *  Mirrors the field in the cache entry of the node shown. */
   combo_evs?: Record<string, number>;
   /** Route A navigation cache: history-path -> per-node strategy bundle.
    *  Lets the UI navigate within an already-solved tree without re-invoking
@@ -262,7 +279,7 @@ export interface SolverResponse {
   strategy_tree?: Record<string, StrategyTreeEntry>;
   /** Path B: cumulative dealt cards from root via this path's chance jumps,
    *  for the CURRENTLY-DISPLAYED node. Empty pre-chance. Mirrors the field
-   *  in the cache entry — `useSolver.navigate()` copies it to the top level
+   *  in the cache entry — copied to the top level for the node shown
    *  so the UI can read it without descending into strategy_tree. */
   dealt_cards?: string[];
   /** Path B: canonical runout reps available at the immediate prior chance,
@@ -389,9 +406,9 @@ export interface DecomposeEstimate {
 export type EarlyStopReason = 'iter_cap' | 'time_budget' | 'exploit_target' | '';
 
 /** One entry in `strategy_tree`. Mirrors the per-node fields the UI reads
- *  from SolverResponse. Lets `useSolver.navigate(history)` synthesize a
+ *  from SolverResponse. Lets the UI (useTreeNav) synthesize a
  *  fresh response from cache without an engine round-trip. */
-export interface StrategyTreeEntry {
+export interface StrategyTreeEntry extends Partial<EngineNodeInfo> {
   acting: 'OOP' | 'IP';
   action_labels: string[];
   global_strategy: Record<string, string>;
@@ -415,6 +432,50 @@ export interface StrategyTreeEntry {
 export interface RunoutOption {
   card: string;     // "2c", "As", etc.
   weight: number;   // orbit size
+}
+
+/** 2026-10-06: the engine's view of a node (Solver::NodeInfo) — the UI
+ *  never re-derives the betting tree. Strategy-tree entries carry these
+ *  fields too, as do `query_node` replies (plus the node's strategies). */
+export type EngineNodeKind = 'player' | 'chance' | 'terminal';
+export type EngineActionType = 'fold' | 'check' | 'call' | 'bet' | 'raise' | 'allin';
+
+export interface EngineAction {
+  /** Engine label, e.g. "Bet_75" — what histories and locks use. */
+  label: string;
+  type: EngineActionType;
+  /** Chips this action puts in. */
+  amount: number;
+  /** The actor's street total afterwards. */
+  raise_to: number;
+  /** What the action leads to. */
+  next: EngineNodeKind;
+}
+
+export interface EngineNodeInfo {
+  kind: EngineNodeKind;
+  /** 0 flop, 1 turn, 2 river. */
+  street: number;
+  pot: number;
+  stack_oop: number;
+  stack_ip: number;
+  to_call: number;
+  board: string[];
+  terminal?: 'fold_oop' | 'fold_ip' | 'showdown';
+  actions: EngineAction[];
+  /** Chance nodes: the runout cards (canonical); empty when the solve
+   *  collapsed the runouts (turn/river approximated). */
+  runouts: RunoutOption[];
+}
+
+/** A node as the UI shows it: engine info + (player nodes) strategies. */
+export interface NodeView extends EngineNodeInfo {
+  acting?: 'OOP' | 'IP';
+  global_strategy?: Record<string, string>;
+  combo_strategies?: Record<string, ComboStrategy>;
+  opponent_side?: 'OOP' | 'IP';
+  opponent_range?: Record<string, number>;
+  combo_evs?: Record<string, number>;
 }
 
 /** Context that scopes which preflop chart is used as the default IP/OOP

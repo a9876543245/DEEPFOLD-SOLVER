@@ -1,20 +1,25 @@
-import React from 'react';
-import type { GameTreeNode, GameAction } from '../lib/gameTree';
-import { getActionColor } from '../lib/poker';
+import type { EngineAction, NodeView } from '../lib/poker';
 import { useT } from '../lib/i18n';
 
 interface Props {
-  node: GameTreeNode;
-  onAction: (action: GameAction) => void;
+  /** The node shown (engine NodeInfo). */
+  view: NodeView;
+  onAction: (action: EngineAction) => void;
   loading: boolean;
 }
 
 /** Format internal chip amount as BB for display. 1 BB = 10 chips (same
  *  convention as MATCHUPS / derivePotStack). Trims trailing .0 so whole
  *  values like 22 BB show as "22" instead of "22.0". */
-function toBB(chips: number): string {
+export function toBB(chips: number): string {
   const v = chips / 10;
   return Number.isInteger(v) ? String(v) : v.toFixed(1);
+}
+
+/** "Bet_75" → "Bet 75%", "Raise_150" → "Raise 150%"; others unchanged. */
+export function prettyAction(label: string): string {
+  const m = /^(Bet|Raise)_(.+)$/.exec(label);
+  return m ? `${m[1]} ${m[2]}%` : label;
 }
 
 /** Map action types to display colors */
@@ -27,20 +32,18 @@ const ACTION_TYPE_COLORS: Record<string, string> = {
   allin: '#FF9F0A',
 };
 
-/**
- * ActionBar — clickable action buttons displayed below the range grid.
- *
- * Shows available actions at the current game tree node.
- * OOP actions: Check / Bet 33% / Bet 75% / All-in
- * Facing bet:  Fold / Call / Raise 3x / All-in
- */
-export function ActionBar({ node, onAction, loading }: Props) {
-  const t = useT();
-  if (node.isTerminal || node.actions.length === 0) {
-    // Terminal node — show result
-    const lastStep = node.path[node.path.length - 1];
-    const isFold = lastStep?.action.type === 'fold';
+const STREET_NAMES = ['flop', 'turn', 'river'] as const;
+const STREET_COLORS = ['#30D158', '#FF9F0A', '#FF453A'];
 
+/**
+ * ActionBar — the actions of the node shown, exactly as the engine solved
+ * them (labels, amounts, what each leads to), below the range grid.
+ */
+export function ActionBar({ view, onAction, loading }: Props) {
+  const t = useT();
+  if (view.kind === 'terminal') {
+    const fold = view.terminal === 'fold_oop' || view.terminal === 'fold_ip';
+    const folder = view.terminal === 'fold_oop' ? 'OOP' : 'IP';
     return (
       <div style={{
         padding: '14px 20px',
@@ -51,24 +54,28 @@ export function ActionBar({ node, onAction, loading }: Props) {
         textAlign: 'center',
       }}>
         <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-secondary)' }}>
-          {isFold ? (
+          {fold ? (
             <>
-              <span style={{ color: ACTION_TYPE_COLORS.fold }}>
-                {lastStep.player}
-              </span>{' '}
-              {t('action.folds')} — {lastStep.player === 'OOP' ? 'IP' : 'OOP'} {t('action.wins')}{' '}
+              <span style={{ color: ACTION_TYPE_COLORS.fold }}>{folder}</span>{' '}
+              {t('action.folds')} — {folder === 'OOP' ? 'IP' : 'OOP'} {t('action.wins')}{' '}
               <span className="text-mono" style={{ color: 'var(--color-green)' }}>
-                {toBB(node.pot)} BB
+                {toBB(view.pot)} BB
               </span>
             </>
           ) : (
-            <span style={{ color: 'var(--color-green)' }}>{t('action.showdown')}</span>
+            <span style={{ color: 'var(--color-green)' }}>
+              {t('action.showdown')}{' '}
+              <span className="text-mono">({toBB(view.pot)} BB)</span>
+            </span>
           )}
         </div>
       </div>
     );
   }
 
+  const street = STREET_NAMES[Math.min(2, view.street)] ?? 'flop';
+  const streetColor = STREET_COLORS[Math.min(2, view.street)] ?? STREET_COLORS[0];
+  const acting = view.acting ?? 'OOP';
   return (
     <div style={{
       padding: '12px 16px',
@@ -80,56 +87,64 @@ export function ActionBar({ node, onAction, loading }: Props) {
       {/* Node context header */}
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        marginBottom: 10,
+        marginBottom: 10, flexWrap: 'wrap', gap: 8,
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          {/* Street badge */}
           <span style={{
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
             padding: '2px 7px', borderRadius: 4,
-            background: node.street === 'flop' ? 'rgba(48,209,88,0.15)'
-              : node.street === 'turn' ? 'rgba(255,159,10,0.15)'
-              : 'rgba(255,69,58,0.15)',
-            color: node.street === 'flop' ? '#30D158'
-              : node.street === 'turn' ? '#FF9F0A'
-              : '#FF453A',
+            background: `${streetColor}26`, color: streetColor,
             fontSize: 10, fontWeight: 700, textTransform: 'uppercase',
             letterSpacing: '0.5px',
           }}>
-            {node.street === 'flop' ? t('board.flop') : node.street === 'turn' ? t('board.turn') : t('board.river')}
+            {t(`board.${street}`)}
           </span>
           <span style={{
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
             padding: '2px 8px', borderRadius: 4,
-            background: node.activePlayer === 'OOP' ? 'rgba(10,132,255,0.2)' : 'rgba(191,90,242,0.2)',
-            color: node.activePlayer === 'OOP' ? 'var(--color-accent)' : 'var(--color-purple)',
+            background: acting === 'OOP' ? 'rgba(10,132,255,0.2)' : 'rgba(191,90,242,0.2)',
+            color: acting === 'OOP' ? 'var(--color-accent)' : 'var(--color-purple)',
             fontSize: 11, fontWeight: 700,
           }}>
-            {node.activePlayer}
+            {acting}
           </span>
           <span style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>
-            {node.awaitingDeal ? t('action.awaitDeal') : t('action.toAct')}
+            {t('action.toAct')}
           </span>
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>
-            Pot: <span className="text-mono" style={{ color: 'var(--color-green)', fontWeight: 600 }}>{toBB(node.pot)} BB</span>
+            Pot: <span className="text-mono" style={{ color: 'var(--color-green)', fontWeight: 600 }}>{toBB(view.pot)} BB</span>
           </div>
+          {view.to_call > 0 && (
+            <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>
+              {t('action.toCall')}: <span className="text-mono" style={{ fontWeight: 600 }}>{toBB(view.to_call)} BB</span>
+            </div>
+          )}
+          {/* Each player's own stack: they differ while a bet is pending. */}
           <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>
-            Stack: <span className="text-mono" style={{ fontWeight: 600 }}>{toBB(node.effectiveStack)} BB</span>
+            OOP <span className="text-mono" style={{ fontWeight: 600 }}>{toBB(view.stack_oop)}</span>
+            {' / '}
+            IP <span className="text-mono" style={{ fontWeight: 600 }}>{toBB(view.stack_ip)}</span> BB
           </div>
         </div>
       </div>
 
+      {view.actions.length === 0 && (
+        <div style={{ fontSize: 12, color: 'var(--color-text-tertiary)' }}>
+          {t('action.solveToExplore')}
+        </div>
+      )}
+
       {/* Action buttons */}
-      <div style={{
-        display: 'flex', gap: 6, flexWrap: 'wrap',
-      }}>
-        {node.actions.map((action, idx) => {
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+        {view.actions.map((action, idx) => {
           const color = ACTION_TYPE_COLORS[action.type] || '#8E8E93';
           const isFold = action.type === 'fold';
-
+          // Bets and raises show the street total they make (raise TO),
+          // calls and all-ins the chips they put in.
+          const shown = action.type === 'bet' || action.type === 'raise' ? action.raise_to : action.amount;
           return (
             <button
               key={action.label}
@@ -142,9 +157,7 @@ export function ActionBar({ node, onAction, loading }: Props) {
                 justifyContent: 'center',
                 gap: 6,
                 padding: '10px 16px',
-                background: isFold
-                  ? 'rgba(99,99,102,0.15)'
-                  : `${color}18`,
+                background: isFold ? 'rgba(99,99,102,0.15)' : `${color}18`,
                 border: `1.5px solid ${color}50`,
                 borderRadius: 8,
                 cursor: loading ? 'wait' : 'pointer',
@@ -176,7 +189,6 @@ export function ActionBar({ node, onAction, loading }: Props) {
                   {idx + 1}
                 </span>
               )}
-              {/* Action icon */}
               <span style={{ fontSize: 12, color }}>
                 {action.type === 'check' ? '✓' :
                  action.type === 'bet' ? '↑' :
@@ -185,20 +197,15 @@ export function ActionBar({ node, onAction, loading }: Props) {
                  action.type === 'fold' ? '✕' :
                  '★'}
               </span>
-              {/* Label */}
-              <span style={{
-                fontSize: 12, fontWeight: 600,
-                color,
-              }}>
-                {action.label}
+              <span style={{ fontSize: 12, fontWeight: 600, color }}>
+                {prettyAction(action.label)}
               </span>
-              {/* Amount — displayed in BB, not chips */}
-              {action.amount !== undefined && action.type !== 'allin' && (
+              {shown > 0 && (
                 <span className="text-mono" style={{
                   fontSize: 10, fontWeight: 500,
                   color: 'var(--color-text-tertiary)',
                 }}>
-                  ({toBB(action.amount)} BB)
+                  ({toBB(shown)} BB)
                 </span>
               )}
             </button>

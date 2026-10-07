@@ -460,6 +460,8 @@ static void run_iso_rank_blocker_spot(const IsoRbSpot& sp,
         // STANDARD: cross-backend match holds under float-order changes.
         // (POSTFLOP is float-sensitive early -- see the pin note above.)
         sc.dcfr_schedule = SolverConfig::DcfrSchedule::STANDARD;
+        // Merged suit classes are what the iso kernels under test serve.
+        sc.iso_mode = IsoMode::Fast;
         if (host_budget_bytes > 0) {
             sc.memory_budget.host_bytes = host_budget_bytes;
         }

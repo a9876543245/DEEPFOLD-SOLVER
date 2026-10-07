@@ -31,6 +31,19 @@
 #include <cstdint>
 #include <cstring>
 
+namespace deepsolver {
+
+/// 2026-10-06 audit: the smallest positive-regret sum whose reciprocal is
+/// finite (FLT_MIN). Regret matching took 1/sum whenever sum > 0; a denormal
+/// sum (reachable once a player's reach falls below ~1e-38) gave 1/sum = inf,
+/// 0·inf = NaN, and the NaN then spread through every value of the solve.
+/// Below this a row falls back to uniform, exactly like a zero sum. Every
+/// regret-matching site (CPU kernels, both CPU backends, the decomposition
+/// trunk, the CUDA kernels) compares against this one value.
+constexpr float kMinRegretSum = 1.17549435e-38f;
+
+}  // namespace deepsolver
+
 namespace deepsolver::cpu_simd {
 
 // ---------------------------------------------------------------------------

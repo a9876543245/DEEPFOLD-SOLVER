@@ -102,6 +102,11 @@ public:
     void iterate(int iteration) override;
     void finalize() override;
     const std::vector<std::vector<float>>& strategy() const override { return strategy_; }
+    std::vector<std::vector<float>> take_strategy() override {
+        std::vector<std::vector<float>> out = std::move(strategy_);
+        strategy_.clear();
+        return out;
+    }
     const char* name() const override {
         return (cpu_simd::active_mode() == cpu_simd::SimdMode::Avx2)
             ? "CPU-Levelized-AVX2"
@@ -779,6 +784,13 @@ private:
                 strat + run.start,
                 run.count);
         }
+    }
+    /// out[c] += src[map[c]] for c < nc — one other member of a merged
+    /// runout orbit (exact isomorphism; see build_runout_class_maps).
+    inline void gather_add_lanes(float* out, const float* src, uint32_t map) const {
+        const uint16_t nc = ctx_.iso->num_canonical;
+        const uint16_t* m = ctx_.runout_maps->maps.data() + static_cast<std::size_t>(map) * nc;
+        for (uint16_t c = 0; c < nc; ++c) out[c] += src[m[c]];
     }
     inline void sparse_set_zero(float* dst, int player) const {
         if (use_active_runs_for_player(player)) {
@@ -1588,7 +1600,7 @@ inline void LevelizedCpuBackend::derive_strategy_row(
                 const uint16_t end =
                     static_cast<uint16_t>(block.start + block.count);
                 for (uint16_t c = block.start; c < end; ++c) {
-                    if (pos_sum_scratch[c] > 0.0f) {
+                    if (pos_sum_scratch[c] >= kMinRegretSum) {
                         inv_pos_sum_scratch[c] =
                             1.0f / pos_sum_scratch[c];
                         uniform_or_zero_scratch[c] = 0.0f;
@@ -1621,7 +1633,7 @@ inline void LevelizedCpuBackend::derive_strategy_row(
                         regret_base[static_cast<std::size_t>(a) * stride + c];
                     if (r > 0.0f) pos_sum += r;
                 }
-                if (pos_sum > 0.0f) {
+                if (pos_sum >= kMinRegretSum) {
                     const float inv = 1.0f / pos_sum;
                     for (uint8_t a = 0; a < na; ++a) {
                         const float r =
@@ -1665,7 +1677,7 @@ inline void LevelizedCpuBackend::derive_strategy_row(
                 }
 
                 for (std::size_t c = 0; c < stride; ++c) {
-                    if (pos_sum_scratch[c] > 0.0f) {
+                    if (pos_sum_scratch[c] >= kMinRegretSum) {
                         inv_pos_sum_scratch[c] = 1.0f / pos_sum_scratch[c];
                         uniform_or_zero_scratch[c] = 0.0f;
                     } else {
@@ -2797,19 +2809,24 @@ inline void LevelizedCpuBackend::backward_pass(int traverser, int iteration) {
                 uint32_t weight = (child < tree.runout_weight.size())
                                     ? tree.runout_weight[child] : 1;
                 if (weight == 0) weight = 1;
-                if (sparse_value) {
-                    sparse_axpy(
-                        out, static_cast<float>(weight),
-                        &value_[row_off(child)], traverser);
-                } else if (block_value) {
-                    block_axpy(
-                        out, static_cast<float>(weight),
-                        &value_[row_off(child)], traverser);
-                } else {
-                    cpu_simd::vec_axpy(
-                        out, static_cast<float>(weight),
-                        &value_[row_off(child)], row_stride_);
-                }
+                const float* src = &value_[row_off(child)];
+                for_runout_orbit(ctx_.runout_maps, child, weight,
+                    [&](float w) {
+                        if (sparse_value) {
+                            sparse_axpy(out, w, src, traverser);
+                        } else if (block_value) {
+                            block_axpy(out, w, src, traverser);
+                        } else {
+                            cpu_simd::vec_axpy(out, w, src, row_stride_);
+                        }
+                    },
+                    [&](uint32_t map) {
+                        // Ranges are symmetric under the runout group, so a
+                        // live lane's image is live: a full gather over the
+                        // nc lanes is exact for the sparse and block rows too
+                        // (their dead lanes are never read).
+                        gather_add_lanes(out, src, map);
+                    });
                 total_weight += weight;
             }
             if (total_weight > 0) {
@@ -2935,8 +2952,12 @@ inline void LevelizedCpuBackend::backward_pass(int traverser, int iteration) {
     };
 
 #if defined(_OPENMP)
+    // The batch path reads the dense category/valid tables; the A/B knob may
+    // only force it where they exist (2026-10-06 audit: a forced batch on a
+    // rank-blocker board read empty tables and crashed).
     const bool force_showdown_batch =
-        ctx_.config != nullptr && ctx_.config->cpu_showdown_batch;
+        ctx_.config != nullptr && ctx_.config->cpu_showdown_batch &&
+        ctx_.matchup_dense_materialized;
     const bool showdown_batch_shortcuts_clear =
         !use_rank_blocker_showdown_for_traverser(0)
         && !use_active_rank_blocker_showdown_for_traverser(0)
@@ -3493,8 +3514,15 @@ inline void LevelizedCpuBackend::dfs_visit(
                                 ? tree.runout_weight[child] : 1;
             if (weight == 0) weight = 1;
             const float* cv_k = cv + static_cast<std::size_t>(2) * k * S;
-            cpu_simd::vec_axpy(out_oop, static_cast<float>(weight), cv_k, S);
-            cpu_simd::vec_axpy(out_ip,  static_cast<float>(weight), cv_k + S, S);
+            for_runout_orbit(ctx_.runout_maps, child, weight,
+                [&](float w) {
+                    cpu_simd::vec_axpy(out_oop, w, cv_k, S);
+                    cpu_simd::vec_axpy(out_ip,  w, cv_k + S, S);
+                },
+                [&](uint32_t map) {
+                    gather_add_lanes(out_oop, cv_k, map);
+                    gather_add_lanes(out_ip,  cv_k + S, map);
+                });
             total_weight += weight;
         }
         if (total_weight > 0) {
@@ -3676,8 +3704,10 @@ inline void LevelizedCpuBackend::dfs_visit_alt(
             uint32_t weight = (child < tree.runout_weight.size())
                                 ? tree.runout_weight[child] : 1;
             if (weight == 0) weight = 1;
-            cpu_simd::vec_axpy(out, static_cast<float>(weight),
-                               cv + static_cast<std::size_t>(k) * S, S);
+            const float* cv_k = cv + static_cast<std::size_t>(k) * S;
+            for_runout_orbit(ctx_.runout_maps, child, weight,
+                [&](float w) { cpu_simd::vec_axpy(out, w, cv_k, S); },
+                [&](uint32_t map) { gather_add_lanes(out, cv_k, map); });
             total_weight += weight;
         }
         if (total_weight > 0) {
@@ -4086,7 +4116,7 @@ inline void LevelizedCpuBackend::finalize() {
             for (uint8_t a = 0; a < na; ++a) {
                 total += sum_base[static_cast<std::size_t>(a) * stride + c];
             }
-            if (total > 1e-7f) {
+            if (total >= kMinRegretSum) {
                 float inv = 1.0f / total;
                 for (uint8_t a = 0; a < na; ++a) {
                     strategy_[i][static_cast<std::size_t>(a) * nc + c] =
