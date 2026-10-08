@@ -9,15 +9,16 @@
  *
  * Usage:
  *   node scripts/compact-presolved.mjs                # compact all
- *   node scripts/compact-presolved.mjs --no-tree      # exclude strategy_tree
- *                                                     # (Tier A, ~50× smaller)
+ *   node scripts/compact-presolved.mjs --no-tree      # root strategy only (preview)
  *   node scripts/compact-presolved.mjs --in <dir>     # override input dir
  *   node scripts/compact-presolved.mjs --out <dir>    # override output dir
  *
- * Note from §3 of the plan: strategy_tree is 99.7% of the raw bytes. Stripping
- * everything else gains <1%. The real lever is `--no-tree` — exclude the tree
- * for "Tier A" preview-only bundles, ~50× smaller. Keep the tree for "Tier B"
- * fully-navigable bundles (default).
+ * Schema v2 (2026-10-07): a spot is a presolve PACK — every flop decision
+ * (`strategy_tree`, ~10-60 KB gzipped) and the exact ranges where each line
+ * ends the flop (`chance_ranges`), from which the app re-solves the turn and
+ * river locally. v1 shipped a 2000-node strategy tree the app never read
+ * (99.7% of the bytes). Raw files that are not packs (no chance_ranges:
+ * solved before bulk-presolve passed --flop-pack) are skipped.
  */
 
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
@@ -56,7 +57,7 @@ function parseArgs(argv) {
 
 const PKG = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8'));
 const SOLVER_VERSION = PKG.version;
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 // ----------------------------------------------------------------------------
 // Filename parsing — mirror the scheme in scripts/bulk-presolve.mjs:spotFilename
@@ -93,15 +94,20 @@ function buildBundledSpot(raw, parsed, includeTree) {
     iterations_run:    raw.iterations_run ?? 0,
     exploitability_pct: raw.exploitability_pct ?? null,
     early_stop_reason:  raw.early_stop_reason ?? null,
+    // Turn/river equity approximated in the solve (the UI warns), and the
+    // pot-percentage menus it was solved with (the turn re-solve uses them).
+    runout_approximated: !!raw.runout_approximated,
+    sizes:              raw.presolve_sizes ?? null,
     global_strategy:    raw.global_strategy ?? {},
     combo_strategies:   raw.combo_strategies ?? {},
     acting_player:      raw.acting_player ?? null,
     opponent_side:      raw.opponent_side ?? null,
     opponent_range:     raw.opponent_range ?? [],
   };
-  // Optional: include strategy_tree for full navigation. ~99.7% of bytes.
-  if (includeTree && raw.strategy_tree) {
+  // The flop pack: every flop decision + the exact ranges ending each line.
+  if (includeTree) {
     out.strategy_tree = raw.strategy_tree;
+    out.chance_ranges = raw.chance_ranges;
   }
   return out;
 }
@@ -150,6 +156,11 @@ function main() {
         ++skipped;
         continue;
       }
+      if (!raw.chance_ranges || !raw.strategy_tree) {
+        console.warn(`SKIP ${file} — not a presolve pack (re-solve it with the current bulk-presolve.mjs)`);
+        ++skipped;
+        continue;
+      }
       const bundled = buildBundledSpot(raw, parsed, args.includeTree);
       const json = JSON.stringify(bundled);
       const gz = gzipSync(json, { level: 9 });
@@ -175,7 +186,7 @@ function main() {
   console.log(`Total gz:     ${(totalGz/1024/1024).toFixed(1)} MB  (avg ${((totalGz/files.length)/1024).toFixed(0)} KB/spot)`);
   console.log(`Bundle slot:  500 MB target (per PRESOLVE_BUNDLE_PLAN §4)`);
   if (totalGz > 500 * 1024 * 1024) {
-    console.log(`              ${((totalGz - 500*1024*1024)/1024/1024).toFixed(0)} MB over budget — try --no-tree or smaller --max-tree-nodes upstream`);
+    console.log(`              ${((totalGz - 500*1024*1024)/1024/1024).toFixed(0)} MB over budget — try --no-tree`);
   } else {
     console.log(`              ${((500*1024*1024 - totalGz)/1024/1024).toFixed(0)} MB under budget`);
   }

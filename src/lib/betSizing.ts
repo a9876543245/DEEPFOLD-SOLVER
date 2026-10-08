@@ -50,7 +50,13 @@ export const SIZING_PRESETS: Record<SizingPresetKey, Record<StreetKey, number[]>
 export const MAX_SIZES_PER_MENU = 6;
 
 export function presetSpec(key: SizingPresetKey): BetSizingSpec {
-  const p = SIZING_PRESETS[key];
+  return listsSpec(SIZING_PRESETS[key]);
+}
+
+/** Pot-percentage lists per street as a spec (the engine's legacy
+ *  --flop-sizes derivation): presets, and the menus presolved spots were
+ *  solved with (their turn re-solve must use the same ones). */
+export function listsSpec(p: Record<StreetKey, number[]>): BetSizingSpec {
   const menu = (st: StreetKey, donk: boolean): StreetMenu => {
     const sizes = p[st].map(v => `${v}%`);
     return { bet: sizes, raise: [...sizes], donk: donk ? [...sizes] : [], allin: true };

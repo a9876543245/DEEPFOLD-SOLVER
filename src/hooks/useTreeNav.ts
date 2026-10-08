@@ -14,7 +14,7 @@
  */
 import { useCallback, useRef, useState } from 'react';
 import type {
-  EngineAction, NodeView, RunoutOption, SolverRequest, SolverResponse,
+  ChanceRanges, EngineAction, NodeView, RunoutOption, SolverRequest, SolverResponse,
 } from '../lib/poker';
 import { isTauri } from '../lib/tauriEnv';
 
@@ -43,6 +43,8 @@ export interface AwaitingCard {
   runouts: RunoutOption[];
   /** No card was solved here: dealing one re-solves the street. */
   collapsed: boolean;
+  /** A presolve pack ends here: the re-solve starts from its stored ranges. */
+  packed?: boolean;
 }
 
 type Solve = (request: SolverRequest) => Promise<SolverResponse | null>;
@@ -138,6 +140,9 @@ async function loadChance(seg: Segment, steps: LineStep[], street: 'turn' | 'riv
     const reply = await queryNode(seg.response.session_id!, historyOf(steps));
     if (reply.kind !== 'chance') return null;
     return { street, runouts: reply.runouts, collapsed: reply.runouts.length === 0 };
+  }
+  if (seg.response.chance_ranges?.[historyOf(steps)]) {
+    return { street, runouts: [], collapsed: true, packed: true };
   }
   return null;
 }
@@ -244,13 +249,14 @@ export function useTreeNav(solve: Solve) {
       commit(segs, next, node, null);
       return;
     }
-    if (!hasSession(seg)) {
+    const history = historyOf(steps.slice(seg.start));
+    const packed = seg.response.chance_ranges?.[history];
+    if (!packed && !hasSession(seg)) {
       throw new Error('Re-solving the next street needs the solve in memory — solve the spot again.');
     }
     const { invoke } = await import('@tauri-apps/api/core');
-    const ranges = await invoke<{
-      pot: number; stack: number; board: string; oop_has_initiative: boolean; oop: string; ip: string;
-    }>('query_ranges', { sessionId: seg.response.session_id, history: historyOf(steps.slice(seg.start)) });
+    const ranges = packed ?? await invoke<ChanceRanges>(
+      'query_ranges', { sessionId: seg.response.session_id, history });
     if (!ranges.oop || !ranges.ip) {
       throw new Error('One player never reaches this point of the line — there is nothing to re-solve.');
     }

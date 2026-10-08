@@ -125,6 +125,9 @@ struct CLIArgs {
     /// node / range queries on stdin (one JSON request per line; each reply
     /// and the initial result end with a kServeEnd line).
     bool serve = false;
+    /// 2026-10-07 (presolve packs): the strategy tree holds only the root
+    /// street's decisions (no node cap) and the output adds `chance_ranges`.
+    bool flop_pack = false;
 
     /// 2026-10-06: the app's process id. A watchdog thread ends this engine
     /// as soon as that process is gone, so a solve or session can never
@@ -285,6 +288,8 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.postsolve = "none";
         } else if (arg == "--no-progress") {
             args.no_progress = true;
+        } else if (arg == "--flop-pack") {
+            args.flop_pack = true;
         } else if (arg == "--serve") {
             args.serve = true;
         } else if (arg == "--parent-pid" && i + 1 < argc) {
@@ -454,6 +459,11 @@ Arguments:
   --force-cpu-postsolve    Skip the GPU postsolve fast path (CPU traversal)
   --gpu-postsolve          Re-enable GPU postsolve (default when supported)
   --no-strategy-tree       Omit the client navigation cache from JSON output
+  --flop-pack              Presolve bundles: the strategy tree holds every
+                           decision of the root street (no node cap) and the
+                           output adds "chance_ranges" - for each line that
+                           ends the street, the "ranges" reply of --serve
+                           (exact per-combo ranges, pot, stack, initiative)
   --no-strategy-tree-evs   Keep strategy tree but omit per-node EV cache
   --gpu-info               Print detected GPU info and exit
   --benchmark <preset>     Run a fixed scenario for perf tracking, emit benchmark JSON.
@@ -2384,6 +2394,10 @@ int main(int argc, char* argv[]) {
             config.has_custom_ranges = true;
         }
 
+        if (args.flop_pack && !args.emit_strategy_tree) {
+            throw std::invalid_argument("--flop-pack needs the strategy tree (drop --no-strategy-tree)");
+        }
+
         // --target-player: the target hand joins that player's range with a
         // small weight wherever the range leaves it out, so the solve plays it.
         if (!args.target_player.empty()) {
@@ -2752,6 +2766,7 @@ int main(int argc, char* argv[]) {
         // Benchmarks can disable this to avoid measuring large JSON output.
         std::map<std::string, deepsolver::Solver::StrategyTreeEntry> strategy_tree;
         const std::map<std::string, deepsolver::Solver::StrategyTreeEntry>* strategy_tree_ptr = nullptr;
+        std::vector<std::pair<std::string, uint32_t>> pack_chances;   // --flop-pack
         if (decomposed && args.emit_strategy_tree) {
             // Stitched trunk + per-turn-card subgames (built in the route above).
             strategy_tree = std::move(decomp.strategy_tree);
@@ -2785,9 +2800,13 @@ int main(int argc, char* argv[]) {
                 result.resources.strategy_tree_max_nodes > 0
                     ? result.resources.strategy_tree_max_nodes
                     : args.strategy_tree_max_nodes;
-            strategy_tree = solver.build_strategy_tree(
-                /*max_player_depth=*/8, ev_mode,
-                /*max_nodes=*/effective_max_nodes, &tree_truncated);
+            strategy_tree = args.flop_pack
+                ? solver.build_strategy_tree(
+                      /*max_player_depth=*/64, ev_mode, /*max_nodes=*/0,
+                      &tree_truncated, 0, &pack_chances)
+                : solver.build_strategy_tree(
+                      /*max_player_depth=*/8, ev_mode,
+                      /*max_nodes=*/effective_max_nodes, &tree_truncated);
             strategy_tree_ptr = &strategy_tree;
             result.resources.strategy_tree_emitted_nodes =
                 static_cast<uint32_t>(strategy_tree.size());
@@ -2977,6 +2996,18 @@ int main(int argc, char* argv[]) {
                     out_json.insert(pos + head.size(),
                         std::string("  \"session\": ") + (session ? "true" : "false") + ",\n");
                 }
+            }
+            if (!pack_chances.empty()) {
+                std::string ranges = "  \"chance_ranges\": {";
+                for (std::size_t i = 0; i < pack_chances.size(); ++i) {
+                    ranges += std::string(i ? ",\n    \"" : "\n    \"") +
+                              escape_json(pack_chances[i].first) + "\": " +
+                              ranges_json(solver, pack_chances[i].second, {0, 1, 2, 3});
+                }
+                ranges += "\n  },\n";
+                const std::string head = "\"status\": \"success\",\n";
+                const std::size_t pos = out_json.find(head);
+                if (pos != std::string::npos) out_json.insert(pos + head.size(), ranges);
             }
             // Review round 2: serializing a large strategy tree into the
             // ostringstream above IS a real host-memory phase — re-sample

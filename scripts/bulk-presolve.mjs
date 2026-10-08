@@ -18,6 +18,17 @@
  *   node scripts/bulk-presolve.mjs --gpu-memory-mb N  # fixed VRAM budget: the enumerate /
  *                                                     # collapse decision no longer depends
  *                                                     # on what else is using the card
+ *   node scripts/bulk-presolve.mjs --list             # print every planned spot
+ *   node scripts/bulk-presolve.mjs --only <file>      # solve only the spots named in <file>
+ *                                                     # (one filename per line: split the
+ *                                                     # work between machines)
+ *   node scripts/bulk-presolve.mjs --out <dir>        # write the raw solves to <dir>
+ *
+ * Each spot is a presolve PACK (engine --flop-pack): every flop decision plus
+ * the exact ranges at each line that ends the flop; the app re-solves the
+ * turn and river from those ranges on the user's machine. The flop needs the
+ * whole turn/river tree to be exact, so the menus are sized to enumerate on
+ * the presolve machine (PRESOLVE_MENUS below).
  *
  * Output:
  *   gto_output/presolved/raw/m<i>_b<j>_<sizing>_<stack>bb.json
@@ -52,7 +63,16 @@ const SIZINGS_TS   = join(REPO_ROOT, 'src/lib/betSizing.ts');
 const CUDA_EXE = resolve(REPO_ROOT, '..', 'DEEPFOLD-SOLVER', 'core', 'build', 'Release', 'deepsolver_core.exe');
 const CPU_EXE  = join(REPO_ROOT, 'core/build_cpu/Release/deepsolver_core.exe');
 
-const OUT_RAW_DIR = join(REPO_ROOT, 'gto_output/presolved/raw');
+const DEFAULT_RAW_DIR = join(REPO_ROOT, 'gto_output/presolved/raw');
+
+// Pot percentages per street, by pot type. 3-bet pots enumerate with the
+// app's Standard menu; a 100bb single-raised pot with Standard needs ~323 GB
+// (46M nodes), so it keeps the two flop sizes and one size on later streets
+// (6.1M nodes: ~41.5 GB host on the CPU, ~67 GB on a GPU).
+const PRESOLVE_MENUS = {
+  SRP:  { flop: [33, 75], turn: [75],     river: [75] },
+  '3BET': { flop: [33, 75], turn: [33, 75], river: [33, 75] },
+};
 
 // ============================================================================
 // Args
@@ -68,7 +88,11 @@ function parseArgs(argv) {
     hostMemoryMb: 0,         // >0: pass --host-memory-mb (bundle machine budget)
     gpuMemoryMb: 0,          // >0: pass --gpu-memory-mb (else the engine probes free VRAM)
     exe: '',                 // engine binary override
-    sizings: ['standard', 'lite'],
+    list: false,
+    only: null,              // Set of spot filenames, or null = all
+    outDir: DEFAULT_RAW_DIR,
+    // 'standard' = the pot type's presolve menu (the key the app loads).
+    sizings: ['standard'],
     stacksBb: ['default'],   // 'default' = use the matchup's defaultStack
     limit: 0,
     backend: 'auto',         // 'cuda' | 'cpu' | 'auto'
@@ -93,6 +117,11 @@ function parseArgs(argv) {
     else if (a === '--host-memory-mb') out.hostMemoryMb = parseInt(argv[++i], 10);
     else if (a === '--gpu-memory-mb') out.gpuMemoryMb = parseInt(argv[++i], 10);
     else if (a === '--exe')       out.exe = resolve(argv[++i]);
+    else if (a === '--list')      out.list = true;
+    else if (a === '--only') {
+      out.only = new Set(readFileSync(argv[++i], 'utf-8').split(/\r?\n/).map((l) => l.trim()).filter(Boolean));
+    }
+    else if (a === '--out')       out.outDir = resolve(argv[++i]);
     else if (a === '--shard') {
       const m = String(argv[++i]).match(/^(\d+)\/(\d+)$/);
       if (!m || Number(m[1]) >= Number(m[2])) throw new Error('--shard expects k/n with k < n');
@@ -178,6 +207,8 @@ function buildPlan() {
         if (!SIZING_PRESETS[sizingKey]) {
           throw new Error(`unknown sizing key: ${sizingKey}`);
         }
+        const sizes = sizingKey === 'standard' ? PRESOLVE_MENUS[m.potType] : SIZING_PRESETS[sizingKey];
+        if (!sizes) throw new Error(`no presolve menu for pot type ${m.potType}`);
         // For now: 'default' = use the matchup's own defaultStack.
         // Future: explicit '50' / '200' bb depths require adjusting pot too,
         // which means recomputing the SRP / 3BET pre-flop pot ratio. Out of
@@ -196,7 +227,7 @@ function buildPlan() {
             stack:    Math.round(effStackBb * 10),
             ipRange:  m.ipRange,
             oopRange: m.oopRange,
-            sizes:    SIZING_PRESETS[sizingKey],
+            sizes,
             // Metadata for the output filename + bundled JSON
             meta: {
               matchup_label: m.label,
@@ -256,6 +287,7 @@ function solveOne(exe, spot) {
       '--postsolve',     'full',
       '--strategy-tree-evs', 'visible',
       '--strategy-tree-max-nodes', String(args.maxTreeNodes),
+      '--flop-pack',
       '--backend',       (exe === CPU_EXE || args.backend === 'cpu') ? 'cpu' : 'cuda',
     ];
     if (args.hostMemoryMb > 0) cmdArgs.push('--host-memory-mb', String(args.hostMemoryMb));
@@ -292,8 +324,14 @@ async function main() {
   if (!existsSync(exe)) {
     throw new Error(`solver exe not found: ${exe}\nBuild with: cmake --build ../DEEPFOLD-SOLVER/core/build --config Release`);
   }
+  if (args.list) {
+    for (const spot of buildPlan()) {
+      console.log(`${spotFilename(spot)}\t${spot.meta.pot_type}\t${spot.meta.matchup_label}\t${spot.board}`);
+    }
+    return;
+  }
   console.log(`Solver:  ${exe}`);
-  console.log(`Output:  ${OUT_RAW_DIR}`);
+  console.log(`Output:  ${args.outDir}`);
   console.log(`Backend: ${args.backend}`);
   if (args.iterations > 0) {
     console.log(`Plan:    ${args.iterations} iter (override) × ${args.exploitability}% exploit target`);
@@ -315,8 +353,12 @@ async function main() {
     return;
   }
 
-  mkdirSync(OUT_RAW_DIR, { recursive: true });
+  mkdirSync(args.outDir, { recursive: true });
   let plan = buildPlan();
+  if (args.only) {
+    plan = plan.filter((spot) => args.only.has(spotFilename(spot)));
+    console.log(`--only: ${plan.length} of ${args.only.size} listed spots are in the plan`);
+  }
   if (args.shard) {
     // By board, not by spot: the plan alternates sizings, so `i % n` put
     // every standard spot in shard 0 and every lite spot in shard 1 (v3.0.0).
@@ -334,7 +376,7 @@ async function main() {
 
   for (const spot of plan) {
     const filename = spotFilename(spot);
-    const outPath  = join(OUT_RAW_DIR, filename);
+    const outPath  = join(args.outDir, filename);
     if (args.resume && existsSync(outPath) && statSync(outPath).size > 0) {
       ++skipped;
       ++done;
@@ -342,9 +384,10 @@ async function main() {
     }
     const tStart = Date.now();
     try {
-      const { stdout, parsed } = await solveOne(exe, spot);
-      // Write raw output. Phase 2 (compact-presolved.mjs) handles compression.
-      writeFileSync(outPath, stdout);
+      const { parsed } = await solveOne(exe, spot);
+      // Write raw output (plus the menu it was solved with, which the app
+      // needs for the turn re-solve). compact-presolved.mjs packs it.
+      writeFileSync(outPath, JSON.stringify({ ...parsed, presolve_sizes: spot.sizes }));
       const elapsed = (Date.now() - tStart) / 1000;
       const eta = computeEta(t0, ++done, plan.length);
       const exploit = parsed.exploitability_pct?.toFixed(2) ?? '?';
@@ -364,7 +407,7 @@ async function main() {
   console.log(`Failed:      ${failed}`);
 
   if (failures.length > 0) {
-    const failPath = join(OUT_RAW_DIR,
+    const failPath = join(args.outDir,
       args.shard ? `failures_${args.shard.k}of${args.shard.n}.log` : 'failures.log');
     writeFileSync(failPath, JSON.stringify(failures, null, 2));
     console.log(`Failures logged: ${failPath}`);

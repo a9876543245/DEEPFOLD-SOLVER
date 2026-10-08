@@ -19,7 +19,7 @@ import {
   expandComboLabel,
   RANK_VALUES,
 } from './poker';
-import type { ComboStrategy, SolverRequest, SolverResponse } from './poker';
+import type { ChanceRanges, ComboStrategy, SolverRequest, SolverResponse, StrategyTreeEntry } from './poker';
 import { MATCHUPS, parseRange } from './ranges';
 import type { PositionMatchup } from './ranges';
 
@@ -49,11 +49,18 @@ export interface PresolvedSpot {
   iterationsRun?: number;
   /** Final exploitability % for badge display. */
   exploitabilityPct?: number;
+  /** Bundled packs (schema v2): every flop decision, the exact ranges where
+   *  each line ends the flop (the turn re-solves from them), the menus the
+   *  spot was solved with, and whether its turn/river were approximated. */
+  strategyTree?: Record<string, StrategyTreeEntry>;
+  chanceRanges?: Record<string, ChanceRanges>;
+  sizes?: Record<'flop' | 'turn' | 'river', number[]>;
+  runoutApproximated?: boolean;
 }
 
 // ----------------------------------------------------------------------------
 // Bundled spot envelope (matches scripts/compact-presolved.mjs:buildBundledSpot
-// schema v1).
+// schema v2).
 // ----------------------------------------------------------------------------
 interface BundledSpot {
   v: number;                    // schema version
@@ -65,17 +72,20 @@ interface BundledSpot {
   iterations_run: number;
   exploitability_pct: number | null;
   early_stop_reason: string | null;
+  runout_approximated: boolean;
+  sizes: Record<'flop' | 'turn' | 'river', number[]> | null;
   global_strategy: Record<string, string>;
   combo_strategies: Record<string, ComboStrategy>;
   acting_player: number | null;
   opponent_side: string | null;
   opponent_range: string[];
-  strategy_tree?: Record<string, unknown>;  // Tier B only
+  strategy_tree?: Record<string, StrategyTreeEntry>;
+  chance_ranges?: Record<string, ChanceRanges>;
 }
 
 /** Schema version + app version the frontend expects. Mismatches → fall through
  *  to live solve so the UI never serves stale strategies after a solver bump. */
-const EXPECTED_SCHEMA_VERSION = 1;
+const EXPECTED_SCHEMA_VERSION = 2;
 import { APP_VERSION } from './appVersion';
 
 // ============================================================================
@@ -380,6 +390,10 @@ export async function tryLoadBundled(
     source: 'bundled',
     iterationsRun: bundled.iterations_run,
     exploitabilityPct: bundled.exploitability_pct ?? undefined,
+    strategyTree: bundled.strategy_tree,
+    chanceRanges: bundled.chance_ranges,
+    sizes: bundled.sizes ?? undefined,
+    runoutApproximated: bundled.runout_approximated,
   };
 }
 

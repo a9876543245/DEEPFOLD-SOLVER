@@ -277,6 +277,10 @@ export interface SolverResponse {
    *  history sent to the engine ("" = root, "Check,Bet_75" = OOP checks
    *  then IP bets 75% pot). Populated on every solve. */
   strategy_tree?: Record<string, StrategyTreeEntry>;
+  /** 2026-10-07 presolve packs (engine --flop-pack): the exact ranges where
+   *  each line ends the street, keyed by its history — what `query_ranges`
+   *  answers on a kept solve, so the next street re-solves without one. */
+  chance_ranges?: Record<string, ChanceRanges>;
   /** Path B: cumulative dealt cards from root via this path's chance jumps,
    *  for the CURRENTLY-DISPLAYED node. Empty pre-chance. Mirrors the field
    *  in the cache entry — copied to the top level for the node shown
@@ -426,6 +430,18 @@ export interface StrategyTreeEntry extends Partial<EngineNodeInfo> {
    *  Empty when no chance preceded this node. Powers the runout-picker UI.
    *  The currently-active runout is the last entry of `dealt_cards`. */
   runout_options?: RunoutOption[];
+}
+
+/** Exact ranges at a chance node, for re-solving the next street: the
+ *  engine's `ranges` reply (query_ranges / --flop-pack). */
+export interface ChanceRanges {
+  pot: number;
+  stack: number;
+  board: string;
+  oop_has_initiative: boolean;
+  /** "AsKs:0.5,..." per-combo weights. */
+  oop: string;
+  ip: string;
 }
 
 /** One canonical runout option for the Path B runout-picker UI. */

@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>

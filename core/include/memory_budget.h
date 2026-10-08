@@ -248,6 +248,19 @@ inline uint64_t gpu_value_regions(bool alternating_updates) {
     return alternating_updates ? 1 : kGpuValueRegions;
 }
 
+/// 2026-10-08: the largest solver state GpuBackend allocates. An explicit
+/// --gpu-memory-mb budget was already checked against the device TOTAL by the
+/// solver's gates, so only an allocator margin stays below free VRAM; the
+/// flat 80% used to reject budgets the gates had accepted (65-70 GB states on
+/// an 80 GB A100 with a 76 GB budget). Without a budget: 80% of free VRAM.
+inline uint64_t gpu_state_alloc_cap(uint64_t budget_bytes, uint64_t free_bytes) {
+    constexpr uint64_t kMargin = 512ULL << 20;
+    if (budget_bytes == 0) {
+        return static_cast<uint64_t>(static_cast<double>(free_bytes) * 0.80);
+    }
+    return std::min(budget_bytes, free_bytes > kMargin ? free_bytes - kMargin : uint64_t(0));
+}
+
 /// GPU backend keeps regrets, strategy_sum, current_strategy (3 compact
 /// strat-shaped buffers of Σ-player-actions × nc; B1a inc 2 dropped
 /// action_values), plus reach_scratch_oop and reach_scratch_ip (2 full-tree

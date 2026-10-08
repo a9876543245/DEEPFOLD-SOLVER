@@ -282,6 +282,26 @@ static void test_polar_oop_produces_bets() {
 // blowing past the original "<60s" comment: the old single binary hit
 // 240s+ which made `ctest -L correctness` useless as a daily gate.
 
+// ----------------------------------------------------------------------------
+// GPU state allocation cap (2026-10-08): an explicit budget is honored up to
+// free VRAM minus a margin; without one, 80% of free VRAM as before.
+// ----------------------------------------------------------------------------
+
+static void test_gpu_state_alloc_cap() {
+    constexpr uint64_t MB = 1ULL << 20;
+    using memory_budget::gpu_state_alloc_cap;
+    // The A100 case: 70.5 GB of state, 80.4 GB free, 76 GB budget.
+    assert_true(gpu_state_alloc_cap(76000 * MB, 80432 * MB) >= 70526 * MB,
+                "a 76 GB budget must admit a 70.5 GB state on 80.4 GB free");
+    assert_true(gpu_state_alloc_cap(0, 80432 * MB) < 70526 * MB,
+                "without a budget the 80% headroom stays");
+    assert_true(gpu_state_alloc_cap(0, 80432 * MB) == static_cast<uint64_t>(80432.0 * MB * 0.80),
+                "no budget: exactly 80% of free");
+    assert_true(gpu_state_alloc_cap(76000 * MB, 30000 * MB) == 30000 * MB - 512 * MB,
+                "a budget above free VRAM is capped at free minus the margin");
+    assert_true(gpu_state_alloc_cap(76000 * MB, 100 * MB) == 0, "less free than the margin: nothing");
+}
+
 int main(int argc, char* argv[]) {
     std::string suite = "all";
     for (int i = 1; i < argc; ++i) {
@@ -297,6 +317,7 @@ int main(int argc, char* argv[]) {
     auto want_stress = (suite == "all" || suite == "stress");
 
     if (want_fast) {
+        RUN_TEST(test_gpu_state_alloc_cap);
         RUN_TEST(test_ev_sanity);
         RUN_TEST(test_global_strategy_shape);
         RUN_TEST(test_root_has_bet_action);

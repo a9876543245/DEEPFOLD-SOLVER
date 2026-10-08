@@ -460,12 +460,18 @@ public:
     /// instead of enumerated — matching the full-game contract where only the
     /// FIRST chance (the turn, dealt by the trunk) is enumerated. Default 0 =
     /// existing behavior (the first chance is enumerated).
+    /// `first_street_chances` (2026-10-07, presolve packs): when non-null the
+    /// walk stops at the first chance of every line — only the root street's
+    /// decisions are emitted — and each (path, chance node) it stopped at is
+    /// appended.
     std::map<std::string, StrategyTreeEntry>
         build_strategy_tree(int max_player_depth = 8,
                             StrategyTreeEvMode ev_mode = StrategyTreeEvMode::VISIBLE,
                             uint32_t max_nodes = 0,
                             bool* out_truncated = nullptr,
-                            int initial_chance_levels_seen = 0) const;
+                            int initial_chance_levels_seen = 0,
+                            std::vector<std::pair<std::string, uint32_t>>*
+                                first_street_chances = nullptr) const;
 
     /// Backward-compat overload — `include_combo_evs=true` ⇒ VISIBLE,
     /// `false` ⇒ NONE. Existing call sites keep working.
@@ -5060,7 +5066,9 @@ inline ComboAnalysis Solver::analyze_combo(const std::string& combo_str,
 inline std::map<std::string, Solver::StrategyTreeEntry>
 Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
                              uint32_t max_nodes, bool* out_truncated,
-                             int initial_chance_levels_seen) const {
+                             int initial_chance_levels_seen,
+                             std::vector<std::pair<std::string, uint32_t>>*
+                                 first_street_chances) const {
     std::map<std::string, StrategyTreeEntry> out;
     if (out_truncated) *out_truncated = false;
     if (!solved_) return out;
@@ -5132,6 +5140,11 @@ Solver::build_strategy_tree(int max_player_depth, StrategyTreeEvMode ev_mode,
         Pending it = std::move(queue.front());
         queue.pop_front();
         uint32_t node = it.node;
+        if (first_street_chances != nullptr && node < tree_.total_nodes &&
+            static_cast<NodeType>(tree_.node_types[node]) == NodeType::CHANCE) {
+            first_street_chances->push_back({it.path, node});
+            continue;
+        }
         bool fanned_out = false;
         while (node < tree_.total_nodes &&
                static_cast<NodeType>(tree_.node_types[node]) == NodeType::CHANCE) {

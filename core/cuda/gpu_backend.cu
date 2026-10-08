@@ -1223,7 +1223,8 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
                                               bool materialize_strategy,
                                               const std::vector<uint32_t>& host_value_row,
                                               size_t value_rows,
-                                              size_t value_regions)
+                                              size_t value_regions,
+                                              size_t gpu_budget_bytes)
 {
     DeviceSolverState ds;
     size_t N  = num_nodes;
@@ -1269,7 +1270,8 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
     {
         size_t free_dev = 0, total_dev = 0;
         if (cudaMemGetInfo(&free_dev, &total_dev) == cudaSuccess) {
-            if (state_bytes_required > static_cast<size_t>(free_dev * 0.80)) {
+            if (state_bytes_required >
+                memory_budget::gpu_state_alloc_cap(gpu_budget_bytes, free_dev)) {
                 std::ostringstream oss;
                 oss << "GpuBackend: solver state would require "
                     << (state_bytes_required >> 20) << " MB but only "
@@ -1932,7 +1934,8 @@ void GpuBackend::prepare(const SolverContext& ctx) {
                                            impl_->host_value_row,
                                            impl_->value_rows,
                                            memory_budget::gpu_value_regions(
-                                               ctx.config->alternating_updates));
+                                               ctx.config->alternating_updates),
+                                           ctx.config->memory_budget.gpu_bytes);
         {
             const uint64_t nc64 = ctx.iso->num_canonical;
             const uint64_t n64  = ctx.tree->total_nodes;
@@ -2023,7 +2026,8 @@ void GpuBackend::reprepare_keep_board(const SolverContext& ctx) {
                                           impl_->host_value_row,
                                           impl_->value_rows,
                                           memory_budget::gpu_value_regions(
-                                              ctx.config->alternating_updates));
+                                              ctx.config->alternating_updates),
+                                          ctx.config->memory_budget.gpu_bytes);
         impl_->sample_vram();  // keep-board path: track min-free vs the
                                // original prepare()'s baseline
         impl_->prepared = true;

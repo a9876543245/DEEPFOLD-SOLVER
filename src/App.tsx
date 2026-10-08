@@ -19,7 +19,7 @@ import type {
 import { SOLVE_MODE_PRESETS, DECOMPOSE_PRESETS } from './lib/poker';
 import type { Position, PositionMatchup } from './lib/ranges';
 import { derivePotStack } from './lib/ranges';
-import { presetSpec, specToEngineJson, type BetSizingSpec } from './lib/betSizing';
+import { listsSpec, presetSpec, specToEngineJson, type BetSizingSpec } from './lib/betSizing';
 import { RangeEditorModal } from './components/RangeEditorModal';
 import { NodeLockEditor } from './components/NodeLockEditor';
 import { GuideModal } from './components/GuideModal';
@@ -834,7 +834,7 @@ function App() {
               street={awaiting.street}
               currentBoard={boardString}
               onCardSelect={handleDealCard}
-              hint={awaiting.collapsed ? t('deal.resolveHint')
+              hint={awaiting.packed ? t('deal.packHint') : awaiting.collapsed ? t('deal.resolveHint')
                 : (segment?.response.session_id == null ? t('deal.cachedOnly') : undefined)}
               allowed={!awaiting.collapsed && segment?.response.session_id == null
                 ? new Set(awaiting.runouts.map(r => r.card)) : undefined}
@@ -977,8 +977,9 @@ function App() {
               ipRange: spot.matchup.ipRange, oopRange: spot.matchup.oopRange, locks: [],
             });
 
-            // v1.8.3+ Phase 3: a bundled, pre-solved spot shows its root
-            // strategy at once; Solve explores the tree from there.
+            // A bundled spot opens at once: its whole flop from the pack,
+            // the turn and river re-solved here from the pack's exact ranges
+            // with the menus it was solved with. (Demo spots: the root only.)
             if (spot.source === 'bundled' || !isRealSolverAvailable()) {
               setError(null);
               start({
@@ -988,11 +989,14 @@ function App() {
                 global_strategy: spot.globalStrategy,
                 combo_strategies: spot.comboStrategies,
                 acting_player: 'OOP',
+                strategy_tree: spot.strategyTree,
+                chance_ranges: spot.chanceRanges,
+                runout_approximated: spot.runoutApproximated,
                 node: {
                   kind: 'player', street: 0, pot: spotPot, stack_oop: spotStack, stack_ip: spotStack,
                   to_call: 0, board: [], actions: [], runouts: [],
                 },
-              }, request);
+              }, spot.sizes ? { ...request, bet_sizing: specToEngineJson(listsSpec(spot.sizes)) } : request);
               return;
             }
             // Tauri mode: a REAL solve with this spot's config and the

@@ -167,6 +167,12 @@ if(HAVE_CUDA)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/cuda
     )
+    # The .cpp files include cuda_runtime.h; MSVC gets the toolkit include
+    # dir from the Visual Studio CUDA integration, gcc/clang do not (Linux).
+    if(NOT MSVC)
+        target_include_directories(deepsolver_core PRIVATE
+            ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    endif()
 else()
     add_executable(deepsolver_core ${CORE_SOURCES})
     target_include_directories(deepsolver_core PRIVATE
@@ -718,7 +724,7 @@ if(BUILD_TESTS)
     # 2026-10-06 audit: CLI inputs fail loudly instead of being ignored or
     # misread (bad ranges/boards/locks/histories), the documented shorthands
     # and spaced JSON are accepted, and --bet-sizing builds Pio-style menus.
-    foreach(_case bad_inputs lenient_inputs bet_sizing serve serve_view target)
+    foreach(_case bad_inputs lenient_inputs bet_sizing serve serve_view target flop_pack)
         add_test(NAME CliInputs_${_case}
             COMMAND ${CMAKE_COMMAND}
                 -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=${_case}

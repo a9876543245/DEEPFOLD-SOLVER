@@ -13,7 +13,7 @@
 
 import type { ComboStrategy } from './poker';
 import { MATCHUPS } from './ranges';
-import { getBundledOrDemo, BOARD_TEMPLATES } from './presolvedSpots';
+import { getBundledOrDemo, BOARD_TEMPLATES, type PresolvedSpot } from './presolvedSpots';
 
 // ============================================================================
 // Types
@@ -62,11 +62,18 @@ export interface DrillSession {
  * no bundle is available (browser mode / missing bundle).
  */
 export async function generateDrillScenario(id: number): Promise<DrillScenario> {
-  const matchupIdx = Math.floor(Math.random() * MATCHUPS.length);
-  const boardIdx = Math.floor(Math.random() * BOARD_TEMPLATES.length);
+  // Skip spots whose turn/river were approximated: their answers can be far
+  // from the exact solution (measured up to ~60 pp per hand on SRP flops).
+  let matchupIdx: number;
+  let boardIdx: number;
+  let spot: PresolvedSpot;
+  let tries = 0;
+  do {
+    matchupIdx = Math.floor(Math.random() * MATCHUPS.length);
+    boardIdx = Math.floor(Math.random() * BOARD_TEMPLATES.length);
+    spot = await getBundledOrDemo(matchupIdx, boardIdx);
+  } while (spot.runoutApproximated && ++tries < 20);
   const matchup = MATCHUPS[matchupIdx];
-
-  const spot = await getBundledOrDemo(matchupIdx, boardIdx);
 
   // Only quiz combos that actually have a solved strategy at this node.
   const comboLabels = Object.keys(spot.comboStrategies).filter((label) => {

@@ -306,6 +306,11 @@ const dict: Dict = {
     zh: '此次求解為了放進記憶體而近似了這條街（發牌未展開）。選一張牌會以此處的精確範圍重新求解這條街。',
     ja: 'このソルブはメモリに収めるためこのストリートを近似しました（ランアウト未展開）。カードを選ぶと、ここでの正確なレンジでこのストリートを再ソルブします。',
   },
+  'deal.packHint': {
+    en: 'This pre-solved spot covers the flop. Picking a card solves the turn and river on this machine from the exact ranges here.',
+    zh: '這個預解點涵蓋翻牌。選一張牌會在這台電腦上，以此處的精確範圍求解轉牌與河牌。',
+    ja: 'このプリソルブ済みスポットはフロップまでを収録しています。カードを選ぶと、ここでの正確なレンジからターンとリバーをこのPCでソルブします。',
+  },
   'deal.cachedOnly': {
     en: 'Only the cards this solve stored can be picked (it is not kept in memory). Suit-equivalent cards play the same strategy.',
     zh: '只能選此次求解有儲存的牌（求解未保留在記憶體中）。花色等價的牌策略相同。',

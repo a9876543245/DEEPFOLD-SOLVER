@@ -11,6 +11,10 @@
 #
 # Usage: cmake -DEXE=<deepsolver_core> -DCASE=<name> -P cli_inputs.cmake
 
+# Script mode starts with every policy OLD on CMake 3.x: CMP0054 OLD made the
+# quoted "chance" below dereference the variable `chance` (Linux CI, 3.28).
+cmake_minimum_required(VERSION 3.20)
+
 if(NOT EXE OR NOT CASE)
   message(FATAL_ERROR "pass -DEXE=<deepsolver_core path> -DCASE=<case name>")
 endif()
@@ -61,6 +65,8 @@ if(CASE STREQUAL "bad_inputs")
     --board AsKd7c2h --target-player oop)
   expect_error("bad target player" "Invalid --target-player"
     --board AsKd7c2h --target AA --target-player both)
+  expect_error("flop pack without the tree" "needs the strategy tree"
+    --board AsKd7c2h --flop-pack --no-strategy-tree)
 
 elseif(CASE STREQUAL "lenient_inputs")
   # Range shorthands: "AK" (both shapes), a specific combo, no weight, a %.
@@ -166,6 +172,45 @@ ${out}")
   if(best STREQUAL "")
     message(FATAL_ERROR "72o added to OOP's range must get a strategy:
 ${out}")
+  endif()
+
+elseif(CASE STREQUAL "flop_pack")
+  # 2026-10-07 presolve packs: only the root street's decisions, and a
+  # chance_ranges entry (exact ranges for the next-street re-solve) for every
+  # action that ends the street.
+  run_ok("flop pack" out --board Td9d6h --oop-range "AA,KK,AKs,KQs"
+    --ip-range "QQ,JJ,AQs,KJs" --flop-pack)
+  string(JSON nodes LENGTH "${out}" strategy_tree)
+  set(street_enders 0)
+  math(EXPR last "${nodes} - 1")
+  foreach(i RANGE ${last})
+    string(JSON path MEMBER "${out}" strategy_tree ${i})
+    string(JSON street GET "${out}" strategy_tree "${path}" street)
+    if(NOT street EQUAL 0)
+      message(FATAL_ERROR "flop pack: '${path}' is on street ${street}")
+    endif()
+    string(JSON nact LENGTH "${out}" strategy_tree "${path}" actions)
+    math(EXPR alast "${nact} - 1")
+    foreach(a RANGE ${alast})
+      string(JSON next GET "${out}" strategy_tree "${path}" actions ${a} next)
+      if(next STREQUAL "chance")
+        string(JSON label GET "${out}" strategy_tree "${path}" actions ${a} label)
+        if(path STREQUAL "")
+          set(line "${label}")
+        else()
+          set(line "${path},${label}")
+        endif()
+        string(JSON oop ERROR_VARIABLE missing GET "${out}" chance_ranges "${line}" oop)
+        if(missing OR oop STREQUAL "")
+          message(FATAL_ERROR "flop pack: no exact ranges for '${line}'")
+        endif()
+        math(EXPR street_enders "${street_enders} + 1")
+      endif()
+    endforeach()
+  endforeach()
+  string(JSON nranges LENGTH "${out}" chance_ranges)
+  if(NOT nranges EQUAL street_enders OR street_enders EQUAL 0)
+    message(FATAL_ERROR "flop pack: ${nranges} chance_ranges for ${street_enders} street-ending actions")
   endif()
 
 elseif(CASE STREQUAL "serve_view")
