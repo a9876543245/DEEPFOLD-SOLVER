@@ -863,6 +863,14 @@ if(BUILD_TESTS)
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
         set_tests_properties(CliBudgetGpuDeviceTotalReject PROPERTIES
             LABELS "smoke;gpu;memory" TIMEOUT 60)
+        # 2026-10-15: AUTO solves an enumerated flop the VRAM cannot hold
+        # exactly on the CPU instead of collapsing it (red on v4.2.0).
+        add_test(NAME CliAutoRoutesExactToCpu
+            COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=auto_routes_exact_cpu
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+        set_tests_properties(CliAutoRoutesExactToCpu PROPERTIES
+            LABELS "smoke;gpu;memory" TIMEOUT 180)
 
         # The peak-host estimate may be conservative but must never sit BELOW
         # the measured peak RSS of the same run. Red before the 2026-08-03

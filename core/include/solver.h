@@ -679,6 +679,11 @@ private:
     /// 2026-10-08: this solve keeps its CFR state in 16 bits — the resolved
     /// SolverConfig::state_precision (fit_enumerated / the host hard gate).
     bool state_q16_ = false;
+    /// 2026-10-15: --backend auto sent this enumerated flop to the CPU: it
+    /// fits the host there but not the GPU (fit_enumerated_auto). The backend
+    /// resolution follows it; the reason becomes fallback_reason.
+    bool auto_cpu_exact_ = false;
+    std::string auto_cpu_exact_reason_;
     int actual_iterations_run_ = 0;
     /// T0/0b: exploitability-probe samples for the current solve. Filled only
     /// when config_.record_convergence is set; moved into the result and
@@ -953,6 +958,41 @@ private:
             }
         }
         return fit;
+    }
+
+    /// 2026-10-15: fit_enumerated() for the ① gates under --backend auto.
+    /// The size heuristic picks the GPU by work alone; an enumerated tree
+    /// that does not fit there but fits on the CPU (16-bit state included)
+    /// is solved exactly on the CPU instead of collapsing its runouts. Sets
+    /// auto_cpu_exact_; when neither fits, returns the GPU's answer as before.
+    EnumeratedFit fit_enumerated_auto(
+        BackendType planned, uint64_t tables, uint64_t player_nodes,
+        uint64_t player_slots, uint64_t host_matchup,
+        bool device_dense_upload, uint64_t equity_tables,
+        uint64_t signed_count_tables, const TreeStats& stats) {
+        auto_cpu_exact_ = false;
+        const EnumeratedFit fit = fit_enumerated(
+            planned, tables, player_nodes, player_slots, host_matchup,
+            device_dense_upload, equity_tables, signed_count_tables, stats);
+        if (fit.fits || backend_type_ != BackendType::AUTO ||
+            planned != BackendType::GPU) {
+            return fit;
+        }
+        const EnumeratedFit cpu = fit_enumerated(
+            BackendType::CPU, tables, player_nodes, player_slots, host_matchup,
+            device_dense_upload, equity_tables, signed_count_tables, stats);
+        if (!cpu.fits) return fit;
+        auto_cpu_exact_ = true;
+        char buf[320];
+        snprintf(buf, sizeof(buf),
+            "The enumerated runout tree does not fit the GPU (needs ~%.2f GB %s, "
+            "%.2f GB available); AUTO solves it exactly on the CPU instead%s.",
+            static_cast<double>(fit.needed) / (1024.0 * 1024.0 * 1024.0),
+            fit.label,
+            static_cast<double>(fit.budget) / (1024.0 * 1024.0 * 1024.0),
+            state_q16_ ? " with 16-bit state" : "");
+        auto_cpu_exact_reason_ = buf;
+        return cpu;
     }
 
     /// 2026-10-08: can this solve keep its CFR state in 16 bits? Only the
@@ -1518,6 +1558,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     convergence_probes_.clear();
     strategy_ = {};   // may view the backend this solve replaces
     state_q16_ = config_.state_precision == SolverConfig::StatePrecision::INT16;
+    auto_cpu_exact_ = false;
 
     auto elapsed_since = [](Clock::time_point begin, Clock::time_point end) {
         return std::chrono::duration<float, std::milli>(end - begin).count();
@@ -1602,7 +1643,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             planned = should_auto_select_gpu(config_, proj.nodes, proj.tables)
                       ? BackendType::GPU : BackendType::CPU;
         }
-        const EnumeratedFit fit = fit_enumerated(
+        const EnumeratedFit fit = fit_enumerated_auto(
             planned, proj.tables, proj.player_nodes, proj.player_slots,
             estimated_host_matchup_bytes(proj.tables, step2_host_dense,
                                          proj.equity_tables),
@@ -1627,9 +1668,11 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     }
     if (!projected_collapse) tree_ = builder.build();
     // A collapsed tree (the projection above or the builder's own runout
-    // gate) is small: its state precision is decided afresh (AUTO from float).
+    // gate) is small: its state precision is decided afresh (AUTO from float),
+    // and AUTO picks its backend by size again.
     if (tree_.runout_approximated) {
         state_q16_ = config_.state_precision == SolverConfig::StatePrecision::INT16;
+        auto_cpu_exact_ = false;
     }
     stage_end = Clock::now();
     timing.tree_build_ms = elapsed_since(stage_start, stage_end);
@@ -1717,7 +1760,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
                       ? BackendType::GPU : BackendType::CPU;
         }
 
-        const EnumeratedFit fit = fit_enumerated(
+        const EnumeratedFit fit = fit_enumerated_auto(
             planned, tables, player_n, player_slots, host_matchup_bytes(),
             terminal_plan_.device_dense_upload, matchup_equity_count(),
             signed_count_device_tables(terminal_plan_, tables),
@@ -1950,9 +1993,11 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     stage_start = Clock::now();
     BackendType selected_backend = backend_type_;
     if (backend_type_ == BackendType::AUTO) {
-        const bool want_gpu = should_auto_select_gpu(
+        // 2026-10-15: an enumerated flop the ① gate sent to the CPU stays there.
+        const bool want_gpu = !auto_cpu_exact_ && should_auto_select_gpu(
             config_, tree_, matchup_ev_per_runout_.size());
         selected_backend = want_gpu ? BackendType::GPU : BackendType::CPU;
+        if (auto_cpu_exact_) fallback_reason = auto_cpu_exact_reason_;
 
         // v1.2.2: when AUTO falls back to CPU because GPU is rejected
         // (no device / CC too low / driver issue), surface the actual
@@ -1961,7 +2006,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         // for a deep turn solve and wonder why it takes 30 minutes.
         // Empty reason means "GPU was usable, just picked CPU due to
         // size heuristic" — don't mislead the user with that case.
-        if (!want_gpu) {
+        if (!want_gpu && !auto_cpu_exact_) {
             std::string r = cuda_gpu_reject_reason();
             if (!r.empty()) {
                 fallback_reason = std::move(r);
@@ -2723,6 +2768,7 @@ inline double Solver::estimated_iteration_seconds(
 // GPU (so the user sees the right number BEFORE backend allocation).
 inline SolveResources Solver::estimate_only() {
     state_q16_ = config_.state_precision == SolverConfig::StatePrecision::INT16;
+    auto_cpu_exact_ = false;
     iso_ = compute_isomorphism(config_.board.data(), config_.board_size,
                                &iso_constraints(), config_.iso_mode);
 
@@ -2773,7 +2819,7 @@ inline SolveResources Solver::estimate_only() {
             planned = should_auto_select_gpu(config_, proj.nodes, proj.tables)
                       ? BackendType::GPU : BackendType::CPU;
         }
-        const EnumeratedFit fit = fit_enumerated(
+        const EnumeratedFit fit = fit_enumerated_auto(
             planned, proj.tables, proj.player_nodes, proj.player_slots,
             estimated_host_matchup_bytes(proj.tables, est_host_dense,
                                          proj.equity_tables),
@@ -2786,9 +2832,11 @@ inline SolveResources Solver::estimate_only() {
     }
     if (!projected_collapse) tree_ = builder.build();
     // A collapsed tree (the projection above or the builder's own runout
-    // gate) is small: its state precision is decided afresh (AUTO from float).
+    // gate) is small: its state precision is decided afresh (AUTO from float),
+    // and AUTO picks its backend by size again.
     if (tree_.runout_approximated) {
         state_q16_ = config_.state_precision == SolverConfig::StatePrecision::INT16;
+        auto_cpu_exact_ = false;
     }
 
     SolveResources r;
@@ -2882,7 +2930,7 @@ inline SolveResources Solver::estimate_only() {
         const uint64_t est_matchup_host =
             estimated_host_matchup_bytes(matchup_tables_exact, est_host_dense,
                                          equity_tables_exact);
-        const EnumeratedFit fit = fit_enumerated(
+        const EnumeratedFit fit = fit_enumerated_auto(
             planned, matchup_tables_exact, player_nodes, player_slots,
             est_matchup_host, est_plan.device_dense_upload, equity_tables_exact,
             signed_count_device_tables(est_plan, matchup_tables_exact),
@@ -2968,9 +3016,13 @@ inline SolveResources Solver::estimate_only() {
     BackendType predicted_backend = backend_type_;
     if (!gpu_downgrade_reason_.empty()) r.fallback_reason = gpu_downgrade_reason_;
     if (backend_type_ == BackendType::AUTO) {
-        const bool want_gpu = should_auto_select_gpu(config_, tree_, matchup_count_est);
+        // 2026-10-15: same routing as solve() step 4.
+        const bool want_gpu = !auto_cpu_exact_ &&
+            should_auto_select_gpu(config_, tree_, matchup_count_est);
         predicted_backend = want_gpu ? BackendType::GPU : BackendType::CPU;
-        if (!want_gpu) {
+        if (auto_cpu_exact_) {
+            r.fallback_reason = auto_cpu_exact_reason_;
+        } else if (!want_gpu) {
             std::string why = cuda_gpu_reject_reason();
             if (!why.empty()) r.fallback_reason = std::move(why);
         }

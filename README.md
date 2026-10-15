@@ -41,7 +41,7 @@ DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). 
 ### Built-in content
 
 - **2,550+ preflop scenarios** browsable in-app. One click applies as IP / OOP range.
-- **120+ pre-solved flop spots** in a one-click library.
+- **312 pre-solved flop spots** (26 matchups on 12 boards) in a one-click library.
 - **Bet sizing — presets or fully custom** — Lite / Standard / Lean / Polar / Small Ball presets (Lean keeps the Standard bet sizes with one raise size, no donk bets and no all-in button, for a tree about 10× smaller), or a Pio-style editor: bet / raise / donk menus per street and per player in % of pot or `2.5x` raises, an all-in toggle, a raise cap and an adjustable all-in threshold. The same menus build the solver tree and the action buttons.
 - **Range editor + node locking** — override any combo frequency and re-solve.
 - **Training mode** — 10-question drills that score your answers against the equilibrium.
@@ -104,7 +104,7 @@ Not a member yet? Upgrade at [deepfold.co](https://deepfold.co).
 | **GTO chart library** | 2,550+ bundled preflop scenarios browsable in-app. One click applies as IP / OOP range. |
 | **Bet sizing** | Presets (Lite / Standard / Lean / Polar / Small Ball) or a Pio-style custom editor (bet / raise / donk per street and player, % or x sizes, all-in threshold, raise cap) — flows through to the solver tree AND the UI buttons. |
 | **Training mode** | 10-question drills that score your answers against the equilibrium. |
-| **Pre-solved spot library** | 120+ common flop spots, one click to load. |
+| **Pre-solved spot library** | 312 flop spots (26 matchups × 12 boards), one click to load. |
 | **Range editor + node locking** | Override any combo frequency and re-solve. |
 
 ## Architecture

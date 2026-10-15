@@ -907,6 +907,86 @@ elseif(CASE STREQUAL "state_q16")
     "${q_nodes} x 8), float collapses there, AUTO at 40 GB -> f32; "
     "16 bits refused with locks and on the level sweeps")
 
+# ---------------------------------------------------------------------------
+elseif(CASE STREQUAL "auto_routes_exact_cpu")
+  # 2026-10-15: --backend auto picks the GPU by work (136k nodes x 2
+  # iterations clears kGpuAutoMinWork). When the enumerated flop does not fit
+  # the 200 MB VRAM budget but fits the host, AUTO solves it exactly on the
+  # CPU (float, or 16 bits when only they fit) instead of collapsing its
+  # runouts; it collapses only when neither fits, and keeps the GPU when the
+  # tree fits there. The preview must predict the same backend and tree.
+  # Red on v4.2.0: the 200 MB budget collapsed the tree.
+  set(a_base --pot 100 --stack 300 --board AsKd7c --flop-sizes 0.75
+             --turn-sizes 0.75 --river-sizes 0.75 --iterations 2
+             --exploitability 0 --backend auto --postsolve none
+             --no-strategy-tree --no-progress)
+
+  foreach(arm "40000;f32" "1300;int16")
+    list(GET arm 0 host_mb)
+    list(GET arm 1 want_prec)
+    execute_process(COMMAND ${EXE} ${a_base} --gpu-memory-mb 200 --host-memory-mb ${host_mb}
+      OUTPUT_VARIABLE r_out RESULT_VARIABLE r_rc ERROR_VARIABLE r_err)
+    if(NOT r_rc EQUAL 0)
+      message(FATAL_ERROR "AUTO at 200 MB VRAM / ${host_mb} MB host failed rc=${r_rc}: ${r_err}")
+    endif()
+    string(JSON r_backend GET "${r_out}" backend)
+    string(JSON r_approx GET "${r_out}" runout_approximated)
+    string(JSON r_prec GET "${r_out}" resources state_precision)
+    string(JSON r_fb GET "${r_out}" resources fallback_reason)
+    if(NOT r_backend MATCHES "^CPU" OR r_approx OR NOT r_prec STREQUAL want_prec)
+      message(FATAL_ERROR
+        "AUTO at 200 MB VRAM / ${host_mb} MB host: backend=${r_backend} "
+        "runout_approximated=${r_approx} state_precision=${r_prec}, "
+        "expected CPU / false / ${want_prec}")
+    endif()
+    string(FIND "${r_fb}" "exactly on the CPU" r_hit)
+    if(r_hit EQUAL -1)
+      message(FATAL_ERROR "fallback_reason must say why AUTO chose the CPU; got: ${r_fb}")
+    endif()
+
+    execute_process(COMMAND ${EXE} ${a_base} --gpu-memory-mb 200 --host-memory-mb ${host_mb}
+              --estimate-only
+      OUTPUT_VARIABLE e_out RESULT_VARIABLE e_rc ERROR_VARIABLE e_err)
+    if(NOT e_rc EQUAL 0)
+      message(FATAL_ERROR "AUTO preview at ${host_mb} MB failed rc=${e_rc}: ${e_err}")
+    endif()
+    string(JSON e_backend GET "${e_out}" resources backend_for_estimate)
+    string(JSON e_approx GET "${e_out}" resources runout_approximated)
+    string(JSON e_prec GET "${e_out}" resources state_precision)
+    if(NOT e_backend MATCHES "^CPU" OR e_approx OR NOT e_prec STREQUAL want_prec)
+      message(FATAL_ERROR
+        "AUTO preview at 200 MB VRAM / ${host_mb} MB host: backend=${e_backend} "
+        "runout_approximated=${e_approx} state_precision=${e_prec}, "
+        "expected CPU / false / ${want_prec} like the solve")
+    endif()
+  endforeach()
+
+  execute_process(COMMAND ${EXE} ${a_base} --gpu-memory-mb 200 --host-memory-mb 900
+    OUTPUT_VARIABLE c_out RESULT_VARIABLE c_rc ERROR_VARIABLE c_err)
+  if(NOT c_rc EQUAL 0)
+    message(FATAL_ERROR "AUTO with neither fitting failed rc=${c_rc}: ${c_err}")
+  endif()
+  string(JSON c_approx GET "${c_out}" runout_approximated)
+  if(NOT c_approx)
+    message(FATAL_ERROR "AUTO at 200 MB VRAM / 900 MB host enumerated; expected a collapse")
+  endif()
+
+  execute_process(COMMAND ${EXE} ${a_base} --gpu-memory-mb 20000 --host-memory-mb 40000
+    OUTPUT_VARIABLE g_out RESULT_VARIABLE g_rc ERROR_VARIABLE g_err)
+  if(NOT g_rc EQUAL 0)
+    message(FATAL_ERROR "AUTO with VRAM to spare failed rc=${g_rc}: ${g_err}")
+  endif()
+  string(JSON g_backend GET "${g_out}" backend)
+  string(JSON g_approx GET "${g_out}" runout_approximated)
+  if(NOT g_backend MATCHES "^CUDA" OR g_approx)
+    message(FATAL_ERROR
+      "AUTO with VRAM to spare: backend=${g_backend} runout_approximated=${g_approx}, "
+      "expected the GPU and the enumerated tree")
+  endif()
+  message(STATUS
+    "auto_routes_exact_cpu: 200 MB VRAM -> exact CPU solve (f32 at 40 GB, "
+    "int16 at 1300 MB, preview agrees), collapse at 900 MB, GPU at 20 GB")
+
 else()
   message(FATAL_ERROR "unknown CASE: ${CASE}")
 endif()

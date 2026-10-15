@@ -41,7 +41,7 @@ DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GP
 ### 內建內容
 
 - **2,550+ preflop 場景** app 內可瀏覽,一鍵套用為 IP / OOP range。
-- **120+ 預解 flop spot** 一鍵載入。
+- **312 個預解 flop spot**(26 組對位 × 12 個盤面)一鍵載入。
 - **下注尺度:預設或完全自訂** — Lite / Standard / Lean / Polar / Small Ball 預設(Lean 沿用 Standard 的下注尺寸,但只有一種加注尺寸、沒有 donk 和全下鍵,樹約小 10 倍),或 Pio 式編輯器:每條街、每位玩家各自的 bet / raise / donk(底池 % 或 `2.5x` 加注)、全下開關、加注上限與可調全下門檻;同一套選單同時建構 solver tree 跟 UI 按鈕。
 - **Range 編輯器 + 節點鎖** — 強制任一手牌的 frequency 然後重 solve。
 - **訓練模式** — 10 題 drill 對你的答案打分(vs 均衡解)。
@@ -103,7 +103,7 @@ GPU 跟 SIMD 都自動偵測:右上角狀態指示燈一眼看出 **CUDA** / **C
 | **GTO 圖庫** | 內建 2,550+ preflop 場景,app 內瀏覽。一鍵套用為 IP / OOP range |
 | **下注尺度** | 預設(Lite / Standard / Lean / Polar / Small Ball)或 Pio 式自訂(每條街 × 每位玩家的 bet / raise / donk、% 或 x、全下門檻、加注上限)— 同時影響 solver tree 跟 UI 按鈕 |
 | **訓練模式** | 10 題 drill 對你的答案打分(vs 均衡) |
-| **預解 spot 圖庫** | 120+ 常見 flop spot,一鍵載入 |
+| **預解 spot 圖庫** | 312 個 flop spot(26 組對位 × 12 個盤面),一鍵載入 |
 | **Range 編輯器 + 節點鎖** | 強制任一手牌的 frequency 然後重 solve |
 
 ## 架構
