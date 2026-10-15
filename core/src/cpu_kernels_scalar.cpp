@@ -14,6 +14,8 @@
 
 #include "cpu_simd.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 
 namespace deepsolver::cpu_simd::scalar_impl {
@@ -733,6 +735,54 @@ static void equity_sign_accumulate(
     }
 }
 
+// 2026-10-08: 16-bit CFR state (see cpu_simd.h).
+static void vec_q16_regret_decode(float* dst, const int16_t* q, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+        const float qf = static_cast<float>(q[i]);
+        dst[i] = qf * std::fabs(qf);
+    }
+}
+
+static float vec_q16_regret_update(float* x, const int16_t* q, float s_pos,
+                                   float s_neg, const float* node_val, std::size_t n) {
+    float m = 0.0f;
+    for (std::size_t i = 0; i < n; ++i) {
+        const float qf = static_cast<float>(q[i]);
+        const float r = qf * std::fabs(qf) * (qf > 0.0f ? s_pos : s_neg) + (x[i] - node_val[i]);
+        x[i] = r;
+        m = std::max(m, std::fabs(r));
+    }
+    return m;
+}
+
+static float vec_q16_strategy_sum(float* x, const uint16_t* q, float inv_unit,
+                                  const float* reach, std::size_t n) {
+    float m = 0.0f;
+    for (std::size_t i = 0; i < n; ++i) {
+        const float add = (reach != nullptr) ? reach[i] * x[i] : x[i];
+        const float r = add * inv_unit + static_cast<float>(q[i]);
+        x[i] = r;
+        m = std::max(m, r);
+    }
+    return m;
+}
+
+static void vec_encode_regret_i16(int16_t* q, const float* x, float inv_scale,
+                                  std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+        const float v = std::nearbyint(
+            std::copysign(std::sqrt(std::fabs(x[i]) * inv_scale) * 32767.0f, x[i]));
+        q[i] = static_cast<int16_t>(std::min(32767.0f, std::max(-32768.0f, v)));
+    }
+}
+
+static void vec_encode_u16(uint16_t* q, const float* x, float enc, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+        const float v = std::nearbyint(x[i] * enc);
+        q[i] = static_cast<uint16_t>(std::min(65535.0f, std::max(0.0f, v)));
+    }
+}
+
 }  // namespace deepsolver::cpu_simd::scalar_impl
 
 namespace deepsolver::cpu_simd {
@@ -777,6 +827,11 @@ const Kernels scalar_kernels = {
     &scalar_impl::showdown_ip_full_active2,
     &scalar_impl::showdown_oop_full_batch,
     &scalar_impl::equity_sign_accumulate,
+    &scalar_impl::vec_q16_regret_decode,
+    &scalar_impl::vec_q16_regret_update,
+    &scalar_impl::vec_q16_strategy_sum,
+    &scalar_impl::vec_encode_regret_i16,
+    &scalar_impl::vec_encode_u16,
 };
 
 }  // namespace deepsolver::cpu_simd

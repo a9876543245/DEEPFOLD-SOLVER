@@ -34,7 +34,7 @@ DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). 
 
 ### Memory you can trust
 
-- **Memory Profile presets** — `safe / balanced / performance` pick host-RAM, JSON, and strategy-tree-node budgets up front, with a live preview of each. The solver respects the budget end-to-end — pre-backend gates evaluate CPU host / GPU VRAM / AUTO fallback **before** allocation, so OOM scenarios become structured errors with a UI badge instead of crashes.
+- **Memory Profile presets** — `safe / balanced / performance` pick host-RAM, JSON, and strategy-tree-node budgets up front, with a live preview of each. The solver respects the budget end-to-end — pre-backend gates evaluate CPU host / GPU VRAM / AUTO fallback **before** allocation, so OOM scenarios become structured errors with a UI badge instead of crashes. When a CPU solve's 32-bit state would not fit, the solver keeps regrets and strategy sums in 16 bits instead of approximating the turn and river, so a Lean single-raised flop solves exactly in about 11 GB.
 - **Common host budget gate** applies on GPU backend too — matchup tables, strategy-tree EV cache, and JSON response all live on host RAM regardless of backend, and all are checked. The diagnostic clarifies that switching to GPU won't fix common-host overflows.
 - **Chunked GPU matchup upload** eliminates host-side `flat_ev` / `flat_valid` duplication; upload happens per-runout via `cudaMemset + cudaMemcpy`, lowering peak host RAM during GPU prep.
 
@@ -42,7 +42,7 @@ DEEPFOLD-SOLVER is the desktop GTO solver from [DEEPFOLD](https://deepfold.co). 
 
 - **2,550+ preflop scenarios** browsable in-app. One click applies as IP / OOP range.
 - **120+ pre-solved flop spots** in a one-click library.
-- **Bet sizing — presets or fully custom** — Lite / Standard / Polar / Small Ball presets, or a Pio-style editor: bet / raise / donk menus per street and per player in % of pot or `2.5x` raises, an all-in toggle, a raise cap and an adjustable all-in threshold. The same menus build the solver tree and the action buttons.
+- **Bet sizing — presets or fully custom** — Lite / Standard / Lean / Polar / Small Ball presets (Lean keeps the Standard bet sizes with one raise size, no donk bets and no all-in button, for a tree about 10× smaller), or a Pio-style editor: bet / raise / donk menus per street and per player in % of pot or `2.5x` raises, an all-in toggle, a raise cap and an adjustable all-in threshold. The same menus build the solver tree and the action buttons.
 - **Range editor + node locking** — override any combo frequency and re-solve.
 - **Training mode** — 10-question drills that score your answers against the equilibrium.
 
@@ -102,7 +102,7 @@ Not a member yet? Upgrade at [deepfold.co](https://deepfold.co).
 | **Memory Profile** | `safe / balanced / performance` presets to bound host-RAM, JSON, and strategy-tree-node budgets. No more silent OOM kills. |
 | **Runout picker** | When iso enumeration is engaged, click any canonical river card to switch subtrees. |
 | **GTO chart library** | 2,550+ bundled preflop scenarios browsable in-app. One click applies as IP / OOP range. |
-| **Bet sizing** | Presets (Lite / Standard / Polar / Small Ball) or a Pio-style custom editor (bet / raise / donk per street and player, % or x sizes, all-in threshold, raise cap) — flows through to the solver tree AND the UI buttons. |
+| **Bet sizing** | Presets (Lite / Standard / Lean / Polar / Small Ball) or a Pio-style custom editor (bet / raise / donk per street and player, % or x sizes, all-in threshold, raise cap) — flows through to the solver tree AND the UI buttons. |
 | **Training mode** | 10-question drills that score your answers against the equilibrium. |
 | **Pre-solved spot library** | 120+ common flop spots, one click to load. |
 | **Range editor + node locking** | Override any combo frequency and re-solve. |

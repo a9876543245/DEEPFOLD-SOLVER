@@ -416,6 +416,97 @@ static void test_vec_reach_weighted_strat_sum() {
 }
 
 // ----------------------------------------------------------------------------
+// 2026-10-08: 16-bit CFR state kernels. The encoders round the same products
+// to nearest-even on both paths, so they must agree EXACTLY; the updates use
+// FMA on AVX2 only, so they agree to float rounding.
+// ----------------------------------------------------------------------------
+
+static std::vector<int16_t> mixed_i16(std::size_t n) {
+    std::vector<int16_t> q(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        q[i] = static_cast<int16_t>((static_cast<int>(i * 7919 % 65535) - 32767));
+    }
+    if (n >= 3) { q[0] = 0; q[1] = 32767; q[2] = -32767; }
+    return q;
+}
+
+static std::vector<uint16_t> mixed_u16(std::size_t n) {
+    std::vector<uint16_t> q(n);
+    for (std::size_t i = 0; i < n; ++i) q[i] = static_cast<uint16_t>(i * 104729 % 65536);
+    if (n >= 2) { q[0] = 0; q[1] = 65535; }
+    return q;
+}
+
+static void test_q16_regret_decode() {
+    for (auto n : kLengths) {
+        const auto q = mixed_i16(n);
+        std::vector<float> sa(n, 0.0f), aa(n, 0.0f);
+        scalar_kernels.vec_q16_regret_decode(sa.data(), q.data(), n);
+        avx2_kernels.vec_q16_regret_decode(aa.data(), q.data(), n);
+        assert_arrays_close(sa, aa, 0.0f, 0.0f, "vec_q16_regret_decode");
+    }
+}
+
+static void test_q16_regret_update() {
+    for (auto n : kLengths) {
+        const auto q = mixed_i16(n);
+        auto action_val = mixed_floats(n, -100.0f, 100.0f);
+        auto node_val = mixed_floats(n, -100.0f, 100.0f);
+        std::vector<float> sa = action_val, aa = action_val;
+        const float ms = scalar_kernels.vec_q16_regret_update(
+            sa.data(), q.data(), 3e-3f, 1e-3f, node_val.data(), n);
+        const float ma = avx2_kernels.vec_q16_regret_update(
+            aa.data(), q.data(), 3e-3f, 1e-3f, node_val.data(), n);
+        assert_arrays_close(sa, aa, 1e-3f, 1e-6f, "vec_q16_regret_update");
+        if (std::fabs(ms - ma) > 1e-3f + 1e-6f * std::fabs(ms)) {
+            fail("vec_q16_regret_update max |x| differs");
+        }
+    }
+}
+
+static void test_q16_strategy_sum() {
+    for (auto n : kLengths) {
+        const auto q = mixed_u16(n);
+        auto strat = mixed_floats(n, 0.0f, 1.0f);
+        auto reach = mixed_floats(n, 0.0f, 1.0f);
+        const float* reaches[2] = {nullptr, reach.data()};
+        for (const float* r : reaches) {
+            std::vector<float> sa = strat, aa = strat;
+            const float ms = scalar_kernels.vec_q16_strategy_sum(sa.data(), q.data(), 812.5f, r, n);
+            const float ma = avx2_kernels.vec_q16_strategy_sum(aa.data(), q.data(), 812.5f, r, n);
+            assert_arrays_close(sa, aa, 1e-2f, 1e-6f, "vec_q16_strategy_sum");
+            if (std::fabs(ms - ma) > 1e-2f + 1e-6f * std::fabs(ms)) {
+                fail("vec_q16_strategy_sum max differs");
+            }
+        }
+    }
+}
+
+static void test_q16_encoders() {
+    for (auto n : kLengths) {
+        auto x = mixed_floats(n, -250.0f, 250.0f);
+        if (n >= 4) { x[0] = 250.0f; x[1] = -250.0f; x[2] = 0.0f; x[3] = -0.0f; }
+        std::vector<int16_t> si(n), ai(n);
+        scalar_kernels.vec_encode_regret_i16(si.data(), x.data(), 1.0f / 250.0f, n);
+        avx2_kernels.vec_encode_regret_i16(ai.data(), x.data(), 1.0f / 250.0f, n);
+        if (si != ai) fail("vec_encode_regret_i16 scalar != AVX2");
+        if (n >= 4 && (si[0] != 32767 || si[1] != -32767 || si[2] != 0 || si[3] != 0)) {
+            fail("vec_encode_regret_i16 does not map +-scale to +-32767 and 0 to 0");
+        }
+        auto s = mixed_floats(n, 0.0f, 65535.0f);
+        std::vector<uint16_t> su(n), au(n);
+        scalar_kernels.vec_encode_u16(su.data(), s.data(), 1.0f, n);
+        avx2_kernels.vec_encode_u16(au.data(), s.data(), 1.0f, n);
+        if (su != au) fail("vec_encode_u16 scalar != AVX2");
+        // Ties round to even on both paths.
+        std::vector<float> ties(n, 2.5f);
+        scalar_kernels.vec_encode_u16(su.data(), ties.data(), 1.0f, n);
+        avx2_kernels.vec_encode_u16(au.data(), ties.data(), 1.0f, n);
+        if (su != au || (n > 0 && su[0] != 2)) fail("vec_encode_u16 tie rounding");
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Reduction kernel tests — output is scalar; tolerance widens with n.
 // ----------------------------------------------------------------------------
 
@@ -2142,6 +2233,12 @@ int main(int /*argc*/, char* /*argv*/[]) {
     RUN_TEST(test_edge_case_all_invalid_showdown);
     RUN_TEST(test_showdown_dual_signed_count);
     RUN_TEST(test_fold_dense_slots);
+    // Last: the generators share one RNG, so a test inserted earlier would
+    // hand every later test different inputs.
+    RUN_TEST(test_q16_regret_decode);
+    RUN_TEST(test_q16_regret_update);
+    RUN_TEST(test_q16_strategy_sum);
+    RUN_TEST(test_q16_encoders);
 
     std::cout << "\n=== " << g_tests_passed << " / " << g_tests_run
               << " tests passed ===\n";

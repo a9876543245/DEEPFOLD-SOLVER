@@ -22,6 +22,7 @@
 
 #include "types.h"
 #include "isomorphism.h"
+#include "final_strategy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -187,6 +188,10 @@ struct SolverContext {
     /// child onto its other orbit members (build_runout_class_maps).
     /// nullptr / kNoRunoutPerms everywhere = plain weight × child.
     const RunoutClassMaps* runout_maps = nullptr;
+    /// 2026-10-08: keep regrets / strategy sums in 16 bits (one scale per
+    /// node). Resolved by the Solver (SolverConfig::state_precision); only
+    /// LevelizedCpuBackend's depth-first path supports it.
+    bool state_q16 = false;
     const FlatGameTree*          tree          = nullptr;
     const IsomorphismMapping*    iso           = nullptr;
     const SolverConfig*          config        = nullptr;
@@ -375,6 +380,14 @@ public:
     /// (6.1 GiB of a 6.55 GiB peak on a 1.28M-node flop). The backend keeps
     /// no strategy afterwards; the next finalize() rebuilds it.
     virtual std::vector<std::vector<float>> take_strategy() { return strategy(); }
+
+    /// 2026-10-08: the finalized strategy as the Solver keeps it. Default:
+    /// the materialized rows. LevelizedCpuBackend returns a view of its
+    /// strategy sums instead — no copy at all (see FinalStrategy).
+    virtual FinalStrategy take_final_strategy() { return FinalStrategy(take_strategy()); }
+
+    /// Before this backend is freed: hand `fs` the buffers it views, if any.
+    virtual void release_into(FinalStrategy& /*fs*/) {}
 
     /// Human-readable backend name, e.g. "CPU-DCFR", "CUDA (RTX 4060, 8GB)".
     /// Shown in UI as the active backend indicator.

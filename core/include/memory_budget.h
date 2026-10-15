@@ -126,11 +126,24 @@ constexpr uint64_t kHostProcessOverheadBytes = 96ULL * 1024ULL * 1024ULL;
 constexpr uint64_t kFlatTreeBytesPerNode = 33;
 constexpr uint64_t kFlatTreeBytesPerEdge = 9;
 constexpr double   kFlatTreeGrowthFactor = 2.0;
+/// 2026-10-08: ...and the build costs more than the flat arrays. Until
+/// flatten() returns, GameTreeBuilder holds a TreeNode per node (~50 B of
+/// fields plus three std::vectors and their heap blocks: children,
+/// runout_cards, runout_member_perms): measured pre-backend peak RSS beyond
+/// the baseline and the matchup tables 173-232 B/node (CPU; turn 180k, mono
+/// 614k, lean 676k, lite 1.28M and 2.11M-node trees). The builder also used
+/// to live on through the whole solve (~140 B/node more at the CPU peak in
+/// prepare(); build() now frees them). This term covers the build-phase
+/// peak and what the freed blocks leave committed in the heap. Hidden until
+/// then inside the CPU's 1.15-copy final strategy, which a FinalStrategy
+/// view no longer charges.
+constexpr uint64_t kTreeBuildResidueBytesPerNode = 160;
 inline uint64_t bytes_for_flat_tree(uint64_t nodes, uint64_t edges) {
     return static_cast<uint64_t>(
         static_cast<double>(nodes * kFlatTreeBytesPerNode
                           + edges * kFlatTreeBytesPerEdge)
-        * kFlatTreeGrowthFactor);
+        * kFlatTreeGrowthFactor)
+        + nodes * kTreeBuildResidueBytesPerNode;
 }
 /// CUDA runtime/context host-side RSS (driver pools, pinned staging).
 /// Measured 125–140 MB on CUDA 13.2 / Win11 / RTX 5090; padded slightly.
@@ -398,7 +411,16 @@ inline uint64_t cpu_lane_stride(uint64_t nc) {
 /// now fails to compile instead of silently mis-estimating.
 inline uint64_t bytes_for_cpu_state_compact(uint64_t player_action_slots,
                                             uint64_t nc,
-                                            bool materialize_strategy) {
+                                            bool materialize_strategy,
+                                            bool q16 = false,
+                                            uint64_t total_nodes = 0) {
+    if (q16) {
+        // 2026-10-08: int16 regrets + uint16 strategy sums (never a third
+        // array: 16 bits needs the derived path) and two float scales per
+        // node (LevelizedCpuBackend::regret_scale_ / strategy_sum_scale_).
+        return player_action_slots * cpu_lane_stride(nc) * 2 * sizeof(int16_t)
+             + total_nodes * 2 * sizeof(float);
+    }
     return player_action_slots * cpu_lane_stride(nc)
          * (materialize_strategy ? memory_budget::kCpuStateArraysPerNode
                                  : memory_budget::kCpuStateArraysPerNodeDerived)
@@ -416,6 +438,23 @@ inline uint64_t bytes_for_final_strategy(uint64_t player_action_slots,
                                          uint64_t player_nodes) {
     return player_action_slots * nc * sizeof(float)
          + player_nodes * 32ULL;  // vector header + allocator slack per row
+}
+
+/// 2026-10-08: LevelizedCpuBackend's own host memory beyond the CFR state,
+/// alive at the end of prepare() — where a CPU solve peaks now that its
+/// averaged strategy is a view (FinalStrategy) instead of a copy:
+///   per node   32 B: node_state_offset_ 8, node_order_ 4, dfs_cut_slot_ 4,
+///              player_nodes_ <= 4, dfs_configure()'s sub 4 + need 8
+///   per table  32 B per canonical hand: the fold- and rank-blocker metadata
+///              built per runout board (~30 B/hand plus vector headers)
+///   dfs rows   the depth-first arenas and cut rows, in lane-stride rows
+///              (LevelizedCpuBackend::dfs_scratch_rows; 0 on the level sweeps)
+/// Measured 7-108 MB over the trees above (heap reuse after the tree build
+/// absorbs part of it); this sum stays above every one.
+inline uint64_t bytes_for_cpu_levelized_host(uint64_t nodes, uint64_t tables,
+                                             uint64_t nc, uint64_t dfs_rows) {
+    return nodes * 32ULL + tables * nc * 32ULL
+         + dfs_rows * cpu_lane_stride(nc) * sizeof(float);
 }
 
 /// v1.7.0: extra heap held by the levelized CPU backend on top of the

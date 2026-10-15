@@ -2,8 +2,8 @@ import { useMemo, useState, type CSSProperties } from 'react';
 import { X } from 'lucide-react';
 import { useT } from '../lib/i18n';
 import {
-  STREETS, SIZING_PRESETS, presetSpec, cloneSpec, parseSizeList, formatSizeList, validateSpec,
-  type BetSizingSpec, type SizingPresetKey, type StreetKey,
+  STREETS, SIZING_PRESET_KEYS, presetSpec, cloneSpec, parseSizeList, formatSizeList, validateSpec,
+  type BetSizingSpec, type StreetKey,
 } from '../lib/betSizing';
 
 interface Props {
@@ -128,7 +128,7 @@ export function BetSizingEditor({ spec, onSave, onClose }: Props) {
         {/* Presets */}
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 14, alignItems: 'center' }}>
           <span style={{ fontSize: 11, color: 'var(--color-text-tertiary)' }}>{t('sizing.loadPreset')}:</span>
-          {(Object.keys(SIZING_PRESETS) as SizingPresetKey[]).map(k => (
+          {SIZING_PRESET_KEYS.map(k => (
             <button key={k} className="btn-pill" onClick={() => load(presetSpec(k))}>
               {t(`config.${k === 'small_ball' ? 'smallBall' : k}`)}
             </button>

@@ -26,10 +26,12 @@ if(NOT EXE)
   message(FATAL_ERROR "pass -DEXE=<deepsolver_core path>")
 endif()
 
+# 2026-10-08: float pinned — at the default budget AUTO would enumerate this
+# flop in 16 bits (1.1M nodes) instead of the collapsed tree it is sized for.
 set(COMMON_ARGS
   --pot 100 --stack 500 --board AsKd7c
   --iterations 3000 --exploitability 0.5
-  --backend cpu --postsolve exploitability
+  --backend cpu --postsolve exploitability --state-precision 32
   --no-strategy-tree --no-progress)
 
 # 2026-09-12: alternating updates reach 0.5% on this fixture at ~150-200

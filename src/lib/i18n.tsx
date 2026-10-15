@@ -131,6 +131,12 @@ const dict: Dict = {
   'config.betSizing': { en: 'Bet Sizing', zh: '下注尺寸', ja: 'ベットサイジング' },
   'config.lite': { en: 'Lite', zh: '輕量', ja: 'ライト' },
   'config.standard': { en: 'Standard', zh: '標準', ja: 'スタンダード' },
+  'config.lean': { en: 'Lean', zh: '精簡', ja: 'リーン' },
+  'config.lean.hint': {
+    en: 'Standard bet sizes on a lean tree: one raise size (2.5x), no donk bets, no all-in button. About 10× smaller, so it solves faster and more flops solve the turn and river exactly.',
+    zh: '與標準相同的下注尺寸，但樹更精簡：只有一種加注尺寸（2.5x）、沒有 donk、沒有全下鍵。樹約小 10 倍，求解更快，也有更多翻牌能完整計算轉牌與河牌。',
+    ja: 'スタンダードと同じベットサイズを簡素なツリーで：レイズは1サイズ（2.5x）、ドンクなし、オールインボタンなし。ツリーは約1/10で、より速く、より多くのフロップでターンとリバーを近似せずに解けます。',
+  },
   'config.polar': { en: 'Polar', zh: '極化', ja: 'ポーラー' },
   'config.smallBall': { en: 'Small Ball', zh: '小球', ja: 'スモールボール' },
   'config.advanced': { en: 'Advanced', zh: '進階', ja: '詳細設定' },

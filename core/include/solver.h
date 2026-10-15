@@ -379,8 +379,12 @@ public:
     /// chance node: the street that just ended): 0 OOP, 1 IP, 2 none.
     uint8_t street_aggressor_at(uint32_t node_idx) const;
     /// Frees the CFR backend (CPU state / GPU VRAM) once the host strategy is
-    /// final. A --serve session keeps only what node queries read.
-    void release_backend() { backend_.reset(); }
+    /// final. A --serve session keeps only what node queries read — for a
+    /// strategy that views the backend's sums, those sums.
+    void release_backend() {
+        if (backend_) backend_->release_into(strategy_);
+        backend_.reset();
+    }
 
     /// One node entry in the cached strategy tree. Mirrors the per-node
     /// fields of SolverResult so the frontend can render a node from this
@@ -580,12 +584,12 @@ public:
         ensure_host_dense_for_current_reach();
         if (!config_.node_locks.empty()) resolve_node_locks();
         SolverContext ctx = make_context();
+        strategy_ = {};   // may view the state prepare() replaces
         backend_->prepare(ctx);
         const int iters = std::max(1, config_.max_iterations);
         for (int t = 0; t < iters; ++t) backend_->iterate(t);
-        strategy_ = {};
         backend_->finalize();
-        strategy_ = backend_->take_strategy();
+        strategy_ = backend_->take_final_strategy();
         apply_node_locks();
         solved_ = true;
     }
@@ -602,12 +606,12 @@ public:
         ensure_host_dense_for_current_reach();
         if (!config_.node_locks.empty()) resolve_node_locks();
         SolverContext ctx = make_context();
+        strategy_ = {};
         backend_->reprepare_keep_board(ctx);
         const int iters = std::max(1, config_.max_iterations);
         for (int t = 0; t < iters; ++t) backend_->iterate(t);
-        strategy_ = {};
         backend_->finalize();
-        strategy_ = backend_->take_strategy();
+        strategy_ = backend_->take_final_strategy();
         apply_node_locks();
         solved_ = true;
     }
@@ -630,12 +634,12 @@ public:
         ensure_host_dense_for_current_reach();
         if (!config_.node_locks.empty()) resolve_node_locks();
         SolverContext ctx = make_context();
+        strategy_ = {};
         backend_->reprepare_keep_state(ctx);
         const int iters = std::max(1, config_.max_iterations);
         for (int t = 0; t < iters; ++t) backend_->iterate(iter_offset + t);
-        strategy_ = {};
         backend_->finalize();
-        strategy_ = backend_->take_strategy();
+        strategy_ = backend_->take_final_strategy();
         apply_node_locks();
         solved_ = true;
     }
@@ -672,6 +676,9 @@ private:
     /// Borrowed override for iso_ (see set_forced_iso). nullptr ⇒ compute it.
     const IsomorphismMapping* forced_iso_ = nullptr;
     bool solved_ = false;
+    /// 2026-10-08: this solve keeps its CFR state in 16 bits — the resolved
+    /// SolverConfig::state_precision (fit_enumerated / the host hard gate).
+    bool state_q16_ = false;
     int actual_iterations_run_ = 0;
     /// T0/0b: exploitability-probe samples for the current solve. Filled only
     /// when config_.record_convergence is set; moved into the result and
@@ -688,7 +695,7 @@ private:
     uint64_t rss_after_finalize_bytes_   = 0;
 
     // Final results (populated after solve)
-    std::vector<std::vector<float>> strategy_;
+    FinalStrategy strategy_;
     std::vector<float> ev_;
     float exploitability_pct_ = 0.0f;
 
@@ -892,11 +899,14 @@ private:
         uint64_t total_nodes = 0;
         uint64_t total_edges = 0;
         uint64_t value_rows  = 0;   ///< gpu_value_rows() of that tree
+        /// LevelizedCpuBackend::dfs_scratch_rows() of that tree (2026-10-08)
+        uint64_t dfs_scratch_rows = 0;
     };
-    static TreeStats tree_stats(const FlatGameTree& t) {
+    TreeStats tree_stats(const FlatGameTree& t) const {
         return {static_cast<uint64_t>(t.total_nodes),
                 static_cast<uint64_t>(t.total_edges),
-                gpu_value_rows(t)};
+                gpu_value_rows(t),
+                LevelizedCpuBackend::dfs_scratch_rows(t, planned_cpu_threads())};
     }
 
     /// The ONE formula behind solve()'s ① collapse gate and
@@ -915,7 +925,55 @@ private:
         BackendType planned, uint64_t tables, uint64_t player_nodes,
         uint64_t player_slots, uint64_t host_matchup,
         bool device_dense_upload, uint64_t equity_tables,
-        uint64_t signed_count_tables, const TreeStats& stats) const;
+        uint64_t signed_count_tables, const TreeStats& stats,
+        bool q16) const;
+
+    /// 2026-10-08: check_enumerated_fit() at the state precision the solve
+    /// will run with — the configured one, or under AUTO float when that
+    /// fits and 16 bits when only that does (and is supported). Sets
+    /// state_q16_ to the answer.
+    EnumeratedFit fit_enumerated(
+        BackendType planned, uint64_t tables, uint64_t player_nodes,
+        uint64_t player_slots, uint64_t host_matchup,
+        bool device_dense_upload, uint64_t equity_tables,
+        uint64_t signed_count_tables, const TreeStats& stats) {
+        state_q16_ = config_.state_precision == SolverConfig::StatePrecision::INT16;
+        EnumeratedFit fit = check_enumerated_fit(
+            planned, tables, player_nodes, player_slots, host_matchup,
+            device_dense_upload, equity_tables, signed_count_tables, stats, state_q16_);
+        if (!fit.fits &&
+            config_.state_precision == SolverConfig::StatePrecision::AUTO &&
+            state_q16_supported(planned)) {
+            const EnumeratedFit fit16 = check_enumerated_fit(
+                planned, tables, player_nodes, player_slots, host_matchup,
+                device_dense_upload, equity_tables, signed_count_tables, stats, true);
+            if (fit16.fits) {
+                state_q16_ = true;
+                return fit16;
+            }
+        }
+        return fit;
+    }
+
+    /// 2026-10-08: can this solve keep its CFR state in 16 bits? Only the
+    /// levelized backend's depth-first visit re-encodes a node's block, so:
+    /// the levelized CPU backend on its depth-first path (no node locks, a
+    /// POSTFLOP-family schedule, --cpu-traversal dfs).
+    bool state_q16_supported(BackendType backend) const {
+        return final_strategy_is_view(backend) && !cpu_uses_level_flats();
+    }
+
+    /// --state-precision 16 on a solve that cannot run it is an error, not a
+    /// silent fall back to float.
+    void check_state_precision_supported(BackendType backend) const {
+        if (config_.state_precision == SolverConfig::StatePrecision::INT16 &&
+            !state_q16_supported(backend)) {
+            throw std::invalid_argument(
+                "--state-precision 16 needs the levelized CPU backend's "
+                "depth-first path: --backend cpu, no node locks, a POSTFLOP "
+                "dcfr schedule and --cpu-traversal dfs");
+        }
+    }
 
     /// Does a mid-loop exploitability probe materialize a HOST strategy
     /// copy on this backend? Since 2026-09-10 the GPU answers probes from
@@ -930,6 +988,36 @@ private:
         return config_.compute_exploitability
             && config_.target_exploitability > 0.0f
             && (backend != BackendType::GPU || config_.force_cpu_postsolve);
+    }
+
+    /// 2026-10-08: does the averaged strategy live as a view of the CPU
+    /// backend's strategy sums (FinalStrategy) rather than a materialized
+    /// copy? The levelized backend hands over a view; the reference backend
+    /// and the GPU's host download still materialize one copy. Every
+    /// host-peak site charges the final strategy through this.
+    bool final_strategy_is_view(BackendType backend) const {
+        return backend != BackendType::GPU
+            && config_.cpu_backend_kind == SolverConfig::CpuBackendKind::LEVELIZED;
+    }
+
+    /// LevelizedCpuBackend's host memory beyond the CFR state
+    /// (bytes_for_cpu_levelized_host); 0 on the other backends. The
+    /// depth-first scratch only exists when the depth-first visit runs.
+    uint64_t cpu_backend_host_bytes(BackendType backend, uint64_t nodes,
+                                    uint64_t tables, uint64_t dfs_rows) const {
+        if (!final_strategy_is_view(backend)) return 0;
+        return bytes_for_cpu_levelized_host(
+            nodes, tables, iso_.num_canonical,
+            cpu_uses_level_flats() ? 0 : dfs_rows);
+    }
+
+    /// The CPU team a solve of this config runs (resolve_cpu_threads).
+    uint32_t planned_cpu_threads() const {
+        uint32_t hw = 1u;
+#ifdef _OPENMP
+        hw = static_cast<uint32_t>(omp_get_max_threads());
+#endif
+        return resolve_cpu_threads(config_.cpu_threads, hw);
     }
 
     /// 2026-09-10: the ENUMERATED flop tree's exact size, derived from the
@@ -1191,6 +1279,7 @@ inline uint16_t Solver::evaluate_combo(const Combo& combo) const {
 
 inline SolverContext Solver::make_context() {
     SolverContext ctx;
+    ctx.state_q16 = state_q16_;
     // Exact isomorphism: how chance nodes fold merged runouts (cheap: a few
     // nc-length maps); rebuilt here because every caller passes the final tree.
     runout_maps_ = build_runout_class_maps(tree_, iso_);
@@ -1313,6 +1402,10 @@ inline Solver::EnumeratedProjection Solver::project_enumerated_tree(
     }
     p.stats.total_nodes = p.nodes;
     p.stats.value_rows  = gpu_value_rows_from_widths(terminals, nt_width);
+    // The collapsed tree's: the same betting lines with narrower chance
+    // frames — low, which only lets the measured gate decide (see there).
+    p.stats.dfs_scratch_rows =
+        LevelizedCpuBackend::dfs_scratch_rows(collapsed, planned_cpu_threads());
     // Root board + one per canonical turn board + distinct 5-card boards
     // (turn A / river B and turn B / river A share a signature).
     p.tables = 1 + K_t + static_cast<uint64_t>(river_sigs.size());
@@ -1326,7 +1419,7 @@ inline Solver::EnumeratedFit Solver::check_enumerated_fit(
     BackendType planned, uint64_t tables, uint64_t player_nodes,
     uint64_t player_slots, uint64_t host_matchup,
     bool device_dense_upload, uint64_t equity_tables,
-    uint64_t signed_count_tables, const TreeStats& stats) const
+    uint64_t signed_count_tables, const TreeStats& stats, bool q16) const
 {
     const uint64_t nc      = iso_.num_canonical;
     const uint64_t total_n = stats.total_nodes;
@@ -1340,10 +1433,12 @@ inline Solver::EnumeratedFit Solver::check_enumerated_fit(
     // then THROW; collapsing instead keeps the solve alive with approximated
     // runouts, which is what this gate exists to do.
     uint64_t host_needed = host_matchup
-        + memory_budget::bytes_for_live_final_strategy(
-              bytes_for_final_strategy(player_slots, nc, player_nodes),
-              planned == BackendType::GPU,
-              host_probe_copies(planned))
+        + (final_strategy_is_view(planned)
+               ? 0
+               : memory_budget::bytes_for_live_final_strategy(
+                     bytes_for_final_strategy(player_slots, nc, player_nodes),
+                     planned == BackendType::GPU,
+                     host_probe_copies(planned)))
         + memory_budget::kHostProcessOverheadBytes;
     // 2026-09-10: the same flat-tree and output-cache terms the pre-backend
     // hard gate charges (build_footprint / total_host_bytes). Without them
@@ -1391,7 +1486,8 @@ inline Solver::EnumeratedFit Solver::check_enumerated_fit(
             memory_budget::bytes_for_gpu_host_overhead(device_needed);
     } else {
         host_needed += bytes_for_cpu_state_compact(
-            player_slots, nc, cpu_materializes_strategy());
+            player_slots, nc, cpu_materializes_strategy(), q16, total_n)
+            + cpu_backend_host_bytes(planned, total_n, tables, stats.dfs_scratch_rows);
         if (cpu_uses_level_flats()) {
             host_needed += bytes_for_levelized_cpu_extra(total_n, nc);
         }
@@ -1420,6 +1516,8 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         : 1;
     actual_iterations_run_ = 0;
     convergence_probes_.clear();
+    strategy_ = {};   // may view the backend this solve replaces
+    state_q16_ = config_.state_precision == SolverConfig::StatePrecision::INT16;
 
     auto elapsed_since = [](Clock::time_point begin, Clock::time_point end) {
         return std::chrono::duration<float, std::milli>(end - begin).count();
@@ -1504,7 +1602,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             planned = should_auto_select_gpu(config_, proj.nodes, proj.tables)
                       ? BackendType::GPU : BackendType::CPU;
         }
-        const EnumeratedFit fit = check_enumerated_fit(
+        const EnumeratedFit fit = fit_enumerated(
             planned, proj.tables, proj.player_nodes, proj.player_slots,
             estimated_host_matchup_bytes(proj.tables, step2_host_dense,
                                          proj.equity_tables),
@@ -1528,6 +1626,11 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         }
     }
     if (!projected_collapse) tree_ = builder.build();
+    // A collapsed tree (the projection above or the builder's own runout
+    // gate) is small: its state precision is decided afresh (AUTO from float).
+    if (tree_.runout_approximated) {
+        state_q16_ = config_.state_precision == SolverConfig::StatePrecision::INT16;
+    }
     stage_end = Clock::now();
     timing.tree_build_ms = elapsed_since(stage_start, stage_end);
     timing.tree_nodes = tree_.total_nodes;
@@ -1614,7 +1717,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
                       ? BackendType::GPU : BackendType::CPU;
         }
 
-        const EnumeratedFit fit = check_enumerated_fit(
+        const EnumeratedFit fit = fit_enumerated(
             planned, tables, player_n, player_slots, host_matchup_bytes(),
             terminal_plan_.device_dense_upload, matchup_equity_count(),
             signed_count_device_tables(terminal_plan_, tables),
@@ -1679,7 +1782,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     // Raw footprint components, backend-independent. The final footprint is
     // assembled by build_footprint() below AFTER backend resolution and all
     // fallbacks (review round 2 P1-2).
-    uint64_t comp_matchup = 0, comp_cpu_state = 0, comp_gpu_state = 0;
+    uint64_t comp_matchup = 0, comp_cpu_state = 0, comp_cpu_state_q16 = 0, comp_gpu_state = 0;
     uint64_t comp_device_total = 0, comp_final_strategy = 0;
     uint64_t comp_tree_ev = 0, comp_json = 0;
     {
@@ -1697,6 +1800,10 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         comp_matchup = host_matchup_bytes();
         comp_cpu_state = bytes_for_cpu_state_compact(
             gate_player_slots, nc, cpu_materializes_strategy());
+        // 2026-10-08: the same state in 16 bits (state_q16_ picks; 16 bits
+        // runs only where the level flats below do not exist).
+        comp_cpu_state_q16 = bytes_for_cpu_state_compact(
+            gate_player_slots, nc, cpu_materializes_strategy(), true, total_n);
         // v1.7.0: levelized backend pre-allocates 3 × total_nodes × nc
         // floats (reach_oop_, reach_ip_, value_) on top of the reference
         // state. Only counted into the final footprint on CPU backends.
@@ -1745,6 +1852,9 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         }
     }
 
+    const uint64_t tree_dfs_rows =
+        LevelizedCpuBackend::dfs_scratch_rows(tree_, planned_cpu_threads());
+
     // Assemble the footprint for a given EXECUTING backend. Review round 2
     // P1-2: the footprint must be (re)built from the FINAL backend after
     // AUTO resolution and every fallback — pricing against a predicted
@@ -1753,10 +1863,11 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     auto build_footprint = [&](BackendType final_be) {
         SolveFootprintEstimate e;
         e.matchup_tables_bytes   = comp_matchup;
-        e.cpu_state_bytes        = (final_be == BackendType::GPU) ? 0 : comp_cpu_state;
+        e.cpu_state_bytes        = (final_be == BackendType::GPU) ? 0
+                                 : (state_q16_ ? comp_cpu_state_q16 : comp_cpu_state);
         e.gpu_state_bytes        = (final_be == BackendType::GPU) ? comp_gpu_state : 0;
         e.device_total_bytes     = (final_be == BackendType::GPU) ? comp_device_total : 0;
-        e.final_strategy_bytes   = comp_final_strategy;
+        e.final_strategy_bytes   = final_strategy_is_view(final_be) ? 0 : comp_final_strategy;
         e.gpu_backend            = (final_be == BackendType::GPU);
         // A HOST-side probe calls finalize(), which materializes a whole
         // extra strategy copy well before the real finalize does; GPU
@@ -1774,7 +1885,9 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
         e.process_overhead_bytes = memory_budget::kHostProcessOverheadBytes
             + (final_be == BackendType::GPU
                    ? memory_budget::bytes_for_gpu_host_overhead(comp_device_total)
-                   : 0);
+                   : cpu_backend_host_bytes(final_be, tree_.total_nodes,
+                                            matchup_ev_per_runout_.size(),
+                                            tree_dfs_rows));
         e.strategy_tree_ev_bytes = comp_tree_ev;
         e.json_response_bytes    = comp_json;
         return e;
@@ -1892,7 +2005,19 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
     // (review round 2 P1-2: any earlier footprint priced a PREDICTED
     // backend; after an AUTO downgrade that left the CPU solve gated with
     // cpu_state=0 and reported budget_decision="gpu_oom_likely").
+    check_state_precision_supported(selected_backend);
+    if (!state_q16_supported(selected_backend)) state_q16_ = false;
     gate_est = build_footprint(selected_backend);
+    // 2026-10-08: AUTO state precision on the trees the ① gate does not see
+    // (turn and river roots, collapsed flops): 16 bits when float does not
+    // fit the host budget. If neither fits, the error below prices 16 bits.
+    if (config_.state_precision == SolverConfig::StatePrecision::AUTO &&
+        !state_q16_ && state_q16_supported(selected_backend) &&
+        config_.memory_budget.host_bytes > 0 &&
+        gate_est.total_host_bytes() > config_.memory_budget.host_bytes) {
+        state_q16_ = true;
+        gate_est = build_footprint(selected_backend);
+    }
 
     // Host PEAK hard gate (review round 2 P1-1: the peak model previously
     // fed only the post-hoc budget_decision diagnostic while the actual
@@ -2080,7 +2205,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
             } else {
                 backend_->finalize();
             }
-            if (!device_probe) strategy_ = backend_->take_strategy();
+            if (!device_probe) strategy_ = backend_->take_final_strategy();
             solved_ = true;
             const float exploit_pct = compute_exploitability();
             const auto probe_end = Clock::now();
@@ -2170,11 +2295,13 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
 
     // Step 6: finalize (normalize strategy_sum → strategy). A probe's copy
     // is released first and the backend's is taken over, not copied: one
-    // finalized strategy is alive here, never two (2026-10-07).
+    // finalized strategy is alive here, never two (2026-10-07) — and on the
+    // levelized CPU backend none at all, it is read off strategy_sum
+    // (2026-10-08, FinalStrategy).
     stage_start = Clock::now();
     strategy_ = {};
     backend_->finalize();
-    strategy_ = backend_->take_strategy();
+    strategy_ = backend_->take_final_strategy();
     apply_node_locks();
     solved_ = true;
     stage_end = Clock::now();
@@ -2394,6 +2521,7 @@ inline SolverResult Solver::solve(ProgressCallback progress_cb) {
                 ? "levelized" : "reference";
             r.cpu_threads_effective = cpu_eff;
         }
+        r.state_precision = state_q16_ ? "int16" : "f32";
 
         result.resources = std::move(r);
     }
@@ -2594,6 +2722,7 @@ inline double Solver::estimated_iteration_seconds(
 // uses (memory_budget.h models). Picks the GPU model when AUTO would select
 // GPU (so the user sees the right number BEFORE backend allocation).
 inline SolveResources Solver::estimate_only() {
+    state_q16_ = config_.state_precision == SolverConfig::StatePrecision::INT16;
     iso_ = compute_isomorphism(config_.board.data(), config_.board_size,
                                &iso_constraints(), config_.iso_mode);
 
@@ -2644,7 +2773,7 @@ inline SolveResources Solver::estimate_only() {
             planned = should_auto_select_gpu(config_, proj.nodes, proj.tables)
                       ? BackendType::GPU : BackendType::CPU;
         }
-        const EnumeratedFit fit = check_enumerated_fit(
+        const EnumeratedFit fit = fit_enumerated(
             planned, proj.tables, proj.player_nodes, proj.player_slots,
             estimated_host_matchup_bytes(proj.tables, est_host_dense,
                                          proj.equity_tables),
@@ -2656,6 +2785,11 @@ inline SolveResources Solver::estimate_only() {
         }
     }
     if (!projected_collapse) tree_ = builder.build();
+    // A collapsed tree (the projection above or the builder's own runout
+    // gate) is small: its state precision is decided afresh (AUTO from float).
+    if (tree_.runout_approximated) {
+        state_q16_ = config_.state_precision == SolverConfig::StatePrecision::INT16;
+    }
 
     SolveResources r;
     r.canonical_combos = board_canonical_combos();
@@ -2748,7 +2882,7 @@ inline SolveResources Solver::estimate_only() {
         const uint64_t est_matchup_host =
             estimated_host_matchup_bytes(matchup_tables_exact, est_host_dense,
                                          equity_tables_exact);
-        const EnumeratedFit fit = check_enumerated_fit(
+        const EnumeratedFit fit = fit_enumerated(
             planned, matchup_tables_exact, player_nodes, player_slots,
             est_matchup_host, est_plan.device_dense_upload, equity_tables_exact,
             signed_count_device_tables(est_plan, matchup_tables_exact),
@@ -2785,14 +2919,16 @@ inline SolveResources Solver::estimate_only() {
     r.estimated_matchup_bytes        =
         estimated_host_matchup_bytes(matchup_count_est, est_host_dense,
                                      equity_tables_exact);
-    r.estimated_cpu_state_bytes      = bytes_for_cpu_state_compact(
-        player_slots, nc, cpu_materializes_strategy());
     // v1.7.0: include the levelized backend's extra reach/value buffers in
     // the pre-solve estimate too, so the UI's ETA banner doesn't say "this
     // fits in 4 GB" right before the host gate rejects on the real solve.
-    if (cpu_uses_level_flats()) {
-        r.estimated_cpu_state_bytes += bytes_for_levelized_cpu_extra(total_n, nc);
-    }
+    // 2026-10-08: at the state precision (16 bits never has the flats).
+    auto cpu_state_at = [&](bool q16) {
+        return bytes_for_cpu_state_compact(player_slots, nc,
+                                           cpu_materializes_strategy(), q16, total_n)
+             + (cpu_uses_level_flats() ? bytes_for_levelized_cpu_extra(total_n, nc) : 0);
+    };
+    r.estimated_cpu_state_bytes      = cpu_state_at(state_q16_);
     r.terminal_representation        = est_plan.label();
     const uint64_t gpu_value_rows_est = gpu_value_rows(tree_);
     r.estimated_gpu_state_bytes      = bytes_for_gpu_state_compact(
@@ -2919,13 +3055,20 @@ inline SolveResources Solver::estimate_only() {
     // peak-lifetime-aware (2× final strategy + process/context overhead) —
     // estimate and gate must never answer differently.
     const bool gpu_final = (predicted_backend == BackendType::GPU);
+    // 2026-10-08: the state precision as solve() resolves it on that backend.
+    check_state_precision_supported(predicted_backend);
+    if (state_q16_ && !state_q16_supported(predicted_backend)) {
+        state_q16_ = false;
+        r.estimated_cpu_state_bytes = cpu_state_at(false);
+    }
     SolveFootprintEstimate gate_est;
     gate_est.matchup_tables_bytes   = r.estimated_matchup_bytes;
     gate_est.cpu_state_bytes        = gpu_final ? 0 : r.estimated_cpu_state_bytes;
     gate_est.gpu_state_bytes        = gpu_final ? r.estimated_gpu_state_bytes : 0;
     gate_est.device_total_bytes     = gpu_final ? r.estimated_device_total_bytes : 0;
-    gate_est.final_strategy_bytes   = bytes_for_final_strategy(
-        player_slots, nc, player_nodes);
+    gate_est.final_strategy_bytes   =
+        final_strategy_is_view(gpu_final ? BackendType::GPU : BackendType::CPU)
+            ? 0 : bytes_for_final_strategy(player_slots, nc, player_nodes);
     gate_est.gpu_backend            = gpu_final;
     // Mirrors build_footprint() in solve() — see the note there.
     gate_est.exploit_probe_runs     = host_probe_copies(
@@ -2938,9 +3081,22 @@ inline SolveResources Solver::estimate_only() {
     gate_est.process_overhead_bytes = memory_budget::kHostProcessOverheadBytes
         + (gpu_final ? memory_budget::bytes_for_gpu_host_overhead(
                            gate_est.device_total_bytes)
-                     : 0);
+                     : cpu_backend_host_bytes(BackendType::CPU, tree_.total_nodes,
+                                              matchup_count_est,
+                                              tree_stats(tree_).dfs_scratch_rows));
     gate_est.strategy_tree_ev_bytes = r.estimated_strategy_tree_bytes;
     gate_est.json_response_bytes    = r.estimated_json_bytes;
+    // AUTO: 16 bits when float does not fit the host budget (solve() does
+    // the same right before its host hard gate).
+    if (config_.state_precision == SolverConfig::StatePrecision::AUTO &&
+        !state_q16_ && state_q16_supported(predicted_backend) &&
+        config_.memory_budget.host_bytes > 0 &&
+        gate_est.total_host_bytes() > config_.memory_budget.host_bytes) {
+        state_q16_ = true;
+        r.estimated_cpu_state_bytes = cpu_state_at(true);
+        gate_est.cpu_state_bytes = r.estimated_cpu_state_bytes;
+    }
+    r.state_precision               = state_q16_ ? "int16" : "f32";
     r.estimated_peak_host_bytes     = gate_est.total_host_bytes();
     r.estimated_overhead_bytes      = gate_est.process_overhead_bytes;
     BudgetDecision d = evaluate_budget(gate_est, config_.memory_budget);
@@ -3617,18 +3773,7 @@ inline void Solver::resolve_node_locks() {
 
 inline void Solver::apply_node_locks() {
     if (resolved_locks_.empty()) return;
-    for (const auto& [key, forced_strat] : resolved_locks_) {
-        auto [node_idx, canonical_idx] = key;
-        if (node_idx >= strategy_.size()) continue;
-        uint8_t n_act = tree_.num_children[node_idx];
-        if (n_act == 0) continue;
-        for (uint8_t a = 0; a < n_act && a < forced_strat.size(); ++a) {
-            size_t idx = a * iso_.num_canonical + canonical_idx;
-            if (idx < strategy_[node_idx].size()) {
-                strategy_[node_idx][idx] = forced_strat[a];
-            }
-        }
-    }
+    strategy_.apply_locks(resolved_locks_, iso_.num_canonical);
 }
 
 // ============================================================================
@@ -3719,10 +3864,11 @@ inline std::vector<float> Solver::cpu_ev_traverse(
 
     int acting = tree_.active_player[node_idx];
     uint8_t na = tree_.num_children[node_idx];
-    if (node_idx >= strategy_.size() || strategy_[node_idx].empty()) {
+    std::vector<float> strat_scratch;
+    const float* strat = strategy_.row(node_idx, strat_scratch);
+    if (strat == nullptr) {
         return record(std::vector<float>(nc, 0.0f));
     }
-    const auto& strat = strategy_[node_idx];
 
     std::vector<float> node_vals(nc, 0.0f);
     uint32_t action_offset = tree_.children_offset[node_idx];
@@ -3821,13 +3967,15 @@ inline std::vector<float> Solver::player_reach_at(uint32_t node_idx, int player)
     }
     const uint16_t nc = iso_.num_canonical;
     const auto own = (player == 0) ? NodeType::PLAYER_OOP : NodeType::PLAYER_IP;
+    std::vector<float> strat_scratch;
     for (auto it = path.rbegin(); it != path.rend(); ++it) {
         const uint32_t n = it->first;
         if (static_cast<NodeType>(tree_.node_types[n]) != own) continue;
-        if (n >= strategy_.size() || strategy_[n].empty()) continue;
+        const float* strat = strategy_.row(n, strat_scratch);
+        if (strat == nullptr) continue;
         const std::size_t base = static_cast<std::size_t>(it->second) * nc;
         for (uint16_t c = 0; c < nc && c < reach.size(); ++c) {
-            if (base + c < strategy_[n].size()) reach[c] *= strategy_[n][base + c];
+            reach[c] *= strat[base + c];
         }
     }
     return reach;
@@ -4144,7 +4292,8 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
     }
 
     // Opponent: play averaged strategy, absorbed into reach, then sum children
-    bool has_strat = (node_idx < strategy_.size() && !strategy_[node_idx].empty());
+    std::vector<float> strat_scratch;
+    const float* strat = strategy_.row(node_idx, strat_scratch);
     std::vector<float> node_vals(nc, 0.0f);
     uint32_t action_offset = tree_.children_offset[node_idx];
     auto& acting_reach = (acting == 0) ? reach_oop : reach_ip;
@@ -4153,8 +4302,8 @@ inline std::vector<float> Solver::cpu_best_response_traverse(
         uint32_t child = tree_.children[action_offset + a];
         for (uint16_t c = 0; c < nc; ++c) {
             saved[c] = acting_reach[c];
-            if (has_strat) {
-                acting_reach[c] *= strategy_[node_idx][a * nc + c];
+            if (strat != nullptr) {
+                acting_reach[c] *= strat[a * nc + c];
             }
         }
         std::vector<float> child_vals =
@@ -4178,7 +4327,7 @@ inline float Solver::compute_exploitability() {
     auto ensure_host_strategy = [&]() {
         if (strategy_.empty() && backend_) {
             backend_->finalize();
-            strategy_ = backend_->take_strategy();
+            strategy_ = backend_->take_final_strategy();
         }
     };
     // Never answer 0 for want of a host strategy: a probe reads 0 as
@@ -4332,7 +4481,10 @@ inline std::vector<std::string> Solver::get_action_labels_at(uint32_t node_idx) 
 
 inline std::vector<std::pair<std::string, float>> Solver::extract_global_strategy_at(uint32_t node_idx) const {
     std::vector<std::pair<std::string, float>> global_strat;
-    if (!solved_ || node_idx >= tree_.total_nodes || strategy_.empty() || strategy_[node_idx].empty()) {
+    std::vector<float> strat_scratch;
+    const float* strat = (!solved_ || node_idx >= tree_.total_nodes || strategy_.empty())
+        ? nullptr : strategy_.row(node_idx, strat_scratch);
+    if (strat == nullptr) {
         return global_strat;
     }
     uint8_t n_act = tree_.num_children[node_idx];
@@ -4359,11 +4511,9 @@ inline std::vector<std::pair<std::string, float>> Solver::extract_global_strateg
         weight *= reach_w;
         for (uint8_t a = 0; a < n_act; ++a) {
             size_t idx = a * iso_.num_canonical + c;
-            if (idx < strategy_[node_idx].size()) {
-                float val = strategy_[node_idx][idx] * weight;
-                totals[a] += val;
-                grand_total += val;
-            }
+            float val = strat[idx] * weight;
+            totals[a] += val;
+            grand_total += val;
         }
     }
 
@@ -4380,8 +4530,10 @@ inline std::vector<std::pair<std::string,
 {
     std::vector<std::pair<std::string,
         std::vector<std::pair<std::string, float>>>> out;
-    if (!solved_ || node_idx >= tree_.total_nodes ||
-        strategy_.empty() || strategy_[node_idx].empty()) {
+    std::vector<float> strat_scratch;
+    const float* strat = (!solved_ || node_idx >= tree_.total_nodes || strategy_.empty())
+        ? nullptr : strategy_.row(node_idx, strat_scratch);
+    if (strat == nullptr) {
         return out;
     }
     uint8_t n_act = tree_.num_children[node_idx];
@@ -4413,9 +4565,7 @@ inline std::vector<std::pair<std::string,
         if (arr.empty()) arr.assign(n_act, 0.0f);
         for (uint8_t a = 0; a < n_act; ++a) {
             size_t idx = a * iso_.num_canonical + ci;
-            if (idx < strategy_[node_idx].size()) {
-                arr[a] += strategy_[node_idx][idx] * reach_w;
-            }
+            arr[a] += strat[idx] * reach_w;
         }
         weights[label] += reach_w;
     }
@@ -4465,9 +4615,7 @@ inline std::vector<std::pair<std::string,
         entry.reserve(n_act);
         for (uint8_t a = 0; a < n_act; ++a) {
             size_t idx = a * iso_.num_canonical + ci;
-            float v = (idx < strategy_[node_idx].size())
-                        ? strategy_[node_idx][idx] : 0.0f;
-            entry.push_back({labels[a], v});
+            entry.push_back({labels[a], strat[idx]});
         }
         out.push_back({std::move(combo_key), std::move(entry)});
     }
@@ -4925,18 +5073,18 @@ Solver::extract_opponent_range_at(uint32_t node_idx) const
     uint16_t nc = iso_.num_canonical;
     std::vector<float> roop = oop_reach_;  // prior
     std::vector<float> rip  = ip_reach_;
+    std::vector<float> strat_scratch;
     for (auto& [n, a] : path) {
         auto ntn = static_cast<NodeType>(tree_.node_types[n]);
         if (ntn == NodeType::CHANCE) continue;
         if (ntn != NodeType::PLAYER_OOP && ntn != NodeType::PLAYER_IP) continue;
         bool is_ip_node = (ntn == NodeType::PLAYER_IP);
         auto& reach = is_ip_node ? rip : roop;
-        if (n >= strategy_.size() || strategy_[n].empty()) continue;
+        const float* strat = strategy_.row(n, strat_scratch);
+        if (strat == nullptr) continue;
         for (uint16_t c = 0; c < nc; ++c) {
             size_t idx = static_cast<size_t>(a) * nc + c;
-            if (idx < strategy_[n].size()) {
-                reach[c] *= strategy_[n][idx];
-            }
+            reach[c] *= strat[idx];
         }
     }
 
@@ -5025,6 +5173,8 @@ inline ComboAnalysis Solver::analyze_combo(const std::string& combo_str,
     const uint8_t n_act = tree_.num_children[node_idx];
     std::vector<double> mix(n_act, 0.0);
     double w_sum = 0.0, ev_sum = 0.0, ev_w = 0.0;
+    std::vector<float> strat_scratch;
+    const float* strat = strategy_.row(node_idx, strat_scratch);
     for (uint16_t idx : members) {
         if (combo_table[idx].conflicts_with(dead)) continue;
         const uint16_t ci = iso_.original_to_canonical[idx];
@@ -5032,7 +5182,7 @@ inline ComboAnalysis Solver::analyze_combo(const std::string& combo_str,
         const double w = reach[ci];
         for (uint8_t a = 0; a < n_act; ++a) {
             const size_t k = static_cast<size_t>(a) * iso_.num_canonical + ci;
-            if (k < strategy_[node_idx].size()) mix[a] += w * strategy_[node_idx][k];
+            if (strat != nullptr) mix[a] += w * strat[k];
         }
         w_sum += w;
         if (node_idx == 0) {

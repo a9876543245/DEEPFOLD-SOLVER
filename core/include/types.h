@@ -504,6 +504,16 @@ struct SolverConfig {
     /// escape hatch, DEEPSOLVER_CPU_TRAVERSAL=dfs|level overrides at the CLI.
     bool cpu_dfs_traversal = true;
 
+    /// 2026-10-08: precision of the CFR state (regrets, strategy sums).
+    /// FLOAT32 is the reference. INT16 keeps them in 16 bits with one scale
+    /// per node, as postflop-solver does — half the bytes of the largest
+    /// object, at a small cost in accuracy (A/B in ROADMAP §0-oct). AUTO, the
+    /// default, uses 16 bits only when the float state would not fit the
+    /// memory budget, so a solve that fits stays bit-identical. Only the
+    /// levelized CPU backend's depth-first path supports INT16 so far.
+    enum class StatePrecision { AUTO, FLOAT32, INT16 };
+    StatePrecision state_precision = StatePrecision::AUTO;
+
     /// 2026-09-12 (ROADMAP Next work 1): alternating (Gauss-Seidel) regret
     /// updates — the IP traversal re-derives every strategy after the OOP
     /// update instead of both traversers reading the iteration-start
@@ -907,6 +917,9 @@ struct SolveResources {
     /// threads). Levelized is BFS-flat with per-level OMP and scales to
     /// all available cores.
     std::string cpu_backend_kind;
+    /// 2026-10-08: "f32" or "int16" — the CFR state precision the solve ran
+    /// with, or (--estimate-only) would run with (SolverConfig::state_precision).
+    std::string state_precision = "f32";
 };
 
 /// One exploitability probe taken during the iteration loop (T0/0b).

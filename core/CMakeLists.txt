@@ -533,6 +533,15 @@ if(BUILD_TESTS)
     set_tests_properties(CliCpuStratBuffer PROPERTIES
         LABELS "smoke;memory" TIMEOUT 120)
 
+    # 2026-10-08: 16-bit CFR state — AUTO picks it exactly when only it fits,
+    # estimate == allocation, and an impossible request is an error.
+    add_test(NAME CliStateQ16
+        COMMAND ${CMAKE_COMMAND}
+            -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=state_q16
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+    set_tests_properties(CliStateQ16 PROPERTIES
+        LABELS "smoke;memory" TIMEOUT 180)
+
     # A4-host inc 4: the builder's runout gate must price the tables the
     # solve really builds (rank tables on a blocker board), so a rainbow flop
     # enumerates when its CFR STATE fits and still collapses when it does

@@ -172,9 +172,6 @@ public:
     /// Build the full game tree and return it in SoA format.
     FlatGameTree build();
 
-    /// Get the total node count (valid after build)
-    uint32_t node_count() const { return static_cast<uint32_t>(nodes_.size()); }
-
     /// The suit permutations every chance node's runout orbits are taken
     /// under (see range_perms_). Solver::project_enumerated_tree()
     /// re-enumerates the canonical runouts with exactly this set, so its
@@ -718,7 +715,12 @@ inline FlatGameTree GameTreeBuilder::build() {
     add_node(std::move(root));
     build_subtree(0);
 
-    return flatten();
+    FlatGameTree flat = flatten();
+    // 2026-10-08: the TreeNodes (each with its own child / runout vectors)
+    // are dead once flattened, but Solver::solve()'s builder lives to the
+    // end of the solve — they used to sit in memory through it all.
+    std::vector<TreeNode>().swap(nodes_);
+    return flat;
 }
 
 inline FlatGameTree GameTreeBuilder::flatten() const {

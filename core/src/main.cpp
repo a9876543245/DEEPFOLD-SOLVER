@@ -208,6 +208,7 @@ struct CLIArgs {
     int cpu_showdown_batch = 0;
     std::string cpu_traversal = "dfs";
     std::string cfr_updates = "alternating";
+    std::string state_precision = "auto";
 
     // Sprint 1 (market-beating plan): per-solve memory budget overrides.
     // Default 0 = use the SolverConfig defaults (6 GB host, 100 MB JSON,
@@ -403,6 +404,8 @@ CLIArgs parse_args(int argc, char* argv[]) {
             args.cpu_traversal = argv[++i];
         } else if (arg == "--cfr-updates" && i + 1 < argc) {
             args.cfr_updates = argv[++i];
+        } else if (arg == "--state-precision" && i + 1 < argc) {
+            args.state_precision = argv[++i];
         } else if (arg == "--include-scalar") {
             args.include_scalar = 1;
         } else if (arg == "--benchmark-case" && i + 1 < argc) {
@@ -528,6 +531,13 @@ Arguments:
                            anchor; simultaneous: both traversers read the
                            iteration-start strategies (pre-3.2 behaviour).
                            DEEPSOLVER_CFR_UPDATES overrides.
+  --state-precision <auto|32|16>
+                           CFR state (regrets, strategy sums) in 32-bit floats
+                           or 16 bits with one scale per node (half the
+                           memory, a small accuracy cost). auto (default): 16
+                           bits only when 32 would not fit the memory budget.
+                           16 needs the levelized CPU backend's depth-first
+                           path (no node locks, a POSTFLOP schedule).
   --bet-sizing <json>      Pio-style menus per player and street, e.g.
                            {"oop":{"flop":{"bet":["33%","75%"],"raise":["2.5x"],
                            "donk":[],"allin":true},...},"ip":{...},
@@ -1425,7 +1435,8 @@ std::string result_to_json(
         // v1.4.0 Phase 2: CPU mode diagnostics (empty/0 on GPU solves).
         json << "    \"cpu_simd\": \"" << escape_json(r.cpu_simd) << "\",\n";
         json << "    \"cpu_threads_effective\": " << r.cpu_threads_effective << ",\n";
-        json << "    \"cpu_backend_kind\": \"" << escape_json(r.cpu_backend_kind) << "\"\n";
+        json << "    \"cpu_backend_kind\": \"" << escape_json(r.cpu_backend_kind) << "\",\n";
+        json << "    \"state_precision\": \"" << escape_json(r.state_precision) << "\"\n";
         json << "  },\n";
     }
 
@@ -2297,6 +2308,15 @@ int main(int argc, char* argv[]) {
                 config.alternating_updates = (std::string(env) == "alternating");
             }
         }
+        if (args.state_precision == "auto") {
+            config.state_precision = SolverConfig::StatePrecision::AUTO;
+        } else if (args.state_precision == "32") {
+            config.state_precision = SolverConfig::StatePrecision::FLOAT32;
+        } else if (args.state_precision == "16") {
+            config.state_precision = SolverConfig::StatePrecision::INT16;
+        } else {
+            throw std::invalid_argument("Invalid --state-precision value: " + args.state_precision);
+        }
 
         // v1.4.0 Phase 2: apply --cpu-simd policy. set_policy() is idempotent
         // and re-resolves the kernel table on next call to kernels(). Done
@@ -2496,7 +2516,8 @@ int main(int argc, char* argv[]) {
                       << "    \"estimated_iteration_ms\": " << r.estimated_iteration_ms << ",\n"
                       << "    \"cpu_simd\": \"" << escape_json(r.cpu_simd) << "\",\n"
                       << "    \"cpu_threads_effective\": " << r.cpu_threads_effective << ",\n"
-                      << "    \"cpu_backend_kind\": \"" << escape_json(r.cpu_backend_kind) << "\"\n"
+                      << "    \"cpu_backend_kind\": \"" << escape_json(r.cpu_backend_kind) << "\",\n"
+                      << "    \"state_precision\": \"" << escape_json(r.state_precision) << "\"\n"
                       << "  }";
 
             // Roadmap ④: Exact-mode feasibility pre-flight. When the caller

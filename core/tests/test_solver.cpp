@@ -71,6 +71,10 @@ static SolverConfig make_flop_config(int max_iter = 100) {
     config.max_iterations = max_iter;
     config.target_exploitability = 0.005f;
     config.exploitability_check_interval = 50;
+    // 2026-10-08: float pinned. At the default 6 GB budget this flop's float
+    // state collapses the runouts; AUTO would enumerate it in 16 bits — a
+    // 1.1M-node solve where these checks were sized for the collapsed tree.
+    config.state_precision = SolverConfig::StatePrecision::FLOAT32;
     return config;
 }
 

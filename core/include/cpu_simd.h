@@ -345,6 +345,32 @@ struct Kernels {
                                    int16_t* acc,
                                    std::size_t begin, std::size_t end,
                                    int16_t ra);
+
+    // 2026-10-08: 16-bit CFR state (LevelizedCpuBackend, depth-first path):
+    // regrets as int16 and strategy sums as uint16, one scale per node.
+    // Regrets are square-root companded — q = 32767 * sign(x) * sqrt(|x| /
+    // scale), x = q * |q| * scale / 32767^2 — so a hand whose regrets are
+    // tiny next to the node's largest keeps them (down to ~5e-10 of the
+    // scale instead of 1.5e-5); sums are linear, x = q * unit.
+    /// dst[i] = q[i] * |q[i]|: a node's regrets up to its common scale,
+    /// which regret matching cancels.
+    void  (*vec_q16_regret_decode)(float* dst, const int16_t* q, std::size_t n);
+    /// x[i] = q[i] * |q[i]| * (q[i] > 0 ? s_pos : s_neg) + (x[i] - node_val[i]),
+    /// with x holding the action values on entry; returns max |x[i]|.
+    float (*vec_q16_regret_update)(float* x, const int16_t* q, float s_pos,
+                                   float s_neg, const float* node_val,
+                                   std::size_t n);
+    /// In units of the stored sums: x[i] = q[i] + x[i] * inv_unit, or
+    /// q[i] + reach[i] * x[i] * inv_unit when reach is given, with x holding
+    /// the strategy on entry; returns max x[i].
+    float (*vec_q16_strategy_sum)(float* x, const uint16_t* q, float inv_unit,
+                                  const float* reach, std::size_t n);
+    /// q[i] = 32767 * sign(x[i]) * sqrt(|x[i]| * inv_scale), rounded to
+    /// nearest (ties to even), saturated.
+    void  (*vec_encode_regret_i16)(int16_t* q, const float* x, float inv_scale,
+                                   std::size_t n);
+    /// q[i] = x[i] * enc rounded to nearest (ties to even), saturated.
+    void  (*vec_encode_u16)(uint16_t* q, const float* x, float enc, std::size_t n);
 };
 
 // Defined in cpu_kernels_scalar.cpp / cpu_kernels_avx2.cpp.
@@ -688,6 +714,25 @@ inline void equity_sign_accumulate(
     std::size_t begin, std::size_t end, int16_t ra)
 {
     kernels().equity_sign_accumulate(ranks, alive, acc, begin, end, ra);
+}
+
+inline void vec_q16_regret_decode(float* dst, const int16_t* q, std::size_t n) {
+    kernels().vec_q16_regret_decode(dst, q, n);
+}
+inline float vec_q16_regret_update(float* x, const int16_t* q, float s_pos,
+                                   float s_neg, const float* node_val, std::size_t n) {
+    return kernels().vec_q16_regret_update(x, q, s_pos, s_neg, node_val, n);
+}
+inline float vec_q16_strategy_sum(float* x, const uint16_t* q, float inv_unit,
+                                  const float* reach, std::size_t n) {
+    return kernels().vec_q16_strategy_sum(x, q, inv_unit, reach, n);
+}
+inline void vec_encode_regret_i16(int16_t* q, const float* x, float inv_scale,
+                                  std::size_t n) {
+    kernels().vec_encode_regret_i16(q, x, inv_scale, n);
+}
+inline void vec_encode_u16(uint16_t* q, const float* x, float enc, std::size_t n) {
+    kernels().vec_encode_u16(q, x, enc, n);
 }
 
 }  // namespace deepsolver::cpu_simd

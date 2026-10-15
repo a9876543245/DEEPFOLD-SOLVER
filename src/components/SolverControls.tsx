@@ -5,7 +5,7 @@ import {
   type MemoryProfile, type SolveMode, type EstimateResponse,
 } from '../lib/poker';
 import {
-  SIZING_PRESETS, presetSpec, matchPreset, describeSpec,
+  SIZING_PRESET_KEYS, presetSpec, matchPreset, describeSpec,
   type BetSizingSpec, type SizingPresetKey,
 } from '../lib/betSizing';
 
@@ -76,6 +76,7 @@ export function SolverControls({
   const presetLabels: Record<SizingPresetKey, string> = {
     lite: t('config.lite'),
     standard: t('config.standard'),
+    lean: t('config.lean'),
     polar: t('config.polar'),
     small_ball: t('config.smallBall'),
   };
@@ -210,7 +211,7 @@ export function SolverControls({
           {t('config.betSizing')}
         </label>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-          {(Object.keys(SIZING_PRESETS) as SizingPresetKey[]).map(key => (
+          {SIZING_PRESET_KEYS.map(key => (
             <button
               key={key}
               className={`btn-pill ${activePreset === key ? 'active' : ''}`}
@@ -230,6 +231,11 @@ export function SolverControls({
         <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginTop: 6 }}>
           {describeSpec(sizingSpec)} (% pot)
         </div>
+        {activePreset === 'lean' && (
+          <div style={{ fontSize: 11, color: 'var(--color-text-tertiary)', marginTop: 4 }}>
+            {t('config.lean.hint')}
+          </div>
+        )}
       </div>
 
       {/* v1.3.0: Solve mode (Quick / Standard / Deep) — picks iter cap +

@@ -26,6 +26,8 @@
 
 #include "cpu_simd.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <immintrin.h>
 
@@ -2031,6 +2033,133 @@ static void equity_sign_accumulate(
     }
 }
 
+// ---------------------------------------------------------------------------
+// 2026-10-08: 16-bit CFR state (see cpu_simd.h). n is a multiple of 8 on
+// every caller (lane-padded rows); the scalar tails only keep them total.
+// ---------------------------------------------------------------------------
+
+static inline float hmax8(__m256 v) {
+    __m128 m = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
+    return _mm_cvtss_f32(m);
+}
+
+static inline __m256 load_i16_as_ps(const int16_t* p) {
+    return _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(p))));
+}
+
+static inline __m256 load_u16_as_ps(const uint16_t* p) {
+    return _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(p))));
+}
+
+static inline __m256 qabsq(__m256 qf) {
+    return _mm256_mul_ps(qf, _mm256_andnot_ps(_mm256_set1_ps(-0.0f), qf));
+}
+
+static void vec_q16_regret_decode(float* dst, const int16_t* q, std::size_t n) {
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) _mm256_storeu_ps(dst + i, qabsq(load_i16_as_ps(q + i)));
+    for (; i < n; ++i) {
+        const float qf = static_cast<float>(q[i]);
+        dst[i] = qf * std::fabs(qf);
+    }
+}
+
+static float vec_q16_regret_update(float* x, const int16_t* q, float s_pos,
+                                   float s_neg, const float* node_val, std::size_t n) {
+    const __m256 vpos = _mm256_set1_ps(s_pos);
+    const __m256 vneg = _mm256_set1_ps(s_neg);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    __m256 vmax = zero;
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 qf = load_i16_as_ps(q + i);
+        const __m256 s = _mm256_blendv_ps(vneg, vpos, _mm256_cmp_ps(qf, zero, _CMP_GT_OS));
+        const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(x + i), _mm256_loadu_ps(node_val + i));
+        const __m256 r = _mm256_fmadd_ps(qabsq(qf), s, d);
+        _mm256_storeu_ps(x + i, r);
+        vmax = _mm256_max_ps(vmax, _mm256_and_ps(r, abs_mask));
+    }
+    float m = hmax8(vmax);
+    for (; i < n; ++i) {
+        const float qf = static_cast<float>(q[i]);
+        const float r = qf * std::fabs(qf) * (qf > 0.0f ? s_pos : s_neg) + (x[i] - node_val[i]);
+        x[i] = r;
+        m = std::max(m, std::fabs(r));
+    }
+    return m;
+}
+
+static float vec_q16_strategy_sum(float* x, const uint16_t* q, float inv_unit,
+                                  const float* reach, std::size_t n) {
+    const __m256 vinv = _mm256_set1_ps(inv_unit);
+    __m256 vmax = _mm256_setzero_ps();
+    std::size_t i = 0;
+    if (reach != nullptr) {
+        for (; i + 8 <= n; i += 8) {
+            const __m256 add = _mm256_mul_ps(_mm256_loadu_ps(reach + i), _mm256_loadu_ps(x + i));
+            const __m256 r = _mm256_fmadd_ps(add, vinv, load_u16_as_ps(q + i));
+            _mm256_storeu_ps(x + i, r);
+            vmax = _mm256_max_ps(vmax, r);
+        }
+    } else {
+        for (; i + 8 <= n; i += 8) {
+            const __m256 r = _mm256_fmadd_ps(_mm256_loadu_ps(x + i), vinv, load_u16_as_ps(q + i));
+            _mm256_storeu_ps(x + i, r);
+            vmax = _mm256_max_ps(vmax, r);
+        }
+    }
+    float m = hmax8(vmax);
+    for (; i < n; ++i) {
+        const float add = (reach != nullptr) ? reach[i] * x[i] : x[i];
+        const float r = add * inv_unit + static_cast<float>(q[i]);
+        x[i] = r;
+        m = std::max(m, r);
+    }
+    return m;
+}
+
+static void vec_encode_regret_i16(int16_t* q, const float* x, float inv_scale,
+                                  std::size_t n) {
+    const __m256 vinv = _mm256_set1_ps(inv_scale);
+    const __m256 vmax = _mm256_set1_ps(32767.0f);
+    const __m256 sign_bit = _mm256_set1_ps(-0.0f);
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 xv = _mm256_loadu_ps(x + i);
+        const __m256 mag = _mm256_mul_ps(
+            _mm256_sqrt_ps(_mm256_mul_ps(_mm256_andnot_ps(sign_bit, xv), vinv)), vmax);
+        const __m256i v = _mm256_cvtps_epi32(_mm256_or_ps(mag, _mm256_and_ps(sign_bit, xv)));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(q + i),
+                         _mm_packs_epi32(_mm256_castsi256_si128(v),
+                                         _mm256_extracti128_si256(v, 1)));
+    }
+    for (; i < n; ++i) {
+        const float v = std::nearbyint(
+            std::copysign(std::sqrt(std::fabs(x[i]) * inv_scale) * 32767.0f, x[i]));
+        q[i] = static_cast<int16_t>(std::min(32767.0f, std::max(-32768.0f, v)));
+    }
+}
+
+static void vec_encode_u16(uint16_t* q, const float* x, float enc, std::size_t n) {
+    const __m256 ve = _mm256_set1_ps(enc);
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256i v = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i), ve));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(q + i),
+                         _mm_packus_epi32(_mm256_castsi256_si128(v),
+                                          _mm256_extracti128_si256(v, 1)));
+    }
+    for (; i < n; ++i) {
+        const float v = std::nearbyint(x[i] * enc);
+        q[i] = static_cast<uint16_t>(std::min(65535.0f, std::max(0.0f, v)));
+    }
+}
+
 }  // namespace deepsolver::cpu_simd::avx2_impl
 
 namespace deepsolver::cpu_simd {
@@ -2075,6 +2204,11 @@ const Kernels avx2_kernels = {
     &avx2_impl::showdown_ip_full_active2,
     &avx2_impl::showdown_oop_full_batch,
     &avx2_impl::equity_sign_accumulate,
+    &avx2_impl::vec_q16_regret_decode,
+    &avx2_impl::vec_q16_regret_update,
+    &avx2_impl::vec_q16_strategy_sum,
+    &avx2_impl::vec_encode_regret_i16,
+    &avx2_impl::vec_encode_u16,
 };
 
 }  // namespace deepsolver::cpu_simd

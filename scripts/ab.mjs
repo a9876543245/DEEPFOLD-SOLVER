@@ -27,7 +27,7 @@
 //
 // Exit code 0 = every fixture byte-identical, 1 = any drift or run failure.
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
@@ -100,7 +100,23 @@ const FIXTURES = [
   { name: 'cpu_early_stop',     args: [...POT, ...STACK, '--board', 'AsKd7c',     '--iterations', '400', '--exploitability', '1.5', '--exploitability-interval', '50', '--backend', 'cpu', '--postsolve', 'full', ...QUIET] },
 ];
 
+// 2026-10-08: binaries with --state-precision default to AUTO, which keeps
+// CFR state in 16 bits whenever float would not fit the budget — the
+// default-budget rainbow/paired CPU flops here then ENUMERATE in 16 bits
+// where float collapsed. This harness is the float path's bit-exact bar, so
+// pin float on every binary that has the flag (older baselines do not).
+const pinFloat = new Map();
+function floatPin(exe) {
+  if (!pinFloat.has(exe)) {
+    const h = spawnSync(exe, ['--help'], { encoding: 'utf-8' });
+    const help = `${h.stdout ?? ''}${h.stderr ?? ''}`;
+    pinFloat.set(exe, help.includes('--state-precision') ? ['--state-precision', '32'] : []);
+  }
+  return pinFloat.get(exe);
+}
+
 function run(exe, args, label) {
+  args = [...args, ...floatPin(exe)];
   try {
     return execFileSync(exe, args, {
       maxBuffer: 512 * 1048576,

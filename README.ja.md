@@ -34,7 +34,7 @@ DEEPFOLD-SOLVER は [DEEPFOLD](https://deepfold.co) のデスクトップ GTO �
 
 ### 信頼できるメモリ制御
 
-- **Memory Profile プリセット** — `safe / balanced / performance` で host RAM、JSON、strategy-tree-node の予算を事前にライブプレビュー付きで決定。ソルバーは予算を全工程で遵守 — pre-backend ゲートが CPU host / GPU VRAM / AUTO fallback をアロケーション**前**に評価、OOM は構造化エラー + UI バッジになり、クラッシュしません。
+- **Memory Profile プリセット** — `safe / balanced / performance` で host RAM、JSON、strategy-tree-node の予算を事前にライブプレビュー付きで決定。ソルバーは予算を全工程で遵守 — pre-backend ゲートが CPU host / GPU VRAM / AUTO fallback をアロケーション**前**に評価、OOM は構造化エラー + UI バッジになり、クラッシュしません。CPU ソルブで 32 ビットの状態が予算に収まらない場合は、ターンとリバーを近似せずに regret と戦略累積を 16 ビットで保持するため、Lean のシングルレイズポットのフロップは約 11 GB で厳密に解けます。
 - **共通ホストバジェットゲートは GPU バックエンドにも適用** — matchup tables、strategy-tree EV cache、JSON response はバックエンドに関わらず host RAM 常駐、全て検査されます。診断メッセージは「GPU に切り替えても common-host のオーバーフローは解決しない」と明示。
 - **Chunked GPU マッチアップ アップロード** が host 側の `flat_ev` / `flat_valid` 重複を排除、runout 単位の `cudaMemset + cudaMemcpy` に変更し、GPU prep 時のピーク host RAM を低減。
 
@@ -42,7 +42,7 @@ DEEPFOLD-SOLVER は [DEEPFOLD](https://deepfold.co) のデスクトップ GTO �
 
 - **2,550+ プリフロップ シナリオ** をアプリ内ブラウズ。ワンクリックで IP / OOP レンジに適用。
 - **120+ 解析済み flop スポット** をワンクリックで読込。
-- **ベットサイジング:プリセットまたは完全カスタム** — Lite / Standard / Polar / Small Ball のプリセット、または Pio 式エディタ:ストリート・プレイヤーごとの bet / raise / donk(ポット % または `2.5x` レイズ)、オールイン切替、レイズ上限、調整可能なオールイン閾値。同じメニューがソルバーツリーと UI ボタンの両方を構成。
+- **ベットサイジング:プリセットまたは完全カスタム** — Lite / Standard / Lean / Polar / Small Ball のプリセット(Lean は Standard のベットサイズのまま、レイズ 1 サイズ・ドンクなし・オールインボタンなしでツリー約 1/10)、または Pio 式エディタ:ストリート・プレイヤーごとの bet / raise / donk(ポット % または `2.5x` レイズ)、オールイン切替、レイズ上限、調整可能なオールイン閾値。同じメニューがソルバーツリーと UI ボタンの両方を構成。
 - **レンジエディタ + ノードロック** — 任意のコンボの頻度を上書きして再ソルブ。
 - **トレーニングモード** — 10 問のドリルが均衡解と比較して回答を採点。
 
@@ -102,7 +102,7 @@ GPU と SIMD はどちらも自動検出。右上のステータスピルで **C
 | **Memory Profile** | `safe / balanced / performance` プリセットで host RAM / JSON / strategy-tree-node 予算を境界決定。サイレント OOM なし |
 | **Runout ピッカー** | iso 列挙有効時、任意の正準 river カードをクリックして枝切替 |
 | **GTO チャートライブラリ** | 2,550 件以上のプリフロップシナリオをアプリ内ブラウズ。ワンクリックで IP / OOP レンジに適用 |
-| **ベットサイジング** | プリセット(Lite / Standard / Polar / Small Ball)または Pio 式カスタム(ストリート・プレイヤーごとの bet / raise / donk、% / x サイズ、オールイン閾値、レイズ上限)— ソルバーツリーと UI ボタンの両方に反映 |
+| **ベットサイジング** | プリセット(Lite / Standard / Lean / Polar / Small Ball)または Pio 式カスタム(ストリート・プレイヤーごとの bet / raise / donk、% / x サイズ、オールイン閾値、レイズ上限)— ソルバーツリーと UI ボタンの両方に反映 |
 | **トレーニングモード** | 10 問のドリルが均衡解と比較して回答を採点 |
 | **解析済みスポットライブラリ** | 120 件以上の一般的な flop スポット、ワンクリックで読込 |
 | **レンジエディタ + ノードロック** | 任意のコンボの頻度を上書きして再ソルブ |

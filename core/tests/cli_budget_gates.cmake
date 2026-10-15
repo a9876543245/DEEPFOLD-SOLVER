@@ -193,8 +193,12 @@ elseif(CASE STREQUAL "postsolve_rb_selfcheck")
   # Increment 2 flipped the default: the PLAN drives the blocker path, so
   # the dense side of this A/B is now the DEEPSOLVER_POSTSOLVE_DENSE=1
   # escape hatch and the blocker side is the plain default.
+  # 2026-10-08: float pinned. The dense run's tables change the memory
+  # footprint, so under AUTO the two runs could settle on different state
+  # precisions — two different solves instead of one solve postsolved twice.
   set(ARGS --pot 100 --stack 500 --board AsKd2c --iterations 60
-      --exploitability 0 --backend cpu --no-strategy-tree --no-progress)
+      --exploitability 0 --backend cpu --no-strategy-tree --no-progress
+      --state-precision 32)
   set(ENV{DEEPSOLVER_POSTSOLVE_DENSE} "1")
   execute_process(
     COMMAND ${EXE} ${ARGS}
@@ -379,7 +383,9 @@ elseif(CASE STREQUAL "rainbow_gate_enumerates")
   # Both directions are pinned, because a build that simply never collapses
   # would pass a one-sided test and then OOM:
   #   40 GB budget → enumerates
-  #    6 GB budget → still collapses (it does not)
+  #    4 GB budget → still collapses (2026-10-08: 6 GB fits now — the default
+  #                  AUTO state precision enumerates it in 16 bits at a
+  #                  5.3 GB peak; float would need ~10.5 GB)
   # On v2.4.0 BOTH report the collapsed tree's 216 player nodes.
   #
   # 2026-09-09 audit: the corrected betting tree (stack ownership, raise
@@ -405,21 +411,21 @@ elseif(CASE STREQUAL "rainbow_gate_enumerates")
 
   execute_process(
     COMMAND ${EXE} --pot 100 --stack 500 --board AsKd7c --iterations 200
-            --estimate-only --backend cpu --host-memory-mb 6000
+            --estimate-only --backend cpu --host-memory-mb 4000
     OUTPUT_VARIABLE small_out RESULT_VARIABLE small_rc ERROR_VARIABLE small_err)
   if(NOT small_rc EQUAL 0)
-    message(FATAL_ERROR "estimate at 6 GB failed rc=${small_rc}: ${small_err}")
+    message(FATAL_ERROR "estimate at 4 GB failed rc=${small_rc}: ${small_err}")
   endif()
   string(JSON small_nodes GET "${small_out}" resources player_nodes)
   if(small_nodes GREATER 10000)
     message(FATAL_ERROR
-      "rainbow flop enumerated at a 6 GB budget (player_nodes "
-      "${small_nodes}) - its CFR state needs ~21 GB, so the state gate is "
-      "not holding")
+      "rainbow flop enumerated at a 4 GB budget (player_nodes "
+      "${small_nodes}) - it needs ~5.3 GB even in 16 bits, so the state "
+      "gate is not holding")
   endif()
   message(STATUS
-    "rainbow_gate_enumerates: 24 GB -> ${big_nodes} player nodes, "
-    "6 GB -> ${small_nodes}")
+    "rainbow_gate_enumerates: 40 GB -> ${big_nodes} player nodes, "
+    "4 GB -> ${small_nodes}")
 
 elseif(CASE STREQUAL "peak_host_model")
   # Peak-host model recalibration (2026-07-27). Two measured corrections,
@@ -803,6 +809,103 @@ elseif(CASE STREQUAL "gpu_iso_terminal_selfcheck")
   message(STATUS
     "gpu_iso_terminal_selfcheck: signed_count_gemm=${sc_n} folds=${fold_n} "
     "plain=${plain_n}; ${diffs}")
+
+elseif(CASE STREQUAL "state_q16")
+  # 2026-10-08: 16-bit CFR state (--state-precision). A rainbow flop whose
+  # state dominates its footprint (rank-blocker tables, 136k nodes): float
+  # peaks ~1.6 GB, 16 bits ~1.06 GB, so a 1300 MB budget fits only 16 bits.
+  #   - AUTO there enumerates in 16 bits (preview and solve agree), the state
+  #     estimate equals the allocation, and that allocation is exactly half
+  #     the float one plus two float scales per node;
+  #   - --state-precision 32 at the same budget collapses the runouts;
+  #   - AUTO with room keeps float (a solve that fits is unchanged);
+  #   - 16 bits where only float runs (node locks, the level sweeps) is an
+  #     error, not a silent fall back.
+  set(q_base --pot 100 --stack 300 --board AsKd7c --flop-sizes 0.75
+             --turn-sizes 0.75 --river-sizes 0.75 --iterations 2
+             --exploitability 0 --backend cpu --postsolve none
+             --no-strategy-tree --no-progress)
+
+  execute_process(COMMAND ${EXE} ${q_base} --host-memory-mb 1300 --estimate-only
+    OUTPUT_VARIABLE pre_out RESULT_VARIABLE pre_rc ERROR_VARIABLE pre_err)
+  if(NOT pre_rc EQUAL 0)
+    message(FATAL_ERROR "AUTO estimate failed rc=${pre_rc}: ${pre_err}")
+  endif()
+  string(JSON pre_prec GET "${pre_out}" resources state_precision)
+  string(JSON pre_approx GET "${pre_out}" resources runout_approximated)
+  if(NOT pre_prec STREQUAL "int16" OR pre_approx)
+    message(FATAL_ERROR
+      "AUTO preview at 1300 MB: state_precision=${pre_prec} "
+      "runout_approximated=${pre_approx}, expected int16 / false")
+  endif()
+
+  execute_process(COMMAND ${EXE} ${q_base} --host-memory-mb 1300
+    OUTPUT_VARIABLE q_out RESULT_VARIABLE q_rc ERROR_VARIABLE q_err)
+  if(NOT q_rc EQUAL 0)
+    message(FATAL_ERROR "AUTO solve at 1300 MB failed rc=${q_rc}: ${q_err}")
+  endif()
+  string(JSON q_prec GET "${q_out}" resources state_precision)
+  string(JSON q_approx GET "${q_out}" runout_approximated)
+  string(JSON q_state GET "${q_out}" resources allocated_state_bytes)
+  string(JSON q_est GET "${q_out}" resources estimated_cpu_state_bytes)
+  string(JSON q_nodes GET "${q_out}" timing tree_nodes)
+  if(NOT q_prec STREQUAL "int16" OR q_approx)
+    message(FATAL_ERROR
+      "AUTO solve at 1300 MB: state_precision=${q_prec} "
+      "runout_approximated=${q_approx}, expected int16 / false")
+  endif()
+  if(NOT q_est EQUAL q_state)
+    message(FATAL_ERROR
+      "16-bit CPU state estimate ${q_est} B != allocation ${q_state} B")
+  endif()
+
+  execute_process(COMMAND ${EXE} ${q_base} --host-memory-mb 1300 --state-precision 32
+    OUTPUT_VARIABLE f_out RESULT_VARIABLE f_rc ERROR_VARIABLE f_err)
+  if(NOT f_rc EQUAL 0)
+    message(FATAL_ERROR "float solve at 1300 MB failed rc=${f_rc}: ${f_err}")
+  endif()
+  string(JSON f_approx GET "${f_out}" runout_approximated)
+  if(NOT f_approx)
+    message(FATAL_ERROR
+      "--state-precision 32 at 1300 MB enumerated - the budget no longer "
+      "separates the two precisions, so this test stopped testing AUTO")
+  endif()
+
+  execute_process(COMMAND ${EXE} ${q_base} --host-memory-mb 40000
+    OUTPUT_VARIABLE w_out RESULT_VARIABLE w_rc ERROR_VARIABLE w_err)
+  if(NOT w_rc EQUAL 0)
+    message(FATAL_ERROR "AUTO solve at 40 GB failed rc=${w_rc}: ${w_err}")
+  endif()
+  string(JSON w_prec GET "${w_out}" resources state_precision)
+  string(JSON w_state GET "${w_out}" resources allocated_state_bytes)
+  if(NOT w_prec STREQUAL "f32")
+    message(FATAL_ERROR "AUTO with room chose ${w_prec}, expected f32")
+  endif()
+  math(EXPR q_expect "${w_state} / 2 + ${q_nodes} * 8")
+  if(NOT q_state EQUAL q_expect)
+    message(FATAL_ERROR
+      "16-bit state ${q_state} B != half the float state + 8 B/node "
+      "(${w_state} / 2 + ${q_nodes} x 8 = ${q_expect} B)")
+  endif()
+
+  execute_process(COMMAND ${EXE} ${q_base} --host-memory-mb 40000 --state-precision 16
+            --node-locks "[{\"history\":\"\",\"combo\":\"AhKh\",\"strategy\":[1,0,0]}]"
+    OUTPUT_VARIABLE l_out RESULT_VARIABLE l_rc ERROR_VARIABLE l_err)
+  if(l_rc EQUAL 0 OR NOT "${l_out}${l_err}" MATCHES "--state-precision 16 needs")
+    message(FATAL_ERROR
+      "--state-precision 16 with node locks did not refuse: rc=${l_rc} ${l_err}")
+  endif()
+  execute_process(COMMAND ${EXE} ${q_base} --host-memory-mb 40000 --state-precision 16
+            --cpu-traversal level
+    OUTPUT_VARIABLE v_out RESULT_VARIABLE v_rc ERROR_VARIABLE v_err)
+  if(v_rc EQUAL 0 OR NOT "${v_out}${v_err}" MATCHES "--state-precision 16 needs")
+    message(FATAL_ERROR
+      "--state-precision 16 on the level sweeps did not refuse: rc=${v_rc} ${v_err}")
+  endif()
+  message(STATUS
+    "state_q16: AUTO at 1300 MB -> int16 (${q_state} B = ${w_state} / 2 + "
+    "${q_nodes} x 8), float collapses there, AUTO at 40 GB -> f32; "
+    "16 bits refused with locks and on the level sweeps")
 
 else()
   message(FATAL_ERROR "unknown CASE: ${CASE}")

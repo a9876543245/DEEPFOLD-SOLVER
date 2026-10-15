@@ -87,25 +87,60 @@ public:
     /// regrets_ at the top of every iterate().
     void reprepare_keep_state(const SolverContext& ctx) override {
         std::vector<float> keep_regrets, keep_strategy_sum;
+        std::vector<int16_t> keep_regrets_q;
+        std::vector<uint16_t> keep_strategy_sum_q;
+        std::vector<float> keep_regret_scale, keep_strategy_sum_unit;
         keep_regrets.swap(regrets_);
         keep_strategy_sum.swap(strategy_sum_);
+        keep_regrets_q.swap(regrets_q_);
+        keep_strategy_sum_q.swap(strategy_sum_q_);
+        keep_regret_scale.swap(regret_scale_);
+        keep_strategy_sum_unit.swap(strategy_sum_unit_);
         prepare(ctx);
-        // Sizes differ only if the tree changed, in which case the carried
-        // state is meaningless — keep prepare()'s zeroed state (cold restart).
+        // Sizes differ only if the tree (or the state precision) changed, in
+        // which case the carried state is meaningless — keep prepare()'s
+        // zeroed state (cold restart).
         if (keep_regrets.size() == regrets_.size() &&
-            keep_strategy_sum.size() == strategy_sum_.size()) {
+            keep_strategy_sum.size() == strategy_sum_.size() &&
+            keep_regrets_q.size() == regrets_q_.size() &&
+            keep_strategy_sum_q.size() == strategy_sum_q_.size() &&
+            keep_regret_scale.size() == regret_scale_.size() &&
+            keep_strategy_sum_unit.size() == strategy_sum_unit_.size()) {
             regrets_.swap(keep_regrets);
             strategy_sum_.swap(keep_strategy_sum);
+            regrets_q_.swap(keep_regrets_q);
+            strategy_sum_q_.swap(keep_strategy_sum_q);
+            regret_scale_.swap(keep_regret_scale);
+            strategy_sum_unit_.swap(keep_strategy_sum_unit);
         }
     }
     bool supports_warm_start() const override { return true; }
     void iterate(int iteration) override;
     void finalize() override;
-    const std::vector<std::vector<float>>& strategy() const override { return strategy_; }
-    std::vector<std::vector<float>> take_strategy() override {
-        std::vector<std::vector<float>> out = std::move(strategy_);
-        strategy_.clear();
-        return out;
+    /// 2026-10-08: no materialized rows — the Solver reads the averaged
+    /// strategy straight off strategy_sum_ (take_final_strategy).
+    const std::vector<std::vector<float>>& strategy() const override {
+        static const std::vector<std::vector<float>> kNone;
+        return kNone;
+    }
+    FinalStrategy take_final_strategy() override {
+        if (q16_) {
+            return FinalStrategy::view(strategy_sum_q_.data(), node_state_offset_.data(),
+                                       action_stride_, ctx_.tree->num_children.data(),
+                                       ctx_.iso->num_canonical);
+        }
+        return FinalStrategy::view(strategy_sum_.data(), node_state_offset_.data(),
+                                   action_stride_, ctx_.tree->num_children.data(),
+                                   ctx_.iso->num_canonical);
+    }
+    void release_into(FinalStrategy& fs) override {
+        if (q16_) {
+            if (fs.views(strategy_sum_q_.data())) {
+                fs.adopt(std::move(strategy_sum_q_), std::move(node_state_offset_));
+            }
+        } else if (fs.views(strategy_sum_.data())) {
+            fs.adopt(std::move(strategy_sum_), std::move(node_state_offset_));
+        }
     }
     const char* name() const override {
         return (cpu_simd::active_mode() == cpu_simd::SimdMode::Avx2)
@@ -147,8 +182,11 @@ public:
         return static_cast<uint64_t>(
                    regrets_.size() + strategy_sum_.size() +
                    current_strategy_.size() +
-                   reach_oop_.size() + reach_ip_.size() + value_.size())
-             * sizeof(float);
+                   reach_oop_.size() + reach_ip_.size() + value_.size() +
+                   regret_scale_.size() + strategy_sum_unit_.size())
+             * sizeof(float)
+             + static_cast<uint64_t>(regrets_q_.size() + strategy_sum_q_.size())
+             * sizeof(int16_t);
     }
 
     CpuBackendDiagnostics cpu_diagnostics() const override {
@@ -258,6 +296,22 @@ private:
 
     std::vector<float> regrets_;
     std::vector<float> strategy_sum_;
+    // 2026-10-08: the same two arrays in 16 bits (ctx.state_q16; depth-first
+    // path only, and then regrets_ / strategy_sum_ stay empty): regrets as
+    // int16 and strategy sums as uint16 in the same layout, with one scale
+    // per node. Regrets: the largest |value| in the node's block, a value
+    // being q * |q| * scale / 32767^2 (square-root companded, see
+    // cpu_simd.h). Sums: the value of one step, q * unit — the DCFR decay
+    // goes into the unit, so a hand's sum is only re-rounded when it grows
+    // (re-encoding every node every iteration rounded small sums back up
+    // instead of letting them decay: an exploitability floor that rose
+    // through each strategy-sum epoch, 0.13% on the 1000-iteration river).
+    // Half the bytes of the largest host object.
+    bool q16_ = false;
+    std::vector<int16_t>  regrets_q_;
+    std::vector<uint16_t> strategy_sum_q_;
+    std::vector<float>    regret_scale_;
+    std::vector<float>    strategy_sum_unit_;
     // Third strategy-shaped array. Allocated ONLY when materialize_strategy_
     // is true (node locks / STANDARD schedule) — otherwise every consumer
     // derives the regret-matched row into per-thread scratch on demand. See
@@ -297,9 +351,6 @@ private:
     // NOTE: dynamic per-terminal skipping of the opponent dimension was built
     // here and REVERTED — ROADMAP §2b-4 has the two measured implementations
     // and why neither pays. Do not rebuild it without re-reading that section.
-
-    // Final averaged strategy (populated in finalize()).
-    std::vector<std::vector<float>> strategy_;
 
     // Cached float copies of canonical weights and inverse weights for SIMD use.
     std::vector<float> canonical_weights_f_;
@@ -935,6 +986,17 @@ private:
     /// strategy reading PRE-discount regrets, exactly as the snapshot did).
     void discount_node_regrets(uint32_t n, float pos_disc, float neg_disc);
 
+    /// 2026-10-08 16-bit state (depth-first path): node n's new strategy sums
+    /// from its strategy rows `strat` (overwritten). dfs_ss_mode_ 1 adds the
+    /// strategy, 2 the reach-weighted strategy; 0 (STANDARD) materializes and
+    /// never gets here.
+    void q16_update_strategy_sum(uint32_t n, float* strat, const float* acting_reach);
+    /// ...and its regrets: decoded and discounted, plus action value minus
+    /// node value, re-encoded. `cv` holds the action-value rows (row stride
+    /// `cv_stride`) and is overwritten.
+    void q16_update_regrets(uint32_t n, float* cv, std::size_t cv_stride,
+                            const float* node_val);
+
     /// DEEPSOLVER_PRUNE_STATS=1 diagnostic. Off by default, called once from
     /// finalize(), and it touches nothing any solve reads — see its definition
     /// for what it measures and why.
@@ -996,6 +1058,13 @@ private:
              + static_cast<std::size_t>(slot) * 4 * row_stride_;
     }
     void dfs_configure();
+public:
+    /// 2026-10-08: rows of the lane stride the depth-first visit allocates
+    /// for `tree` beyond the CFR state: `threads` arenas, 4 rows per cut
+    /// subtree and the 4 root rows. Mirrors dfs_configure() for the Solver's
+    /// host estimate.
+    static uint64_t dfs_scratch_rows(const FlatGameTree& tree, uint32_t threads);
+private:
     void dfs_trunk_forward(uint32_t n, const float* r_oop, const float* r_ip,
                            DfsArena& arena);
     void dfs_visit(uint32_t n, const float* r_oop, const float* r_ip,
@@ -1131,7 +1200,6 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
     action_stride_ = round_up_to_lane(nc);
     row_stride_ = action_stride_;
     node_state_offset_.assign(N, kNoDecisionState);
-    strategy_.clear();
     player_nodes_.clear();
     player_nodes_.reserve(N / 4);
 
@@ -1154,8 +1222,30 @@ inline void LevelizedCpuBackend::prepare(const SolverContext& ctx) {
         !ctx.config->node_locks.empty()
         || dcfr_materializes_strategy(*ctx.config);
 
-    regrets_.assign(decision_state_floats, 0.0f);
-    strategy_sum_.assign(decision_state_floats, 0.0f);
+    // 16-bit state re-encodes a node's whole block at its update, which only
+    // the depth-first visit does in one place. The Solver asks for it only
+    // there (Solver::state_q16_supported); this is the backstop.
+    q16_ = ctx.state_q16;
+    if (q16_ && (materialize_strategy_ || !ctx.config->cpu_dfs_traversal)) {
+        throw std::logic_error(
+            "16-bit CFR state needs the depth-first traversal "
+            "(no node locks, a POSTFLOP-family schedule)");
+    }
+    if (q16_) {
+        std::vector<float>().swap(regrets_);
+        std::vector<float>().swap(strategy_sum_);
+        regrets_q_.assign(decision_state_floats, 0);
+        strategy_sum_q_.assign(decision_state_floats, 0);
+        regret_scale_.assign(N, 0.0f);
+        strategy_sum_unit_.assign(N, 0.0f);
+    } else {
+        std::vector<int16_t>().swap(regrets_q_);
+        std::vector<uint16_t>().swap(strategy_sum_q_);
+        std::vector<float>().swap(regret_scale_);
+        std::vector<float>().swap(strategy_sum_unit_);
+        regrets_.assign(decision_state_floats, 0.0f);
+        strategy_sum_.assign(decision_state_floats, 0.0f);
+    }
     if (materialize_strategy_) {
         current_strategy_.assign(decision_state_floats, 0.0f);
         for (uint32_t i : player_nodes_) {
@@ -1574,7 +1664,19 @@ inline void LevelizedCpuBackend::derive_strategy_row(
     {
         uint8_t na = ctx_.tree->num_children[n];
         const float uniform = 1.0f / na;
-        const float* regret_base = regret_ptr(n);
+        const float* regret_base;
+        if (q16_) {
+            // 16-bit: q * |q| IS the regret up to the node's common scale,
+            // which regret matching cancels. Decode into `out` and match
+            // there in place (the dense kernels are elementwise).
+            for (uint8_t a = 0; a < na; ++a) {
+                cpu_simd::vec_q16_regret_decode(out + static_cast<std::size_t>(a) * stride,
+                                                regrets_q_.data() + state_off(n, a), stride);
+            }
+            regret_base = out;
+        } else {
+            regret_base = regret_ptr(n);
+        }
         float*       strat_base  = out;
         const int acting = ctx_.tree->active_player[n];
 
@@ -1741,6 +1843,82 @@ inline void LevelizedCpuBackend::discount_node_regrets(
     } else {
         std::size_t total = static_cast<std::size_t>(na) * stride;
         cpu_simd::vec_dcfr_discount(regret_ptr(n), pos_disc, neg_disc, total);
+    }
+}
+
+// A block whose largest |value| is below this is stored as all zeros, so the
+// encode factor (32767 / max) can never overflow.
+constexpr float kQ16MinScale = 1e-30f;
+
+inline void LevelizedCpuBackend::q16_update_strategy_sum(
+    uint32_t n, float* strat, const float* acting_reach)
+{
+    const uint8_t na = ctx_.tree->num_children[n];
+    const std::size_t S = action_stride_;
+    const float* reach = (dfs_ss_mode_ == 2) ? acting_reach : nullptr;
+    // s = s * sw + strat in units of one step: the decay shrinks the unit,
+    // the stored steps stay, and this iteration's strategy is added in the
+    // decayed unit. A zero unit (first visit, or the schedule's sw = 0
+    // reset) starts from this iteration's strategy alone.
+    float unit = strategy_sum_unit_[n] * dfs_sw_;
+    if (!(unit > 0.0f)) {
+        for (uint8_t a = 0; a < na; ++a) {
+            std::fill_n(strategy_sum_q_.data() + state_off(n, a), S, uint16_t{0});
+        }
+        unit = 0.0f;
+    }
+    const float inv_unit = (unit > 0.0f) ? 1.0f / unit : 1.0f;
+    float m = 0.0f;
+    for (uint8_t a = 0; a < na; ++a) {
+        m = std::max(m, cpu_simd::vec_q16_strategy_sum(
+            strat + static_cast<std::size_t>(a) * S,
+            strategy_sum_q_.data() + state_off(n, a), inv_unit, reach, S));
+    }
+    if (unit > 0.0f && m <= 65535.0f) {
+        // In range: only the steps that grew are re-rounded.
+        strategy_sum_unit_[n] = unit;
+        for (uint8_t a = 0; a < na; ++a) {
+            cpu_simd::vec_encode_u16(strategy_sum_q_.data() + state_off(n, a),
+                                     strat + static_cast<std::size_t>(a) * S, 1.0f, S);
+        }
+        return;
+    }
+    // Overflow (or a fresh start): renormalize the largest to half the range,
+    // so many iterations of growth fit before the next re-rounding.
+    if (!(m > kQ16MinScale)) {
+        strategy_sum_unit_[n] = 0.0f;
+        for (uint8_t a = 0; a < na; ++a) {
+            std::fill_n(strategy_sum_q_.data() + state_off(n, a), S, uint16_t{0});
+        }
+        return;
+    }
+    const float f = 32768.0f / m;
+    strategy_sum_unit_[n] = (unit > 0.0f ? unit : 1.0f) / f;
+    for (uint8_t a = 0; a < na; ++a) {
+        cpu_simd::vec_encode_u16(strategy_sum_q_.data() + state_off(n, a),
+                                 strat + static_cast<std::size_t>(a) * S, f, S);
+    }
+}
+
+inline void LevelizedCpuBackend::q16_update_regrets(
+    uint32_t n, float* cv, std::size_t cv_stride, const float* node_val)
+{
+    const uint8_t na = ctx_.tree->num_children[n];
+    const std::size_t S = action_stride_;
+    const float dec = regret_scale_[n] / (32767.0f * 32767.0f);
+    float m = 0.0f;
+    for (uint8_t a = 0; a < na; ++a) {
+        m = std::max(m, cpu_simd::vec_q16_regret_update(
+            cv + static_cast<std::size_t>(a) * cv_stride,
+            regrets_q_.data() + state_off(n, a),
+            dec * dfs_pos_disc_, dec * dfs_neg_disc_, node_val, S));
+    }
+    const bool live = m > kQ16MinScale;
+    regret_scale_[n] = live ? m : 0.0f;
+    const float inv = live ? 1.0f / m : 0.0f;
+    for (uint8_t a = 0; a < na; ++a) {
+        cpu_simd::vec_encode_regret_i16(regrets_q_.data() + state_off(n, a),
+                                        cv + static_cast<std::size_t>(a) * cv_stride, inv, S);
     }
 }
 
@@ -3381,6 +3559,50 @@ inline void LevelizedCpuBackend::dfs_configure() {
     dfs_root_rows_.assign(4 * S + 16, 0.0f);
 }
 
+inline uint64_t LevelizedCpuBackend::dfs_scratch_rows(const FlatGameTree& tree,
+                                                      uint32_t threads) {
+    const uint32_t N = tree.total_nodes;
+    if (N == 0) return 0;
+    // dfs_configure()'s frames and needs, in rows. Children carry larger
+    // indices than their parent, so a reverse index walk sees them first.
+    std::vector<uint32_t> sub(N, 1);
+    std::vector<uint32_t> need(N, 0);
+    for (uint32_t n = N; n-- > 0;) {
+        const uint8_t nch = tree.num_children[n];
+        const auto nt = static_cast<NodeType>(tree.node_types[n]);
+        if (nt == NodeType::TERMINAL || nch == 0) continue;
+        uint32_t total = 1, child_need = 0;
+        const uint32_t off = tree.children_offset[n];
+        for (uint8_t k = 0; k < nch; ++k) {
+            const uint32_t c = tree.children[off + k];
+            total += sub[c];
+            child_need = std::max(child_need, need[c]);
+        }
+        sub[n] = total;
+        need[n] = ((nt == NodeType::CHANCE) ? 2u * nch : 3u * nch + 1u) + child_need;
+    }
+    const uint64_t T = std::max<uint32_t>(1u, threads);
+    uint64_t cuts = 0;
+    if (T > 1) {
+        const uint64_t target = std::max<uint64_t>(1, N / (kDfsSubtreesPerThread * T));
+        std::vector<uint32_t> stack{0u};
+        while (!stack.empty()) {
+            const uint32_t n = stack.back();
+            stack.pop_back();
+            const uint8_t nch = tree.num_children[n];
+            if (static_cast<NodeType>(tree.node_types[n]) == NodeType::TERMINAL ||
+                nch == 0 || sub[n] <= target) {
+                ++cuts;
+                continue;
+            }
+            const uint32_t off = tree.children_offset[n];
+            for (uint8_t k = 0; k < nch; ++k) stack.push_back(tree.children[off + k]);
+        }
+    }
+    // Arena: need[root] + 2 rows, rounded up to 16 floats (< 1 row).
+    return T * (static_cast<uint64_t>(need[0]) + 3) + 4 * cuts + 4;
+}
+
 inline void LevelizedCpuBackend::dfs_trunk_forward(
     uint32_t n, const float* r_oop, const float* r_ip, DfsArena& arena)
 {
@@ -3541,7 +3763,9 @@ inline void LevelizedCpuBackend::dfs_visit(
     float* strat = arena.alloc(static_cast<std::size_t>(nch) * S);
     derive_strategy_row(n, strat, tid);
     const float* acting_reach = (acting == 0) ? r_oop : r_ip;
-    for (uint8_t a = 0; a < nch; ++a) {
+    // 16-bit state updates its sums after the children instead
+    // (q16_update_strategy_sum), where the strategy rows can be overwritten.
+    for (uint8_t a = 0; a < nch && !q16_; ++a) {
         const float* strat_a = strat + static_cast<std::size_t>(a) * S;
         if (dfs_ss_mode_ == 1) {
             cpu_simd::vec_decay_add(strategy_sum_ptr(n, a), dfs_sw_, strat_a, S);
@@ -3578,11 +3802,16 @@ inline void LevelizedCpuBackend::dfs_visit(
         cpu_simd::vec_fmadd(out_self, strat + static_cast<std::size_t>(a) * S,
                             cv + static_cast<std::size_t>(2) * a * S + self_off, S);
     }
-    discount_node_regrets(n, dfs_pos_disc_, dfs_neg_disc_);
-    for (uint8_t a = 0; a < nch; ++a) {
-        cpu_simd::vec_regret_update(
-            regret_ptr(n, a), cv + static_cast<std::size_t>(2) * a * S + self_off,
-            out_self, S);
+    if (q16_) {
+        q16_update_strategy_sum(n, strat, acting_reach);
+        q16_update_regrets(n, cv + self_off, 2 * S, out_self);
+    } else {
+        discount_node_regrets(n, dfs_pos_disc_, dfs_neg_disc_);
+        for (uint8_t a = 0; a < nch; ++a) {
+            cpu_simd::vec_regret_update(
+                regret_ptr(n, a), cv + static_cast<std::size_t>(2) * a * S + self_off,
+                out_self, S);
+        }
     }
     // Other player's side: the acting strategy is already in the reach.
     cpu_simd::vec_set_zero(out_other, S);
@@ -3723,7 +3952,8 @@ inline void LevelizedCpuBackend::dfs_visit_alt(
     float* strat = arena.alloc(static_cast<std::size_t>(nch) * S);
     derive_strategy_row(n, strat, tid);
     const float* acting_reach = (acting == 0) ? r_oop : r_ip;
-    if (acting == traverser) {
+    // 16-bit state updates its sums after the children (see dfs_visit).
+    if (acting == traverser && !q16_) {
         for (uint8_t a = 0; a < nch; ++a) {
             const float* strat_a = strat + static_cast<std::size_t>(a) * S;
             if (dfs_ss_mode_ == 1) {
@@ -3756,10 +3986,15 @@ inline void LevelizedCpuBackend::dfs_visit_alt(
             cpu_simd::vec_fmadd(out, strat + static_cast<std::size_t>(a) * S,
                                 cv + static_cast<std::size_t>(a) * S, S);
         }
-        discount_node_regrets(n, dfs_pos_disc_, dfs_neg_disc_);
-        for (uint8_t a = 0; a < nch; ++a) {
-            cpu_simd::vec_regret_update(
-                regret_ptr(n, a), cv + static_cast<std::size_t>(a) * S, out, S);
+        if (q16_) {
+            q16_update_strategy_sum(n, strat, acting_reach);
+            q16_update_regrets(n, cv, S, out);
+        } else {
+            discount_node_regrets(n, dfs_pos_disc_, dfs_neg_disc_);
+            for (uint8_t a = 0; a < nch; ++a) {
+                cpu_simd::vec_regret_update(
+                    regret_ptr(n, a), cv + static_cast<std::size_t>(a) * S, out, S);
+            }
         }
     } else {
         for (uint8_t a = 0; a < nch; ++a) {
@@ -3949,15 +4184,24 @@ inline bool LevelizedCpuBackend::evaluate_fold_dual(
 inline void LevelizedCpuBackend::dfs_state_hash_report() const {
     const char* env = std::getenv("DEEPSOLVER_STATE_HASH");
     if (env == nullptr || env[0] != '1') return;
-    auto fnv1a = [](const std::vector<float>& v) -> unsigned long long {
+    auto fnv1a = [](const auto& v) -> unsigned long long {
         unsigned long long h = 1469598103934665603ull;
-        const auto* p = reinterpret_cast<const uint32_t*>(v.data());
-        for (std::size_t i = 0; i < v.size(); ++i) {
-            h ^= static_cast<unsigned long long>(p[i]);
+        for (const auto x : v) {
+            uint32_t word = 0;
+            std::memcpy(&word, &x, sizeof(x));
+            h ^= static_cast<unsigned long long>(word);
             h *= 1099511628211ull;
         }
         return h;
     };
+    if (q16_) {
+        std::fprintf(stderr,
+                     "state_hash traversal=dfs precision=16 regrets=%016llx strategy_sum=%016llx "
+                     "regret_scale=%016llx strategy_sum_scale=%016llx\n",
+                     fnv1a(regrets_q_), fnv1a(strategy_sum_q_),
+                     fnv1a(regret_scale_), fnv1a(strategy_sum_unit_));
+        return;
+    }
     std::fprintf(stderr,
                  "state_hash traversal=%s regrets=%016llx strategy_sum=%016llx\n",
                  dfs_enabled_ ? "dfs" : "level",
@@ -4084,12 +4328,12 @@ inline void LevelizedCpuBackend::report_prune_opportunity() const {
 }
 
 // ============================================================================
-// finalize ??same as CpuBackend; normalize strategy_sum into strategy.
+// finalize — diagnostics only since 2026-10-08: the Solver reads the averaged
+// strategy straight off strategy_sum_ (take_final_strategy / FinalStrategy,
+// which normalizes with the arithmetic this function used to).
 // ============================================================================
 
 inline void LevelizedCpuBackend::finalize() {
-    const uint16_t nc = ctx_.iso->num_canonical;
-    const uint32_t N = ctx_.tree->total_nodes;
     report_prune_opportunity();
     dfs_state_hash_report();
     if (dfs_live_stats_) {
@@ -4103,46 +4347,6 @@ inline void LevelizedCpuBackend::finalize() {
                 "dfs_live_stats showdown_visits=%.0f work_per_terminal_live=%.3f work_per_chance_live=%.3f (fractions of nc^2)\n",
                 t.terminals, t.per_terminal / t.full, t.per_chance / t.full);
         }
-    }
-    strategy_.assign(N, {});
-
-    auto finalize_node = [&](uint32_t i) {
-        uint8_t na = ctx_.tree->num_children[i];
-        strategy_[i].assign(static_cast<std::size_t>(na) * nc, 0.0f);
-        const std::size_t stride = action_stride_;
-        const float* sum_base = strategy_sum_ptr(i);
-        for (uint16_t c = 0; c < nc; ++c) {
-            float total = 0.0f;
-            for (uint8_t a = 0; a < na; ++a) {
-                total += sum_base[static_cast<std::size_t>(a) * stride + c];
-            }
-            if (total >= kMinRegretSum) {
-                float inv = 1.0f / total;
-                for (uint8_t a = 0; a < na; ++a) {
-                    strategy_[i][static_cast<std::size_t>(a) * nc + c] =
-                        sum_base[static_cast<std::size_t>(a) * stride + c] * inv;
-                }
-            } else {
-                float uniform = 1.0f / na;
-                for (uint8_t a = 0; a < na; ++a) {
-                    strategy_[i][static_cast<std::size_t>(a) * nc + c] = uniform;
-                }
-            }
-        }
-    };
-
-#if defined(_OPENMP)
-    if (cpu_threads_effective_ > 1 && player_nodes_.size() >= 4096) {
-        #pragma omp parallel for schedule(static) num_threads(static_cast<int>(cpu_threads_effective_))
-        for (int64_t idx = 0; idx < static_cast<int64_t>(player_nodes_.size()); ++idx) {
-            finalize_node(player_nodes_[static_cast<std::size_t>(idx)]);
-        }
-        return;
-    }
-#endif
-
-    for (uint32_t i : player_nodes_) {
-        finalize_node(i);
     }
 }
 

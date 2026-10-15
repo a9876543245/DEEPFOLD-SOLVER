@@ -3,7 +3,7 @@
  * a bet menu, a raise menu, OOP's donk menu and an all-in switch, plus a raise
  * cap and an all-in threshold — sent to the engine as `--bet-sizing` JSON.
  *
- * The presets are specs too. They reproduce the engine's legacy trees (one
+ * The presets are specs too. The list presets reproduce the engine's legacy trees (one
  * pot-fraction list per street for bets AND raises of both players, OOP donks
  * the later streets with the same list), so preset solves are unchanged; and
  * because every solve carries the full spec, a later-street re-solve gets
@@ -34,10 +34,14 @@ export interface BetSizingSpec {
   allin_threshold: number;
 }
 
-export type SizingPresetKey = 'lite' | 'standard' | 'polar' | 'small_ball';
+type ListPresetKey = 'lite' | 'standard' | 'polar' | 'small_ball';
+export type SizingPresetKey = ListPresetKey | 'lean';
+
+/** Preset pills, in display order. */
+export const SIZING_PRESET_KEYS: SizingPresetKey[] = ['lite', 'standard', 'lean', 'polar', 'small_ball'];
 
 /** Pot percentages per street (engine legacy lists). */
-export const SIZING_PRESETS: Record<SizingPresetKey, Record<StreetKey, number[]>> = {
+export const SIZING_PRESETS: Record<ListPresetKey, Record<StreetKey, number[]>> = {
   // Single 50% size per street: the smallest sensible menu, ~30-40% faster
   // than Standard with a small EV gap.
   lite:       { flop: [50],      turn: [50],      river: [50] },
@@ -50,7 +54,21 @@ export const SIZING_PRESETS: Record<SizingPresetKey, Record<StreetKey, number[]>
 export const MAX_SIZES_PER_MENU = 6;
 
 export function presetSpec(key: SizingPresetKey): BetSizingSpec {
-  return listsSpec(SIZING_PRESETS[key]);
+  return key === 'lean' ? leanSpec() : listsSpec(SIZING_PRESETS[key]);
+}
+
+/** 2026-10-08 "Lean": Standard's bet sizes on a Pio-shaped tree — one raise
+ *  size (2.5x), no donk bets, no all-in button (the threshold still turns
+ *  near-stack bets into all-ins). BTN vs BB SRP AsKd2c 100bb: 46.3M -> 4.7M
+ *  nodes, CPU 323 -> 31.4 GB. */
+function leanSpec(): BetSizingSpec {
+  const menu = (): StreetMenu => ({ bet: ['33%', '75%'], raise: ['2.5x'], donk: [], allin: false });
+  return {
+    oop: { flop: menu(), turn: menu(), river: menu() },
+    ip: { flop: menu(), turn: menu(), river: menu() },
+    raise_cap: 3,
+    allin_threshold: 12,
+  };
 }
 
 /** Pot-percentage lists per street as a spec (the engine's legacy
@@ -147,7 +165,7 @@ export function describeSpec(spec: BetSizingSpec): string {
 /** Which preset the spec equals, if any. */
 export function matchPreset(spec: BetSizingSpec): SizingPresetKey | null {
   const key = specKey(spec);
-  for (const k of Object.keys(SIZING_PRESETS) as SizingPresetKey[]) {
+  for (const k of SIZING_PRESET_KEYS) {
     if (specKey(presetSpec(k)) === key) return k;
   }
   return null;

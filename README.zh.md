@@ -34,7 +34,7 @@ DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GP
 
 ### 記憶體控制可信任
 
-- **Memory Profile 預設** — `safe / balanced / performance` 三組預設一鍵把 host RAM、JSON、strategy-tree-node 預算定死,選的時候即時預覽。Solver 全程遵守預算 — Pre-backend gate 在 allocation **前**就評估完 CPU host / GPU VRAM / AUTO fallback,OOM 變成結構化錯誤 + UI badge,不是 crash。
+- **Memory Profile 預設** — `safe / balanced / performance` 三組預設一鍵把 host RAM、JSON、strategy-tree-node 預算定死,選的時候即時預覽。Solver 全程遵守預算 — Pre-backend gate 在 allocation **前**就評估完 CPU host / GPU VRAM / AUTO fallback,OOM 變成結構化錯誤 + UI badge,不是 crash。CPU 解算時若 32 位元狀態放不下預算,改用 16 位元存 regret 與策略累加,不再把轉牌河牌近似掉:Lean 的單一加注底池翻牌約 11 GB 就能精確解。
 - **共同 host budget gate 在 GPU 後端也會檢查** — matchup tables、strategy-tree EV cache、JSON response 不論用哪個 backend 都常駐 host RAM,通通都會檢查。錯誤訊息會明確說「換 GPU 也救不了 common-host 超量」。
 - **Chunked GPU matchup 上傳** 拿掉 host 端 `flat_ev` / `flat_valid` 重複,改成 per-runout 的 `cudaMemset + cudaMemcpy`,GPU prep 時 peak host RAM 降低。
 
@@ -42,7 +42,7 @@ DEEPFOLD-SOLVER 是 [DEEPFOLD](https://deepfold.co) 的桌面端 GTO solver。GP
 
 - **2,550+ preflop 場景** app 內可瀏覽,一鍵套用為 IP / OOP range。
 - **120+ 預解 flop spot** 一鍵載入。
-- **下注尺度:預設或完全自訂** — Lite / Standard / Polar / Small Ball 預設,或 Pio 式編輯器:每條街、每位玩家各自的 bet / raise / donk(底池 % 或 `2.5x` 加注)、全下開關、加注上限與可調全下門檻;同一套選單同時建構 solver tree 跟 UI 按鈕。
+- **下注尺度:預設或完全自訂** — Lite / Standard / Lean / Polar / Small Ball 預設(Lean 沿用 Standard 的下注尺寸,但只有一種加注尺寸、沒有 donk 和全下鍵,樹約小 10 倍),或 Pio 式編輯器:每條街、每位玩家各自的 bet / raise / donk(底池 % 或 `2.5x` 加注)、全下開關、加注上限與可調全下門檻;同一套選單同時建構 solver tree 跟 UI 按鈕。
 - **Range 編輯器 + 節點鎖** — 強制任一手牌的 frequency 然後重 solve。
 - **訓練模式** — 10 題 drill 對你的答案打分(vs 均衡解)。
 
@@ -101,7 +101,7 @@ GPU 跟 SIMD 都自動偵測:右上角狀態指示燈一眼看出 **CUDA** / **C
 | **Memory Profile** | `safe / balanced / performance` 預設管 host RAM / JSON / strategy-tree-node 預算。不再沉默 OOM |
 | **Runout 選擇器** | iso 列舉啟用時,點任一 canonical river card 切換子樹 |
 | **GTO 圖庫** | 內建 2,550+ preflop 場景,app 內瀏覽。一鍵套用為 IP / OOP range |
-| **下注尺度** | 預設(Lite / Standard / Polar / Small Ball)或 Pio 式自訂(每條街 × 每位玩家的 bet / raise / donk、% 或 x、全下門檻、加注上限)— 同時影響 solver tree 跟 UI 按鈕 |
+| **下注尺度** | 預設(Lite / Standard / Lean / Polar / Small Ball)或 Pio 式自訂(每條街 × 每位玩家的 bet / raise / donk、% 或 x、全下門檻、加注上限)— 同時影響 solver tree 跟 UI 按鈕 |
 | **訓練模式** | 10 題 drill 對你的答案打分(vs 均衡) |
 | **預解 spot 圖庫** | 120+ 常見 flop spot,一鍵載入 |
 | **Range 編輯器 + 節點鎖** | 強制任一手牌的 frequency 然後重 solve |
