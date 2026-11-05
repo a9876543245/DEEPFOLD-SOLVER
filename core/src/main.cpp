@@ -565,7 +565,9 @@ Arguments:
                            answer one JSON request per stdin line:
                            {"cmd":"node","history":"Check,Bet_75"} (node view;
                            a history ending a street without "#card" names the
-                           chance node), {"cmd":"ranges","history":...}
+                           chance node), {"cmd":"combos","history":...}
+                           (only the node's combo strategies, no EVs - cheap),
+                           {"cmd":"ranges","history":...}
                            (per-combo ranges for a later-street re-solve),
                            {"cmd":"quit"}. Every reply, and the result itself,
                            is followed by a line @@DEEPSOLVER_END@@.
@@ -1139,6 +1141,38 @@ void permute_node_info(deepsolver::Solver::NodeInfo& info, const SuitPerm& p) {
               [](const auto& a, const auto& b) { return a.card < b.card; });
 }
 
+/// `"combo_strategies":{...}` of a player node: grid labels AND specific
+/// combos (the per-variant panel), keys seen through `view`.
+void write_combo_strategies(std::ostringstream& json, const deepsolver::Solver& solver,
+                            uint32_t node, const SuitPerm& view) {
+    const bool relabel = !is_identity(view);
+    json << "\"combo_strategies\":{";
+    const auto cs = solver.extract_combo_strategies_at(node);
+    for (size_t i = 0; i < cs.size(); ++i) {
+        const std::string key = relabel ? permute_combo_key(cs[i].first, view) : cs[i].first;
+        json << (i ? "," : "") << "\"" << escape_json(key) << "\":{";
+        for (size_t j = 0; j < cs[i].second.size(); ++j) {
+            json << (j ? "," : "") << "\"" << escape_json(cs[i].second[j].first)
+                 << "\":" << jsafe(cs[i].second[j].second);
+        }
+        json << "}";
+    }
+    json << "}";
+}
+
+/// --serve `combos`: only the node's combo strategies. The strategy-tree
+/// cache keeps grid labels only, and a full `node` reply also walks the
+/// subtree for EVs (seconds at a big flop root) - this is the cheap way to
+/// fill the per-variant panel of a cached node.
+std::string combos_json(const deepsolver::Solver& solver, uint32_t node,
+                        const SuitPerm& view) {
+    std::ostringstream json;
+    json << "{\"status\":\"ok\"," << std::fixed << std::setprecision(4);
+    write_combo_strategies(json, solver, node, view);
+    json << "}";
+    return json.str();
+}
+
 /// --serve: everything the UI shows for one node.
 std::string node_view_json(const deepsolver::Solver& solver, uint32_t node,
                            const std::string& history, const SuitPerm& view) {
@@ -1157,20 +1191,8 @@ std::string node_view_json(const deepsolver::Solver& solver, uint32_t node,
             json << (i ? "," : "") << "\"" << escape_json(gs[i].first) << "\":\""
                  << jsafe(gs[i].second) << "%\"";
         }
-        json << "}" << std::setprecision(4);
-        // Grid labels AND specific combos (the per-variant panel).
-        json << ",\"combo_strategies\":{";
-        const auto cs = solver.extract_combo_strategies_at(node);
-        for (size_t i = 0; i < cs.size(); ++i) {
-            const std::string key = relabel ? permute_combo_key(cs[i].first, view) : cs[i].first;
-            json << (i ? "," : "") << "\"" << escape_json(key) << "\":{";
-            for (size_t j = 0; j < cs[i].second.size(); ++j) {
-                json << (j ? "," : "") << "\"" << escape_json(cs[i].second[j].first)
-                     << "\":" << jsafe(cs[i].second[j].second);
-            }
-            json << "}";
-        }
-        json << "}";
+        json << "}" << std::setprecision(4) << ",";
+        write_combo_strategies(json, solver, node, view);
         const auto opp = solver.extract_opponent_range_at(node);
         json << ",\"opponent_side\":\"" << opp.opponent << "\",\"opponent_range\":{";
         for (size_t i = 0; i < opp.labels.size(); ++i) {
@@ -1255,6 +1277,8 @@ void serve_loop(const deepsolver::Solver& solver) {
             }
             if (c == "node") {
                 reply = node_view_json(solver, node, history, view);
+            } else if (c == "combos") {
+                reply = combos_json(solver, node, view);
             } else if (c == "ranges") {
                 reply = ranges_json(solver, node, view);
             } else {
@@ -2084,7 +2108,21 @@ static void watch_parent(uint32_t pid) {
 #endif
 }
 
+static int run_main(int argc, char* argv[]);
+
+// 2026-11-05: write stdout out before returning to the CRT. Once CUDA has
+// been initialized, a short-lived run (--estimate-only, --gpu-info) that
+// leaves its JSON in the stdout buffer loses all of it in ~1-3% of runs: the
+// process ends with rc=0 before the CRT's exit-time flush, even when stdout
+// is a plain file. Reproduced without our code (cudaGetDeviceCount + print
+// + return); an explicit flush before return was 0/1500.
 int main(int argc, char* argv[]) {
+    const int rc = run_main(argc, argv);
+    std::cout.flush();
+    return rc;
+}
+
+static int run_main(int argc, char* argv[]) {
     // 2026-10-06 audit: argument parsing used to run outside every try block
     // ("--iterations abc" aborted with nothing on stdout or stderr).
     CLIArgs args;

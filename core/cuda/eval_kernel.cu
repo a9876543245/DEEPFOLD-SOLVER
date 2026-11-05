@@ -337,6 +337,7 @@ __global__ void terminal_level_kernel(
     const float* __restrict__ canonical_weights,
     uint32_t num_runouts,
     const float* __restrict__ reach_opp_base,
+    const uint32_t* __restrict__ reach_row_opp,     // [N] node -> reach row
     // B1b inc 1: the opponent's live canonical combos, ascending. Every loop
     // below sums reach_opp[cj]*...; zero-reach terms contribute exactly +-0.0
     // and x + 0.0 == x, so walking this list instead of [0, nc) is bit-exact
@@ -371,7 +372,7 @@ __global__ void terminal_level_kernel(
     size_t table_off = static_cast<size_t>(mi) * per_table;
     const float* matchup_ev = matchup_ev_concat + table_off;
     const float* matchup_valid = matchup_valid_concat + table_off;
-    const float* reach_opp = reach_opp_base + static_cast<size_t>(n) * num_canonical;
+    const float* reach_opp = reach_opp_base + static_cast<size_t>(reach_row_opp[n]) * num_canonical;
     // B3 inc 1: rows are addressed through value_row, not by node index.
     float* out_values =
         node_values + static_cast<size_t>(value_row[n]) * num_canonical;
@@ -536,6 +537,7 @@ __global__ void rank_blocker_terminal_kernel(
     const uint16_t* __restrict__ card_list,      // [2*nc]
     uint32_t num_runouts,
     const float* __restrict__ reach_opp_base,    // [N * nc]
+    const uint32_t* __restrict__ reach_row_opp,     // [N] node -> reach row
     float* __restrict__ node_values,             // [value_rows * nc]
     uint16_t num_canonical,
     uint16_t max_bucket_count,
@@ -559,7 +561,7 @@ __global__ void rank_blocker_terminal_kernel(
     if (mi < 0 || static_cast<uint32_t>(mi) >= num_runouts) mi = 0;
     const uint16_t* __restrict__ mbucket = combo_bucket + static_cast<size_t>(mi) * nc;
     const int B = static_cast<int>(bucket_count[mi]);
-    const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(n) * nc;
+    const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(reach_row_opp[n]) * nc;
     float* __restrict__ out_values =
         node_values + static_cast<size_t>(value_row[n]) * nc;
 
@@ -793,6 +795,7 @@ void launch_terminal_level(
     const float* d_canonical_weights,
     uint32_t num_runouts,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     const uint16_t* d_opp_live,
     uint16_t num_opp_live,
     uint16_t nc,
@@ -815,7 +818,7 @@ void launch_terminal_level(
         d_value_row, d_level_indices, num_level_nodes,
         d_matchup_ev_concat, d_matchup_valid_concat,
         d_canonical_weights, num_runouts,
-        d_reach_opp_base, d_opp_live, num_opp_live, nc, perspective,
+        d_reach_opp_base, d_reach_row_opp, d_opp_live, num_opp_live, nc, perspective,
         rake_rate, rake_cap, d_equity_concat, d_equity_slot, d_node_values);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -838,6 +841,7 @@ void launch_rank_blocker_terminal_level(
     const uint16_t* d_card_list,
     uint32_t num_runouts,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     uint16_t nc,
     uint16_t max_bucket_count,
     int perspective,
@@ -863,7 +867,7 @@ void launch_rank_blocker_terminal_level(
         d_value_row, d_level_indices, num_level_nodes,
         d_combo_bucket, d_bucket_count,
         d_combo_card0, d_combo_card1, d_card_off, d_card_list,
-        num_runouts, d_reach_opp_base, d_node_values,
+        num_runouts, d_reach_opp_base, d_reach_row_opp, d_node_values,
         nc, max_bucket_count, perspective, rake_rate, rake_cap,
         d_equity_concat, d_equity_slot);
     CUDA_CHECK(cudaGetLastError());
@@ -911,6 +915,7 @@ __global__ void equity_showdown_gemm_kernel(
     int index_by_runout,          // 0: matrix_concat[eq_slot]; 1: matrix_concat[mi]
     const float* __restrict__ canonical_weights,
     const float* __restrict__ reach_opp_base,
+    const uint32_t* __restrict__ reach_row_opp,     // [N] node -> reach row
     uint16_t num_canonical,
     float rake_rate,
     float rake_cap,
@@ -929,12 +934,15 @@ __global__ void equity_showdown_gemm_kernel(
     __shared__ __align__(16) float Ws[kEqTileK][kEqSmemStride];   // [k][terminal]
     __shared__ __align__(16) float Ms[kEqTileK][kEqSmemStride];   // [k][hand]
     __shared__ uint32_t s_node[kEqTileM];
+    __shared__ uint32_t s_rrow[kEqTileM];   // reach row of s_node[t]
 
     const int tid = static_cast<int>(threadIdx.x);
     const int tx = tid & 15;
     const int ty = tid >> 4;
     for (int t = tid; t < kEqTileM; t += kEqThreads) {
-        s_node[t] = (t < M) ? eq_terminal_order[tile.t_begin + t] : 0u;
+        const uint32_t tn = (t < M) ? eq_terminal_order[tile.t_begin + t] : 0u;
+        s_node[t] = tn;
+        s_rrow[t] = (t < M) ? reach_row_opp[tn] : 0u;
     }
     __syncthreads();
 
@@ -957,8 +965,7 @@ __global__ void equity_showdown_gemm_kernel(
             const int kk = k0 + k;
             float w = 0.0f;
             if (r < M && kk < nc) {
-                const uint32_t n = s_node[r];
-                w = reach_opp_base[static_cast<size_t>(n) * nc + kk]
+                w = reach_opp_base[static_cast<size_t>(s_rrow[r]) * nc + kk]
                   * canonical_weights[kk];
             }
             Ws[k][r] = w;
@@ -1025,6 +1032,7 @@ __global__ void equity_rb_compat_add_kernel(
     const uint16_t* __restrict__ card_list,
     uint32_t num_runouts,
     const float* __restrict__ reach_opp_base,
+    const uint32_t* __restrict__ reach_row_opp,     // [N] node -> reach row
     uint16_t num_canonical,
     float rake_rate,
     float rake_cap,
@@ -1039,7 +1047,7 @@ __global__ void equity_rb_compat_add_kernel(
     int32_t mi = matchup_idx[n];
     if (mi < 0 || static_cast<uint32_t>(mi) >= num_runouts) mi = 0;
     const uint16_t* __restrict__ mbucket = combo_bucket + static_cast<size_t>(mi) * nc;
-    const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(n) * nc;
+    const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(reach_row_opp[n]) * nc;
     float* __restrict__ out_values =
         node_values + static_cast<size_t>(value_row[n]) * nc;
 
@@ -1090,6 +1098,7 @@ void launch_equity_showdown_gemm(
     int index_by_runout,
     const float* d_canonical_weights,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     uint16_t nc,
     float rake_rate,
     float rake_cap,
@@ -1102,7 +1111,7 @@ void launch_equity_showdown_gemm(
     equity_showdown_gemm_kernel<<<grid, kEqThreads>>>(
         d_tiles, d_eq_terminal_order, d_pots, d_value_row,
         d_matrix_concat, index_by_runout, d_canonical_weights,
-        d_reach_opp_base, nc, rake_rate, rake_cap, coef_kind, accumulate,
+        d_reach_opp_base, d_reach_row_opp, nc, rake_rate, rake_cap, coef_kind, accumulate,
         d_node_values);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1131,6 +1140,7 @@ __global__ void signed_count_showdown_gemm_kernel(
     const int8_t* __restrict__ count_concat,      // [num_runouts x nc x nc]
     const float* __restrict__ canonical_weights,
     const float* __restrict__ reach_opp_base,
+    const uint32_t* __restrict__ reach_row_opp,     // [N] node -> reach row
     uint16_t num_canonical,
     float rake_rate,
     float rake_cap,
@@ -1146,12 +1156,15 @@ __global__ void signed_count_showdown_gemm_kernel(
     __shared__ __align__(16) float Ws[kEqTileK][kEqSmemStride];   // [k][terminal]
     __shared__ __align__(16) float Ms[kEqTileK][kEqSmemStride];   // [k][hand]
     __shared__ uint32_t s_node[kEqTileM];
+    __shared__ uint32_t s_rrow[kEqTileM];   // reach row of s_node[t]
 
     const int tid = static_cast<int>(threadIdx.x);
     const int tx = tid & 15;
     const int ty = tid >> 4;
     for (int t = tid; t < kEqTileM; t += kEqThreads) {
-        s_node[t] = (t < M) ? terminal_order[tile.t_begin + t] : 0u;
+        const uint32_t tn = (t < M) ? terminal_order[tile.t_begin + t] : 0u;
+        s_node[t] = tn;
+        s_rrow[t] = (t < M) ? reach_row_opp[tn] : 0u;
     }
     __syncthreads();
 
@@ -1171,8 +1184,7 @@ __global__ void signed_count_showdown_gemm_kernel(
             const int kk = k0 + k;
             float w = 0.0f;
             if (r < M && kk < nc) {
-                const uint32_t n = s_node[r];
-                w = reach_opp_base[static_cast<size_t>(n) * nc + kk];
+                w = reach_opp_base[static_cast<size_t>(s_rrow[r]) * nc + kk];
             }
             Ws[k][r] = w;
             float m = 0.0f;
@@ -1229,6 +1241,7 @@ void launch_signed_count_showdown_gemm(
     const int8_t* d_count_concat,
     const float* d_canonical_weights,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     uint16_t nc,
     float rake_rate,
     float rake_cap,
@@ -1238,7 +1251,7 @@ void launch_signed_count_showdown_gemm(
     const dim3 grid(num_tiles, (static_cast<unsigned>(nc) + kEqTileN - 1) / kEqTileN);
     signed_count_showdown_gemm_kernel<<<grid, kEqThreads>>>(
         d_tiles, d_terminal_order, d_pots, d_value_row, d_count_concat,
-        d_canonical_weights, d_reach_opp_base, nc, rake_rate, rake_cap,
+        d_canonical_weights, d_reach_opp_base, d_reach_row_opp, nc, rake_rate, rake_cap,
         d_node_values);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1258,6 +1271,7 @@ void launch_equity_rb_compat_add(
     const uint16_t* d_card_list,
     uint32_t num_runouts,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     uint16_t nc,
     float rake_rate,
     float rake_cap,
@@ -1267,7 +1281,7 @@ void launch_equity_rb_compat_add(
     equity_rb_compat_add_kernel<<<num_eq_terminals, kRbBlock>>>(
         d_eq_terminal_order, num_eq_terminals, d_pots, d_matchup_idx,
         d_value_row, d_combo_bucket, d_combo_card0, d_combo_card1,
-        d_card_off, d_card_list, num_runouts, d_reach_opp_base, nc,
+        d_card_off, d_card_list, num_runouts, d_reach_opp_base, d_reach_row_opp, nc,
         rake_rate, rake_cap, d_node_values);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1308,6 +1322,7 @@ __global__ void fold_blocker_terminal_kernel(
     const uint8_t* __restrict__ combo_card1,     // [nc]
     uint32_t num_runouts,
     const float* __restrict__ reach_opp_base,    // [N * nc]
+    const uint32_t* __restrict__ reach_row_opp,     // [N] node -> reach row
     uint16_t num_canonical,
     int perspective,
     float rake_rate,
@@ -1323,7 +1338,7 @@ __global__ void fold_blocker_terminal_kernel(
     int32_t mi = matchup_idx[n];
     if (mi < 0 || static_cast<uint32_t>(mi) >= num_runouts) mi = 0;
     const uint16_t* __restrict__ mbucket = combo_bucket + static_cast<size_t>(mi) * nc;
-    const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(n) * nc;
+    const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(reach_row_opp[n]) * nc;
     float* __restrict__ out_values =
         node_values + static_cast<size_t>(value_row[n]) * nc;
 
@@ -1391,6 +1406,7 @@ void launch_fold_blocker_terminals(
     const uint8_t* d_combo_card1,
     uint32_t num_runouts,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     uint16_t nc,
     int perspective,
     float rake_rate,
@@ -1402,7 +1418,7 @@ void launch_fold_blocker_terminals(
         d_terminal_types, d_pots, d_parent_indices, d_bet_into, d_matchup_idx,
         d_value_row, d_fold_terminal_order, num_fold_terminals,
         d_combo_bucket, d_combo_card0, d_combo_card1, num_runouts,
-        d_reach_opp_base, nc, perspective, rake_rate, rake_cap, d_node_values);
+        d_reach_opp_base, d_reach_row_opp, nc, perspective, rake_rate, rake_cap, d_node_values);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1433,6 +1449,7 @@ __global__ void iso_fold_terminal_kernel(
     const unsigned long long* __restrict__ board_masks,  // [num_runouts]
     uint32_t num_runouts,
     const float* __restrict__ reach_opp_base,     // [N * nc]
+    const uint32_t* __restrict__ reach_row_opp,     // [N] node -> reach row
     uint16_t num_canonical,
     int perspective,
     float rake_rate,
@@ -1448,7 +1465,7 @@ __global__ void iso_fold_terminal_kernel(
     int32_t mi = matchup_idx[n];
     if (mi < 0 || static_cast<uint32_t>(mi) >= num_runouts) mi = 0;
     const unsigned long long bm = board_masks[mi];
-    const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(n) * nc;
+    const float* __restrict__ reach_opp = reach_opp_base + static_cast<size_t>(reach_row_opp[n]) * nc;
     float* __restrict__ out_values =
         node_values + static_cast<size_t>(value_row[n]) * nc;
 
@@ -1528,6 +1545,7 @@ void launch_iso_fold_terminals(
     const unsigned long long* d_board_masks,
     uint32_t num_runouts,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     uint16_t nc,
     int perspective,
     float rake_rate,
@@ -1539,7 +1557,7 @@ void launch_iso_fold_terminals(
         d_terminal_types, d_pots, d_parent_indices, d_bet_into, d_matchup_idx,
         d_value_row, d_fold_terminal_order, num_fold_terminals,
         d_orig_off, d_orig_card0, d_orig_card1, d_orbit_denom, d_board_masks,
-        num_runouts, d_reach_opp_base, nc, perspective, rake_rate, rake_cap,
+        num_runouts, d_reach_opp_base, d_reach_row_opp, nc, perspective, rake_rate, rake_cap,
         d_node_values);
     CUDA_CHECK(cudaGetLastError());
 }

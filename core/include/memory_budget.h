@@ -276,9 +276,19 @@ inline uint64_t gpu_state_alloc_cap(uint64_t budget_bytes, uint64_t free_bytes) 
 
 /// GPU backend keeps regrets, strategy_sum, current_strategy (3 compact
 /// strat-shaped buffers of Σ-player-actions × nc; B1a inc 2 dropped
-/// action_values), plus reach_scratch_oop and reach_scratch_ip (2 full-tree
-/// N×nc buffers) and node_values (B3 inc 1: value_rows × nc, smaller than
-/// N × nc — see gpu_value_layout.h). Summed in `bytes_for_gpu_state_compact`.
+/// action_values), plus ONE reach buffer of gpu_reach_rows() × nc for both
+/// players (2026-11-04; was 2 full-tree N×nc buffers) and node_values (B3
+/// inc 1: value_rows × nc, smaller than N × nc — see gpu_value_layout.h).
+/// Summed in `bytes_for_gpu_state_compact`.
+
+/// 2026-11-04 (review item 6): rows of the GPU reach buffer. A player's reach
+/// only changes on its own action edges, so each action slot holds the
+/// acting player's reach below that edge and every other node aliases the
+/// row of the last such edge above it; plus one root row per player. The
+/// estimator and GpuBackend::prepare() both size the buffer from THIS.
+inline uint64_t gpu_reach_rows(uint64_t player_action_slots) {
+    return player_action_slots + 2ULL;
+}
 
 } // namespace memory_budget
 
@@ -486,9 +496,11 @@ inline uint64_t bytes_for_levelized_cpu_extra(uint64_t total_nodes, uint64_t nc)
 ///     4th buffer (action_values) — aggregate/update_regrets gather child
 ///     node_values directly. Keep this factor in sync with
 ///     alloc_solver_state's own pre-flight.
-///   - reach_scratch_oop, reach_scratch_ip, node_values: each N×nc floats
-///   - node_offset slot table: N uint32
-/// Total = (3·slots + 3·N) · nc · sizeof(float) + N · sizeof(uint32)
+///   - reach: (slots + 2) × nc floats, both players (gpu_reach_rows)
+///   - node_values: value_regions × value_rows × nc floats
+///   - node_offset, value_row, reach_row_oop, reach_row_ip: N uint32 each
+/// Total = (S·slots + (slots + 2) + regions·value_rows) · nc · sizeof(float)
+///       + 4 · N · sizeof(uint32), S = 2 or 3 strat-shaped buffers
 ///
 /// The pre-B1a dense formula ((4·MAX_ACTIONS + 3) · N · nc) over-counted
 /// enumerated monotone trees ~2.9× (7,453 MB estimated vs 2,587 MB measured
@@ -515,10 +527,12 @@ inline uint64_t bytes_for_gpu_state_compact(uint64_t total_nodes,
                                             uint64_t value_regions) {
     const uint64_t strat_buffers = materialize_strategy ? 3ULL : 2ULL;
     const uint64_t values = value_rows ? value_rows : total_nodes;
-    return (strat_buffers * player_action_slots + 2ULL * total_nodes
+    return (strat_buffers * player_action_slots
+              + memory_budget::gpu_reach_rows(player_action_slots)
               + value_regions * values)
              * nc * sizeof(float)
-         + 2ULL * total_nodes * sizeof(uint32_t);  // node_offset + value_row
+         + 4ULL * total_nodes * sizeof(uint32_t);  // node_offset, value_row,
+                                                   // reach_row_oop/_ip
 }
 
 /// Device-side TOTAL for a GPU solve (review round 2, P1-3): the VRAM

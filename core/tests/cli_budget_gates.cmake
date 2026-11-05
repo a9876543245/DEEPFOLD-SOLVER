@@ -525,9 +525,13 @@ elseif(CASE STREQUAL "gpu_strat_buffer")
   endif()
   # One strat-shaped buffer is the difference. Anything larger means the two
   # solves differ in more than the strategy buffer and this stopped being a
-  # test of increment 3.
+  # test of increment 3. Since 2026-11-04 the reach buffer is slot-sized too
+  # (slots + 2 rows), so the unlocked state holds THREE slot-sized terms
+  # (regrets, strategy_sum, reach) plus values: one strat buffer is always
+  # under a third of it, two are not (AsKd7c2h: 19.2 MB of 75.1 MB; it was
+  # 96.4 MB with two N-row reach buffers, which is what the old /4 assumed).
   math(EXPR delta "${lock_state} - ${free_state}")
-  math(EXPR bound "${free_state} / 4")
+  math(EXPR bound "${free_state} / 3")
   if(delta GREATER ${bound})
     message(FATAL_ERROR
       "locked-vs-unlocked device state differs by ${delta} B, more than the "
@@ -536,6 +540,44 @@ elseif(CASE STREQUAL "gpu_strat_buffer")
   message(STATUS
     "gpu_strat_buffer: unlocked ${free_state} B, locked ${lock_state} B "
     "(+${delta} B = the materialized strategy)")
+
+# ---------------------------------------------------------------------------
+elseif(CASE STREQUAL "gpu_reach_rows")
+  # 2026-11-04 (review item 6): GPU reach lives in ONE buffer of slots + 2
+  # rows instead of two N-row buffers, which takes 22% off the device total.
+  # This enumerated flop (135,996 nodes) needs ~2,568 MiB on the device now
+  # and needed ~3,251 MiB before, so a 2,900 MB budget holds it only with the
+  # slot-keyed layout: red on c5083ccc / v4.2.1 (the ① gate collapsed it).
+  # The real solve must also allocate exactly what the estimate priced
+  # (Phase 0 contract), or the gate's verdict above means nothing.
+  set(r_base --pot 100 --stack 300 --board AsKd7c --flop-sizes 0.75
+             --turn-sizes 0.75 --river-sizes 0.75 --iterations 2
+             --exploitability 0 --backend gpu --postsolve none
+             --no-strategy-tree --no-progress
+             --gpu-memory-mb 2900 --host-memory-mb 40000)
+  execute_process(COMMAND ${EXE} ${r_base}
+    OUTPUT_VARIABLE r_out RESULT_VARIABLE r_rc ERROR_VARIABLE r_err)
+  if(NOT r_rc EQUAL 0)
+    message(FATAL_ERROR "GPU solve at 2900 MB failed rc=${r_rc}: ${r_err}")
+  endif()
+  string(JSON r_approx GET "${r_out}" runout_approximated)
+  string(JSON r_nodes GET "${r_out}" resources tree_nodes)
+  string(JSON r_alloc GET "${r_out}" resources allocated_state_bytes)
+  string(JSON r_est GET "${r_out}" resources estimated_gpu_state_bytes)
+  if(r_approx OR NOT r_nodes EQUAL 135996)
+    message(FATAL_ERROR
+      "AsKd7c at 2900 MB VRAM: runout_approximated=${r_approx} nodes=${r_nodes}, "
+      "expected the enumerated 135996-node tree on the GPU (reach rows not "
+      "slot-keyed, or the estimator still prices two N-row reach buffers)")
+  endif()
+  if(NOT r_alloc EQUAL r_est)
+    message(FATAL_ERROR
+      "GPU state allocated ${r_alloc} B but the estimate priced ${r_est} B - "
+      "bytes_for_gpu_state_compact and alloc_solver_state disagree")
+  endif()
+  message(STATUS
+    "gpu_reach_rows: enumerated ${r_nodes} nodes at 2900 MB, state ${r_alloc} B "
+    "== estimate")
 
 elseif(CASE STREQUAL "peak_host_not_under")
   # The peak-host gate REJECTS solves whose predicted host footprint exceeds

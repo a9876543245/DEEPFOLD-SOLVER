@@ -7,7 +7,7 @@ mod api_server;
 
 use commands::{
     solve, estimate_solve, cancel_solve, engine_status, save_solution, load_solution, get_gpu_info, start_google_oauth,
-    query_node, query_ranges, close_session,
+    query_node, query_ranges, query_combos, close_session,
 };
 use gto_charts::{list_gto_scenarios, load_gto_chart, read_bundled_presolve};
 
@@ -31,6 +31,7 @@ pub fn run() {
             read_bundled_presolve,
             query_node,
             query_ranges,
+            query_combos,
             close_session
         ])
         .setup(|_app| {

@@ -733,7 +733,8 @@ if(BUILD_TESTS)
     # 2026-10-06 audit: CLI inputs fail loudly instead of being ignored or
     # misread (bad ranges/boards/locks/histories), the documented shorthands
     # and spaced JSON are accepted, and --bet-sizing builds Pio-style menus.
-    foreach(_case bad_inputs lenient_inputs bet_sizing serve serve_view target flop_pack)
+    # stdout_flush (2026-11-05): short runs after CUDA init keep their stdout.
+    foreach(_case bad_inputs lenient_inputs bet_sizing serve serve_view target flop_pack stdout_flush)
         add_test(NAME CliInputs_${_case}
             COMMAND ${CMAKE_COMMAND}
                 -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=${_case}
@@ -799,6 +800,15 @@ if(BUILD_TESTS)
                 -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=gpu_strat_buffer
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
         set_tests_properties(CliGpuStratBuffer PROPERTIES
+            LABELS "smoke;gpu;memory" TIMEOUT 120)
+        # 2026-11-04: GPU reach rows keyed by action slot (one buffer, slots + 2
+        # rows) — a flop that only fits 2900 MB with that layout enumerates,
+        # and the allocation equals the estimate. Red on v4.2.1 (collapses).
+        add_test(NAME CliGpuReachRows
+            COMMAND ${CMAKE_COMMAND}
+                -DEXE=$<TARGET_FILE:deepsolver_core> -DCASE=gpu_reach_rows
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_budget_gates.cmake)
+        set_tests_properties(CliGpuReachRows PROPERTIES
             LABELS "smoke;gpu;memory" TIMEOUT 120)
 
         add_test(NAME CliEnumeratedGpuParity

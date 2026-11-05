@@ -58,7 +58,19 @@ pub async fn query_ranges(session_id: u64, history: String) -> Result<serde_json
     session_reply(reply)
 }
 
-/// Drop an in-memory solve (frees its RAM); no id = all of them.
+/// 2026-11-04: only the combo strategies (grid labels + specific combos) at a
+/// node of the in-memory solve. Fills the per-variant panel of a node shown
+/// from the strategy-tree cache (grid labels only) without the subtree EV
+/// walk a full `query_node` does.
+#[tauri::command]
+pub async fn query_combos(session_id: u64, history: String) -> Result<serde_json::Value, String> {
+    let reply = engine::query_session(
+        session_id, serde_json::json!({ "cmd": "combos", "history": history })).await?;
+    session_reply(reply)
+}
+
+/// Drop an in-memory solve (frees its RAM); no id = all of them. Resolves
+/// once the engine processes have exited.
 #[tauri::command]
 pub async fn close_session(session_id: Option<u64>) {
     engine::close_session(session_id).await;

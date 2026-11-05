@@ -340,10 +340,14 @@ export function useSolver() {
   // One solve at a time: a second call while one runs is refused instead of
   // racing it (both used to write the shared result).
   const runningRef = useRef(false);
+  // Bumped by every solve and reset: an estimate reply only lands while the
+  // solve that asked for it is still the one running.
+  const generationRef = useRef(0);
 
   const solve = useCallback(async (request: SolverRequest): Promise<SolverResponse | null> => {
     if (runningRef.current) return null;
     runningRef.current = true;
+    const generation = ++generationRef.current;
     setLoading(true);
     setError(null);
     setEstimate(null);  // clear stale estimate from previous solve
@@ -361,7 +365,7 @@ export function useSolver() {
         try {
           const { invoke } = await import('@tauri-apps/api/core');
           const est = await invoke<EstimateResponse>('estimate_solve', { request });
-          setEstimate(est);
+          if (generationRef.current === generation && runningRef.current) setEstimate(est);
         } catch (e) {
           // Don't surface — the actual solve provides the same data on
           // completion. This only suppresses the pre-solve banner.
@@ -521,6 +525,7 @@ export function useSolver() {
   }, []);
 
   const reset = useCallback(() => {
+    generationRef.current++;
     setError(null);
     setElapsed(0);
     setProgress(null);

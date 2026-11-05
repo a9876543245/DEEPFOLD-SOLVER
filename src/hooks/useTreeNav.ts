@@ -12,9 +12,9 @@
  * the solve collapsed (turn/river approximated) is re-solved from the exact
  * ranges at its chance node (`query_ranges`) — a new segment of the line.
  */
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
-  ChanceRanges, EngineAction, NodeView, RunoutOption, SolverRequest, SolverResponse,
+  ChanceRanges, ComboStrategy, EngineAction, NodeView, RunoutOption, SolverRequest, SolverResponse,
 } from '../lib/poker';
 import { isTauri } from '../lib/tauriEnv';
 
@@ -147,15 +147,45 @@ async function loadChance(seg: Segment, steps: LineStep[], street: 'turn' | 'riv
   return null;
 }
 
-async function closeSessions(segs: Segment[]) {
-  if (!isTauri()) return;
-  const { invoke } = await import('@tauri-apps/api/core');
-  for (const s of segs) {
-    if (s.response.session_id != null) {
-      invoke('close_session', { sessionId: s.response.session_id }).catch(() => {});
+/** Session closes still in flight. A new root solve waits for all of them:
+ *  its memory budget assumes the old engines have exited. */
+const closing = new Set<Promise<void>>();
+
+/** End the segments' in-memory solves; resolves once their engines have
+ *  exited (the Rust command returns after the process is reaped). */
+function closeSessions(segs: Segment[]): Promise<void> {
+  const ids = segs.map(s => s.response.session_id).filter((id): id is number => id != null);
+  if (!isTauri() || ids.length === 0) return Promise.resolve();
+  const done = (async () => {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const results = await Promise.allSettled(
+        ids.map(sessionId => invoke('close_session', { sessionId })));
+      for (const r of results) {
+        if (r.status === 'rejected') console.warn('close_session failed:', r.reason);
+      }
+    } catch (e) {
+      console.warn('close_session failed:', e);
     }
-  }
+  })();
+  closing.add(done);
+  void done.finally(() => closing.delete(done));
+  return done;
 }
+
+/** A node whose combo strategies include specific combos ("AhKs"), as a
+ *  session reply does. Strategy-tree cache entries keep grid labels only. */
+function hasVariants(v: NodeView): boolean {
+  return Object.keys(v.combo_strategies ?? {}).some(k => k.length === 4);
+}
+
+/** Whether the per-variant (specific combo) strategies of the shown node are
+ *  there: 'ready' (a combo missing then is not in range), being fetched from
+ *  the solve in memory, or not available (no solve in memory). */
+export type VariantStatus = 'ready' | 'loading' | 'unavailable';
+
+/** Fetched per-variant strategies kept, by session + history. */
+const VARIANT_CACHE_SIZE = 64;
 
 const NOT_AVAILABLE =
   'This node is not in the solved tree that is still available — solve again to explore it.';
@@ -167,6 +197,8 @@ export function useTreeNav(solve: Solve) {
   const [awaiting, setAwaiting] = useState<AwaitingCard | null>(null);
   const [navError, setNavError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [variants, setVariants] = useState<{ key: string; combos: Record<string, ComboStrategy> | null } | null>(null);
+  const variantCache = useRef(new Map<string, Record<string, ComboStrategy>>());
   // Latest state for the async handlers (two quick clicks must not both
   // start from the pre-click line).
   const stateRef = useRef({ segments, line, view, awaiting });
@@ -205,14 +237,17 @@ export function useTreeNav(solve: Solve) {
 
   /** Free the in-memory solves but keep the line navigable from the
    *  strategy-tree cache: a new root solve needs that RAM (a session holds
-   *  its whole solved tree). */
-  const releaseSessions = useCallback(() => {
+   *  its whole solved tree). Resolves once every engine closed so far has
+   *  exited, so the new solve never overlaps them. */
+  const releaseSessions = useCallback(async () => {
     const segs = stateRef.current.segments;
-    if (!segs.some(s => s.response.session_id != null)) return;
-    closeSessions(segs);
-    const stripped = segs.map(s => ({ ...s, response: { ...s.response, session_id: undefined } }));
-    stateRef.current = { ...stateRef.current, segments: stripped };
-    setSegments(stripped);
+    if (segs.some(s => s.response.session_id != null)) {
+      void closeSessions(segs);
+      const stripped = segs.map(s => ({ ...s, response: { ...s.response, session_id: undefined } }));
+      stateRef.current = { ...stateRef.current, segments: stripped };
+      setSegments(stripped);
+    }
+    await Promise.all([...closing]);
   }, []);
 
   const act = useCallback((action: EngineAction) => run(async () => {
@@ -345,6 +380,44 @@ export function useTreeNav(solve: Solve) {
   const segmentHistory = segment ? historyOf(line.slice(segment.start)) : '';
   /** Cache-form of the same (strategy-tree keys). */
   const segmentCacheKey = segment ? historyOf(line.slice(segment.start), true) : '';
+
+  // A node shown from the strategy-tree cache has grid-label strategies
+  // only; the variant panel's specific combos come from the solve in memory
+  // (`query_combos`: no EV walk, unlike a full node query). While a card is
+  // awaited the view is the node the street-ending action was taken at, one
+  // step before the line's end.
+  const viewHistory = segment ? historyOf(line.slice(segment.start, awaiting ? -1 : undefined)) : '';
+  const variantKey = view && view.kind === 'player' && !hasVariants(view) && segment && hasSession(segment)
+    ? `${segment.response.session_id}|${viewHistory}` : null;
+  useEffect(() => {
+    if (!variantKey || !segment) return;
+    const cached = variantCache.current.get(variantKey);
+    if (cached) { setVariants({ key: variantKey, combos: cached }); return; }
+    let live = true;
+    const sessionId = segment.response.session_id;
+    (async () => {
+      let combos: Record<string, ComboStrategy> | null = null;
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const reply = await invoke<{ combo_strategies?: Record<string, ComboStrategy> }>(
+          'query_combos', { sessionId, history: viewHistory });
+        combos = reply.combo_strategies ?? {};
+        const cache = variantCache.current;
+        if (cache.size >= VARIANT_CACHE_SIZE) cache.delete(cache.keys().next().value!);
+        cache.set(variantKey, combos);
+      } catch (e) {
+        console.warn('query_combos failed:', e);
+      }
+      if (live) setVariants({ key: variantKey, combos });
+    })();
+    return () => { live = false; };
+  }, [variantKey]);   // names segment + viewHistory
+  const variantStatus: VariantStatus = !view || view.kind !== 'player' || hasVariants(view) ? 'ready'
+    : variantKey == null ? 'unavailable'
+    : variants?.key !== variantKey ? 'loading'
+    : variants.combos ? 'ready' : 'unavailable';
+  /** The fetched per-variant strategies of the shown node, if any. */
+  const variantStrategies = variants && variants.key === variantKey ? variants.combos : null;
   /** Root board + every card dealt so far, in deal order. */
   const boardCards: string[] = [];
   if (segments.length > 0) {
@@ -355,7 +428,7 @@ export function useTreeNav(solve: Solve) {
 
   return {
     segments, segment, line, view, awaiting, navError, busy,
-    segmentHistory, segmentCacheKey, boardCards,
+    segmentHistory, segmentCacheKey, boardCards, variantStatus, variantStrategies,
     start, clear, releaseSessions, act, deal, back, redeal, resolveSegment,
     clearError: () => setNavError(null),
   };

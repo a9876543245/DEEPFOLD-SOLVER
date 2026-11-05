@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import type { SolverResponse, ComboStrategy } from '../lib/poker';
 import { getActionColor, parseBoardCards, expandComboLabel, SUIT_SYMBOLS, SUIT_COLORS } from '../lib/poker';
 import type { SolverProgress } from '../hooks/useSolver';
+import type { VariantStatus } from '../hooks/useTreeNav';
 import { useT } from '../lib/i18n';
 import { aggregateTurns } from '../lib/aggregateRunouts';
 import { RunoutReportModal } from './RunoutReportModal';
@@ -18,6 +19,9 @@ interface Props {
   progress?: SolverProgress | null;
   board?: string;
   onLockNode?: () => void;
+  /** Whether `result.combo_strategies` has this node's specific combos
+   *  (a node shown from the strategy-tree cache has grid labels only). */
+  variantStatus?: VariantStatus;
   /** Sprint Aggregated-Report-Lite: history string for the current node
    *  (e.g. "Check,Bet_33,Call"). Drives the per-turn runout aggregation.
    *  When undefined or empty the report button still renders for the root,
@@ -89,7 +93,7 @@ function ComboDisplay({ rank1, suit1, rank2, suit2, isDead }: {
   );
 }
 
-export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress, board, onLockNode, currentHistory }: Props) {
+export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress, board, onLockNode, variantStatus, currentHistory }: Props) {
   const t = useT();
   const [showRunoutReport, setShowRunoutReport] = useState(false);
   const [showComboDrill, setShowComboDrill] = useState(false);
@@ -703,7 +707,10 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
           </span>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
             {comboVariants.map(cv => {
-              const isNotInRange = cv.strategy?.['Not in range'];
+              // With the node's specific combos loaded, a combo missing from
+              // them has no reach here: it is not in range.
+              const isNotInRange = cv.strategy?.['Not in range']
+                || (!cv.strategy && variantStatus === 'ready');
               const isDead = cv.isDead || !!isNotInRange;
 
               return (
@@ -732,6 +739,13 @@ export function StrategyPanel({ result, hoveredCombo, elapsed, loading, progress
                       </span>
                     ) : cv.strategy ? (
                       <VariantStrategyBar strategy={cv.strategy} />
+                    ) : variantStatus === 'loading' || variantStatus === 'unavailable' ? (
+                      <span
+                        title={variantStatus === 'unavailable' ? t('panel.variantUnavailableHint') : undefined}
+                        style={{ fontSize: 10, color: 'var(--color-text-tertiary)' }}
+                      >
+                        {t(variantStatus === 'loading' ? 'panel.variantLoading' : 'panel.variantUnavailable')}
+                      </span>
                     ) : null}
                   </div>
 

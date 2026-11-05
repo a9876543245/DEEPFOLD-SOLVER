@@ -218,6 +218,13 @@ const dict: Dict = {
   'panel.live': { en: 'live', zh: '存活', ja: '有効' },
   'panel.dead': { en: 'DEAD', zh: '已死', ja: '無効' },
   'panel.out': { en: 'OUT', zh: '範圍外', ja: '範囲外' },
+  'panel.variantLoading': { en: 'Loading…', zh: '載入中…', ja: '読み込み中…' },
+  'panel.variantUnavailable': { en: 'n/a', zh: '無資料', ja: 'データなし' },
+  'panel.variantUnavailableHint': {
+    en: 'Per-suit strategies need the solve in memory — solve the spot again.',
+    zh: '各花色組合的策略需要記憶體中的求解結果——請重新求解此局面。',
+    ja: 'スート別の戦略にはメモリ上の解が必要です。もう一度ソルブしてください。',
+  },
   'panel.offRange': { en: 'Off-Range', zh: '範圍外', ja: '範囲外' },
   'panel.offRangeWarning': {
     en: "Not in the acting player's range at this node. Below is what the solver plays with it (solved with the hand added at a tiny weight).",

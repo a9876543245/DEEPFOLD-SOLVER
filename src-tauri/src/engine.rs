@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -68,71 +68,109 @@ const SERVE_END: &str = "@@DEEPSOLVER_END@@";
 /// and answers node / range queries, so navigating the tree never re-solves.
 /// Several can be alive - a later-street re-solve keeps the earlier street's
 /// solve queryable - but at most MAX_SESSIONS (least recently used dropped).
+///
+/// 2026-11-04: the registry lock only finds, reorders and removes sessions.
+/// Each session serialises its own pipe (`io`), so a slow query on one never
+/// holds up another, and closing one kills its process through `child` (not
+/// queued behind its pending read, which then ends at EOF).
 struct EngineSession {
     id: u64,
-    child: Child,
+    child: tokio::sync::Mutex<Child>,
+    io: tokio::sync::Mutex<SessionIo>,
+}
+
+struct SessionIo {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+impl EngineSession {
+    fn new(id: u64, child: Child, stdin: ChildStdin, stdout: BufReader<ChildStdout>) -> Self {
+        EngineSession {
+            id,
+            child: tokio::sync::Mutex::new(child),
+            io: tokio::sync::Mutex::new(SessionIo { stdin, stdout }),
+        }
+    }
 }
 
 const MAX_SESSIONS: usize = 3;
 static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(1);
 const SESSION_GONE: &str = "The solved spot is no longer in memory - solve it again.";
 
-/// Sessions, least recently used first.
-fn sessions() -> &'static tokio::sync::Mutex<Vec<EngineSession>> {
-    static SLOT: OnceLock<tokio::sync::Mutex<Vec<EngineSession>>> = OnceLock::new();
-    SLOT.get_or_init(|| tokio::sync::Mutex::new(Vec::new()))
+/// Sessions, least recently used first. A std Mutex, so the compiler refuses
+/// to hold it across an await.
+fn sessions() -> std::sync::MutexGuard<'static, Vec<Arc<EngineSession>>> {
+    static SLOT: OnceLock<std::sync::Mutex<Vec<Arc<EngineSession>>>> = OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
-async fn kill_session(mut s: EngineSession) {
-    let _ = s.child.kill().await;
-    let _ = s.child.wait().await;
+/// Take the sessions `pick` selects out of the registry.
+fn take_sessions(pick: impl Fn(&EngineSession) -> bool) -> Vec<Arc<EngineSession>> {
+    let mut list = sessions();
+    let (gone, keep): (Vec<_>, Vec<_>) = list.drain(..).partition(|s| pick(s));
+    *list = keep;
+    gone
+}
+
+/// Kill the process and wait until it has exited (its RAM / VRAM is free).
+async fn kill_session(s: &EngineSession) {
+    let mut child = s.child.lock().await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
 
 /// End one in-memory session (frees its RAM); `None` ends all of them.
+/// Returns once the processes have exited.
 pub async fn close_session(id: Option<u64>) {
-    let mut list = sessions().lock().await;
-    let (gone, keep): (Vec<_>, Vec<_>) =
-        list.drain(..).partition(|s| id.map_or(true, |i| i == s.id));
-    *list = keep;
-    for s in gone {
-        kill_session(s).await;
+    for s in take_sessions(|s| id.map_or(true, |i| i == s.id)) {
+        kill_session(&s).await;
     }
 }
 
 async fn add_session(session: EngineSession) {
-    let mut list = sessions().lock().await;
-    while list.len() >= MAX_SESSIONS {
-        let oldest = list.remove(0);
-        kill_session(oldest).await;
+    let evicted: Vec<_> = {
+        let mut list = sessions();
+        let excess = (list.len() + 1).saturating_sub(MAX_SESSIONS);
+        let evicted = list.drain(..excess).collect();
+        list.push(Arc::new(session));
+        evicted
+    };
+    for s in evicted {
+        kill_session(&s).await;
     }
-    list.push(session);
 }
 
 /// Send one request to in-memory session `id` and return its JSON reply.
 pub async fn query_session(id: u64, request: serde_json::Value) -> Result<serde_json::Value, String> {
-    let mut list = sessions().lock().await;
-    let pos = list.iter().position(|s| s.id == id).ok_or_else(|| SESSION_GONE.to_string())?;
-    // Most recently used goes last.
-    let session = list.remove(pos);
-    list.push(session);
-    let session = list.last_mut().unwrap();
+    let session = {
+        let mut list = sessions();
+        let pos = list.iter().position(|s| s.id == id).ok_or_else(|| SESSION_GONE.to_string())?;
+        // Most recently used goes last.
+        let session = list.remove(pos);
+        list.push(Arc::clone(&session));
+        session
+    };
     let line = format!("{}\n", request);
-    let reply = timeout(Duration::from_secs(600), async {
-        session.stdin.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
-        session.stdin.flush().await.map_err(|e| e.to_string())?;
-        read_until_end(&mut session.stdout).await
-    })
-    .await;
+    let reply = {
+        let mut io = session.io.lock().await;
+        let io = &mut *io;
+        timeout(Duration::from_secs(600), async {
+            io.stdin.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
+            io.stdin.flush().await.map_err(|e| e.to_string())?;
+            read_until_end(&mut io.stdout).await
+        })
+        .await
+    };
     match reply {
         Ok(Ok(Some(text))) => serde_json::from_str(&text)
             .map_err(|e| format!("Bad engine reply: {}", e)),
         _ => {
-            // The process died or hung: drop it.
-            if let Some(s) = list.pop() {
-                kill_session(s).await;
-            }
+            // The process died, hung or was closed: drop it.
+            take_sessions(|s| s.id == id);
+            kill_session(&session).await;
             Err(SESSION_GONE.to_string())
         }
     }
@@ -206,11 +244,10 @@ pub fn shutdown() {
     if pid != 0 {
         let _ = kill_pid(pid);
     }
-    if let Ok(mut list) = sessions().try_lock() {
-        for s in list.iter_mut() {
-            let _ = s.child.start_kill();
+    for s in std::mem::take(&mut *sessions()) {
+        if let Ok(mut child) = s.child.try_lock() {
+            let _ = child.start_kill();
         }
-        list.clear();
     }
 }
 
@@ -763,7 +800,7 @@ async fn try_run_solver(
             (true, Some(stdin)) => {
                 let id = NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst) as u64;
                 response.session_id = Some(id);
-                add_session(EngineSession { id, child, stdin, stdout: stdout_reader }).await;
+                add_session(EngineSession::new(id, child, stdin, stdout_reader)).await;
             }
             _ => {
                 response.session = false;
@@ -1032,6 +1069,54 @@ mod tests {
         ).unwrap();
         assert_eq!(p.phase, "finalize");
         assert_eq!(p.sweep_total, 3);
+    }
+
+    /// A stand-in engine session: cmd.exe running `script` on piped stdio.
+    #[cfg(windows)]
+    fn fake_session(id: u64, script: &str) -> EngineSession {
+        let mut child = Command::new("cmd")
+            .args(["/D", "/Q", "/C", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn cmd");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        EngineSession::new(id, child, stdin, stdout)
+    }
+
+    /// 2026-11-04 review: a query used to hold the registry lock for its whole
+    /// read (600 s timeout), so one stuck engine blocked every other session's
+    /// queries and closes.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stuck_session_blocks_neither_others_nor_its_close() {
+        let (stuck, live) = (u64::MAX - 1, u64::MAX - 2);
+        // Reads the request, then waits for a second line forever.
+        add_session(fake_session(stuck, "set /p a=& set /p b=")).await;
+        // Answers one request with the JSON value 1.
+        add_session(fake_session(live, "set /p a=& echo 1& echo @@DEEPSOLVER_END@@")).await;
+
+        let pending = tokio::spawn(query_session(stuck, serde_json::json!({ "cmd": "node" })));
+        tokio::time::sleep(Duration::from_millis(500)).await;   // its read is in flight
+
+        let reply = timeout(Duration::from_secs(10), query_session(live, serde_json::json!({ "cmd": "node" })))
+            .await
+            .expect("query of the live session waited on the stuck one")
+            .expect("live session query failed");
+        assert_eq!(reply, serde_json::json!(1));
+
+        timeout(Duration::from_secs(10), close_session(Some(stuck)))
+            .await
+            .expect("close waited behind the stuck read");
+        let ended = timeout(Duration::from_secs(10), pending)
+            .await
+            .expect("the stuck read outlived its close")
+            .unwrap();
+        assert_eq!(ended.unwrap_err(), SESSION_GONE);
+        close_session(Some(live)).await;
     }
 
     #[test]

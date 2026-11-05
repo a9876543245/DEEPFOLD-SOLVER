@@ -62,11 +62,11 @@ void launch_compute_strategy(
 void launch_propagate_reach(
     const uint8_t* d_node_types, const uint8_t* d_active_player,
     const uint8_t* d_num_children,
-    const uint32_t* d_children_offset, const uint32_t* d_children,
     const uint32_t* d_node_offset,
     const uint32_t* d_level_indices, uint32_t num_level_nodes,
     const float* d_strat_src, int strat_src_mode,
-    float* d_reach_oop, float* d_reach_ip, uint16_t nc,
+    float* d_reach, const uint32_t* d_reach_row_oop,
+    const uint32_t* d_reach_row_ip, uint16_t nc,
     int players);   // bit 0 OOP, bit 1 IP: whose reach rows to (re)write
 
 void launch_aggregate_node_values(
@@ -84,8 +84,9 @@ void launch_aggregate_node_values(
     // node_values by blockIdx.z * value_span. 1 / 0 reproduces the old launch.
     int num_traversers = 1, size_t value_span = 0, DeviceRunoutMaps rm = {},
     // CFR passes only (d_regrets set): the fused strategy_sum update.
-    float* d_strategy_sum = nullptr, const float* d_reach_oop = nullptr,
-    const float* d_reach_ip = nullptr, float strat_weight = 0.0f, int ss_mode = 0);
+    float* d_strategy_sum = nullptr, const float* d_reach = nullptr,
+    const uint32_t* d_reach_row_oop = nullptr, const uint32_t* d_reach_row_ip = nullptr,
+    float strat_weight = 0.0f, int ss_mode = 0);
 
 // Postsolve variant: max-over-actions at traverser-acting nodes.
 // Same signature as launch_aggregate_node_values.
@@ -126,6 +127,7 @@ void launch_terminal_level(
     const float* d_canonical_weights,
     uint32_t num_runouts,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     const uint16_t* d_opp_live,
     uint16_t num_opp_live,
     uint16_t nc,
@@ -154,6 +156,7 @@ void launch_rank_blocker_terminal_level(
     const uint16_t* d_card_list,
     uint32_t num_runouts,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     uint16_t nc,
     uint16_t max_bucket_count,
     int perspective,
@@ -175,6 +178,7 @@ void launch_equity_showdown_gemm(
     int index_by_runout,
     const float* d_canonical_weights,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     uint16_t nc,
     float rake_rate,
     float rake_cap,
@@ -193,6 +197,7 @@ void launch_signed_count_showdown_gemm(
     const int8_t* d_count_concat,
     const float* d_canonical_weights,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     uint16_t nc,
     float rake_rate,
     float rake_cap,
@@ -215,6 +220,7 @@ void launch_iso_fold_terminals(
     const unsigned long long* d_board_masks,
     uint32_t num_runouts,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     uint16_t nc,
     int perspective,
     float rake_rate,
@@ -236,6 +242,7 @@ void launch_fold_blocker_terminals(
     const uint8_t* d_combo_card1,
     uint32_t num_runouts,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     uint16_t nc,
     int perspective,
     float rake_rate,
@@ -255,6 +262,7 @@ void launch_equity_rb_compat_add(
     const uint16_t* d_card_list,
     uint32_t num_runouts,
     const float* d_reach_opp_base,
+    const uint32_t* d_reach_row_opp,
     uint16_t nc,
     float rake_rate,
     float rake_cap,
@@ -400,9 +408,18 @@ struct DeviceSolverState {
     float* regrets           = nullptr;  // [total_slots * nc] compact
     float* strategy_sum      = nullptr;  // [total_slots * nc] compact
     float* current_strategy  = nullptr;  // [total_slots * nc] compact
-    // Scratch buffers for backward pass (Phase 4.5 uses these)
-    float* reach_scratch_oop = nullptr;  // [N * nc]   per-node reach for OOP
-    float* reach_scratch_ip  = nullptr;  // [N * nc]   per-node reach for IP
+    // 2026-11-04 (review item 6): reach for BOTH players in one buffer of
+    // reach_rows = total_slots + 2 rows, not two [N * nc] buffers. A player's
+    // reach only changes on its own action edges, so a node's row for that
+    // player is the row of the last such edge above it (the edge's slot), or
+    // the player's root row. reach_row_oop/_ip map every node to that row;
+    // see build_reach_rows. Same floats as before, fewer copies of them.
+    float*    reach          = nullptr;  // [reach_rows * nc]
+    uint32_t* reach_row_oop  = nullptr;  // [N] node -> OOP reach row
+    uint32_t* reach_row_ip   = nullptr;  // [N] node -> IP reach row
+    size_t    reach_rows     = 0;
+    uint32_t  reach_root_oop = 0;        // host copies of the root rows,
+    uint32_t  reach_root_ip  = 0;        // seeded from DeviceReach each pass
     // B3 inc 1: [value_rows * nc], NOT [N * nc] — compacted terminal rows plus
     // a 2-level non-terminal window. Index through value_row[n], never by n.
     //
@@ -1063,6 +1080,7 @@ static void run_equity_batch(const DeviceTree& tree,
                              const DeviceEquityBatch& eb,
                              const uint32_t* d_value_row,
                              const float* reach_opp_base,
+                             const uint32_t* reach_row_opp,
                              uint16_t nc,
                              const SolverConfig& cfg,
                              float* nv)
@@ -1072,7 +1090,7 @@ static void run_equity_batch(const DeviceTree& tree,
     launch_equity_showdown_gemm(
         eb.tiles, eb.num_tiles, eb.terminal_order, tree.pots, d_value_row,
         mu.equity, /*index_by_runout=*/0, mu.canonical_weights,
-        reach_opp_base, nc, cfg.rake_rate, cfg.rake_cap,
+        reach_opp_base, reach_row_opp, nc, cfg.rake_rate, cfg.rake_cap,
         /*coef_kind=*/0, /*accumulate=*/0, nv);
     if (cfg.rake_rate > 0.0f && cfg.rake_cap > 0.0f) {
         if (mu.rb_valid) {
@@ -1081,12 +1099,12 @@ static void run_equity_batch(const DeviceTree& tree,
                 tree.matchup_idx, d_value_row,
                 mu.rb_combo_bucket, mu.rb_combo_card0, mu.rb_combo_card1,
                 mu.rb_card_off, mu.rb_card_list, mu.num_runouts,
-                reach_opp_base, nc, cfg.rake_rate, cfg.rake_cap, nv);
+                reach_opp_base, reach_row_opp, nc, cfg.rake_rate, cfg.rake_cap, nv);
         } else if (mu.matchup_valid != nullptr) {
             launch_equity_showdown_gemm(
                 eb.tiles, eb.num_tiles, eb.terminal_order, tree.pots,
                 d_value_row, mu.matchup_valid, /*index_by_runout=*/1,
-                mu.canonical_weights, reach_opp_base, nc,
+                mu.canonical_weights, reach_opp_base, reach_row_opp, nc,
                 cfg.rake_rate, cfg.rake_cap,
                 /*coef_kind=*/1, /*accumulate=*/1, nv);
         } else {
@@ -1114,6 +1132,7 @@ static void run_terminal_pass(const DeviceTree& tree,
                               const DeviceReach& reach,
                               const uint32_t* d_value_row,
                               const float* reach_opp_base,
+                              const uint32_t* reach_row_opp,
                               uint16_t nc,
                               int traverser,
                               const SolverConfig& cfg,
@@ -1140,7 +1159,7 @@ static void run_terminal_pass(const DeviceTree& tree,
                 mu.rb_combo_bucket, mu.rb_bucket_count,
                 mu.rb_combo_card0, mu.rb_combo_card1,
                 mu.rb_card_off, mu.rb_card_list,
-                mu.num_runouts, reach_opp_base, nc,
+                mu.num_runouts, reach_opp_base, reach_row_opp, nc,
                 mu.rb_max_bucket_count, traverser,
                 cfg.rake_rate, cfg.rake_cap,
                 mu.equity, mu.equity_slot, nv);
@@ -1157,7 +1176,7 @@ static void run_terminal_pass(const DeviceTree& tree,
                 tree.parent_indices, tree.bet_into, tree.matchup_idx,
                 d_value_row, lv.terminal_order, lv.num_terminals,
                 mu.matchup_ev, mu.matchup_valid, mu.canonical_weights,
-                mu.num_runouts, reach_opp_base, opp_live, num_opp_live,
+                mu.num_runouts, reach_opp_base, reach_row_opp, opp_live, num_opp_live,
                 nc, traverser, cfg.rake_rate, cfg.rake_cap,
                 mu.equity, mu.equity_slot, nv);
         }
@@ -1169,7 +1188,7 @@ static void run_terminal_pass(const DeviceTree& tree,
             tree.bet_into, tree.matchup_idx, d_value_row,
             lv.fold_order, lv.num_folds,
             mu.rb_combo_bucket, mu.rb_combo_card0, mu.rb_combo_card1,
-            mu.num_runouts, reach_opp_base, nc, traverser,
+            mu.num_runouts, reach_opp_base, reach_row_opp, nc, traverser,
             cfg.rake_rate, cfg.rake_cap, nv);
     } else if (mu.iso_fold_valid && lv.num_folds > 0) {
         // 2026-09-11: iso (SignedCount) boards
@@ -1179,16 +1198,16 @@ static void run_terminal_pass(const DeviceTree& tree,
             lv.fold_order, lv.num_folds,
             mu.iso_orig_off, mu.iso_orig_card0, mu.iso_orig_card1,
             mu.iso_denom, mu.iso_board_mask, mu.num_runouts,
-            reach_opp_base, nc, traverser, cfg.rake_rate, cfg.rake_cap, nv);
+            reach_opp_base, reach_row_opp, nc, traverser, cfg.rake_rate, cfg.rake_cap, nv);
     }
     tmark(2);
-    run_equity_batch(tree, mu, eb, d_value_row, reach_opp_base, nc, cfg, nv);
+    run_equity_batch(tree, mu, eb, d_value_row, reach_opp_base, reach_row_opp, nc, cfg, nv);
     // 2026-09-11: full-board showdowns on SignedCount boards, one GEMM.
     if (scb.num_tiles > 0 && mu.signed_count_valid) {
         launch_signed_count_showdown_gemm(
             scb.tiles, scb.num_tiles, scb.terminal_order, tree.pots,
             d_value_row, mu.signed_count, mu.canonical_weights,
-            reach_opp_base, nc, cfg.rake_rate, cfg.rake_cap, nv);
+            reach_opp_base, reach_row_opp, nc, cfg.rake_rate, cfg.rake_cap, nv);
     }
     tmark(3);
     if (kTiming) {
@@ -1210,6 +1229,42 @@ static void run_terminal_pass(const DeviceTree& tree,
 }
 
 // ---- Solver state allocation ----
+
+/// 2026-11-04: every node's reach row for each player. Root rows are
+/// total_slots (OOP) and total_slots + 1 (IP). On an edge the ACTING player
+/// moves to the edge's slot (node_offset[n] + a) — the row
+/// propagate_reach_forward_kernel writes — and the waiting player keeps its
+/// row; chance edges keep both. Requires the BFS-flattened tree (child index >
+/// parent index), like every other per-node table built here.
+static void build_reach_rows(const FlatGameTree& tree,
+                             const std::vector<uint32_t>& node_offset,
+                             size_t total_slots,
+                             std::vector<uint32_t>& row_oop,
+                             std::vector<uint32_t>& row_ip)
+{
+    const uint32_t N = tree.total_nodes;
+    row_oop.assign(N, 0u);
+    row_ip.assign(N, 0u);
+    if (N == 0) return;
+    row_oop[0] = static_cast<uint32_t>(total_slots);
+    row_ip[0]  = static_cast<uint32_t>(total_slots + 1);
+    for (uint32_t n = 0; n < N; ++n) {
+        const auto nt = static_cast<NodeType>(tree.node_types[n]);
+        const uint8_t na = tree.num_children[n];
+        const bool player = nt == NodeType::PLAYER_OOP || nt == NodeType::PLAYER_IP;
+        const bool oop_acts = player && tree.active_player[n] == 0;
+        for (uint8_t a = 0; a < na; ++a) {
+            const uint32_t child = tree.children[tree.children_offset[n] + a];
+            if (child <= n || child >= N) {
+                throw std::runtime_error(
+                    "GpuBackend: reach rows need a BFS-flattened tree");
+            }
+            const uint32_t slot = node_offset[n] + a;
+            row_oop[child] = (player && oop_acts)  ? slot : row_oop[n];
+            row_ip[child]  = (player && !oop_acts) ? slot : row_ip[n];
+        }
+    }
+}
 
 /// `materialize_strategy` (B1a inc 3): allocate the current_strategy buffer.
 /// Only node-locked solves need it — the lock override is a WRITE into a
@@ -1255,7 +1310,8 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
     //     on node-locked solves) = 2 or 3 buffers of total_slots*nc floats
     //     (compact; inc 2 dropped action_values, inc 3 dropped
     //     current_strategy — keep bytes_for_gpu_state_compact in sync)
-    //   reach = 2 buffers of N*nc floats (full tree)
+    //   reach = ONE buffer of (total_slots + 2) * nc floats for both
+    //     players (2026-11-04; was 2 buffers of N*nc) + two [N] row maps
     //   node_values = value_regions × value_rows*nc floats — B3 inc 1 split
     //     it into compacted terminal rows + a 2-level non-terminal window, so
     //     one region is smaller than N*nc (83.9% on the 4.65M-node target);
@@ -1263,10 +1319,11 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
     //     backward passes share one grid (gpu_value_regions)
     const size_t strat_buffers = materialize_strategy ? 3u : 2u;
     size_t bytes_strat = strat_stride * sizeof(float);
-    size_t bytes_reach = N * nc * sizeof(float);
+    const size_t reach_rows = memory_budget::gpu_reach_rows(total_slots);
+    size_t bytes_reach = reach_rows * nc * sizeof(float);
     size_t bytes_values = value_regions * value_rows * nc * sizeof(float);
     size_t state_bytes_required = bytes_strat * strat_buffers
-                                + bytes_reach * 2 + bytes_values;
+                                + bytes_reach + bytes_values;
     {
         size_t free_dev = 0, total_dev = 0;
         if (cudaMemGetInfo(&free_dev, &total_dev) == cudaSuccess) {
@@ -1289,8 +1346,16 @@ static DeviceSolverState alloc_solver_state(uint32_t num_nodes,
     ds.strategy_sum       = alloc_device_zero<float>(strat_stride);
     ds.current_strategy   = materialize_strategy
         ? alloc_device_zero<float>(strat_stride) : nullptr;
-    ds.reach_scratch_oop  = alloc_device_zero<float>(N * nc);
-    ds.reach_scratch_ip   = alloc_device_zero<float>(N * nc);
+    {
+        std::vector<uint32_t> row_oop, row_ip;
+        build_reach_rows(tree, ds.host_node_offset, total_slots, row_oop, row_ip);
+        ds.reach          = alloc_device_zero<float>(reach_rows * nc);
+        ds.reach_rows     = reach_rows;
+        ds.reach_root_oop = row_oop.empty() ? 0u : row_oop[0];
+        ds.reach_root_ip  = row_ip.empty()  ? 0u : row_ip[0];
+        ds.reach_row_oop  = upload_vector(row_oop);
+        ds.reach_row_ip   = upload_vector(row_ip);
+    }
     ds.node_values        = alloc_device_zero<float>(value_regions * value_rows * nc);
     ds.value_rows         = value_rows;
     ds.value_span         = value_rows * nc;
@@ -1328,8 +1393,10 @@ static void free_solver_state(DeviceSolverState& ds) {
     free_device(ds.regrets);
     free_device(ds.strategy_sum);
     free_device(ds.current_strategy);
-    free_device(ds.reach_scratch_oop);
-    free_device(ds.reach_scratch_ip);
+    free_device(ds.reach);
+    free_device(ds.reach_row_oop);
+    free_device(ds.reach_row_ip);
+    ds.reach_rows = 0;
     free_device(ds.node_values);
     free_device(ds.value_row);
     free_device(ds.node_offset);
@@ -1385,14 +1452,14 @@ struct GpuBackend::Impl {
     const FlatGameTree*       host_tree = nullptr;
     bool prepared = false;
     bool finalized = false;  // true once finalize() has populated current_strategy with averaged
-    // 2026-10-07: which players' reach_scratch rows match their CURRENT
+    // 2026-10-07: which players' reach rows match their CURRENT
     // strategy (bit 0 OOP, bit 1 IP). A player's reach depends on that
     // player's strategy alone, so after one traverser's regret update only
     // that side needs propagating again. Anything else that writes the rows
     // (prepare, the postsolve passes) clears it.
     int reach_fresh = 0;
 
-    // The postsolve scratch buffers (reach_scratch_*, node_values) are
+    // The postsolve scratch buffers (reach, node_values) are
     // shared across run_postsolve_pass invocations. The
     // Solver's parallel-postsolve mode runs compute_combo_evs and
     // compute_exploitability concurrently, which means up to 3 passes can
@@ -1942,11 +2009,13 @@ void GpuBackend::prepare(const SolverContext& ctx) {
             const uint64_t strat_buffers = impl_->materialize_strategy ? 3ULL : 2ULL;
             impl_->device_state_bytes_exact =
                 strat_buffers * impl_->state.state_stride * sizeof(float)
-              + 2ULL * n64 * nc64 * sizeof(float)                  // reach ×2
+              + static_cast<uint64_t>(impl_->state.reach_rows)     // reach,
+                    * nc64 * sizeof(float)                         // both players
               + impl_->state.value_regions                         // B3 inc 1 +
                     * static_cast<uint64_t>(impl_->value_rows)     // regions
                     * nc64 * sizeof(float)
-              + 2ULL * n64 * sizeof(uint32_t);   // node_offset + value_row
+              + 4ULL * n64 * sizeof(uint32_t);   // node_offset, value_row,
+                                                 // reach_row_oop/_ip
         }
 
         // Post-allocation sample: prepare() holds every buffer the CFR loop
@@ -2204,13 +2273,15 @@ void GpuBackend::iterate(int iteration) {
     // 2) Forward reach propagation.
     //    Initialize root reach (node 0) from the uploaded range weights.
     if (players & 1) {
-        CUDA_CHECK(cudaMemcpy(I.state.reach_scratch_oop,
+        CUDA_CHECK(cudaMemcpy(I.state.reach
+                                   + static_cast<size_t>(I.state.reach_root_oop) * nc,
                                I.reach.oop_reach,
                                static_cast<size_t>(nc) * sizeof(float),
                                cudaMemcpyDeviceToDevice));
     }
     if (players & 2) {
-        CUDA_CHECK(cudaMemcpy(I.state.reach_scratch_ip,
+        CUDA_CHECK(cudaMemcpy(I.state.reach
+                                   + static_cast<size_t>(I.state.reach_root_ip) * nc,
                                I.reach.ip_reach,
                                static_cast<size_t>(nc) * sizeof(float),
                                cudaMemcpyDeviceToDevice));
@@ -2229,18 +2300,18 @@ void GpuBackend::iterate(int iteration) {
         const uint32_t* d_level = I.levels.node_order + start;
         launch_propagate_reach(
             I.tree.node_types, I.tree.active_player, I.tree.num_children,
-            I.tree.children_offset, I.tree.children,
             I.state.node_offset,
             d_level, count,
             strat_src, strat_src_mode,
-            I.state.reach_scratch_oop, I.state.reach_scratch_ip, nc, players);
+            I.state.reach, I.state.reach_row_oop, I.state.reach_row_ip,
+            nc, players);
     }
     if (kIterHash) {
-        const size_t nvspan = static_cast<size_t>(N) * nc;
-        std::fprintf(stderr, "[ih] it=%d reachO=%016llx reachI=%016llx\n",
+        // One buffer for both players since 2026-11-04 (layout changed, so
+        // this hash is not comparable with pre-change builds; nv/reg/ss are).
+        std::fprintf(stderr, "[ih] it=%d reach=%016llx\n",
                      iteration,
-                     hash_dev(I.state.reach_scratch_oop, nvspan),
-                     hash_dev(I.state.reach_scratch_ip, nvspan));
+                     hash_dev(I.state.reach, I.state.reach_rows * nc));
     }
     };
     // Refresh only the stale side: after an alternating iteration that is the
@@ -2266,8 +2337,9 @@ void GpuBackend::iterate(int iteration) {
                             ? static_cast<size_t>(traverser) : 0;
         float* nv = I.state.node_values + region * I.state.value_span;
 
-        float* reach_opp_base = (traverser == 0) ? I.state.reach_scratch_ip
-                                                  : I.state.reach_scratch_oop;
+        const float* reach_opp_base = I.state.reach;
+        const uint32_t* reach_row_opp = (traverser == 0) ? I.state.reach_row_ip
+                                                         : I.state.reach_row_oop;
         // All terminals in a handful of launches (rank-blocker showdowns,
         // folds, equity GEMM — see run_terminal_pass). Their value depends
         // only on reach, which the forward pass has already finished, so
@@ -2275,7 +2347,7 @@ void GpuBackend::iterate(int iteration) {
         // keeping them out of it is what keeps the depth-keyed schedule
         // from paying 9-13× the launch overhead on small trees.
         run_terminal_pass(I.tree, I.matchup, I.levels, I.eqbatch, I.scbatch, I.reach,
-                          I.state.value_row, reach_opp_base, nc, traverser,
+                          I.state.value_row, reach_opp_base, reach_row_opp, nc, traverser,
                           *I.config, nv);
         mark("terminals");
 
@@ -2329,7 +2401,7 @@ void GpuBackend::iterate(int iteration) {
                 I.state.value_span,
                 I.runout_maps.view(),
                 I.state.strategy_sum,
-                I.state.reach_scratch_oop, I.state.reach_scratch_ip,
+                I.state.reach, I.state.reach_row_oop, I.state.reach_row_ip,
                 strat_weight, ss_mode);
         }
     };
@@ -2358,15 +2430,16 @@ void GpuBackend::iterate(int iteration) {
         const uint32_t count = N;
         const uint32_t* d_level = I.levels.node_order + start;
         for (int trav = 0; trav < 2; ++trav) {
-            float* reach_opp = (trav == 0) ? I.state.reach_scratch_ip
-                                           : I.state.reach_scratch_oop;
+            const float* reach_opp = I.state.reach;
+            const uint32_t* reach_row_opp = (trav == 0) ? I.state.reach_row_ip
+                                                        : I.state.reach_row_oop;
             launch_terminal_level(
                 I.tree.node_types, I.tree.terminal_types, I.tree.pots,
                 I.tree.parent_indices, I.tree.bet_into, I.tree.matchup_idx,
                 I.state.value_row, d_level, count,
                 I.matchup.matchup_ev, I.matchup.matchup_valid,
                 I.matchup.canonical_weights, I.matchup.num_runouts,
-                reach_opp,
+                reach_opp, reach_row_opp,
                 (trav == 0) ? I.reach.live_ip : I.reach.live_oop,
                 (trav == 0) ? I.reach.num_live_ip : I.reach.num_live_oop,
                 nc, trav,
@@ -2376,7 +2449,7 @@ void GpuBackend::iterate(int iteration) {
             // showdowns + fold kernel + equity GEMM over the production
             // lists), so a drifted production launch shows up here.
             run_terminal_pass(I.tree, I.matchup, I.levels, I.eqbatch, I.scbatch, I.reach,
-                              I.state.value_row, reach_opp, nc, trav,
+                              I.state.value_row, reach_opp, reach_row_opp, nc, trav,
                               *I.config, d_rb);
             CUDA_CHECK(cudaDeviceSynchronize());
             std::vector<float> hd(span), hr(span);
@@ -2631,11 +2704,11 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
 
     // 1) Reset per-node reach scratch by seeding the root from the upload.
     //    All subsequent levels are written by propagate_reach_forward_kernel.
-    CUDA_CHECK(cudaMemcpy(state.reach_scratch_oop,
+    CUDA_CHECK(cudaMemcpy(state.reach + static_cast<size_t>(state.reach_root_oop) * nc,
                           reach.oop_reach,
                           static_cast<size_t>(nc) * sizeof(float),
                           cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(state.reach_scratch_ip,
+    CUDA_CHECK(cudaMemcpy(state.reach + static_cast<size_t>(state.reach_root_ip) * nc,
                           reach.ip_reach,
                           static_cast<size_t>(nc) * sizeof(float),
                           cudaMemcpyDeviceToDevice));
@@ -2661,11 +2734,11 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
         const uint32_t* d_level = levels.node_order + start;
         launch_propagate_reach(
             tree.node_types, tree.active_player, tree.num_children,
-            tree.children_offset, tree.children,
             state.node_offset,
             d_level, count,
             ps_src, ps_src_mode,
-            state.reach_scratch_oop, state.reach_scratch_ip, nc, /*players=*/3);
+            state.reach, state.reach_row_oop, state.reach_row_ip,
+            nc, /*players=*/3);
     }
     // The CFR loop's reach rows are gone (averaged-strategy reach now).
     reach_fresh = 0;
@@ -2674,10 +2747,11 @@ std::vector<float> GpuBackend::Impl::run_postsolve_pass(int traverser, bool best
     //    forward pass above has already finished), then the backward value
     //    pass deepest level → root, where aggregate gathers children's
     //    node_values directly (sum-mode for EV, max-at-traverser for BR).
-    float* reach_opp_base = (traverser == 0) ? state.reach_scratch_ip
-                                              : state.reach_scratch_oop;
+    const float* reach_opp_base = state.reach;
+    const uint32_t* reach_row_opp = (traverser == 0) ? state.reach_row_ip
+                                                     : state.reach_row_oop;
     run_terminal_pass(tree, matchup, levels, eqbatch, scbatch, reach, state.value_row,
-                      reach_opp_base, nc, traverser, *config, state.node_values);
+                      reach_opp_base, reach_row_opp, nc, traverser, *config, state.node_values);
 
     const uint32_t num_levels = levels.num_levels;
     for (int L = static_cast<int>(num_levels) - 1; L >= 0; --L) {

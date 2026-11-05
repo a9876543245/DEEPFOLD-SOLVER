@@ -272,7 +272,8 @@ function App() {
 
   /** Solve `request` and make it the line shown. */
   const solveRoot = useCallback(async (request: SolverRequest) => {
-    releaseSessions();
+    // The old engines must have exited before the new one allocates.
+    await releaseSessions();
     const resp = await solve(request);
     if (resp) {
       setOffRangeCache({});
@@ -405,14 +406,17 @@ function App() {
     return {
       ...segment.response,
       global_strategy: view.global_strategy ?? {},
-      combo_strategies: view.combo_strategies,
+      // A cached node's grid labels, plus its specific combos once fetched.
+      combo_strategies: nav.variantStrategies
+        ? { ...view.combo_strategies, ...nav.variantStrategies }
+        : view.combo_strategies,
       acting_player: view.acting,
       opponent_side: view.opponent_side,
       opponent_range: view.opponent_range,
       combo_evs: view.combo_evs,
       target_combo_analysis: targetAnalysis ?? undefined,
     };
-  }, [segment, view, targetAnalysis]);
+  }, [segment, view, targetAnalysis, nav.variantStrategies]);
 
   // Locks of the solve shown (root: the nodeLocks state; later streets:
   // their own request).
@@ -873,6 +877,7 @@ function App() {
           loading={loading}
           progress={progress}
           board={boardString}
+          variantStatus={nav.variantStatus}
           currentHistory={nav.segmentCacheKey}
           onLockNode={() => {
             const targetCombo = targetAnalysis?.combo;

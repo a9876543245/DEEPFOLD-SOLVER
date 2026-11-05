@@ -221,6 +221,7 @@ elseif(CASE STREQUAL "serve_view")
   file(WRITE "${req}"
     "{\"cmd\":\"node\",\"history\":\"Check,Check#2s\"}\n"
     "{\"cmd\":\"node\",\"history\":\"Check,Check#Td\"}\n"
+    "{\"cmd\":\"combos\",\"history\":\"Check,Check#2s\"}\n"
     "{\"cmd\":\"quit\"}\n")
   execute_process(COMMAND ${EXE} ${COMMON} --board Td9d6h --serve
     --oop-range "22,AA,KK" --ip-range "QQ,JJ,AQs,KJs"
@@ -248,6 +249,46 @@ elseif(CASE STREQUAL "serve_view")
   string(JSON status GET "${onboard}" status)
   if(NOT status STREQUAL "error")
     message(FATAL_ERROR "serve_view: a turn card on the board must be an error reply")
+  endif()
+  # 2026-11-04: `combos` (the cheap per-variant reply) sees the same world as
+  # `node`, and skips the node's EVs.
+  list(GET parts 3 combos)
+  string(JSON live ERROR_VARIABLE no_live GET "${combos}" combo_strategies 2h2c)
+  string(JSON dead ERROR_VARIABLE no_dead GET "${combos}" combo_strategies 2s2h)
+  string(JSON evs ERROR_VARIABLE no_evs GET "${combos}" combo_evs)
+  if(no_live OR NOT no_dead OR NOT no_evs)
+    message(FATAL_ERROR "serve_view: combos for '#2s' must list 2h2c, not 2s2h, and carry no EVs:\n${combos}")
+  endif()
+  string(JSON node_live GET "${turn}" combo_strategies 2h2c)
+  if(NOT live STREQUAL node_live)
+    message(FATAL_ERROR "serve_view: combos and node disagree on 2h2c:\n${live}\n${node_live}")
+  endif()
+
+elseif(CASE STREQUAL "stdout_flush")
+  # 2026-11-05: once CUDA was initialized, a short-lived run lost its whole
+  # stdout (rc=0, not a byte written, even to a file) in ~1-3% of runs - the
+  # CRT's exit-time flush never ran. The app's ETA preview and GPU indicator
+  # came back empty. main() now flushes before returning. 150 previews are
+  # red on 3d24d4bd with ~98% odds (17/600 empty there, 0/600 fixed); with no
+  # CUDA device there is nothing to race and this passes trivially.
+  set(est --pot 100 --stack 300 --board AsKd7c --flop-sizes 0.75
+          --turn-sizes 0.75 --river-sizes 0.75 --iterations 2
+          --exploitability 0 --backend auto --gpu-memory-mb 200
+          --postsolve none --no-strategy-tree --no-progress --estimate-only)
+  set(empty 0)
+  foreach(i RANGE 1 150)
+    execute_process(COMMAND ${EXE} ${est}
+      OUTPUT_VARIABLE out ERROR_VARIABLE err RESULT_VARIABLE rc)
+    if(NOT rc EQUAL 0)
+      message(FATAL_ERROR "stdout_flush: run ${i} failed rc=${rc}:\n${err}")
+    endif()
+    string(FIND "${out}" "\"backend_for_estimate\"" hit)
+    if(hit EQUAL -1)
+      math(EXPR empty "${empty} + 1")
+    endif()
+  endforeach()
+  if(empty GREATER 0)
+    message(FATAL_ERROR "stdout_flush: ${empty}/150 --estimate-only runs exited 0 with no JSON on stdout")
   endif()
 
 else()
